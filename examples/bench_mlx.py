@@ -284,13 +284,41 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
 
     mx.set_default_device(mx.cpu if device == 'cpu' else mx.gpu)
     dtype = mx.float64 if precision == 'f64' else mx.float32
-    xsources = mx.array(inputs.xsources)
-    diagonals = mx.array(inputs.diagonals).astype(dtype)
-    vinit = mx.array(inputs.vinit).astype(dtype)
+    # Pass dtype at CONSTRUCTION, never construct-then-cast: MLX's docs state that "NumPy
+    # arrays with type float64 will be default converted to MLX arrays with type float32"
+    # (https://ml-explore.github.io/mlx/build/html/usage/numpy.html). mx.array(x).astype(dtype)
+    # truncates to float32 in the first call and only then casts back up in the second -- the
+    # low bits are already gone, so an "f64" arm silently ends up doing float64 arithmetic on
+    # float32-precision data (this is exactly what happened before this fix: mlx-cpu-f64 showed
+    # the f32 matvec-error floor of 2.07e-08, not the ~1e-15 a genuine f64 matvec gives).
+    # mx.array(x, dtype) builds at the target precision directly, with no lossy intermediate.
+    # xsources is int32 (see _bench_common.py), not floating point: MLX's default integer type
+    # is also int32 and int64 is a full native dtype (unlike float64, it is not narrowed on
+    # numpy ingest), so this array was never at risk -- dtype is still passed explicitly here
+    # for symmetry and so the _time_mlx dtype guard below has something to check.
+    xsources = mx.array(inputs.xsources, mx.int32)
+    diagonals = mx.array(inputs.diagonals, dtype)
+    vinit = mx.array(inputs.vinit, dtype)
+
+    # Guard against a silent precision downgrade recurring: without this, a future
+    # construct-then-cast regression (or any other dtype bug) would produce an "f64" arm that
+    # quietly runs at f32 precision, visible only if someone reads the eigenvalue/matvec_err
+    # closely enough to notice the f32 error floor -- exactly how this bug hid before. Assert
+    # actual .dtype against the requested dtype right after construction, for every array.
+    for name, arr, expected in (('xsources', xsources, mx.int32),
+                                ('diagonals', diagonals, dtype),
+                                ('vinit', vinit, dtype)):
+        assert arr.dtype == expected, (
+            f'{arm}: {name} was constructed with dtype {arr.dtype}, expected {expected} -- '
+            'a construct-then-cast (mx.array(x).astype(...)) or similar ingest bug silently '
+            'downgraded precision. Pass dtype at construction: mx.array(x, dtype).')
 
     # Same random probe as _time_jax (identical values, only the array framework differs), so
     # matvec_err is comparable across the two paths -- see the matvec_probe comment in run_arm.
-    probe = mx.array(matvec_probe).astype(dtype)
+    probe = mx.array(matvec_probe, dtype)
+    assert probe.dtype == dtype, (
+        f'{arm}: matvec probe was constructed with dtype {probe.dtype}, expected {dtype} -- '
+        'a construct-then-cast ingest bug silently downgraded precision.')
     matvec_out = np.asarray(apply_h_xz_mlx(probe, xsources, diagonals), dtype=np.float64)
     matvec_err = float(np.abs(matvec_out - matrix @ matvec_probe).max())
 

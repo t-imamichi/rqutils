@@ -35,9 +35,19 @@ for device, name in ((mx.cpu, 'cpu'), (mx.gpu, 'gpu')):
             continue
         try:
             mx.set_default_device(device)
-            xs = mx.array(inputs.xsources)
-            dg = mx.array(inputs.diagonals).astype(dtype)
-            v0 = mx.array(inputs.vinit).astype(dtype)
+            # Pass dtype at CONSTRUCTION, never construct-then-cast: MLX's docs state that
+            # "NumPy arrays with type float64 will be default converted to MLX arrays with
+            # type float32" (https://ml-explore.github.io/mlx/build/html/usage/numpy.html).
+            # mx.array(inputs.diagonals).astype(dtype) truncates to float32 in the first call
+            # and only then casts back up in the second -- the low bits are already gone, so
+            # the "f64" arm ends up doing float64 arithmetic on float32-precision data. Passing
+            # dtype directly (mx.array(x, dtype)) builds at the target precision with no lossy
+            # intermediate. xsources is int32 (see _bench_common.py); MLX's default integer
+            # type is also int32 and int64 is a full native dtype (not narrowed on ingest like
+            # float64 is), so no explicit dtype is required here -- passed anyway for symmetry.
+            xs = mx.array(inputs.xsources, mx.int32)
+            dg = mx.array(inputs.diagonals, dtype)
+            v0 = mx.array(inputs.vinit, dtype)
 
             mv = np.asarray(apply_h_xz_mlx(v0, xs, dg), dtype=np.float64)
             mverr = np.abs(mv - H @ inputs.vinit).max()
