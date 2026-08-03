@@ -250,9 +250,97 @@ This lives in the shared `timeit` so no arm can get it wrong.
 5. **The author of this spec could not execute MLX.** `mlx.core` loads a Metal
    device even for `mx.cpu` arrays, and the authoring session was headless
    (`RuntimeError: [metal::load_device] No Metal device available`). The port was
-   written and checked statically against the mlx 0.32.0 headers; **no benchmark
-   number in this design has been measured.** Expect a debug round-trip on
-   first run.
+   written and checked statically against the mlx 0.32.0 headers. Every number in
+   the Results section below was measured by the user on real hardware, not by the
+   author; the debug round-trip this predicted did happen, and took two rounds
+   (see Results → Correctness).
+6. **The MLX arms rebuild their op graph on every timed call**, a cost JAX
+   amortizes into `compile_s`. This biases the per-iteration numbers against MLX.
+   Quantified in the Results section: it accounts for essentially all of the
+   measured MLX time.
+
+## Results
+
+Measured by the user on an Apple M1 (7 GPU cores), mlx 0.32.0, jax 0.11.0, at
+`--num-qubits 12 --num-paulis 100 --num-states 1000` (subspace dimension
+N=893 after uniquification, J=100 distinct X signatures):
+
+| arm | setup_s | compile_s | per_it_ms | solve_s | iters | matvec_err | eigval |
+|---|---|---|---|---|---|---|---|
+| jax-cpu-f64 | 0.221 | 0.263 | **0.232** | 0.050 | 217 | 3.55e-15 | -5.3960400377 |
+| jax-cpu-f32 | 0.224 | 0.275 | **0.229** | 0.010 | 42 | 1.69e-06 | -5.3958568573 |
+| jax-metal-f32 | — | — | skipped | — | — | — | jax-metal not installed |
+| mlx-cpu-f64 | 0.237 | 1.487 | **7.608** | 4.623 | 652 | 5.33e-15 | -5.3960400377 |
+| mlx-cpu-f32 | 0.249 | 1.509 | **7.874** | 0.314 | 42 | 1.20e-06 | -5.3958401680 |
+| mlx-gpu-f32 | 0.226 | 1.501 | **8.354** | 0.344 | 42 | 1.20e-06 | -5.3958587646 |
+
+`setup_s` is the shared, untimed JAX setup, shown for context only.
+
+### Verdict
+
+**MLX is ~34× slower per iteration than JAX, and the Metal GPU is 6% slower
+than MLX's own CPU backend.** For this kernel at this size, MLX is not worth
+pursuing, and the GPU does not help.
+
+But the *reason* matters more than the ratio, and it limits how far the verdict
+generalizes. Per-iteration cost is essentially flat across the three MLX arms —
+7.608 (cpu-f64), 7.874 (cpu-f32), 8.354 (gpu-f32) ms, a 9.8% spread. Note the
+direction: **f32 is slower than f64, and the GPU is slower than the CPU.**
+Compute-bound work cannot behave that way (f32 moves half the bytes; the GPU has
+7 cores). That flatness is the signature of a fixed per-call cost, and it is
+large enough to account for essentially all of the MLX time: a `fixed(100it)`
+call constructs roughly 126,000 Python-level MLX ops (J=100 groups × 3 ops ×
+~4 matvecs × 100 iterations), at ~6.25 µs each. JAX pays this once, because
+`jax.lax.scan` traces the loop and then runs entirely in compiled code; MLX,
+having no `scan`/`while_loop`, rebuilds the graph on every call.
+
+So **these numbers largely measure Python graph-construction overhead, not MLX
+kernel throughput.** Two things would be needed for a verdict on MLX itself:
+`mx.compile` over the loop body (deferred by design — see the loop-strategy
+decision above), and a substantially larger N. The problem here is tiny: an
+893-element vector is ~7 KiB, L1-resident, far too small for a GPU to amortize
+kernel-launch latency.
+
+### Correctness
+
+The port is faithful. `mlx-cpu-f64` reproduces `jax-cpu-f64`'s eigenvalue to all
+ten printed digits (-5.3960400377), and **all three f32 arms converge in exactly
+42 iterations** — JAX and MLX, CPU and GPU. At the smaller gate size
+(n=10/200 states) both f32 arms converged in exactly 26 iterations, again
+matching JAX f32.
+
+Two bugs were found and one non-bug diagnosed along the way:
+
+1. **Silent float64 → float32 truncation on MLX ingest.** `mx.array(x)` converts
+   float64 numpy arrays to float32 (documented MLX behaviour), so the original
+   `mx.array(x).astype(mx.float64)` upcast already-truncated data — the f64 arm
+   ran float64 *arithmetic* on float32-*precision* data. Diagnosed from the
+   `matvec_err` column: it read 2.07e-08 (the f32 error floor) on the f64 arm,
+   identically to the f32 arms. Fixed by passing dtype at construction, plus a
+   dtype assertion so a silent precision downgrade now fails loudly.
+2. **A NaN could pass the correctness gate.** The gate was
+   `if abs(eigval - reference) > rtol`, and IEEE 754 makes every NaN comparison
+   false, so a non-converged NaN eigenvalue was reported as a clean result with a
+   full timing row. Fixed with an explicit `np.isfinite` check.
+3. **Not a port bug:** `mlx-cpu-f64` needing 652 iterations versus JAX's 217
+   traces to `eigenpair_3x3`, whose Cardano formulation loses ~8 digits when two
+   eigenvalues are nearly degenerate — the regime a converging LOBPCG enters.
+   `rqutils.ground_locg.eigenpair_3x3` (the JAX original) exhibits *bit-identical*
+   error, 3.616e-08 on the same 300 near-degenerate matrices, agreeing with the
+   port to 15 digits. The port reproduced a pre-existing library characteristic.
+   Why JAX tolerates it in 217 iterations while MLX needs 652 is most likely a
+   difference in accumulation order (Python loop vs `jax.lax.scan`) changing which
+   intermediate matrices each encounters. **This is worth a separate `rqutils`
+   issue**: it is a robustness property of the library's Rayleigh–Ritz step, not
+   of this port.
+
+### What this does not tell you
+
+Beyond the four limitations listed above, all of which held: the comparison is
+fp32-only where the GPU is concerned, covers only the solver loop, and — most
+importantly — is dominated by per-call overhead rather than kernel time. Read
+the 34× as "MLX without `mx.compile` is unsuited to a Python-level iteration
+loop of this shape", not as "MLX kernels are 34× slower than XLA's".
 
 ## Out of scope
 
