@@ -20,7 +20,8 @@ dependencies = [
     "numpy",
     "scipy",
     "h5py",
-    "jax[cuda12]"
+    "jax[cuda12]; sys_platform == 'linux'",
+    "jax; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]
