@@ -203,6 +203,23 @@ def run_arm(arm, options):
     # indices) from a solver-loop bug -- without it, a broken matvec would only ever be visible
     # as a wrong eigenvalue, which is much harder to root-cause. Must fail before any timing
     # number is reported, same as the eigenvalue gate below.
+    # Explicit non-finite check, ahead of the comparison-based gates below. A comparison-based
+    # guard cannot catch NaN: `nan > x` and `abs(nan - y) > z` are both False for every x, y, z
+    # under IEEE 754, so a NaN result silently falls through a `if err > atol: raise` gate
+    # instead of tripping it. np.isfinite is required here specifically because it is not a
+    # comparison -- do not "simplify" this back into the threshold checks below. The iteration
+    # count is the diagnostic: hitting maxiter (iters == the configured cap) means the solver
+    # never converged, as opposed to a numerical blow-up partway through.
+    if not np.isfinite(result['matvec_err']):
+        raise SystemExit(f'gate failed for {arm}: matvec error is non-finite '
+                         f'({result["matvec_err"]!r}) after {result["iters"]} solver '
+                         'iterations -- solver did not converge cleanly')
+
+    if not np.isfinite(result['eigval']):
+        raise SystemExit(f'gate failed for {arm}: eigenvalue is non-finite '
+                         f'({result["eigval"]!r}) after {result["iters"]} solver iterations '
+                         '-- solver did not converge cleanly')
+
     matvec_atol = MATVEC_ATOL[precision]
     if result['matvec_err'] > matvec_atol:
         raise SystemExit(f'gate failed for {arm}: matvec error {result["matvec_err"]} exceeds '
