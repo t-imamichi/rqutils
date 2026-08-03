@@ -4,7 +4,7 @@ A transcription of ``rqutils.ground_locg`` and ``rqutils.sqd.apply_h_xz_cached``
 for benchmarking against the JAX originals. See
 ``docs/superpowers/specs/2026-08-03-mlx-sqd-poc-design.md``.
 
-Three structural differences from the JAX version, all forced by MLX:
+Four structural differences from the JAX version, all forced by MLX:
 
 * ``jax.lax.scan`` over X groups becomes a Python loop. J is static and small (tens), so
   unrolling into MLX's lazy graph is fine.
@@ -13,6 +13,11 @@ Three structural differences from the JAX version, all forced by MLX:
   for an MLX user, not a measurement artifact. Pass ``tol=0.`` to skip the check entirely
   and get a sync-free fixed-iteration run.
 * All ``out_sharding=`` arguments are dropped; MLX has unified memory and no sharding.
+* Everything is real-valued: MLX has no complex128 anywhere and no float64 on Metal, so this
+  port relies on the even-Y constraint enforced by ``_bench_common.build_solver_inputs`` to
+  keep every coefficient real. ``eigenpair_2x2`` and ``eigenpair_3x3`` in particular drop the
+  ``.conjugate()`` calls and real/imag norm splits the JAX originals need for the general
+  (complex-Hermitian) case -- see their docstrings.
 
 The analytic 2x2/3x3 Rayleigh-Ritz step carries over directly, which is what makes this port
 feasible at all -- MLX has no ``eigh``.
@@ -141,7 +146,15 @@ def _project_out(basis, vector):
 
 
 def eigenpair_2x2(mat):
-    """Lowest eigenpair of a real symmetric 2x2 matrix."""
+    """Lowest eigenpair of a real symmetric 2x2 matrix.
+
+    Assumes ``mat`` is real symmetric, not just Hermitian. The JAX original
+    (``rqutils.ground_locg.eigenpair_2x2``) handles the general complex-Hermitian case with a
+    ``.conjugate()`` on the off-diagonal element and a real/imag norm split; both are dropped
+    here because they are no-ops when everything is real. That is guaranteed only by the
+    even-Y constraint enforced in ``_bench_common.build_solver_inputs`` -- if that constraint
+    is ever relaxed, this function must regain the conjugate and the norm split.
+    """
     d = mx.stack([mat[0, 0], mat[1, 1]])
     off = mat[1, 0]
     det = d[0] * d[1] - off * off
@@ -158,6 +171,17 @@ def eigenpair_3x3(mat):
     Reference: J. Kopp, Int. J. Mod. Phys. C. 19, 523 (2008). Ported from
     ``rqutils.ground_locg.eigenpair_3x3``; MLX has no eigh, so the analytic route is the
     only route.
+
+    Assumes ``mat`` is real symmetric, not just Hermitian. The JAX original ends with
+    ``jnp.cross(v0, v1).conjugate()`` and then normalizes via a real/imag norm split
+    (``re[0]*re[0] + ... + im[0]*im[0] + ...``); both are dropped here -- the ``.conjugate()``
+    call and the imaginary half of the norm -- because they vanish identically once every
+    input is real. That is true only because of the even-Y constraint enforced upstream in
+    ``_bench_common.build_solver_inputs`` (odd-Y Pauli strings produce complex coefficients,
+    which MLX cannot represent at any precision). If that constraint is ever relaxed, this
+    function silently returns wrong eigenvalues -- there is no real-input-only assertion
+    here, and the numpy-shim static check exercises only real inputs by construction, so
+    nothing in this repo would catch the regression.
     """
     d = mx.stack([mat[0, 0], mat[1, 1], mat[2, 2]])
     modod = mx.stack([mat[1, 0], mat[2, 0], mat[2, 1]]) ** 2
