@@ -101,6 +101,16 @@ def parse_args(argv=None):
                              'reconstructed every call. A no-op for jax arms -- reported as a '
                              'note rather than an error, since JAX already amortizes graph '
                              'construction via jax.jit/lax.while_loop (see compile_s).')
+    parser.add_argument('--host-rayleigh-ritz', action='store_true',
+                        help='MLX arms only (Optimization 4): solve the 2x2/3x3 Rayleigh-Ritz '
+                             'eigenproblem on the host with np.linalg.eigh instead of the '
+                             'analytic eigenpair_2x2/eigenpair_3x3 MLX kernels, replacing 35 '
+                             'kernel launches/iteration with 2 host syncs. A no-op for jax arms '
+                             '-- reported as a note rather than an error, since JAX has a native '
+                             'jnp.linalg.eigh-free analytic path already and no equivalent '
+                             'concept of an MLX kernel-launch bottleneck. Mutually exclusive '
+                             'with --compile-body for MLX arms (see ground_locg_mlx); passing '
+                             'both raises rather than silently picking one.')
     parser.add_argument('--json', action='store_true', help='Emit JSON instead of a table.')
     parser.add_argument('--skip-brute-force', action='store_true',
                         help='Explicitly skip the 2^n reference at any --num-qubits. It is '
@@ -222,6 +232,23 @@ def run_arm(arm, options):
         )
         print(f'NOTE: {compile_body_note}', file=sys.stderr)
 
+    host_rayleigh_ritz_note = None
+    if framework == 'jax' and options.host_rayleigh_ritz:
+        # --host-rayleigh-ritz is MLX-only (Optimization 4: np.linalg.eigh on the host in place
+        # of the analytic eigenpair_2x2/eigenpair_3x3 MLX kernels). JAX has no MLX-style
+        # per-launch kernel overhead to amortize -- jax.jit compiles the whole solver loop into
+        # one executable via jax.lax.while_loop, so there is no "35 kernel launches on a 3x3"
+        # cost for this flag to remove. Reported as a note, not an error, for the same reason as
+        # --compile-body above: a jax arm must not fail just because this flag was passed (e.g.
+        # under --all, which passes the same flags to every arm).
+        host_rayleigh_ritz_note = (
+            f'--host-rayleigh-ritz is MLX-only (Optimization 4, np.linalg.eigh on the host in '
+            f'place of the analytic Rayleigh-Ritz MLX kernels); ignored for {arm} because JAX '
+            'has no per-launch kernel overhead for this to amortize -- jax.jit already compiles '
+            'the whole solver loop into one executable.'
+        )
+        print(f'NOTE: {host_rayleigh_ritz_note}', file=sys.stderr)
+
     rtol = RTOL[precision]
     if framework == 'jax':
         result = _time_jax(arm, inputs, precision, options, matrix, matvec_probe)
@@ -271,6 +298,8 @@ def run_arm(arm, options):
     result['chunk'] = options.chunk if options.matvec == 'chunked' else None
     result['compile_body'] = bool(options.compile_body) and framework == 'mlx'
     result['compile_body_note'] = compile_body_note
+    result['host_rayleigh_ritz'] = bool(options.host_rayleigh_ritz) and framework == 'mlx'
+    result['host_rayleigh_ritz_note'] = host_rayleigh_ritz_note
     return result
 
 
@@ -403,16 +432,22 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
     # --compile-body is Optimization 2: mx.compile over the LOBPCG iteration body. Off by
     # default (compile_body=False), which reproduces this function's behaviour exactly as it
     # was before the parameter existed -- see ground_locg_mlx's docstring.
+    # --host-rayleigh-ritz is Optimization 4: np.linalg.eigh on the host in place of the
+    # analytic Rayleigh-Ritz MLX kernels. Also off by default, and mutually exclusive with
+    # compile_body -- ground_locg_mlx itself raises ValueError if both are True, so that
+    # combination fails loudly here rather than the CLI silently picking one.
     def fixed():
         return ground_locg_mlx(matvec_fn, vinit, args=(xsources, diagonals),
                                maxiter=options.fixed_iters, tol=0.,
-                               compile_body=options.compile_body)
+                               compile_body=options.compile_body,
+                               host_rayleigh_ritz=options.host_rayleigh_ritz)
 
     compile_s, fixed_s = timeit(fixed, options.repeat, sync)
 
     def solve():
         return ground_locg_mlx(matvec_fn, vinit, args=(xsources, diagonals),
-                               compile_body=options.compile_body)
+                               compile_body=options.compile_body,
+                               host_rayleigh_ritz=options.host_rayleigh_ritz)
 
     _, solve_s = timeit(solve, options.repeat, sync)
     eigval, _, iters = solve()
@@ -440,6 +475,8 @@ def run_all(options):
             argv.append('--skip-brute-force')
         if options.compile_body:
             argv.append('--compile-body')
+        if options.host_rayleigh_ritz:
+            argv.append('--host-rayleigh-ritz')
         proc = subprocess.run(argv, capture_output=True, text=True)
         if proc.returncode != 0:
             results.append({'arm': arm, 'status': 'failed',
@@ -473,6 +510,8 @@ def report(results, as_json):
             opt += f'(chunk={row.get("chunk")})'
         if row.get('compile_body'):
             opt += ' compile_body'
+        if row.get('host_rayleigh_ritz'):
+            opt += ' host_rayleigh_ritz'
         print(f'{row["arm"]:<15}{row["setup_s"]:>9.4f}{row["compile_s"]:>10.4f}'
               f'{row["fixed_s"]:>10.4f}{row["per_it_ms"]:>11.3f}{row["solve_s"]:>10.4f}'
               f'{row["iters"]:>7d}{row["matvec_err"]:>12.2e}  {row["eigval"]:<15.10f}  {opt}')
@@ -491,6 +530,8 @@ def report(results, as_json):
             print(f'NOTE [{row["arm"]}]: {row["brute_force_note"]}')
         if row.get('compile_body_note'):
             print(f'NOTE [{row["arm"]}]: {row["compile_body_note"]}')
+        if row.get('host_rayleigh_ritz_note'):
+            print(f'NOTE [{row["arm"]}]: {row["host_rayleigh_ritz_note"]}')
 
 
 def main():

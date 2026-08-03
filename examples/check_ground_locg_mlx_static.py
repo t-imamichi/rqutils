@@ -207,4 +207,46 @@ assert abs(eigval_default2 - eigval) < 1e-12
 print('OK  default path (compile_body=False) unaffected -- byte-identical to the pre-existing '
      f'behaviour (iters={iters_default2})')
 
+# 3h. host_rayleigh_ritz=True (Optimization 4): solves the 2x2/3x3 Rayleigh-Ritz eigenproblem
+# with np.linalg.eigh on the host instead of the analytic eigenpair_2x2/eigenpair_3x3 kernels.
+# The shim calls numpy directly (mx.array is np.array under the shim), so this path is exercised
+# exactly as it runs under real MLX except for the actual device sync.
+eigval_host, _, iters_host = ground_locg_mlx(
+    apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals),
+    host_rayleigh_ritz=True)
+assert abs(eigval_host - ref) < 1e-9 * max(1., abs(ref)), (
+    f'host_rayleigh_ritz=True got {eigval_host}, reference {ref}')
+print(f'OK  host_rayleigh_ritz=True: eig={eigval_host:.12f} ref={ref:.12f} iters={iters_host} '
+     f'(default path: iters={iters})')
+
+# 3i. The default path (host_rayleigh_ritz=False) must remain completely unaffected --
+# byte-identical iteration count and eigenvalue to before host_rayleigh_ritz existed (3b above).
+eigval_default3, _, iters_default3 = ground_locg_mlx(
+    apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals))
+assert iters_default3 == iters == 89, (
+    f'default (host_rayleigh_ritz=False) iteration count changed: {iters_default3} vs 89')
+assert abs(eigval_default3 - ref) < 1e-9 * max(1., abs(ref))
+assert eigval_default3 == eigval, (
+    f'default path eigenvalue changed after exercising host_rayleigh_ritz: '
+    f'{eigval_default3} vs original {eigval} -- host_rayleigh_ritz must be a strict no-op '
+    'when unset')
+print('OK  default path (host_rayleigh_ritz=False) unaffected -- byte-identical to the '
+     f'pre-existing behaviour (iters={iters_default3}, eig={eigval_default3:.12f})')
+
+# 3j. host_rayleigh_ritz=True and compile_body=True are mutually exclusive: mx.compile traces a
+# fixed array-in/array-out graph by running the body once, so a host sync inside it is not
+# traceable (it would freeze at trace-time values instead of recomputing every call). This must
+# raise loudly rather than silently picking one flag or producing a wrong answer.
+try:
+    ground_locg_mlx(apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals),
+                    host_rayleigh_ritz=True, compile_body=True)
+except ValueError as exc:
+    assert 'compile' in str(exc).lower() and 'host' in str(exc).lower(), (
+        f'unexpected guard message: {exc}')
+    print('OK  host_rayleigh_ritz=True + compile_body=True raises ValueError as documented')
+else:
+    raise AssertionError(
+        'host_rayleigh_ritz=True + compile_body=True did not raise -- mutual exclusion guard '
+        'did not fire')
+
 print('\nALL STATIC CHECKS PASSED (numpy shim; MLX itself still unverified)')
