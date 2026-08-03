@@ -2,7 +2,12 @@
 
 Only the solver loop is compared. Setup (uniquification, X-source lookup, diagonal
 composition) always runs in JAX on CPU and is not timed, so every arm consumes identical
-arrays -- see docs/superpowers/specs/2026-08-03-mlx-sqd-poc-design.md.
+arrays -- see docs/superpowers/specs/2026-08-03-mlx-sqd-poc-design.md. The one exception is
+``jax-metal-f32``: JAX's x64 flag is process-global, and Metal supports neither float64 nor
+complex128, so that arm's *setup* (not just its solve) runs at reduced precision and is
+therefore not solving byte-identical arrays to every other arm. This is disclosed via a
+``setup_precision`` field in every result and a footnote in the text report -- see I3 in
+.superpowers/sdd/2026-08-03-mlx-sqd-poc/final-review.md.
 
 JAX's platform and x64 flag are process-global and must be set before importing jax, so each
 JAX arm needs its own process. --all re-executes this script once per arm and collates.
@@ -10,13 +15,26 @@ JAX arm needs its own process. --all re-executes this script once per arm and co
 .. code-block:: sh
 
     uv run python examples/bench_mlx.py --arm mlx-gpu-f32
-    uv run python examples/bench_mlx.py --all
-    uv run python examples/bench_mlx.py --all --json > results.json
+    uv run python examples/bench_mlx.py --all --num-qubits 10
+    uv run python examples/bench_mlx.py --all --num-qubits 10 --json > results.json
 
 Two metrics are reported per arm: per-iteration cost at a fixed iteration count (identical
 work per arm, so a clean speed comparison) and time-to-convergence with its iteration count
 (what production actually pays). Reporting both makes it visible when fp32 is faster per
 iteration but needs more iterations.
+
+CAVEAT -- MLX per-call graph reconstruction is not subtracted out. ``ground_locg_mlx`` is
+plain Python: every timed call re-walks the iteration loop and re-constructs MLX's op graph
+from scratch, in Python, before any device work happens. ``ground_locg`` (the JAX original)
+is ``@jax.jit``: tracing happens once and is reported in ``compile_s``, and every subsequent
+timed call dispatches an already-compiled executable with no further Python-level graph
+construction. So the MLX arms' ``fixed_s`` / ``per_it_ms`` / ``solve_s`` numbers include a
+per-call Python graph-construction cost that the JAX arms' numbers do not pay in the same
+column. This biases the comparison AGAINST MLX (JAX's steady-state number is cleaner than
+MLX's), which is the safer direction for a benchmark whose main risk is a bogus MLX win --
+but the magnitude has not been measured here (it would require timing graph construction
+without ``mx.eval``, which this PoC does not do; see I4 in the final review). Do not read
+"MLX is slower per iteration" as a verdict on MLX's kernels without accounting for this.
 """
 import argparse
 import json
@@ -30,16 +48,27 @@ ARMS = ('jax-cpu-f64', 'jax-cpu-f32', 'jax-metal-f32',
 # Relative tolerance for the correctness gate, by precision.
 RTOL = {'f64': 1e-9, 'f32': 1e-4}
 
-# Absolute tolerance on matvec_err (||ported_matvec(v) - H @ v||_inf for a one-hot v), by
-# precision. apply_h_xz_mlx/apply_h_xz_cached sum at most num_xgroups terms of magnitude <= 1
-# each, so the error floor is a few ULPs of the accumulation dtype, not something that scales
-# with subspace_dim. Measured directly (see task-3-report.md) across n=10..14 /
-# num_paulis=20..100 / num_states=200..4000: f64 error is exactly 0 in every trial (Task 2's
-# static check separately measured ~4.4e-16 for a similar comparison), f32 error is ~2-3e-8,
-# comfortably under f32 eps (~1.19e-7). Reusing RTOL's numbers as absolute thresholds gives
-# a >1000x margin over both observed floors while staying far below "the matvec is just
-# wrong" territory (mismatches from a real bug, e.g. bad mx.take indexing, show up as
-# order-1 errors, not order-1e-8).
+# Above this many qubits, the 2^n-by-2^n brute-force cross-check (build the full dense matrix
+# by Kronecker products) is skipped by default: n=12 measures ~4 s / ~270 MB per Pauli string
+# here, which is tolerable, but n=13 is already ~20 s and n=14 is ~470 s and >4 GB per string
+# (measured on this machine; see final-review.md I2). n=10 -- the spec's gate size -- and n=12
+# both always run it. The dense-from-solver-inputs gate (dense_reference) is NOT size-limited
+# and always runs; only this independent 2^n cross-check is skipped, and skipping is always
+# disclosed (see run_arm). --skip-brute-force remains available as an explicit override at any
+# size.
+BRUTE_FORCE_MAX_QUBITS = 12
+
+# Absolute tolerance on matvec_err (||ported_matvec(v) - H @ v||_inf for a random v), by
+# precision. Probing with a fixed-seed random vector (not the one-hot vinit) is required by the
+# design spec and is what gives this gate its sensitivity to gather bugs -- see I1 in
+# final-review.md. Re-measured directly with the random probe (jax-cpu-f64/f32) across
+# n=10/12 x num_paulis=20/100 x num_states=200/1000 (see final-fix-report.md for the exact
+# runs): f64 error tops out at 3.55e-15 (now that dozens of O(1) terms accumulate per output
+# entry instead of one, the floor rose off the one-hot probe's exact 0.0, but is still far
+# below the threshold -- a >280,000x margin), f32 error tops out at 1.69e-6, a >59x margin
+# under 1e-4 and still comfortably above f32 eps (~1.19e-7) times a modest accumulation
+# factor. Both margins stay far below "the matvec is just wrong" territory (mismatches from a
+# real bug, e.g. bad mx.take indexing, show up as order-1 errors, not order-1e-6/1e-15).
 MATVEC_ATOL = {'f64': 1e-9, 'f32': 1e-4}
 
 
@@ -58,7 +87,9 @@ def parse_args(argv=None):
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--json', action='store_true', help='Emit JSON instead of a table.')
     parser.add_argument('--skip-brute-force', action='store_true',
-                        help='Skip the 2^n reference (needed above ~n=14).')
+                        help='Explicitly skip the 2^n reference at any --num-qubits. It is '
+                             f'auto-skipped above --num-qubits {BRUTE_FORCE_MAX_QUBITS} '
+                             'regardless of this flag; either way the skip is reported.')
     parser.add_argument('--self-test-break-gate', action='store_true',
                         help=argparse.SUPPRESS)  # corrupts the problem to prove the gate bites
     options = parser.parse_args(argv)
@@ -90,7 +121,9 @@ def run_arm(arm, options):
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _bench_common import (generate_problem, build_solver_inputs, dense_reference,
-                               brute_force_reference, timeit)
+                               brute_force_reference)
+    import time
+    import numpy as np
 
     if framework == 'jax' and device == 'metal':
         try:
@@ -102,27 +135,67 @@ def run_arm(arm, options):
             return {'arm': arm, 'status': 'skipped',
                     'reason': f'jax backend is {backend}, not metal'}
 
+    setup_start = time.perf_counter()
     pauli_strings, coeffs, states = generate_problem(
         options.num_qubits, options.num_paulis, options.num_states, options.seed
     )
     inputs = build_solver_inputs(pauli_strings, coeffs, states)
+    setup_s = time.perf_counter() - setup_start
 
     if options.self_test_break_gate:
         # Corrupt the diagonals so the solver cannot reach the reference eigenvalue.
         inputs.diagonals = inputs.diagonals * 2.5 + 1.0
 
+    # Matvec probe vector: a fixed-seed random vector, per the design spec (line 213), shared
+    # verbatim between _time_jax and _time_mlx so their matvec_err values are comparable. A
+    # one-hot vector (e.g. inputs.vinit) has a single nonzero entry and is nearly blind to
+    # gather bugs such as a dropped X group or an off-by-one `take` index -- see I1 in
+    # final-review.md, which measured 1% vs 100% detection of injected perturbations. The seed
+    # is fixed (not options.seed) so the probe is reproducible independent of the problem seed.
+    matvec_probe = np.random.default_rng(20260803).normal(size=inputs.subspace_dim)
+
+    # setup_precision reflects the precision the SHARED SETUP stage ran at, which is float64
+    # for every arm except jax-metal-f32 (see the jax_enable_x64 comment above). This is
+    # independent of `precision`, the arm's target SOLVE precision: jax-cpu-f32's setup is
+    # still float64, only its solve is float32. Disclosed in every result (I3) because an arm
+    # whose setup precision differs is not solving byte-identical arrays to the rest.
+    setup_precision = 'f32' if device == 'metal' else 'f64'
+
     matrix, reference = dense_reference(inputs)
-    if not options.skip_brute_force:
+    brute_force_note = None
+    skip_brute_force = options.skip_brute_force
+    if not skip_brute_force and options.num_qubits > BRUTE_FORCE_MAX_QUBITS:
+        skip_brute_force = True
+        brute_force_note = (
+            f'brute-force 2^n cross-check auto-skipped: --num-qubits {options.num_qubits} > '
+            f'{BRUTE_FORCE_MAX_QUBITS} (the 2^n dense matrix becomes too large/slow -- see '
+            'BRUTE_FORCE_MAX_QUBITS in this module). The dense-from-solver-inputs gate '
+            '(dense_reference) still ran.'
+        )
+        print(f'NOTE: {brute_force_note}', file=sys.stderr)
+    elif skip_brute_force:
+        brute_force_note = 'brute-force 2^n cross-check skipped: --skip-brute-force was passed.'
+        print(f'NOTE: {brute_force_note}', file=sys.stderr)
+
+    if not skip_brute_force:
         brute = brute_force_reference(pauli_strings, coeffs, states)
-        if abs(reference - brute) > 1e-9 * max(1., abs(brute)):
+        # The threshold scales with setup precision, not solve precision: a float32 setup
+        # (jax-metal-f32 only) accumulates rounding error in the setup chain itself (measured
+        # |H_metal - H_cpu|_inf ~= 2.79e-08 in the final review), which a fixed 1e-9 threshold
+        # sits right at the edge of -- passing or failing depending on n by accident. Scaling by
+        # RTOL[setup_precision] makes the gate's behaviour depend on a disclosed, principled
+        # quantity instead of luck.
+        brute_force_rtol = RTOL[setup_precision]
+        if abs(reference - brute) > brute_force_rtol * max(1., abs(brute)):
             raise SystemExit(f'gate failed: dense reference {reference} disagrees with '
-                             f'brute force {brute} -- the setup chain is wrong')
+                             f'brute force {brute} by more than rtol={brute_force_rtol} '
+                             f'(setup_precision={setup_precision}) -- the setup chain is wrong')
 
     rtol = RTOL[precision]
     if framework == 'jax':
-        result = _time_jax(arm, inputs, precision, options)
+        result = _time_jax(arm, inputs, precision, options, matrix, matvec_probe)
     else:
-        result = _time_mlx(arm, inputs, device, precision, options)
+        result = _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe)
 
     # Gate: the ported matvec (apply_h_xz_mlx, or apply_h_xz_cached re-checked for symmetry)
     # must agree with the dense H @ v built straight from the same solver inputs. This isolates
@@ -140,11 +213,14 @@ def run_arm(arm, options):
                          f'reference {reference} by more than rtol={rtol}')
 
     result['reference'] = reference
+    result['setup_precision'] = setup_precision
+    result['brute_force_note'] = brute_force_note
+    result['setup_s'] = setup_s
     result['status'] = 'ok'
     return result
 
 
-def _time_jax(arm, inputs, precision, options):
+def _time_jax(arm, inputs, precision, options, matrix, matvec_probe):
     import numpy as np
     import jax
     import jax.numpy as jnp
@@ -158,10 +234,11 @@ def _time_jax(arm, inputs, precision, options):
     diagonals = jnp.asarray(inputs.diagonals, dtype=dtype)
     vinit = jnp.asarray(inputs.vinit, dtype=dtype)
 
-    # Gate: the ported matvec and the original must agree on the same input.
-    matvec_out = np.asarray(apply_h_xz_cached(vinit, xsources, diagonals), dtype=np.float64)
-    matrix, _ = _reference_matrix(inputs)
-    matvec_err = float(np.abs(matvec_out - matrix @ inputs.vinit).max())
+    # Gate: the ported matvec and the original must agree on the same input, probed with a
+    # random vector (not vinit) -- see the matvec_probe comment in run_arm.
+    probe = jnp.asarray(matvec_probe, dtype=dtype)
+    matvec_out = np.asarray(apply_h_xz_cached(probe, xsources, diagonals), dtype=np.float64)
+    matvec_err = float(np.abs(matvec_out - matrix @ matvec_probe).max())
 
     def fixed():
         return ground_locg(apply_h_xz_cached, vinit, args=(xsources, diagonals),
@@ -181,7 +258,7 @@ def _time_jax(arm, inputs, precision, options):
             'matvec_err': matvec_err}
 
 
-def _time_mlx(arm, inputs, device, precision, options):
+def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
     import numpy as np
     import mlx.core as mx
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -194,9 +271,11 @@ def _time_mlx(arm, inputs, device, precision, options):
     diagonals = mx.array(inputs.diagonals).astype(dtype)
     vinit = mx.array(inputs.vinit).astype(dtype)
 
-    matvec_out = np.asarray(apply_h_xz_mlx(vinit, xsources, diagonals), dtype=np.float64)
-    matrix, _ = _reference_matrix(inputs)
-    matvec_err = float(np.abs(matvec_out - matrix @ inputs.vinit).max())
+    # Same random probe as _time_jax (identical values, only the array framework differs), so
+    # matvec_err is comparable across the two paths -- see the matvec_probe comment in run_arm.
+    probe = mx.array(matvec_probe).astype(dtype)
+    matvec_out = np.asarray(apply_h_xz_mlx(probe, xsources, diagonals), dtype=np.float64)
+    matvec_err = float(np.abs(matvec_out - matrix @ matvec_probe).max())
 
     def sync(result):
         # MLX is lazy: without this we would time graph construction, not computation.
@@ -219,12 +298,6 @@ def _time_mlx(arm, inputs, device, precision, options):
             'per_it_ms': fixed_s / options.fixed_iters * 1e3,
             'solve_s': solve_s, 'iters': int(iters), 'eigval': float(eigval),
             'matvec_err': matvec_err}
-
-
-def _reference_matrix(inputs):
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from _bench_common import dense_reference
-    return dense_reference(inputs)
 
 
 def run_all(options):
@@ -258,17 +331,30 @@ def report(results, as_json):
         print(json.dumps({'results': results}, indent=2))
         return
 
-    header = (f'{"arm":<15}{"compile_s":>10}{"fixed_s":>10}{"per_it_ms":>11}'
-              f'{"solve_s":>10}{"iters":>7}  eigval')
+    header = (f'{"arm":<15}{"setup_s":>9}{"compile_s":>10}{"fixed_s":>10}{"per_it_ms":>11}'
+              f'{"solve_s":>10}{"iters":>7}{"matvec_err":>12}  eigval')
     print(header)
     print('-' * len(header))
     for row in results:
         if row.get('status') != 'ok':
             print(f'{row["arm"]:<15}{row.get("status", "?"):>10}  {row.get("reason", "")}')
             continue
-        print(f'{row["arm"]:<15}{row["compile_s"]:>10.4f}{row["fixed_s"]:>10.4f}'
-              f'{row["per_it_ms"]:>11.3f}{row["solve_s"]:>10.4f}{row["iters"]:>7d}'
-              f'  {row["eigval"]:.10f}')
+        print(f'{row["arm"]:<15}{row["setup_s"]:>9.4f}{row["compile_s"]:>10.4f}'
+              f'{row["fixed_s"]:>10.4f}{row["per_it_ms"]:>11.3f}{row["solve_s"]:>10.4f}'
+              f'{row["iters"]:>7d}{row["matvec_err"]:>12.2e}  {row["eigval"]:.10f}')
+
+    # Disclosure footnotes (I2, I3): a silently skipped correctness check or a silently
+    # reduced-precision setup is exactly the failure mode this benchmark exists to avoid.
+    for row in results:
+        if row.get('status') != 'ok':
+            continue
+        if row.get('setup_precision') == 'f32':
+            print(f'NOTE [{row["arm"]}]: setup ran at reduced precision (float32, Metal has no '
+                  'float64) -- this arm solved a measurably different problem from the '
+                  'f64-setup arms and its eigval/matvec_err are not strictly comparable to '
+                  'theirs.')
+        if row.get('brute_force_note'):
+            print(f'NOTE [{row["arm"]}]: {row["brute_force_note"]}')
 
 
 def main():

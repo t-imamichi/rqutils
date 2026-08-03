@@ -12,8 +12,6 @@ import time
 from collections.abc import Callable
 from typing import Any
 import numpy as np
-import jax
-import jax.numpy as jnp
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import uniquify_states, get_xsource, get_diagonal
 
@@ -90,7 +88,7 @@ def build_solver_inputs(
 
     valid = xsources >= 0
     xsources = np.where(valid, xsources, 0).astype(np.int32)
-    diagonals = np.where(valid, diagonals, 0.).real.astype(np.float64)
+    diagonals = np.where(valid, diagonals, 0.).astype(np.float64)
 
     # Mirror sqd's vinit_from_min_diag: one-hot at the minimum diagonal entry.
     if np.all(hamiltonian.x[0] == 0):
@@ -114,6 +112,12 @@ def dense_reference(inputs: SolverInputs) -> tuple[np.ndarray, float]:
     rows = np.arange(dim)
     for xsource, diagonal in zip(inputs.xsources, inputs.diagonals):
         np.add.at(matrix, (rows, xsource), diagonal)
+    asym = np.abs(matrix - matrix.T).max()
+    assert asym == 0.0, (
+        f'gate failed: dense reference is not symmetric (|H - H.T|_inf = {asym}); eigvalsh '
+        'would silently ignore the upper triangle and return a wrong reference. This should be '
+        'impossible for even-Y (real) input -- see _bench_common.build_solver_inputs.'
+    )
     return matrix, float(np.linalg.eigvalsh(matrix)[0])
 
 
