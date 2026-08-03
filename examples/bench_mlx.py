@@ -30,6 +30,18 @@ ARMS = ('jax-cpu-f64', 'jax-cpu-f32', 'jax-metal-f32',
 # Relative tolerance for the correctness gate, by precision.
 RTOL = {'f64': 1e-9, 'f32': 1e-4}
 
+# Absolute tolerance on matvec_err (||ported_matvec(v) - H @ v||_inf for a one-hot v), by
+# precision. apply_h_xz_mlx/apply_h_xz_cached sum at most num_xgroups terms of magnitude <= 1
+# each, so the error floor is a few ULPs of the accumulation dtype, not something that scales
+# with subspace_dim. Measured directly (see task-3-report.md) across n=10..14 /
+# num_paulis=20..100 / num_states=200..4000: f64 error is exactly 0 in every trial (Task 2's
+# static check separately measured ~4.4e-16 for a similar comparison), f32 error is ~2-3e-8,
+# comfortably under f32 eps (~1.19e-7). Reusing RTOL's numbers as absolute thresholds gives
+# a >1000x margin over both observed floors while staying far below "the matvec is just
+# wrong" territory (mismatches from a real bug, e.g. bad mx.take indexing, show up as
+# order-1 errors, not order-1e-8).
+MATVEC_ATOL = {'f64': 1e-9, 'f32': 1e-4}
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
@@ -111,6 +123,17 @@ def run_arm(arm, options):
         result = _time_jax(arm, inputs, precision, options)
     else:
         result = _time_mlx(arm, inputs, device, precision, options)
+
+    # Gate: the ported matvec (apply_h_xz_mlx, or apply_h_xz_cached re-checked for symmetry)
+    # must agree with the dense H @ v built straight from the same solver inputs. This isolates
+    # a matvec bug (e.g. mx.take behaving unlike jax's fill-mode gather on out-of-bounds
+    # indices) from a solver-loop bug -- without it, a broken matvec would only ever be visible
+    # as a wrong eigenvalue, which is much harder to root-cause. Must fail before any timing
+    # number is reported, same as the eigenvalue gate below.
+    matvec_atol = MATVEC_ATOL[precision]
+    if result['matvec_err'] > matvec_atol:
+        raise SystemExit(f'gate failed for {arm}: matvec error {result["matvec_err"]} exceeds '
+                         f'atol={matvec_atol}')
 
     if abs(result['eigval'] - reference) > rtol * max(1., abs(reference)):
         raise SystemExit(f'gate failed for {arm}: eigenvalue {result["eigval"]} differs from '
