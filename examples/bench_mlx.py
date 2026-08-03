@@ -85,7 +85,7 @@ def parse_args(argv=None):
     parser.add_argument('--fixed-iters', type=int, default=100,
                         help='Iteration count for the fixed-work measurement.')
     parser.add_argument('--seed', type=int, default=1)
-    parser.add_argument('--matvec', choices=('loop', 'chunked'), default='loop',
+    parser.add_argument('--matvec', choices=('loop', 'chunked', 'metal'), default='loop',
                         help='Matvec kernel, applied to BOTH jax and mlx arms so the comparison '
                              'stays about the solver loop rather than the matvec (Optimization '
                              '1). "loop" (default) is the original group-at-a-time gather -- '
@@ -293,6 +293,13 @@ def _time_jax(arm, inputs, precision, options, matrix, matvec_probe):
     # mlx arms (Optimization 1) -- see apply_h_xz_chunked's docstring in _bench_common.py for
     # the op-count/memory tradeoff. "loop" (default) is apply_h_xz_cached unchanged, so the
     # existing measured results stay reproducible.
+    if options.matvec == 'metal':
+        # Fail loudly rather than silently substituting a different kernel: a "metal" row that
+        # actually timed apply_h_xz_cached would be a fabricated comparison.
+        raise SystemExit(
+            f'{arm}: --matvec metal is an MLX-only custom Metal kernel and has no JAX '
+            'equivalent. Use --matvec loop or --matvec chunked for the jax arms.'
+        )
     if options.matvec == 'chunked':
         matvec_fn = functools.partial(apply_h_xz_chunked, chunk=options.chunk)
     else:
@@ -328,11 +335,22 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
     import mlx.core as mx
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _bench_common import timeit
-    from ground_locg_mlx import apply_h_xz_mlx, apply_h_xz_mlx_chunked, ground_locg_mlx
+    from ground_locg_mlx import (apply_h_xz_mlx, apply_h_xz_mlx_chunked, apply_h_xz_mlx_metal,
+                                 ground_locg_mlx)
 
     # --matvec selects the kernel, mirroring _time_jax exactly (Optimization 1) -- see
     # apply_h_xz_mlx_chunked's docstring for the op-count/memory tradeoff.
-    if options.matvec == 'chunked':
+    if options.matvec == 'metal':
+        # Optimization 3: one fused custom Metal kernel instead of a sequence of MLX ops.
+        # Metal has no float64, so this path is f32-only; refuse rather than silently running
+        # a different kernel than the one the row claims to be timing.
+        if precision != 'f32':
+            raise SystemExit(
+                f'{arm}: --matvec metal requires float32 (Metal has no float64). Use an f32 '
+                'arm, or --matvec chunked for the f64 arms.'
+            )
+        matvec_fn = apply_h_xz_mlx_metal
+    elif options.matvec == 'chunked':
         matvec_fn = functools.partial(apply_h_xz_mlx_chunked, chunk=options.chunk)
     else:
         matvec_fn = apply_h_xz_mlx

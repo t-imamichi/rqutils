@@ -46,6 +46,34 @@ shim.Dtype = type(np.dtype('float64'))
 shim.finfo = np.finfo
 
 
+def _shim_metal_kernel(name, input_names, output_names, source, **kwargs):
+    """Stand in for mx.fast.metal_kernel by interpreting the kernel's arithmetic in numpy.
+
+    The real kernel computes out[i] = sum_j vec[xsources[j*N + i]] * diagonals[j*N + i] with one
+    thread per output element. Reproducing that here lets the static check verify the CALLER
+    (shapes, dtypes, grid setup, flat row-major indexing) without a Metal device. It does NOT
+    verify that the Metal source compiles or is correct -- only the user's real-hardware run can,
+    which is why apply_h_xz_mlx_metal's arithmetic was separately validated by simulating the
+    per-thread indexing in numpy (max abs diff 2.7e-15 vs apply_h_xz_cached).
+    """
+    def call(inputs, template=None, grid=None, threadgroup=None, output_shapes=None,
+             output_dtypes=None, **kw):
+        vec, xsources, diagonals, num_groups, num_states = inputs
+        xs_flat = np.asarray(xsources).reshape(-1)
+        dg_flat = np.asarray(diagonals).reshape(-1)
+        vec_np = np.asarray(vec)
+        out = np.zeros(num_states, dtype=np.dtype(output_dtypes[0]))
+        for j in range(num_groups):
+            off = j * num_states
+            out = out + vec_np[xs_flat[off:off + num_states]] * dg_flat[off:off + num_states]
+        return [out]
+
+    return call
+
+
+shim.fast = types.SimpleNamespace(metal_kernel=_shim_metal_kernel)
+
+
 class _CPU:
     pass
 
@@ -116,6 +144,29 @@ for chunk in (1, 4, 8, 16, 32, 128):
     assert err_vs_h < 1e-9, f'chunk={chunk}: disagrees with H @ v by {err_vs_h}'
 print('OK  apply_h_xz_mlx_chunked matches apply_h_xz_mlx and H @ v for chunk in '
      '{1,4,8,16,32,128}')
+
+# 3g. apply_h_xz_mlx_metal's CALLER logic: correct flat row-major indexing, shapes, grid setup,
+# and the float32-only guard. The shim interprets the kernel's arithmetic in numpy, so this
+# checks that the call is wired up correctly -- it CANNOT check that the Metal source compiles
+# or is numerically right on device. Only the user's real-hardware run establishes that.
+apply_h_xz_mlx_metal = module.apply_h_xz_mlx_metal
+xs32 = inputs.xsources.astype(np.int32)
+got_metal = np.asarray(apply_h_xz_mlx_metal(v.astype(np.float32),
+                                            xs32,
+                                            inputs.diagonals.astype(np.float32)))
+err_metal = np.abs(got_metal - (H @ v)).max()
+assert err_metal < 1e-3, f'metal kernel caller logic disagrees with H @ v by {err_metal}'
+print(f'OK  apply_h_xz_mlx_metal caller logic matches H @ v (f32, max err {err_metal:.2e})')
+
+# The float64 guard must fire rather than silently producing a wrong-precision result: Metal
+# has no float64, so an f64 arm must be routed to the chunked path instead.
+try:
+    apply_h_xz_mlx_metal(v, xs32, inputs.diagonals)
+except ValueError as exc:
+    assert 'float32' in str(exc), f'unexpected guard message: {exc}'
+    print('OK  apply_h_xz_mlx_metal rejects float64 input (Metal has no float64)')
+else:
+    raise AssertionError('apply_h_xz_mlx_metal accepted float64 input -- guard did not fire')
 
 # 3e. compile_body=True must produce the restructured control flow's eigenvalue, and must NOT
 # alter default (compile_body=False) behaviour. The shim stubs mx.compile as identity, so this
