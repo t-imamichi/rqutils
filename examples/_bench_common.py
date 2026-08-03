@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 import numpy as np
+import jax.numpy as jnp
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import uniquify_states, get_xsource, get_diagonal
 
@@ -99,6 +100,71 @@ def build_solver_inputs(
     vinit[start] = 1.
 
     return SolverInputs(xsources, diagonals, vinit, subspace_dim, xsources.shape[0])
+
+
+def apply_h_xz_chunked(
+    vec: jnp.ndarray,
+    xsources: jnp.ndarray,
+    diagonals: jnp.ndarray,
+    chunk: int = 16
+) -> jnp.ndarray:
+    """Return Hv via chunked batched gather, the JAX counterpart of ``apply_h_xz_mlx_chunked``.
+
+    ``rqutils.sqd.apply_h_xz_cached`` (and ``ground_locg_mlx.apply_h_xz_mlx``) loop over the J
+    X-groups doing one take+multiply+add per group -- 3J elementary ops per matvec. Since
+    ``xsources``/``diagonals`` are dense ``(J, N)`` arrays, groups can instead be processed in
+    chunks: gather a whole chunk with one flat ``take``, reshape, and reduce with a single
+    weighted sum, cutting the op count from ``3*J`` to roughly ``3*ceil(J/chunk)``.
+
+    ``chunk`` bounds the size of the temporary gathered block to ``chunk * N`` elements rather
+    than the full ``J * N`` a fully-batched (``chunk=J``) version would materialize. At the large
+    N this benchmark is ultimately meant to probe (SQD's matrix-free design targets N up to
+    ~10**7), a full ``(J, N)`` gather would cost ~8 GB versus ~80 MB for the unchunked
+    group-at-a-time loop -- exactly the memory blowup the matrix-free loop exists to avoid.
+    Chunking keeps the op-count win while capping the temporary at ``chunk * N``. This is why
+    the implementation deliberately chunks rather than fully batching, even though full batching
+    (``chunk=J``) would look "simpler."
+
+    Op-count / temporary-size tradeoff measured at J=100 (see the design doc's Results section
+    for the corresponding per-iteration timings):
+
+    ========  ========================  =================
+    chunk     ops per matvec (3*ceil)   temporary (chunk*N)
+    ========  ========================  =================
+    1 (loop)  300                       N        (baseline)
+    8         39   (7.7x fewer)         8*N
+    16        21   (14.3x fewer)        16*N   <- default
+    32        12   (25x fewer)          32*N
+    ========  ========================  =================
+
+    This same function is used by the JAX arms of the benchmark (see ``--matvec chunked`` in
+    ``bench_mlx.py``): batching the gather is an algorithmic improvement independent of the
+    framework, so restricting it to the MLX arm would confound "MLX got faster" with "the matvec
+    got better." Applying it symmetrically keeps the JAX-vs-MLX comparison about the solver loop,
+    not about who has the better matvec.
+
+    Verified (design doc, Optimization 1): max abs diff vs the unchunked loop matvec is
+    <= 2.7e-15 for chunk in {1, 4, 8, 16, 32, 50, 100, 128}, and matches ``H @ v`` to 1.8e-15.
+
+    Args:
+        vec: The vector to multiply, shape ``(N,)``.
+        xsources: Sanitized X-source indices, shape ``(J, N)``, dtype int32.
+        diagonals: Sanitized diagonals, shape ``(J, N)``, matching ``vec``'s dtype.
+        chunk: Number of X-groups to gather per flat ``take``. Static (Python int) -- it
+            controls how many trace-time loop iterations ``jax.jit`` unrolls, exactly like the
+            existing ``xsources.shape[0]`` group loop in ``apply_h_xz_cached``.
+
+    Returns:
+        ``H @ vec``, algebraically identical to ``apply_h_xz_cached``.
+    """
+    num_groups = xsources.shape[0]
+    out = jnp.zeros_like(vec)
+    for start in range(0, num_groups, chunk):
+        xc = xsources[start:start + chunk]
+        dc = diagonals[start:start + chunk]
+        gathered = jnp.take(vec, xc.reshape(-1)).reshape(xc.shape)
+        out = out + jnp.sum(gathered * dc, axis=0)
+    return out
 
 
 def dense_reference(inputs: SolverInputs) -> tuple[np.ndarray, float]:

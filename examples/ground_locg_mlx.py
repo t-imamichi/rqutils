@@ -39,7 +39,62 @@ def apply_h_xz_mlx(vec, xsources, diagonals):
     return out
 
 
-def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None):
+def apply_h_xz_mlx_chunked(vec, xsources, diagonals, chunk=16):
+    """Return Hv via chunked batched gather -- the MLX counterpart of ``apply_h_xz_mlx``.
+
+    ``apply_h_xz_mlx`` above loops over the J X-groups doing one ``take``+multiply+add per
+    group -- 3J Python-level MLX op constructions per matvec. Since ``xsources``/``diagonals``
+    are dense ``(J, N)`` arrays, groups can instead be processed in chunks: gather a whole chunk
+    with one flat ``take``, reshape, and reduce with a single weighted sum, cutting the op count
+    from ``3*J`` to roughly ``3*ceil(J/chunk)``.
+
+    ``chunk`` bounds the size of the gathered temporary to ``chunk * N`` elements, rather than
+    the full ``(J, N)`` a fully-batched (``chunk=J``) version would materialize -- at the large N
+    this benchmark is ultimately meant to probe (SQD's matrix-free design targets N up to
+    ~10**7), a full ``(J, N)`` gather would cost ~8 GB versus ~80 MB for the unchunked
+    group-at-a-time loop. This is a deliberate tradeoff, not an oversight: do not "simplify"
+    this to full batching (``chunk=J``).
+
+    Op-count / temporary-size tradeoff measured at J=100:
+
+    ========  ========================  ===================
+    chunk     ops per matvec (3*ceil)   temporary (chunk*N)
+    ========  ========================  ===================
+    1 (loop)  300                       N        (baseline)
+    8         39   (7.7x fewer)         8*N
+    16        21   (14.3x fewer)        16*N   <- default
+    32        12   (25x fewer)          32*N
+    ========  ========================  ===================
+
+    See ``examples/_bench_common.apply_h_xz_chunked`` for the JAX equivalent used by the JAX
+    arms of the benchmark -- batching the gather is applied symmetrically to both frameworks so
+    the comparison stays about the solver loop, not about who has the better matvec.
+
+    Verified (design doc, Optimization 1): max abs diff vs the unchunked loop matvec is
+    <= 2.7e-15 for chunk in {1, 4, 8, 16, 32, 50, 100, 128}, and matches ``H @ v`` to 1.8e-15.
+
+    Args:
+        vec: The vector to multiply, shape ``(N,)``.
+        xsources: Sanitized X-source indices, shape ``(J, N)``.
+        diagonals: Sanitized diagonals, shape ``(J, N)``, matching ``vec``'s dtype.
+        chunk: Number of X-groups to gather per flat ``take``. J is static and small, so this
+            is a plain Python int controlling how many groups are unrolled per flat gather.
+
+    Returns:
+        ``H @ vec``, algebraically identical to ``apply_h_xz_mlx``.
+    """
+    num_groups = xsources.shape[0]
+    out = mx.zeros_like(vec)
+    for start in range(0, num_groups, chunk):
+        xc = xsources[start:start + chunk]
+        dc = diagonals[start:start + chunk]
+        gathered = mx.take(vec, xc.reshape(-1)).reshape(xc.shape)
+        out = out + mx.sum(gathered * dc, axis=0)
+    return out
+
+
+def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None,
+                    compile_body=False, compile_chunk=10):
     """Single-vector LOBPCG in MLX.
 
     Args:
@@ -49,6 +104,19 @@ def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None):
         maxiter: Maximum gradient-descent iterations.
         tol: Convergence tolerance. ``None`` uses the dtype epsilon. ``0.`` disables the
             check, running exactly ``maxiter`` iterations with no per-iteration device sync.
+        compile_body: If True, wrap the per-iteration body in ``mx.compile`` so the ~1260
+            MLX ops it constructs are traced once instead of on every call. Opt-in and OFF by
+            default: with ``compile_body=False`` this function's behaviour, including its
+            exact iteration count, is unchanged from before this parameter existed.
+        compile_chunk: When ``compile_body`` is True, the number of raw iterations the compiled
+            body runs before control returns to Python for a convergence check. MLX has no
+            ``while_loop``/``cond``, so checking convergence at all forces a ``float()``
+            device sync; checking after every single iteration (chunk=1) would sync exactly as
+            often as the uncompiled path and defeat the point of compiling. Running a chunk of
+            iterations per compiled call amortizes that sync over ``compile_chunk`` iterations
+            instead of paying it every time. In fixed-iteration mode (``tol=0.``) no
+            convergence check happens at all, so the compiled body runs start-to-finish with no
+            per-iteration sync regardless of this value -- see the fixed-iteration branch below.
 
     Returns:
         (eigenvalue, eigenvector, iterations).
@@ -87,8 +155,8 @@ def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None):
     ycurr = tmp_t / mx.linalg.norm(tmp_t)
     rcurr = matvec(xcurr) - theta * xcurr
 
-    niter = 0
-    for niter in range(1, maxiter + 1):
+    def iter_body(xcurr, ycurr, rcurr):
+        """One LOBPCG gradient-descent step. Returns (theta, xcurr, ycurr, rcurr, axnext)."""
         tmp_p = _project_out((xcurr, ycurr), rcurr)
         theta, kappa = rayleigh_ritz(xcurr, ycurr, tmp_p)
         tmp_s = ycurr * kappa[1] + tmp_p * kappa[2]
@@ -99,13 +167,57 @@ def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None):
         ycurr = tmp_t / mx.linalg.norm(tmp_t)
         axnext = matvec(xcurr)
         rcurr = axnext - xcurr * theta
+        return theta, xcurr, ycurr, rcurr, axnext
 
-        if check_convergence:
-            # Same heuristic as the JAX version: compare the residual norm against the
-            # floating-point error we'd expect from forming the residual at all.
-            reltol = (mx.linalg.norm(axnext) - theta) * xcurr.shape[0] * 10
-            # This float() forces a device sync -- the price of MLX having no while_loop.
-            if float(mx.linalg.norm(rcurr)) < tol * float(reltol):
+    def converged(xcurr, theta, rcurr, axnext):
+        # Same heuristic as the JAX version: compare the residual norm against the
+        # floating-point error we'd expect from forming the residual at all.
+        reltol = (mx.linalg.norm(axnext) - theta) * xcurr.shape[0] * 10
+        # This float() forces a device sync -- the price of MLX having no while_loop.
+        return float(mx.linalg.norm(rcurr)) < tol * float(reltol)
+
+    niter = 0
+    if not compile_body:
+        for niter in range(1, maxiter + 1):
+            theta, xcurr, ycurr, rcurr, axnext = iter_body(xcurr, ycurr, rcurr)
+            if check_convergence and converged(xcurr, theta, rcurr, axnext):
+                break
+    elif not check_convergence:
+        # Fixed-iteration mode: no convergence check at all, so the compiled body can run every
+        # requested iteration with zero per-iteration device sync -- the clean per-iteration
+        # speed measurement the design calls for. mx.compile traces iter_body's op graph once
+        # (over the (xcurr, ycurr, rcurr) array tree) instead of once per maxiter call.
+        compiled_body = mx.compile(iter_body)
+        for niter in range(1, maxiter + 1):
+            theta, xcurr, ycurr, rcurr, _axnext = compiled_body(xcurr, ycurr, rcurr)
+    else:
+        # Convergence checking mode with compilation: run compile_chunk raw iterations inside a
+        # single compiled function, then sync once to check convergence, instead of syncing
+        # after every single iteration. A compiled chunk-of-iterations body is what amortizes
+        # the unavoidable float()-sync cost over compile_chunk iterations rather than paying it
+        # every time -- compiling a body that itself contains a Python-level convergence branch
+        # is not an option, since mx.compile traces a fixed array-in/array-out computation and
+        # has no equivalent of jax.lax.while_loop/cond to make that branch part of the graph.
+        def chunk_body(xcurr, ycurr, rcurr):
+            theta = mx.array(0., xcurr.dtype)
+            axnext = xcurr
+            for _ in range(compile_chunk):
+                theta, xcurr, ycurr, rcurr, axnext = iter_body(xcurr, ycurr, rcurr)
+            return theta, xcurr, ycurr, rcurr, axnext
+
+        compiled_chunk = mx.compile(chunk_body)
+        niter = 0
+        while niter < maxiter:
+            this_chunk = min(compile_chunk, maxiter - niter)
+            if this_chunk == compile_chunk:
+                theta, xcurr, ycurr, rcurr, axnext = compiled_chunk(xcurr, ycurr, rcurr)
+            else:
+                # Final partial chunk: fall back to the uncompiled body so niter lands exactly
+                # on maxiter, matching the uncompiled path's semantics one iteration at a time.
+                for _ in range(this_chunk):
+                    theta, xcurr, ycurr, rcurr, axnext = iter_body(xcurr, ycurr, rcurr)
+            niter += this_chunk
+            if converged(xcurr, theta, rcurr, axnext):
                 break
 
     return float(theta), xcurr, niter

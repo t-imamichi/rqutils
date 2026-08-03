@@ -102,4 +102,58 @@ _, _, fixed_iters = ground_locg_mlx(apply_h_xz_mlx, inputs.vinit,
                                     maxiter=100, tol=0.)
 assert fixed_iters == 100, f'tol=0. ran {fixed_iters} iterations, expected exactly 100'
 print('OK  tol=0. gives fixed-iteration mode')
+
+# 3d. apply_h_xz_mlx_chunked must agree with apply_h_xz_mlx and with H @ v, for several chunk
+# sizes -- this is the restructured-control-flow check for Optimization 1 (chunked matvec). The
+# shim's mx.take/mx.sum are plain numpy, so this exercises the chunking logic itself, not MLX
+# kernels.
+apply_h_xz_mlx_chunked = module.apply_h_xz_mlx_chunked
+for chunk in (1, 4, 8, 16, 32, 128):
+    got_chunked = np.asarray(apply_h_xz_mlx_chunked(v, inputs.xsources, inputs.diagonals, chunk))
+    err_vs_loop = np.abs(got_chunked - got).max()
+    err_vs_h = np.abs(got_chunked - H @ v).max()
+    assert err_vs_loop < 1e-9, f'chunk={chunk}: disagrees with loop matvec by {err_vs_loop}'
+    assert err_vs_h < 1e-9, f'chunk={chunk}: disagrees with H @ v by {err_vs_h}'
+print('OK  apply_h_xz_mlx_chunked matches apply_h_xz_mlx and H @ v for chunk in '
+     '{1,4,8,16,32,128}')
+
+# 3e. compile_body=True must produce the restructured control flow's eigenvalue, and must NOT
+# alter default (compile_body=False) behaviour. The shim stubs mx.compile as identity, so this
+# does not validate real MLX compilation -- only that the chunked-convergence-check control
+# flow this port adds is numerically sound. Use tol=0. (fixed-iteration) first: no convergence
+# check happens at all, so the compiled body must reproduce the uncompiled tol=0. trajectory
+# exactly (same ops, same order).
+eigval_default, _, iters_default = ground_locg_mlx(
+    apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals),
+    maxiter=100, tol=0.)
+eigval_compiled, _, iters_compiled = ground_locg_mlx(
+    apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals),
+    maxiter=100, tol=0., compile_body=True)
+assert iters_compiled == iters_default == 100, (
+    f'compile_body fixed-iteration mismatch: {iters_compiled} vs {iters_default}')
+assert abs(eigval_compiled - eigval_default) < 1e-12, (
+    f'compile_body changed the fixed-iteration eigenvalue: {eigval_compiled} vs {eigval_default}')
+print('OK  compile_body=True, tol=0. matches compile_body=False bit-for-bit '
+     f'(eig={eigval_compiled:.12f}, iters={iters_compiled})')
+
+# 3f. compile_body=True with convergence checking (chunked between compile_chunk iterations)
+# must still reach the reference eigenvalue, and compile_body=False must be completely
+# unaffected by compile_body's existence (same call as 3b, repeated to prove no state leaks).
+eigval_chunked_conv, _, iters_chunked_conv = ground_locg_mlx(
+    apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals),
+    compile_body=True, compile_chunk=10)
+assert abs(eigval_chunked_conv - ref) < 1e-9 * max(1., abs(ref)), (
+    f'compile_body=True with convergence checking got {eigval_chunked_conv}, reference {ref}')
+print(f'OK  compile_body=True with chunked convergence checking: '
+     f'eig={eigval_chunked_conv:.12f} iters={iters_chunked_conv}')
+
+eigval_default2, _, iters_default2 = ground_locg_mlx(
+    apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals))
+assert iters_default2 == iters, (
+    f'default (compile_body=False) iteration count changed after exercising compile_body: '
+    f'{iters_default2} vs original {iters} -- compile_body must be a strict no-op when unset')
+assert abs(eigval_default2 - eigval) < 1e-12
+print('OK  default path (compile_body=False) unaffected -- byte-identical to the pre-existing '
+     f'behaviour (iters={iters_default2})')
+
 print('\nALL STATIC CHECKS PASSED (numpy shim; MLX itself still unverified)')

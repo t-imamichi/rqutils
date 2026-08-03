@@ -85,6 +85,22 @@ def parse_args(argv=None):
     parser.add_argument('--fixed-iters', type=int, default=100,
                         help='Iteration count for the fixed-work measurement.')
     parser.add_argument('--seed', type=int, default=1)
+    parser.add_argument('--matvec', choices=('loop', 'chunked'), default='loop',
+                        help='Matvec kernel, applied to BOTH jax and mlx arms so the comparison '
+                             'stays about the solver loop rather than the matvec (Optimization '
+                             '1). "loop" (default) is the original group-at-a-time gather -- '
+                             'existing measured results are only reproducible with this default. '
+                             '"chunked" gathers --chunk X-groups per flat take, cutting op count '
+                             'roughly 3*J -> 3*ceil(J/chunk).')
+    parser.add_argument('--chunk', type=int, default=16,
+                        help='Chunk size for --matvec chunked (default 16 -> ~14.3x fewer ops '
+                             'at J=100, temporary bounded to chunk*N). Ignored for --matvec loop.')
+    parser.add_argument('--compile-body', action='store_true',
+                        help='MLX arms only (Optimization 2): wrap the LOBPCG iteration body in '
+                             'mx.compile so its ~1260 ops/iteration are traced once instead of '
+                             'reconstructed every call. A no-op for jax arms -- reported as a '
+                             'note rather than an error, since JAX already amortizes graph '
+                             'construction via jax.jit/lax.while_loop (see compile_s).')
     parser.add_argument('--json', action='store_true', help='Emit JSON instead of a table.')
     parser.add_argument('--skip-brute-force', action='store_true',
                         help='Explicitly skip the 2^n reference at any --num-qubits. It is '
@@ -191,6 +207,21 @@ def run_arm(arm, options):
                              f'brute force {brute} by more than rtol={brute_force_rtol} '
                              f'(setup_precision={setup_precision}) -- the setup chain is wrong')
 
+    compile_body_note = None
+    if framework == 'jax' and options.compile_body:
+        # --compile-body is Optimization 2, an MLX-only concept (mx.compile over the LOBPCG
+        # iteration body). JAX already amortizes Python-level graph construction via jax.jit
+        # over the whole solver loop (jax.lax.while_loop/scan) -- that is exactly what compile_s
+        # measures for jax arms -- so there is nothing for this flag to do here. Reported as a
+        # note, not an error: per the WIRING requirements, a jax arm must not fail just because
+        # --compile-body was passed (e.g. under --all, which passes the same flags to every arm).
+        compile_body_note = (
+            f'--compile-body is MLX-only (Optimization 2, mx.compile over the LOBPCG iteration '
+            f'body); ignored for {arm} because JAX already amortizes graph construction via '
+            'jax.jit (see compile_s).'
+        )
+        print(f'NOTE: {compile_body_note}', file=sys.stderr)
+
     rtol = RTOL[precision]
     if framework == 'jax':
         result = _time_jax(arm, inputs, precision, options, matrix, matvec_probe)
@@ -234,37 +265,53 @@ def run_arm(arm, options):
     result['brute_force_note'] = brute_force_note
     result['setup_s'] = setup_s
     result['status'] = 'ok'
+    # Self-describing options: a saved per_it_ms/eigval is useless for comparison unless the
+    # matvec/compile settings that produced it travel with it.
+    result['matvec'] = options.matvec
+    result['chunk'] = options.chunk if options.matvec == 'chunked' else None
+    result['compile_body'] = bool(options.compile_body) and framework == 'mlx'
+    result['compile_body_note'] = compile_body_note
     return result
 
 
 def _time_jax(arm, inputs, precision, options, matrix, matvec_probe):
+    import functools
     import numpy as np
     import jax
     import jax.numpy as jnp
     from rqutils.ground_locg import ground_locg
     from rqutils.sqd import apply_h_xz_cached
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from _bench_common import timeit
+    from _bench_common import timeit, apply_h_xz_chunked
 
     dtype = np.float64 if precision == 'f64' else np.float32
     xsources = jnp.asarray(inputs.xsources)
     diagonals = jnp.asarray(inputs.diagonals, dtype=dtype)
     vinit = jnp.asarray(inputs.vinit, dtype=dtype)
 
+    # --matvec selects the kernel used by the solver loop, applied identically to the jax and
+    # mlx arms (Optimization 1) -- see apply_h_xz_chunked's docstring in _bench_common.py for
+    # the op-count/memory tradeoff. "loop" (default) is apply_h_xz_cached unchanged, so the
+    # existing measured results stay reproducible.
+    if options.matvec == 'chunked':
+        matvec_fn = functools.partial(apply_h_xz_chunked, chunk=options.chunk)
+    else:
+        matvec_fn = apply_h_xz_cached
+
     # Gate: the ported matvec and the original must agree on the same input, probed with a
     # random vector (not vinit) -- see the matvec_probe comment in run_arm.
     probe = jnp.asarray(matvec_probe, dtype=dtype)
-    matvec_out = np.asarray(apply_h_xz_cached(probe, xsources, diagonals), dtype=np.float64)
+    matvec_out = np.asarray(matvec_fn(probe, xsources, diagonals), dtype=np.float64)
     matvec_err = float(np.abs(matvec_out - matrix @ matvec_probe).max())
 
     def fixed():
-        return ground_locg(apply_h_xz_cached, vinit, args=(xsources, diagonals),
+        return ground_locg(matvec_fn, vinit, args=(xsources, diagonals),
                            maxiter=options.fixed_iters, tol=0.)
 
     compile_s, fixed_s = timeit(fixed, options.repeat, jax.block_until_ready)
 
     def solve():
-        return ground_locg(apply_h_xz_cached, vinit, args=(xsources, diagonals))
+        return ground_locg(matvec_fn, vinit, args=(xsources, diagonals))
 
     _, solve_s = timeit(solve, options.repeat, jax.block_until_ready)
     eigval, _, iters = solve()
@@ -276,11 +323,19 @@ def _time_jax(arm, inputs, precision, options, matrix, matvec_probe):
 
 
 def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
+    import functools
     import numpy as np
     import mlx.core as mx
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _bench_common import timeit
-    from ground_locg_mlx import apply_h_xz_mlx, ground_locg_mlx
+    from ground_locg_mlx import apply_h_xz_mlx, apply_h_xz_mlx_chunked, ground_locg_mlx
+
+    # --matvec selects the kernel, mirroring _time_jax exactly (Optimization 1) -- see
+    # apply_h_xz_mlx_chunked's docstring for the op-count/memory tradeoff.
+    if options.matvec == 'chunked':
+        matvec_fn = functools.partial(apply_h_xz_mlx_chunked, chunk=options.chunk)
+    else:
+        matvec_fn = apply_h_xz_mlx
 
     mx.set_default_device(mx.cpu if device == 'cpu' else mx.gpu)
     dtype = mx.float64 if precision == 'f64' else mx.float32
@@ -319,7 +374,7 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
     assert probe.dtype == dtype, (
         f'{arm}: matvec probe was constructed with dtype {probe.dtype}, expected {dtype} -- '
         'a construct-then-cast ingest bug silently downgraded precision.')
-    matvec_out = np.asarray(apply_h_xz_mlx(probe, xsources, diagonals), dtype=np.float64)
+    matvec_out = np.asarray(matvec_fn(probe, xsources, diagonals), dtype=np.float64)
     matvec_err = float(np.abs(matvec_out - matrix @ matvec_probe).max())
 
     def sync(result):
@@ -327,14 +382,19 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
         mx.eval(result[1])
         return result
 
+    # --compile-body is Optimization 2: mx.compile over the LOBPCG iteration body. Off by
+    # default (compile_body=False), which reproduces this function's behaviour exactly as it
+    # was before the parameter existed -- see ground_locg_mlx's docstring.
     def fixed():
-        return ground_locg_mlx(apply_h_xz_mlx, vinit, args=(xsources, diagonals),
-                               maxiter=options.fixed_iters, tol=0.)
+        return ground_locg_mlx(matvec_fn, vinit, args=(xsources, diagonals),
+                               maxiter=options.fixed_iters, tol=0.,
+                               compile_body=options.compile_body)
 
     compile_s, fixed_s = timeit(fixed, options.repeat, sync)
 
     def solve():
-        return ground_locg_mlx(apply_h_xz_mlx, vinit, args=(xsources, diagonals))
+        return ground_locg_mlx(matvec_fn, vinit, args=(xsources, diagonals),
+                               compile_body=options.compile_body)
 
     _, solve_s = timeit(solve, options.repeat, sync)
     eigval, _, iters = solve()
@@ -355,9 +415,13 @@ def run_all(options):
                 '--num-states', str(options.num_states),
                 '--repeat', str(options.repeat),
                 '--fixed-iters', str(options.fixed_iters),
-                '--seed', str(options.seed)]
+                '--seed', str(options.seed),
+                '--matvec', options.matvec,
+                '--chunk', str(options.chunk)]
         if options.skip_brute_force:
             argv.append('--skip-brute-force')
+        if options.compile_body:
+            argv.append('--compile-body')
         proc = subprocess.run(argv, capture_output=True, text=True)
         if proc.returncode != 0:
             results.append({'arm': arm, 'status': 'failed',
@@ -377,16 +441,23 @@ def report(results, as_json):
         return
 
     header = (f'{"arm":<15}{"setup_s":>9}{"compile_s":>10}{"fixed_s":>10}{"per_it_ms":>11}'
-              f'{"solve_s":>10}{"iters":>7}{"matvec_err":>12}  eigval')
+              f'{"solve_s":>10}{"iters":>7}{"matvec_err":>12}  {"eigval":<15}  options')
     print(header)
     print('-' * len(header))
     for row in results:
         if row.get('status') != 'ok':
             print(f'{row["arm"]:<15}{row.get("status", "?"):>10}  {row.get("reason", "")}')
             continue
+        # Self-describing options string: a saved per_it_ms/eigval is useless for comparison
+        # unless the matvec/compile settings that produced it travel with it (WIRING requirement).
+        opt = f'matvec={row.get("matvec", "loop")}'
+        if row.get('matvec') == 'chunked':
+            opt += f'(chunk={row.get("chunk")})'
+        if row.get('compile_body'):
+            opt += ' compile_body'
         print(f'{row["arm"]:<15}{row["setup_s"]:>9.4f}{row["compile_s"]:>10.4f}'
               f'{row["fixed_s"]:>10.4f}{row["per_it_ms"]:>11.3f}{row["solve_s"]:>10.4f}'
-              f'{row["iters"]:>7d}{row["matvec_err"]:>12.2e}  {row["eigval"]:.10f}')
+              f'{row["iters"]:>7d}{row["matvec_err"]:>12.2e}  {row["eigval"]:<15.10f}  {opt}')
 
     # Disclosure footnotes (I2, I3): a silently skipped correctness check or a silently
     # reduced-precision setup is exactly the failure mode this benchmark exists to avoid.
@@ -400,6 +471,8 @@ def report(results, as_json):
                   'theirs.')
         if row.get('brute_force_note'):
             print(f'NOTE [{row["arm"]}]: {row["brute_force_note"]}')
+        if row.get('compile_body_note'):
+            print(f'NOTE [{row["arm"]}]: {row["compile_body_note"]}')
 
 
 def main():
