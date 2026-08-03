@@ -276,14 +276,19 @@ N=893 after uniquification, J=100 distinct X signatures):
 
 `setup_s` is the shared, untimed JAX setup, shown for context only.
 
-### Verdict
+### Verdict (baseline, before optimization)
 
-**MLX is ~34× slower per iteration than JAX, and the Metal GPU is 6% slower
-than MLX's own CPU backend.** For this kernel at this size, MLX is not worth
-pursuing, and the GPU does not help.
+> **Superseded — see "Optimization results" below.** The unoptimized numbers in
+> the table above led to "MLX is ~34× slower and the Metal GPU does not help."
+> Both halves turned out to be artifacts of MLX's default execution model rather
+> than properties of MLX or of the M1 GPU. The diagnosis in this subsection is
+> what pointed at the fix, so it is kept; the conclusion it reached is not.
 
-But the *reason* matters more than the ratio, and it limits how far the verdict
-generalizes. Per-iteration cost is essentially flat across the three MLX arms —
+As measured with the default `--matvec loop` path, MLX was ~34× slower per
+iteration than JAX and the Metal GPU was 6% slower than MLX's own CPU backend.
+
+The *reason* mattered more than the ratio. Per-iteration cost is essentially flat
+across the three MLX arms —
 7.608 (cpu-f64), 7.874 (cpu-f32), 8.354 (gpu-f32) ms, a 9.8% spread. Note the
 direction: **f32 is slower than f64, and the GPU is slower than the CPU.**
 Compute-bound work cannot behave that way (f32 moves half the bytes; the GPU has
@@ -301,7 +306,118 @@ decision above), and a substantially larger N. The problem here is tiny: an
 893-element vector is ~7 KiB, L1-resident, far too small for a GPU to amortize
 kernel-launch latency.
 
-### Correctness
+## Optimization results
+
+Acting on that diagnosis, four optimizations were tried. All measurements are
+`mlx-*-f32` at the same problem size (n=12, 100 paulis, 1000 states → N=893,
+J=100), against `jax-cpu-f32` at **0.229 ms/iter**.
+
+| config | per_it_ms | vs MLX baseline | vs JAX f32 | compile_s |
+|---|---|---|---|---|
+| cpu, `loop` (baseline) | 8.106 | 1.00× | 35.4× slower | 1.54 |
+| cpu, `chunked` (chunk=16) | 4.393 | 1.85× | 19.2× slower | 0.38 |
+| cpu, `chunked` + `compile_body` | 2.991 | 2.71× | 13.1× slower | 2.11 |
+| cpu, `metal` | 1.404 | 5.77× | 6.1× slower | 0.15 |
+| gpu, `metal` | 0.664 | 12.2× | 2.90× slower | 0.10 |
+| **gpu, `metal` + `compile_body`** | **0.373** | **21.7×** | **1.63× slower** | 0.06 |
+| gpu, `metal` + host Rayleigh–Ritz | 0.910 | 8.9× | 3.97× slower | 0.21 |
+
+**Net: 21.7× faster than the baseline, closing the gap to JAX from 35× to 1.63×.**
+Full solve went 0.317 s → 0.0296 s. `matvec_err` stayed at 1.69e-06, identical to
+JAX f32's — the speedups are numerically exact, not traded against accuracy.
+
+Two conclusions the baseline verdict got wrong:
+
+1. **The Metal GPU does help — 2.11× over MLX's CPU backend** on the identical
+   fused kernel (0.664 vs 1.404 ms). On the op-graph path the GPU was 1.06%
+   *slower*. That inversion is direct evidence the original "GPU doesn't help"
+   finding was measuring dispatch overhead, not the M1 GPU.
+2. **MLX is not inherently ~34× slower.** Nearly all of that gap was MLX's
+   default execution model — no `scan`/`while_loop`, so a Python-level loop
+   rebuilds the op graph every call and launches one kernel per op.
+
+### What actually governs performance: syncs, then launches
+
+The optimization sequence taught a cost model that the initial op-count reasoning
+got wrong, and the correction is the most transferable finding here.
+
+Per-iteration MLX op launches, measured by instrumenting the module with a
+counting shim, *after* the fused Metal matvec landed:
+
+| component | ops/iter | share |
+|---|---|---|
+| `eigenpair_3x3` | 19 | 37.3% |
+| `_compute_sas` | 16 | 31.4% |
+| `_project_out` | 15 | 29.4% |
+| matvec (`metal`) | **1** | **2.0%** |
+
+The matvec — 89,300 gathers — became 2% of the launches, while the Rayleigh–Ritz
+step (35 of 51 launches, 69%) does arithmetic on a 3×3 matrix, i.e. nine numbers.
+At ~7.3 µs per launch, nine-number scalar math cost ~20× the entire gather. Note
+the irony: `rqutils` hand-rolled the analytic 2×2/3×3 eigensolver to save memory
+on huge vectors, which is exactly the wrong tradeoff once every op is a launch.
+
+That suggested moving the 3×3 eigensolve to the host with `np.linalg.eigh` —
+2 syncs replacing 35 launches, and `eigh` is also 2×10⁷ times more accurate than
+the Cardano formulation on the near-degenerate matrices this solver produces
+(1.8e-15 vs 3.6e-08), at 4.23 µs per call.
+
+**It was 1.37× slower** (0.910 vs 0.664 ms), and the reason is the lesson: the
+model priced a host sync at roughly one kernel launch (~7 µs); the measurement
+implies **~389 µs each, ~53× a launch.** A launch is *pipelined* — MLX queues it
+and continues — but a sync *drains the pipeline*: every queued op must retire
+before the CPU can read the value. MLX being lazy, pulling the 3×3 to numpy
+forces the whole iteration graph to complete, destroying the async overlap that
+made the fused kernel fast. That option was reverted (commit `4dc8510`).
+
+So: **sync count dominates, launch count is secondary, op-construction count is
+tertiary.** This also explains why `compile_body` is the single best lever — it
+removes syncs — and it predicts that any optimization moving per-iteration work
+to the host will lose, however favourable its op-count arithmetic looks.
+
+### Optimizations, and what remains untried
+
+1. **Chunked gather** (`--matvec chunked --chunk N`, both frameworks) — process
+   X-groups in chunks of N, cutting matvec ops from `3J` to `3⌈J/chunk⌉` (300 → 21
+   at chunk=16). Chunked rather than fully batched because a full `(J, N)` gather
+   costs ~8 GB at N=10⁷ versus ~80 MB, which would defeat SQD's matrix-free
+   design. Worth 1.85× on MLX. **Applied to JAX too, where it is a net loss**
+   (0.239 → 0.327–0.386 ms at f64): XLA already fuses the unrolled loop, so this
+   is not a framework difference but an MLX-specific one.
+2. **`mx.compile` on the iteration body** (`--compile-body`, MLX only) — traces
+   the body once instead of rebuilding per call. Worth 1.95× alone. Convergence
+   is checked between `compile_chunk`-sized batches of iterations, since
+   `mx.compile` has no `while_loop` equivalent; that is why the compiled arms show
+   50 iterations instead of 42 (overshoot up to `compile_chunk`), which
+   incidentally lands *closer* to the f64 reference.
+3. **Fused custom Metal kernel** (`--matvec metal`, MLX f32 only) — one
+   `mx.fast.metal_kernel` launch computing
+   `out[i] = Σⱼ vec[xsources[j,i]] · diagonals[j,i]` with the accumulator in a
+   per-thread register: no intermediates, no atomics (thread `i` solely owns
+   `out[i]`), coalesced index reads. The single largest win, 5.8× on CPU and
+   12.2× on GPU.
+4. **Host-side Rayleigh–Ritz** — tried, 1.37× slower, reverted. See above.
+
+Untried, in the order worth trying:
+
+- **Larger N.** Still the decisive measurement. At N=893 the vector is ~7 KiB and
+  only 893 threads launch on a 7-core GPU, so every number here remains
+  overhead-dominated at a size where the hardware cannot show up. Constraint:
+  the f32 arms already fail the eigenvalue gate above ~1000 states at n=14
+  (5.4e-3 relative error vs rtol 1e-4), and Metal is fp32-only — so fp32
+  convergence at large subspace dimension is a real prerequisite, not just a
+  benchmarking nuisance.
+- **Fuse Rayleigh–Ritz into a Metal kernel.** The on-device version of
+  optimization 4: zero syncs, so unlike the host version it *composes* with
+  `compile_body`. Would mean writing the 3×3 eigensolve in Metal and inheriting
+  the Cardano near-degeneracy fragility.
+- **Tuning** `threadgroup` (256) and `compile_chunk` (10). Flag-only.
+
+## Correctness
+
+Applies to every run above, optimized and unoptimized: the correctness gate is
+identical in all of them, and no measurement in this document comes from an arm
+that failed it.
 
 The port is faithful. `mlx-cpu-f64` reproduces `jax-cpu-f64`'s eigenvalue to all
 ten printed digits (-5.3960400377), and **all three f32 arms converge in exactly
@@ -334,13 +450,24 @@ Two bugs were found and one non-bug diagnosed along the way:
    issue**: it is a robustness property of the library's Rayleigh–Ritz step, not
    of this port.
 
-### What this does not tell you
+## What this does not tell you
 
 Beyond the four limitations listed above, all of which held: the comparison is
-fp32-only where the GPU is concerned, covers only the solver loop, and — most
-importantly — is dominated by per-call overhead rather than kernel time. Read
-the 34× as "MLX without `mx.compile` is unsuited to a Python-level iteration
-loop of this shape", not as "MLX kernels are 34× slower than XLA's".
+fp32-only where the GPU is concerned, and covers only the solver loop.
+
+**The subspace dimension is the big one.** Every number here is at N=893 — a
+~7 KiB vector, L1-resident, launching 893 threads on a 7-core GPU. Even the best
+configuration is still substantially launch-latency-bound, so none of these
+measurements reflect what either framework does when the hardware is saturated.
+The honest reading of the final 1.63× is "MLX, aggressively optimized, is within
+striking distance of JAX on a problem too small to distinguish their kernels" —
+not a verdict on either framework's throughput.
+
+The strategic case for MLX on Apple silicon, which these numbers do support: it
+is currently the *only* way to use the M1 GPU for this workload at all.
+`jax-metal` could not be measured here — it is not installed, and is effectively
+unmaintained — so the `jax-metal-f32` arm was skipped in every run. There is no
+JAX-on-GPU number to compare against.
 
 ## Out of scope
 
