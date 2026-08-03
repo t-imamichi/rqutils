@@ -178,7 +178,7 @@ def apply_h_xz_mlx_metal(vec, xsources, diagonals, threadgroup=256):
 
 
 def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None,
-                    compile_body=False, compile_chunk=10, host_rayleigh_ritz=False):
+                    compile_body=False, compile_chunk=10):
     """Single-vector LOBPCG in MLX.
 
     Args:
@@ -201,40 +201,10 @@ def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None,
             instead of paying it every time. In fixed-iteration mode (``tol=0.``) no
             convergence check happens at all, so the compiled body runs start-to-finish with no
             per-iteration sync regardless of this value -- see the fixed-iteration branch below.
-        host_rayleigh_ritz: If True, solve the 2x2/3x3 Rayleigh-Ritz eigenproblem on the host
-            with ``np.linalg.eigh`` instead of the analytic ``eigenpair_2x2``/``eigenpair_3x3``
-            kernels. The measured bottleneck is 35 of 51 per-iteration MLX op launches (69% of
-            the time) doing scalar arithmetic on a 3x3 (nine floats) -- ``np.linalg.eigh`` on
-            that same 3x3 costs about one kernel launch and is ~2e7x more accurate (no Cardano
-            round-off), replacing 35 launches with 2 host syncs (pull the matrix, push back the
-            eigenpair). Opt-in and OFF by default: this is a genuine host sync per iteration,
-            which is the correct trade only when the per-launch overhead this benchmark measured
-            dominates. Mutually exclusive with ``compile_body=True`` -- see the ValueError below.
 
     Returns:
         (eigenvalue, eigenvector, iterations).
-
-    Raises:
-        ValueError: If both ``host_rayleigh_ritz`` and ``compile_body`` are True. ``mx.compile``
-            traces a fixed array-in/array-out graph by running the Python body once and
-            recording the ops; a host sync (pulling a live array's values into numpy) inside
-            that trace does not become part of the traced graph -- it would run exactly once,
-            at trace time, against whatever the tracer's placeholder values happened to be, and
-            never again on subsequent compiled calls. That is silently wrong, not merely slow,
-            so this combination is rejected outright rather than guessing which flag "wins".
     """
-    if host_rayleigh_ritz and compile_body:
-        raise ValueError(
-            'host_rayleigh_ritz=True and compile_body=True are mutually exclusive: '
-            'mx.compile traces a fixed array-in/array-out graph by running the body once, so a '
-            'host sync inside it (host_rayleigh_ritz pulls the Rayleigh-Ritz matrix to numpy '
-            'every iteration) is not traceable -- it would execute once at trace time and never '
-            'again, silently freezing the Rayleigh-Ritz result instead of recomputing it. '
-            'Choose one: host_rayleigh_ritz for the lowest per-iteration op count without '
-            'compilation, or compile_body for graph-construction amortization with the '
-            'analytic (Cardano) Rayleigh-Ritz kernels.'
-        )
-
     xinit = mx.array(xinit)
     check_convergence = tol != 0.
     if tol is None:
@@ -245,16 +215,11 @@ def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None,
     def matvec(vec):
         return mat(vec, *args)
 
-    if host_rayleigh_ritz:
-        def rayleigh_ritz(*vectors):
-            sas = _compute_sas(matvec, *vectors)
-            return _eigenpair_host(sas)
-    else:
-        def rayleigh_ritz(*vectors):
-            sas = _compute_sas(matvec, *vectors)
-            if len(vectors) == 2:
-                return eigenpair_2x2(sas)
-            return eigenpair_3x3(sas)
+    def rayleigh_ritz(*vectors):
+        sas = _compute_sas(matvec, *vectors)
+        if len(vectors) == 2:
+            return eigenpair_2x2(sas)
+        return eigenpair_3x3(sas)
 
     xinit = xinit / mx.linalg.norm(xinit)
 
@@ -374,50 +339,6 @@ def _project_out(basis, vector):
             vector = vector - vb * ip
 
     return vector * (mx.linalg.norm(vector) >= 0.99).astype(vector.dtype)
-
-
-def _eigenpair_host(mat):
-    """Lowest eigenpair of a real symmetric 2x2 or 3x3 matrix, solved on the host.
-
-    The MLX-native ``eigenpair_2x2``/``eigenpair_3x3`` below express the closed-form
-    (quadratic-formula / Cardano) solution as ~16-19 MLX ops apiece, each a separate kernel
-    launch at ~7.3 us regardless of the fact that the matrix is only 4 or 9 numbers -- see the
-    ``host_rayleigh_ritz`` docstring on ``ground_locg_mlx`` for the measured breakdown.
-    ``np.linalg.eigh`` solves the same problem in one host-side call (~4.2 us, comparable to a
-    single launch) and is far more accurate (Cardano's cube root loses precision for
-    near-degenerate matrices; measured up to 3.6e-8 vs. 1.8e-15 for ``eigh`` on this solver's
-    matrices), at the cost of a device sync to pull ``mat`` to numpy and another to push the
-    result back. Two syncs total: one read (``mat`` -> numpy), one write (eigenvalue + a length-
-    2 or length-3 eigenvector -> mx.array) -- there is no way to do this in fewer than one
-    round trip, since the values must actually be examined by an off-device routine.
-
-    ``np.linalg.eigh`` returns eigenvalues in ascending order, so index 0 is the lowest -- see
-    https://numpy.org/doc/stable/reference/generated/numpy.linalg.eigh.html. Unlike
-    ``eigenpair_2x2``/``eigenpair_3x3``, which build the eigenvector via a specific
-    construction (cross product of two shifted rows, or the 2x2 closed form) that fixes a
-    particular overall sign/scale, ``eigh``'s eigenvector sign is whatever LAPACK happens to
-    return. That is harmless here: ``kappa`` (the returned eigenvector, called ``kappa`` at the
-    call site) enters ``ground_locg_mlx`` only through linear combinations that are immediately
-    renormalized (e.g. ``xcurr = tmp_u / norm(tmp_u)``), so a global sign flip of ``kappa``
-    propagates to an equal-and-opposite global sign flip of the renormalized vectors and cancels
-    out of ``theta`` (a quadratic form) entirely. What matters -- and what is preserved here --
-    is that the returned vector is a single self-consistent eigenvector of the lowest
-    eigenvalue, not any particular sign convention.
-
-    Args:
-        mat: MLX array, shape ``(2, 2)`` or ``(3, 3)``, real symmetric.
-
-    Returns:
-        ``(eigval, eigvec)`` matching ``eigenpair_2x2``/``eigenpair_3x3``'s return contract:
-        ``eigval`` a 0-d MLX array (the lowest eigenvalue), ``eigvec`` a length-2 or length-3
-        MLX array (its eigenvector), both in ``mat``'s dtype.
-    """
-    mat_np = np.array(mat)  # Sync 1: pull the 4 or 9 floats to host.
-    eigvals, eigvecs = np.linalg.eigh(mat_np)
-    eigval = eigvals[0]
-    eigvec = eigvecs[:, 0]
-    dtype = mat.dtype
-    return mx.array(eigval, dtype), mx.array(eigvec, dtype)  # Sync 2: push the result back.
 
 
 def eigenpair_2x2(mat):
