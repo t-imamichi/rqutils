@@ -29,8 +29,13 @@ mpl = ["matplotlib"]
 qutip = ["qutip"]
 qiskit = ["qiskit"]
 docs = ["sphinx", "sphinx-rtd-theme"]
+test = ["pytest"]
 
 [project.urls]
 Homepage = "https://github.com/UTokyo-ICEPP/rqutils"
 Issues = "https://github.com/UTokyo-ICEPP/rqutils/issues"
 Documentation = "https://rqutils.readthedocs.io/en/latest/index.html"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
