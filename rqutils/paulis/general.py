@@ -137,8 +137,6 @@ import string
 from collections.abc import Sequence
 from types import ModuleType
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from scipy.sparse import csr_array
@@ -311,17 +309,20 @@ def components(
     Raises:
         ValueError: If `prod(dim)` does not match the matrix dimension.
     """
-    if npmod is np:
-        if dim is None:
-            dim = (matrix.shape[-1],)
-        elif isinstance(dim, (int, np.integer)):
-            dim = (int(dim),)
+    # Normalizing dim is Python-level shape inference on a static value, so it must happen for every
+    # npmod -- `len(dim)` below needs a sequence either way. Gating it left `components(m, dim=3,
+    # npmod=jnp)` raising "object of type 'int' has no len()" from the return statement, naming
+    # nothing. Only the *validation* belongs behind the gate, per CLAUDE.md's npmod rule.
+    if dim is None:
+        dim = (matrix.shape[-1],)
+    elif isinstance(dim, (int, np.integer)):
+        dim = (int(dim),)
 
-        if np.prod(dim) != matrix.shape[-1]:
-            raise ValueError(
-                f"Invalid subsystem dimensions {dim}"
-                f" (prod {np.prod(dim)} != matrix shape {matrix.shape[-1]})"
-            )
+    if npmod is np and np.prod(dim) != matrix.shape[-1]:
+        raise ValueError(
+            f"Invalid subsystem dimensions {dim}"
+            f" (prod {np.prod(dim)} != matrix shape {matrix.shape[-1]})"
+        )
 
     basis = paulis(dim)
     return npmod.tensordot(matrix, basis, ((-2, -1), (-1, -2))) * (2 ** (len(dim) - 2))
@@ -340,14 +341,15 @@ def compose(
     Returns:
         A complex array of shape `(..., d1*d2*..., d1*d2*...)`.
     """
-    if npmod is np:
-        if dim is None:
-            dim = tuple(map(int, np.around(np.sqrt(components.shape))))
-        elif isinstance(dim, (int, np.integer)):
-            dim = (int(dim),)
+    # As in components(): the dim normalization is static shape inference and must run for every
+    # npmod, since len(dim) is needed below regardless. Only the validation is gated.
+    if dim is None:
+        dim = tuple(map(int, np.around(np.sqrt(components.shape))))
+    elif isinstance(dim, (int, np.integer)):
+        dim = (int(dim),)
 
-        if not np.allclose(np.square(dim), components.shape[-len(dim) :]):
-            raise ValueError("Components array shape invalid")
+    if npmod is np and not np.allclose(np.square(dim), components.shape[-len(dim) :]):
+        raise ValueError("Components array shape invalid")
 
     basis = paulis(dim)
     comp_axes = list(range(-len(dim), 0))
@@ -401,13 +403,22 @@ def truncate(
     Returns:
         Components of the submatrix, shape (..., r1**2, r2**2, ...)
     """
-    if npmod is np and isinstance(reduced_dim, (int, np.integer)):
-        reduced_dim = (int(reduced_dim),) * len(components.shape)
+    # Normalizing a scalar reduced_dim is pure Python shape inference on a static value, so it
+    # belongs outside the `npmod is np` gate: gating it left the jnp path receiving a bare int and
+    # failing at `len(reduced_dim)` below with "object of type 'int' has no len()", naming nothing.
+    # A scalar means "one subsystem", not "one per array axis" -- keying the repeat count off
+    # len(components.shape) also mis-sized the tuple whenever the component array carried leading
+    # axes (the documented time-series case), since those are not subsystems.
+    if isinstance(reduced_dim, (int, np.integer)):
+        reduced_dim = (int(reduced_dim),)
 
     num_subsystems = len(reduced_dim)
     first_component_axis = len(components.shape) - num_subsystems
 
     original_shape = components.shape[first_component_axis:]
+    # np.square, not npmod.square: reduced_dim is a static Python tuple of ints, and jnp.square
+    # would turn it into a traced array, making `reduced_shape[idim]` unusable as the static
+    # argument that l0_projector and eye need below.
     reduced_shape = np.square(reduced_dim)
 
     if npmod is np:
@@ -417,7 +428,12 @@ def truncate(
         if np.allclose(reduced_shape, original_shape):
             return components.copy()
 
-    original_dim = npmod.around(npmod.sqrt(original_shape)).astype(int)
+    # np, not npmod: original_shape is components.shape, a static Python tuple. jnp.sqrt rejects a
+    # tuple outright ("sqrt requires ndarray or scalar arguments"), which is why the npmod=jnp path
+    # of this function had never actually run. Shape arithmetic is static in both backends, so
+    # computing it with numpy is correct as well as necessary -- and original_dim must stay a
+    # concrete array to index l0_projector and eye below.
+    original_dim = np.around(np.sqrt(original_shape)).astype(int)
 
     def project_dim(idim, components):
         # Construct the projection matrix
@@ -441,22 +457,18 @@ def truncate(
         # After tensordot, the projected axis is at position 0
         return npmod.moveaxis(projected, 0, first_component_axis + idim)
 
-    if npmod is jnp:
-
-        def loop_body(idim, components):
-            return jax.lax.cond(
-                reduced_dim[idim] == original_dim[idim],
-                lambda c: c,
-                lambda c: project_dim(idim, c),
-                components,
-            )
-
-        components = jax.lax.fori_loop(0, num_subsystems, loop_body, components)
-
-    else:
-        for idim in range(num_subsystems):
-            if reduced_dim[idim] != original_dim[idim]:
-                components = project_dim(idim, components)
+    # A Python loop over subsystems, not jax.lax.fori_loop, even under jnp. The trip count is
+    # len(reduced_dim) -- static in both backends -- and the body indexes reduced_dim and
+    # original_dim, which are Python/numpy sequences of *static* dimensions. fori_loop passes a
+    # traced index, so `reduced_dim[idim]` raised TracerIntegerConversionError: the previous jnp
+    # branch could not run at all. Unrolling is also what lets project_dim build its projector from
+    # concrete shapes, which jnp.eye and l0_projector both require.
+    #
+    # The per-subsystem skip stays a Python `if` for the same reason: the comparison is between two
+    # static ints, so there is no data-dependent control flow here for lax.cond to resolve.
+    for idim in range(num_subsystems):
+        if reduced_dim[idim] != original_dim[idim]:
+            components = project_dim(idim, components)
 
     return components
 
