@@ -440,10 +440,21 @@ class QPrintBase(ABC):
     def _qobj_data(self, qobj):
         if HAS_QUTIP and isinstance(qobj, Qobj):
             if self._dim is None:
-                self._dim = tuple(qobj.dims[0])
+                # dims[0] is the row (ket) space and dims[1] the column (bra) space. For a bra,
+                # dims[0] is the trivial [1] and the real subsystem structure is in dims[1], so
+                # taking dims[0] unconditionally raised "Product of subsystem dimensions 1 and qobj
+                # dimension 3 do not match" for every bra. Operators have both sides populated and
+                # are unaffected either way.
+                row_dims, column_dims = tuple(qobj.dims[0]), tuple(qobj.dims[1])
+                self._dim = column_dims if np.prod(row_dims) == 1 else row_dims
 
-            qobj = qobj.data
-            data = qobj.data
+            # Qobj.full(), not Qobj.data: in qutip 4 `.data` was a scipy sparse matrix, so
+            # `qobj.data.data` reached its value buffer, but qutip 5 wraps the payload in its own
+            # Dense/CSR class which has no `.data` -- the chained access raised
+            # "'qutip.core.data.dense.Dense' object has no attribute 'data'" and made every Qobj
+            # input fail. `.full()` returns a dense ndarray in both versions.
+            qobj = np.asarray(qobj.full())
+            data = qobj
         elif isinstance(qobj, scipy.sparse.csr_matrix):
             data = qobj.data
         elif isinstance(qobj, np.ndarray):
@@ -487,11 +498,25 @@ class QPrintBase(ABC):
             elif term.sign == -1:
                 line_expr += "-"
 
-            if term.amp != "1":
+            # Track whether anything numeric precedes the label, rather than inspecting the string
+            # afterwards: text-mode labels carry the multiplication sign as a prefix
+            # (QPrintPauli._add_labels), and both the amplitude and the phase can be absent, so only
+            # the caller knows whether that "*" has a left operand.
+            wrote_amp = term.amp != "1"
+            if wrote_amp:
                 line_expr += term.amp
 
-            line_expr += self._format_phase(term.phase, mode)
-            line_expr += term.label
+            phase_expr = self._format_phase(term.phase, mode)
+            line_expr += phase_expr
+
+            label = term.label
+            # A dangling separator: the amplitude is suppressed when it is exactly "1", which
+            # rendered a unit-coefficient Pauli term as "- *IZ/2" instead of "- IZ/2". The latex path
+            # was unaffected because its labels carry no separator, so the two renderers disagreed on
+            # the same term -- which is why this survived: neither output looks wrong on its own.
+            if not wrote_amp and not phase_expr and label.startswith("*"):
+                label = label[1:]
+            line_expr += label
 
             num_terms += 1
             if num_terms == self.terms_per_row:
@@ -842,6 +867,18 @@ class QPrintMatrix(QPrintBase):
 
         return qobj, data
 
+    def _add_labels(self, terms, mode):
+        """No-op: a matrix element is identified by its position, not by a basis label.
+
+        ``QPrintBase`` declares this abstract because its own ``_make_lines`` calls it to attach a
+        basis label to each term. This class overrides ``_make_lines`` and lays the terms out by
+        ``(row, column)`` instead, so there is nothing to label -- but the abstract declaration
+        still had to be satisfied, and it was not: ``QPrintMatrix`` could not be instantiated at all
+        ("Can't instantiate abstract class QPrintMatrix without an implementation for abstract
+        method '_add_labels'"), so ``fmt='matrix'`` raised TypeError for every input and both output
+        modes.
+        """
+
     def _make_lines(self, mode):
         global_sign, global_amp, global_phase, terms = self._process()
 
@@ -865,8 +902,11 @@ class QPrintMatrix(QPrintBase):
             if term.sign == -1:
                 element += "-"
 
-            if mode == "text" or term.amp != "1":
-                element += term.amp
+            # Always emit the amplitude, even when it is exactly "1". Suppressing it is correct where
+            # a basis label follows -- "\frac{IZ}{2}" reads better than "1\frac{IZ}{2}" -- but a
+            # matrix element has no label, so dropping the 1 left the cell empty and produced
+            # "\begin{pmatrix} & 0 & 0 & 0 \\ ...", a malformed matrix missing its first entry.
+            element += term.amp
 
             element += self._format_phase(term.phase, mode)
 
