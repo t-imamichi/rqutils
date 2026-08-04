@@ -276,12 +276,18 @@ _METAL_SAS_SOURCE = """
 
     // Unrank `pair` into (i, j) with i <= j. n_basis is 2 or 3, so a short scan is cheaper
     // than any closed form and avoids integer-sqrt rounding concerns entirely.
-    uint i = 0;
-    uint j = 0;
-    uint seen = 0;
-    for (uint a = 0; a < n_basis; ++a) {
-        for (uint b = a; b < n_basis; ++b) {
-            if (seen == pair) {
+    // n_basis/n_states arrive as `const constant int32_t` (MLX passes Python ints as int32), so
+    // the loop counters are int too: comparing a uint counter against them is a signedness
+    // mismatch that Metal warns on (-Wsign-compare). Both are small positive counts.
+    int nbasis = n_basis;
+    int nstates = n_states;
+
+    int i = 0;
+    int j = 0;
+    int seen = 0;
+    for (int a = 0; a < nbasis; ++a) {
+        for (int b = a; b < nbasis; ++b) {
+            if (seen == (int)pair) {
                 i = a;
                 j = b;
             }
@@ -292,17 +298,23 @@ _METAL_SAS_SOURCE = """
     // Strided partial sum in a register. Stride `lanes` keeps adjacent lanes on adjacent
     // addresses, so these loads coalesce.
     T acc = 0;
-    for (uint k = lane; k < n_states; k += lanes) {
-        acc += vectors[i * n_states + k] * mvs[j * n_states + k];
+    for (int k = (int)lane; k < nstates; k += (int)lanes) {
+        acc += vectors[i * nstates + k] * mvs[j * nstates + k];
     }
     partials[lane] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Tree reduction over the threadgroup. `lanes` is a power of two (the caller rounds down),
     // so the halving is exact and no lane reads past the written region.
-    for (uint half = lanes / 2; half > 0; half /= 2) {
-        if (lane < half) {
-            partials[lane] += partials[lane + half];
+    //
+    // NOTE: the stride variable must NOT be named `half` -- that is a reserved built-in scalar
+    // type in Metal Shading Language (16-bit float), so `uint half = ...` fails to compile with
+    // "cannot combine with previous 'type-name' declaration specifier" and cascades into eight
+    // further errors. Neither the numpy shim nor any static check can catch this, since Python
+    // has no such reserved word; it was found only by a real-device run.
+    for (uint stride = lanes / 2; stride > 0; stride /= 2) {
+        if (lane < stride) {
+            partials[lane] += partials[lane + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -311,8 +323,8 @@ _METAL_SAS_SOURCE = """
         // Write BOTH triangles with the identical value, so the result is exactly symmetric by
         // construction and no separate symmetrization op is needed. For i == j this writes the
         // same slot twice, which is harmless.
-        out[i * n_basis + j] = partials[0];
-        out[j * n_basis + i] = partials[0];
+        out[i * nbasis + j] = partials[0];
+        out[j * nbasis + i] = partials[0];
     }
 """.replace("_METAL_SAS_MAX_THREADGROUP_LITERAL_", str(_METAL_SAS_MAX_THREADGROUP))
 

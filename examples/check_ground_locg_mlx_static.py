@@ -16,6 +16,7 @@ Metal device and cannot run headless.
 import ast
 import inspect
 import os
+import re
 import sys
 import types
 
@@ -614,5 +615,72 @@ for index in (0, 5):
             f"OK  large-magnitude diagonal seed guard ({dtype_name}): index={index} "
             f"eig={eig_big:.3e} (rel err {rel_err_big:.1e})"
         )
+
+# 3l. Metal Shading Language reserved-identifier scan over the kernel SOURCE TEXT.
+#
+# This is the one check here that reads the kernels' `source` strings rather than the shim's
+# reimplementation of them. It exists because a real-device run found `uint half = lanes / 2` in
+# _METAL_SAS_SOURCE: `half` is a reserved built-in scalar type in MSL (16-bit float), so that line
+# failed to compile with "cannot combine with previous 'type-name' declaration specifier" and
+# cascaded into eight further errors. Nothing headless could have caught it -- the numpy shim never
+# compiles the Metal text, and `half` is a perfectly ordinary Python identifier.
+#
+# A name scan cannot verify that the Metal compiles (only hardware can), but it does pin the
+# specific failure mode that got through, which is the whole point of a regression check.
+_MSL_RESERVED = {
+    # Scalar and vector built-in types that are also legal Python/C identifiers.
+    "half",
+    "short",
+    "long",
+    "char",
+    "uchar",
+    "ushort",
+    "ulong",
+    "size_t",
+    "ptrdiff_t",
+    "float2",
+    "float3",
+    "float4",
+    "int2",
+    "int3",
+    "int4",
+    "uint2",
+    "uint3",
+    "uint4",
+    "bool2",
+    "bool3",
+    "bool4",
+    "half2",
+    "half3",
+    "half4",
+    # Address-space, function and resource qualifiers.
+    "device",
+    "constant",
+    "threadgroup",
+    "thread",
+    "kernel",
+    "vertex",
+    "fragment",
+    "matrix",
+    "sampler",
+    "texture",
+    "atomic",
+    "simdgroup",
+}
+_kernel_sources = {
+    "_METAL_SAS_SOURCE": module._METAL_SAS_SOURCE,
+    "_METAL_MATVEC_SOURCE": module._METAL_MATVEC_SOURCE,
+}
+for _src_name, _src_text in _kernel_sources.items():
+    # Strip // comments first: prose legitimately discusses `half` to explain this very bug.
+    _code_only = re.sub(r"//[^\n]*", "", _src_text)
+    _declared = set(re.findall(r"\b(?:uint|int|float|bool|T)\s+(\w+)\s*(?:=|;|\[)", _code_only))
+    _collisions = sorted(_declared & _MSL_RESERVED)
+    assert not _collisions, (
+        f"{_src_name} declares variable(s) named after MSL reserved types: {_collisions}. "
+        "Metal will fail to compile this with a 'cannot combine with previous type-name' error. "
+        "Rename them (e.g. `half` -> `stride`)."
+    )
+    print(f"OK  {_src_name} declares no MSL-reserved identifiers ({len(_declared)} names checked)")
 
 print("\nALL STATIC CHECKS PASSED (numpy shim; MLX itself still unverified)")
