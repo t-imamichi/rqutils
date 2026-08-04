@@ -54,8 +54,15 @@ The X and Z signatures are bit-packed into arrays of 8-bit integers.
 
 The input states are then sorted and similarly bit-packed to allow bitwise operations between the
 states and the X/Z signatures. The resulting array :math:`S = [s^{0}, \dots, s^{N-1}]` is the basis
-on which the Hamiltonian is projected. We then define the initial one-hot vector of length :math:`N`
-as the input to the LOBPCG function.
+on which the Hamiltonian is projected. We then define the initial vector of length :math:`N` as the
+input to the LOBPCG function.
+
+That initial vector is a deterministic pseudo-random spread over the subspace, with the
+minimum-diagonal state weighted heavily on top of it when the Hamiltonian has a diagonal part. It is
+deliberately *not* a one-hot vector: LOBPCG requires a non-vanishing overlap with the ground state,
+and a one-hot cannot leave the connected component of the projected Hamiltonian that contains it, so
+a subspace whose Hamiltonian splits into disconnected blocks would silently yield that block's
+minimum instead of the global one. See :func:`_spread_seed`.
 
 Let :math:`J` be the number of distinct X signatures in the Hamiltonian, and :math:`K^{(j)}` be the
 number of Z signatures and coefficients associated with the :math:`j` th X signature. The
@@ -162,7 +169,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec, get_abstract_mesh
-from numpy.typing import NDArray
+from numpy.typing import DTypeLike, NDArray
 from scipy.sparse import coo_array, csr_array
 
 from rqutils.ground_locg import ground_locg
@@ -278,7 +285,10 @@ def hproj(
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian, add_padding=True)
     if not unique_states:
         states = np.unique(states, axis=0)
-    states_p = np.packbits(states, axis=1)
+    # The Hamiltonian above is built with add_padding=True, which shifts every X/Z signature right
+    # by one bit, so the states must carry the same leading pad bit or the two disagree on bit
+    # alignment and every matrix element lands in the wrong column. This mirrors what sqd() does.
+    states_p = np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
 
     @jax.jit
     def cols_elems(_hamiltonian, _states_p):
@@ -295,6 +305,39 @@ def hproj(
     data = np.array(elements[valid])
     cols = np.array(columns[valid])
     return csr_array(coo_array((data, (rows, cols))))
+
+
+def _spread_seed(
+    states_size: int, states_u: StateList, dtype: DTypeLike, sharding: PartitionSpec | None
+) -> jax.Array:
+    """Return a deterministic pseudo-random unit-scale vector over the subspace.
+
+    Used as (part of) ``run_sqd``'s initial vector. The point is coverage, not quality: LOBPCG
+    requires a non-vanishing overlap with the ground state, and a one-hot seed can fail that
+    outright -- it cannot leave the connected component of the projected Hamiltonian that contains
+    it, so a subspace whose Hamiltonian splits into disconnected blocks yields that block's
+    minimum rather than the global one. See the comments at both call sites for the measured cases.
+
+    The values come from a fixed bit-mixing hash of the index rather than from ``jax.random``, so
+    this stays a pure function of ``states_size`` with no PRNG key to thread through the public
+    signature, and is reproducible run to run. An unreproducible eigensolver seed would make
+    convergence itself irreproducible, which is a poor trade for a slightly better spread.
+
+    Fill-in slots produced by uniquification (marked by the high bit of byte 0) are zeroed: they
+    carry no basis state, so weight there would place the iterate partly outside the subspace.
+    """
+    index = jax.lax.broadcasted_iota(jnp.uint32, (states_size,), 0, out_sharding=sharding)
+    # Two xorshift-multiply rounds (the constants are Murmur-style mixers): enough that consecutive
+    # indices give uncorrelated outputs, which is all that is needed to avoid an accidental
+    # orthogonality against any one eigenvector.
+    mixed = index ^ (index >> 16)
+    mixed = mixed * jnp.uint32(0x7FEB352D)
+    mixed = mixed ^ (mixed >> 15)
+    mixed = mixed * jnp.uint32(0x846CA68B)
+    mixed = mixed ^ (mixed >> 16)
+    # Map to [-1, 1). The distribution does not matter, only that no entry is systematically zero.
+    vec = mixed.astype(dtype) * (2.0 / float(2**32)) - 1.0
+    return jnp.where(states_u[:, 0] == 255, jnp.zeros_like(vec), vec)
 
 
 @jax.jit(static_argnames=["states_size", "return_eigvec", "cache_level", "log_level"])
@@ -375,15 +418,29 @@ def run_sqd(
         # Set the fill-in components to the maximum value so that argmin only sees the valid entries
         diagonal = jnp.where(states_u[:, 0] == 255, jnp.max(diagonal), diagonal)
         imin = jnp.argmin(diagonal)
-        return (
-            jax.lax.broadcasted_iota(imin.dtype, (states_size,), 0, out_sharding=sharding) == imin
-        ).astype(hamiltonian.c.dtype)
+        # Weight the minimum-diagonal state heavily -- it is the best single guess available, and
+        # keeping it dominant preserves this heuristic's fast convergence -- but add the spread seed
+        # underneath rather than returning a bare one-hot.
+        #
+        # A pure one-hot cannot leave its own connected component: Krylov iteration only ever
+        # reaches states linked to the seed by a nonzero matrix element, so if the projected
+        # Hamiltonian splits into disconnected blocks (routine for a sampled subspace, where whole
+        # groups of bitstrings may share no Pauli-induced transition), the solver returns that
+        # block's minimum and reports convergence. Measured on a 14-state subspace that splits 4+10:
+        # sqd returned -1.293, the exact minimum of the block holding the seed, against a true
+        # minimum of -2.191 in the other block. The answer was a genuine eigenvalue, just not the
+        # lowest one -- so nothing downstream could detect it.
+        return _spread_seed(states_size, states_u, hamiltonian.c.dtype, sharding).at[imin].add(1.0)
 
     def vinit_nodiag():
-        # TODO: Come up with a way to find a good vinit when there is no diagonal term
-        return (
-            jax.lax.broadcasted_iota(np.int32, (states_size,), 0, out_sharding=sharding) == 0
-        ).astype(hamiltonian.c.dtype)
+        # No diagonal to rank states by, so the spread seed is all there is. A one-hot here is not
+        # merely suboptimal but wrong: ground_locg's documented precondition is a non-vanishing
+        # overlap with v0, and e_0 violates it outright whenever state 0 is decoupled from the rest
+        # of the subspace (every xsource from it lands outside, so row 0 of the projected H is
+        # identically zero). e_0 is then a true eigenvector with eigenvalue 0, the zero-residual
+        # guard correctly reports convergence, and sqd returns 0.0 -- silently, with
+        # converged=True. Reproduced on a 9-state IIIX subspace whose true answer is -1.
+        return _spread_seed(states_size, states_u, hamiltonian.c.dtype, sharding)
 
     if log_level <= logging.DEBUG:
         jax.debug.print("Generating vinit")
@@ -513,7 +570,11 @@ def compute_diagonal(diag_signs: NDArray[np.uint8], coeffs: NDArray[np.inexact])
         diagonal, iterm = val
         coeff = coeffs[iterm]
         ibyte = iterm // 8
-        ibit = iterm & 255
+        # iterm & 7, not iterm & 255: this is the bit offset WITHIN the byte selected above, so it
+        # must wrap at 8. With & 255 the shift 7 - ibit goes negative from iterm=8 onward, i.e. as
+        # soon as an X group holds more than 8 Z terms, and the composed diagonal is silently wrong
+        # (measured: 0.71 absolute error on 9 terms, and a 25% error in the end-to-end eigenvalue).
+        ibit = iterm & 7
         signed = (diag_signs[:, ibyte] >> (7 - ibit)) & 1
         signs = 1.0 - 2.0 * signed
         return diagonal + coeff * signs, iterm + 1

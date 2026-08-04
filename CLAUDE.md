@@ -95,7 +95,6 @@ Eight largely independent modules under `rqutils/`; nothing but `sqd.py → {pau
 
 ## Known rough edges
 
-- `rqutils/sqd.py:544` has `ibit = iterm & 255` where `iterm & 7` is intended (`ibyte = iterm // 8`, then shift by `7 - ibit`), so the `cache_level[1] == 1` path is wrong for >8 Z terms per X group.
-- `hproj` builds the Hamiltonian with `add_padding=True` but packs states without the pad bit, so its bit alignment disagrees with the `sqd` path.
 - `paulis(dim)` for multiple subsystems uses `np.einsum` with 3 letters per subsystem, capping at ~17 subsystems; `sparse=True` for products raises `NotImplementedError`.
 - `sqd` is limited to `N ≤ 2^31` subspace states because `get_xsource` sorts a `2N` stack on a single device; that sort is also noted to leak GPU memory.
+- `run_sqd`'s initial vector is a deterministic pseudo-random spread (`_spread_seed`), not a one-hot: a one-hot cannot leave the connected component of the projected Hamiltonian that contains it, so a subspace whose Hamiltonian splits into disconnected blocks silently returned that block's minimum with `converged=True`. `vinit_from_min_diag` still weights the minimum-diagonal state heavily on top of the spread. Don't "simplify" either back to a one-hot — `tests/test_sqd.py::TestSqdInitialVector` covers both failure modes.
