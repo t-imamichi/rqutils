@@ -321,7 +321,7 @@ def _time_jax(arm, inputs, precision, options, matrix, matvec_probe):
         return ground_locg(matvec_fn, vinit, args=(xsources, diagonals))
 
     _, solve_s = timeit(solve, options.repeat, jax.block_until_ready)
-    eigval, _, iters = solve()
+    eigval, _, iters, _ = solve()
 
     return {'arm': arm, 'compile_s': compile_s, 'fixed_s': fixed_s,
             'per_it_ms': fixed_s / options.fixed_iters * 1e3,

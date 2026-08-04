@@ -400,7 +400,7 @@ def run_sqd(
     if log_level <= logging.DEBUG:
         jax.debug.print(f'Starting minimization with cache_level {cache_level}')
 
-    eigval, eigvec, _ = ground_locg(matvec, vinit, args=args, log_level=log_level)
+    eigval, eigvec, _, _ = ground_locg(matvec, vinit, args=args, log_level=log_level)
     result = (eigval,)
     if return_eigvec:
         if sharding:
