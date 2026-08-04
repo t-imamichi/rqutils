@@ -245,6 +245,21 @@ def sqd(
     # We need to insert the bit with pad() at this point because packbits() fills from the left
     # Perhaps write a new ufunc if this becomes too slow for very large input?
     states_p = np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
+    # Pad the *input* up to states_size too, not just the internal arrays. states_p is a traced
+    # argument of run_sqd, so its leading dimension is part of the jit cache key: leaving it at the
+    # raw input length retraces the whole solver on every distinct len(states), which is precisely
+    # what states_size exists to prevent (measured 0.44 s per call versus 0.064 s once the shape
+    # repeats). uniquify_states already pins every array it derives, so this was the one shape that
+    # still leaked the input length through.
+    #
+    # 255 is the correct filler, and for the same reason uniquify_states uses it: an all-ones row
+    # sorts to the end of the lexsort, and its high bit in byte 0 is the fill-in marker that
+    # _spread_seed and the diagonal masking below already test via states_u[:, 0] >> 7. A genuine
+    # state can never collide with it, because the pad bit inserted above forces byte 0 < 128.
+    if (deficit := states_size - states_p.shape[0]) > 0:
+        states_p = np.append(
+            states_p, np.full((deficit, states_p.shape[1]), 255, dtype=np.uint8), axis=0
+        )
 
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
@@ -290,16 +305,7 @@ def hproj(
     # alignment and every matrix element lands in the wrong column. This mirrors what sqd() does.
     states_p = np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
 
-    @jax.jit
-    def cols_elems(_hamiltonian, _states_p):
-        def get_from_one(_, ham):
-            columns = get_xsource(ham[0], _states_p)
-            diagonals = get_diagonal(ham[1], ham[2], _states_p)
-            return None, (columns, diagonals)
-
-        return jax.lax.scan(get_from_one, None, _hamiltonian.arrays)[1]
-
-    columns, elements = cols_elems(hamiltonian, states_p)
+    columns, elements = _hproj_cols_elems(hamiltonian, states_p)
     valid = columns != -1
     rows = np.tile(np.arange(states.shape[0])[None, :], (columns.shape[0], 1))[valid]
     data = np.array(elements[valid])
@@ -313,6 +319,32 @@ def hproj(
     # index arrays"); the projection is legitimately the zero matrix in that case.
     dim = states.shape[0]
     return csr_array(coo_array((data, (rows, cols)), shape=(dim, dim)))
+
+
+@jax.jit
+def _hproj_cols_elems(hamiltonian: PauliSumXZ, states_p: StateList) -> tuple[jax.Array, jax.Array]:
+    """Scan every Pauli term, returning its column indices and matrix elements.
+
+    Module scope is load-bearing, not style. ``jax.jit`` keys its trace cache on the wrapped
+    function *object*, so defining this inside ``hproj`` -- as it used to be -- made a fresh key on
+    every call and the cache never hit: each ``hproj`` call paid a full retrace and XLA compile,
+    measured at 0.098 s versus 0.0001 s once the cache is warm, i.e. essentially the entire
+    steady-state cost of ``hproj``. Nothing else in ``hproj`` is worth hoisting for speed, and not
+    because of where it sits: ``PauliSumXZ.from_paulisum`` is 0.4 ms and the ``packbits`` below
+    noise. The distinction is compile cost versus host work, and only this closure was compile cost.
+
+    ``states_p`` must stay an argument rather than a captured closure variable, or the retrace
+    returns -- a capture is part of the function object, so a new array means a new key again. As an
+    argument it is traced, and the cache keys on shape and dtype, which repeat across calls.
+    ``PauliSumXZ`` is a registered dataclass pytree, so it passes through as a jit argument.
+    """
+
+    def get_from_one(_, ham):
+        columns = get_xsource(ham[0], states_p)
+        diagonals = get_diagonal(ham[1], ham[2], states_p)
+        return None, (columns, diagonals)
+
+    return jax.lax.scan(get_from_one, None, hamiltonian.arrays)[1]
 
 
 def _spread_seed(

@@ -31,6 +31,7 @@ from rqutils.sqd import (
     get_diagonal,
     get_xsource,
     hproj,
+    run_sqd,
     sqd,
     uniquify_states,
 )
@@ -391,6 +392,33 @@ class TestSqdEndToEnd:
         states = rng.integers(0, 2, size=(12, 4)).astype(np.uint8)
         with pytest.raises(ValueError, match="states_size smaller"):
             sqd((["ZIII"], [1.0]), states, states_size=4)
+
+    def test_states_size_actually_prevents_recompilation(self):
+        """``states_size`` pinned the internal arrays but not the input, so it never worked.
+
+        ``sqd`` packed ``states`` to its raw length and handed that to ``run_sqd``, where
+        ``states_p`` is a *traced* argument -- so its leading dimension entered the jit cache key and
+        every distinct ``len(states)`` retraced the whole solver despite the pin. That is the exact
+        thing the parameter is documented to prevent, and it failed silently: results stayed correct,
+        only ~7x slower (measured 0.44 s per call versus 0.064 s once the shape repeats, n=16
+        N=4096). The companion test above covers the numbers; this one covers the contract.
+
+        Asserting on cache misses rather than wall-clock keeps it deterministic on a loaded machine.
+        """
+        rng = np.random.default_rng(20260804)
+        strings = real_pauli_strings(4, 5, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = rng.integers(0, 2, size=(12, 4)).astype(np.uint8)
+        states_size = 16
+
+        # Warm the cache at the pinned shape, then count misses across shorter inputs.
+        eigval_of(strings, coeffs, states, states_size=states_size)
+        before = run_sqd._cache_size()
+        for length in (11, 10, 9):
+            eigval_of(strings, coeffs, states[:length], states_size=states_size)
+        assert run_sqd._cache_size() == before, (
+            "run_sqd retraced for a shorter input despite states_size being pinned"
+        )
 
 
 class TestMatvecKernels:
