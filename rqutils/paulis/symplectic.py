@@ -115,6 +115,21 @@ class PauliSumXZ:
 
         if np.all(phcoeffs.imag == 0.0):
             phcoeffs = phcoeffs.real
+        elif force_real:
+            # The check above on `coeffs` sees only the *input* coefficients, but the
+            # (-i)^{x.z} phase is folded in afterwards, so a Pauli string with an odd number of Ys
+            # turns real input complex again -- and force_real=True returned complex128 with no
+            # warning at all. Callers were left to notice on their own:
+            # examples/_bench_common.build_solver_inputs raises on `.c.dtype != np.float64` for
+            # exactly this reason. Warn rather than raise, matching the pre-phase check's
+            # best-effort semantics so no existing caller changes behaviour.
+            warnings.warn(
+                "force_real=True but the coefficients are complex after the (-i)^{x.z} phase is "
+                "applied; a Pauli string with an odd number of Ys cannot have a real coefficient "
+                "in this convention. The returned .c is complex128 -- check its dtype if your "
+                "downstream code requires float64.",
+                stacklevel=2,
+            )
 
         if add_padding:
             # Add a dummy identity Pauli at the padding bit to align with the padding on the states

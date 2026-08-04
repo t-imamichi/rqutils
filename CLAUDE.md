@@ -51,15 +51,25 @@ uv run --extra dev pytest              # whole suite
 uv run --extra dev pytest -v -x        # verbose, stop at first failure
 ```
 
-`tests/test_ground_locg.py` covers `rqutils/ground_locg.py` only — the other six modules have no
-automated tests yet, so for those still write a throwaway `uv run python -c ...` script or run the
-matching `examples/` script. `tests/` also contains three Jupyter notebooks (`paulis.ipynb`,
-`qprint.ipynb`, `sqd.ipynb`) used as interactive scratchpads; pytest does not collect them.
+One `tests/test_<module>.py` per module. All seven are covered — `ground_locg`, `sqd`, `svsim`,
+`paulis/general`, `paulis/symplectic`, `qprint`, `math` — but **only single-device**: nothing
+exercises a multi-device mesh, so `ground_locg`'s `out_sharding` contract, `sqd`'s mesh-size
+padding, and `svsim`'s `out_sharding` are all unverified. `rqutils/ground_locg_mlx.py` needs a Metal
+device and is checked by `examples/check_ground_locg_mlx_static.py` (numpy shim, runs anywhere) and
+`examples/check_ground_locg_mlx_mlx.py` (real device) instead. `tests/` also contains three Jupyter
+notebooks used as interactive scratchpads; pytest does not collect them.
 
 `tests/conftest.py` enables `jax_enable_x64` before any `rqutils` import — every tolerance in the
-suite depends on it. Tests are organized by defect and keyed to the audit items in `docs/locg.md`;
-when adding one, name the item it locks down and assert on the eigenvector residual as well as the
-eigenvalue (the audit's I3 returned an exact eigenvalue with a garbage eigenvector).
+suite depends on it — and holds the shared reference helpers (dense Pauli sums, projections, gate
+unitaries), each validated against qiskit before being trusted as a reference.
+
+**Tests are organized by defect.** Writing these suites found bugs in five of the seven modules, all
+of the same character: a plausible finite answer rather than a raise or a `NaN`. So when adding a
+test, name the defect it locks down and record the measured wrong value, and prefer an *independent*
+reference (a dense construction, scipy, qiskit) over self-consistency — several bugs made every
+internal code path agree on the same wrong number. Verify a new test actually fails against the bug
+it targets by reverting the fix in place; a copy of the repo does not work, since the venv holds an
+editable install pointing at the original.
 
 ## Architecture
 
@@ -68,7 +78,7 @@ Eight largely independent modules under `rqutils/`; nothing but `sqd.py → {pau
 **Two unrelated Pauli representations — do not confuse them:**
 
 - `paulis/general.py` — dense generalized (Gell-Mann-like) basis for arbitrary dimension. `paulis(dim)`, `components()`, `compose()`, `truncate()`, `labels()`. Normalization is `tr(λ_k λ_l) = 2δ_kl`, so **`λ_0 = sqrt(2/n)·I`, not `I`** — the most bug-prone invariant here. Basis-index ordering is fixed by a shell-by-shell construction loop and is relied on by `symmetry`, `l0_projector`, and `truncate`. Shapes: `paulis(dim)` → `(d1², …, D, D)` (basis axes *first*); component arrays → `(…, d1², …)` (component axes *last*). Everything is memoized in module-level dicts keyed by a `tuple(int)`-normalized `dim`.
-- `paulis/symplectic.py` — `PauliSumXZ`, a bit-packed qubit-only form for JAX/GPU. Convention `Q = (-i)^{x·z} Z^z X^x` with **little-endian qubit ordering** (Qiskit's `.x`/`.z` get reversed on ingest). Terms are grouped by unique X signature, Z groups zero-padded to a rectangle, the `(-i)^{popcount(x&z)}` phase folded into the coefficients, then `np.packbits`.
+- `paulis/symplectic.py` — `PauliSumXZ`, a bit-packed qubit-only form for JAX/GPU. Convention `Q = (-i)^{x·z} Z^z X^x` with **little-endian qubit ordering** (Qiskit's `.x`/`.z` get reversed on ingest). Terms are grouped by unique X signature, Z groups zero-padded to a rectangle, the `(-i)^{popcount(x&z)}` phase folded into the coefficients, then `np.packbits`. Note that `packbits` fills each byte from the **most significant** end, so a signature's payload bits are the *first* `num_qubits` entries of `np.unpackbits`, in string-character order (leftmost character = index 0) — the reverse of the qubit numbering. `force_real=True` is best-effort: it warns but does not raise, and it **cannot** succeed for an odd-Y string, since the `(-i)^{x·z}` phase makes real input complex. Check `.c.dtype` if you need float64.
 
 **`sqd.py`** — sample-based quantum diagonalization: project a large Pauli-sum Hamiltonian onto the subspace spanned by a list of computational-basis bitstrings and solve matrix-free. `sqd(...)` is the entry point; `hproj(...)` is the dense/debug path. Two conventions dominate:
 
