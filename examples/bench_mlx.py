@@ -158,6 +158,16 @@ def parse_args(argv=None):
         "note rather than an error, since JAX already amortizes graph "
         "construction via jax.jit/lax.while_loop (see compile_s).",
     )
+    parser.add_argument(
+        "--sas",
+        choices=("ops", "metal"),
+        default="ops",
+        help='Rayleigh-Ritz inner-product kernel, MLX f32 arms only. "ops" '
+        "(default) is the portable op-graph _compute_sas -- existing measured "
+        'results are only reproducible with this default. "metal" fuses all '
+        "six distinct inner products into one custom Metal launch, replacing "
+        "16 op launches per iteration and eliminating the symmetrization.",
+    )
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of a table.")
     parser.add_argument(
         "--skip-brute-force",
@@ -297,6 +307,13 @@ def run_arm(arm, options):
         )
         print(f"NOTE: {compile_body_note}", file=sys.stderr)
 
+    if options.sas == "metal" and framework != "mlx":
+        # Fail loudly rather than silently substituting a different kernel: a "metal" row that
+        # actually timed the op-graph path would misreport what was measured.
+        raise SystemExit(
+            f"{arm}: --sas metal is an MLX-only custom Metal kernel and has no JAX equivalent."
+        )
+
     rtol = RTOL[precision]
     if framework == "jax":
         result = _time_jax(arm, inputs, precision, options, matrix, matvec_probe)
@@ -351,6 +368,7 @@ def run_arm(arm, options):
     # matvec/compile settings that produced it travel with it.
     result["matvec"] = options.matvec
     result["chunk"] = options.chunk if options.matvec == "chunked" else None
+    result["sas"] = options.sas
     result["compile_body"] = bool(options.compile_body) and framework == "mlx"
     result["compile_body_note"] = compile_body_note
     return result
@@ -456,6 +474,12 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
     else:
         matvec_fn = apply_h_xz_mlx
 
+    if options.sas == "metal" and precision != "f32":
+        raise SystemExit(
+            f"{arm}: --sas metal requires float32 (Metal has no float64). Use an f32 arm, or "
+            "--sas ops for the f64 arms."
+        )
+
     mx.set_default_device(mx.cpu if device == "cpu" else mx.gpu)
     dtype = mx.float64 if precision == "f64" else mx.float32
     # Pass dtype at CONSTRUCTION, never construct-then-cast: MLX's docs state that "NumPy
@@ -516,6 +540,7 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
             maxiter=options.fixed_iters,
             tol=0.0,
             compile_body=options.compile_body,
+            sas=options.sas,
         )
 
     compile_s, fixed_s = timeit(fixed, options.repeat, sync)
@@ -530,6 +555,7 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
             args=(xsources, diagonals),
             tol=SOLVE_TOL[precision],
             compile_body=options.compile_body,
+            sas=options.sas,
         )
 
     _, solve_s = timeit(solve, options.repeat, sync)
@@ -573,6 +599,8 @@ def run_all(options):
             options.matvec,
             "--chunk",
             str(options.chunk),
+            "--sas",
+            options.sas,
         ]
         if options.skip_brute_force:
             argv.append("--skip-brute-force")
@@ -628,6 +656,8 @@ def report(results, as_json):
             opt += f"(chunk={row.get('chunk')})"
         if row.get("compile_body"):
             opt += " compile_body"
+        if row.get("sas") == "metal":
+            opt += " sas=metal"
         print(
             f"{row['arm']:<15}{row['setup_s']:>9.4f}{row['compile_s']:>10.4f}"
             f"{row['fixed_s']:>10.4f}{row['per_it_ms']:>11.3f}{row['solve_s']:>10.4f}"
