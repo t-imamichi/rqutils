@@ -7,26 +7,30 @@ module produces, so timing differences are attributable to the solver alone.
 This module must not import mlx at module level -- the JAX-only arms run in processes where
 mlx may be unavailable.
 """
-from dataclasses import dataclass
+
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
-import numpy as np
+
 import jax.numpy as jnp
+import numpy as np
+
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import uniquify_states, get_xsource, get_diagonal
+from rqutils.sqd import get_diagonal, get_xsource, uniquify_states
 
 _PAULI_MATRICES = {
-    'I': np.eye(2, dtype=np.complex128),
-    'X': np.array([[0., 1.], [1., 0.]], dtype=np.complex128),
-    'Y': np.array([[0., -1.j], [1.j, 0.]], dtype=np.complex128),
-    'Z': np.diag([1., -1.]).astype(np.complex128)
+    "I": np.eye(2, dtype=np.complex128),
+    "X": np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128),
+    "Y": np.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=np.complex128),
+    "Z": np.diag([1.0, -1.0]).astype(np.complex128),
 }
 
 
 @dataclass
 class SolverInputs:
     """Everything the solver loop needs, with invalid X sources already neutralized."""
+
     xsources: np.ndarray
     diagonals: np.ndarray
     vinit: np.ndarray
@@ -35,10 +39,7 @@ class SolverInputs:
 
 
 def generate_problem(
-    num_qubits: int,
-    num_paulis: int,
-    num_states: int,
-    seed: int = 0
+    num_qubits: int, num_paulis: int, num_states: int, seed: int = 0
 ) -> tuple[list[str], np.ndarray, np.ndarray]:
     """Generate a random Hamiltonian with real coefficients, plus a subspace of states.
 
@@ -49,20 +50,18 @@ def generate_problem(
     rng = np.random.default_rng(seed)
     pauli_strings = []
     while len(pauli_strings) < num_paulis:
-        chars = rng.choice(list('IXYZ'), size=num_qubits)
-        if np.count_nonzero(chars == 'Y') % 2:
+        chars = rng.choice(list("IXYZ"), size=num_qubits)
+        if np.count_nonzero(chars == "Y") % 2:
             continue
-        pauli_strings.append(''.join(chars))
+        pauli_strings.append("".join(chars))
 
-    coeffs = rng.uniform(-1., 1., num_paulis)
+    coeffs = rng.uniform(-1.0, 1.0, num_paulis)
     states = rng.choice(2, size=(num_states, num_qubits)).astype(np.uint8)
     return pauli_strings, coeffs, states
 
 
 def build_solver_inputs(
-    pauli_strings: list[str],
-    coeffs: np.ndarray,
-    states: np.ndarray
+    pauli_strings: list[str], coeffs: np.ndarray, states: np.ndarray
 ) -> SolverInputs:
     """Run the JAX setup stage and return sanitized solver inputs.
 
@@ -73,23 +72,27 @@ def build_solver_inputs(
     by 0., which is algebraically identical and costs nothing inside the solver loop.
     Both frameworks receive these same arrays, so neither is advantaged.
     """
-    hamiltonian = PauliSumXZ.from_paulisum((pauli_strings, coeffs), force_real=True,
-                                           add_padding=True)
+    hamiltonian = PauliSumXZ.from_paulisum(
+        (pauli_strings, coeffs), force_real=True, add_padding=True
+    )
     if hamiltonian.c.dtype != np.float64:
-        raise ValueError(f'Hamiltonian coefficients are {hamiltonian.c.dtype}, expected float64.'
-                         ' Pauli strings must have an even number of Ys.')
+        raise ValueError(
+            f"Hamiltonian coefficients are {hamiltonian.c.dtype}, expected float64."
+            " Pauli strings must have an even number of Ys."
+        )
 
     states_p = np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
     subspace_dim = int(np.unique(states_p, axis=0).shape[0])
     states_u = uniquify_states(states_p, subspace_dim)
 
     xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
-    diagonals = np.stack([np.asarray(get_diagonal(z, c, states_u))
-                          for z, c in zip(hamiltonian.z, hamiltonian.c)])
+    diagonals = np.stack(
+        [np.asarray(get_diagonal(z, c, states_u)) for z, c in zip(hamiltonian.z, hamiltonian.c)]
+    )
 
     valid = xsources >= 0
     xsources = np.where(valid, xsources, 0).astype(np.int32)
-    diagonals = np.where(valid, diagonals, 0.).astype(np.float64)
+    diagonals = np.where(valid, diagonals, 0.0).astype(np.float64)
 
     # Mirror sqd's vinit_from_min_diag: one-hot at the minimum diagonal entry.
     if np.all(hamiltonian.x[0] == 0):
@@ -97,16 +100,13 @@ def build_solver_inputs(
     else:
         start = 0
     vinit = np.zeros(subspace_dim, dtype=np.float64)
-    vinit[start] = 1.
+    vinit[start] = 1.0
 
     return SolverInputs(xsources, diagonals, vinit, subspace_dim, xsources.shape[0])
 
 
 def apply_h_xz_chunked(
-    vec: jnp.ndarray,
-    xsources: jnp.ndarray,
-    diagonals: jnp.ndarray,
-    chunk: int = 16
+    vec: jnp.ndarray, xsources: jnp.ndarray, diagonals: jnp.ndarray, chunk: int = 16
 ) -> jnp.ndarray:
     """Return Hv via chunked batched gather, the JAX counterpart of ``apply_h_xz_mlx_chunked``.
 
@@ -160,8 +160,8 @@ def apply_h_xz_chunked(
     num_groups = xsources.shape[0]
     out = jnp.zeros_like(vec)
     for start in range(0, num_groups, chunk):
-        xc = xsources[start:start + chunk]
-        dc = diagonals[start:start + chunk]
+        xc = xsources[start : start + chunk]
+        dc = diagonals[start : start + chunk]
         gathered = jnp.take(vec, xc.reshape(-1)).reshape(xc.shape)
         out = out + jnp.sum(gathered * dc, axis=0)
     return out
@@ -180,17 +180,15 @@ def dense_reference(inputs: SolverInputs) -> tuple[np.ndarray, float]:
         np.add.at(matrix, (rows, xsource), diagonal)
     asym = np.abs(matrix - matrix.T).max()
     assert asym == 0.0, (
-        f'gate failed: dense reference is not symmetric (|H - H.T|_inf = {asym}); eigvalsh '
-        'would silently ignore the upper triangle and return a wrong reference. This should be '
-        'impossible for even-Y (real) input -- see _bench_common.build_solver_inputs.'
+        f"gate failed: dense reference is not symmetric (|H - H.T|_inf = {asym}); eigvalsh "
+        "would silently ignore the upper triangle and return a wrong reference. This should be "
+        "impossible for even-Y (real) input -- see _bench_common.build_solver_inputs."
     )
     return matrix, float(np.linalg.eigvalsh(matrix)[0])
 
 
 def brute_force_reference(
-    pauli_strings: list[str],
-    coeffs: np.ndarray,
-    states: np.ndarray
+    pauli_strings: list[str], coeffs: np.ndarray, states: np.ndarray
 ) -> float:
     """Ground energy via the full 2^n matrix, projected onto the unique states.
 
@@ -198,9 +196,9 @@ def brute_force_reference(
     dense_reference validates that chain. Costs ~0.13 s at n=10; do not call it for large n.
     """
     num_qubits = states.shape[1]
-    full = np.zeros((2 ** num_qubits,) * 2, dtype=np.complex128)
+    full = np.zeros((2**num_qubits,) * 2, dtype=np.complex128)
     for string, coeff in zip(pauli_strings, coeffs):
-        operator = np.array([[1.]], dtype=np.complex128)
+        operator = np.array([[1.0]], dtype=np.complex128)
         for char in string:
             operator = np.kron(operator, _PAULI_MATRICES[char])
         full += coeff * operator
@@ -212,11 +210,7 @@ def brute_force_reference(
     return float(np.linalg.eigvalsh(projected)[0].real)
 
 
-def timeit(
-    fn: Callable[[], Any],
-    repeat: int,
-    sync: Callable[[Any], Any]
-) -> tuple[float, float]:
+def timeit(fn: Callable[[], Any], repeat: int, sync: Callable[[Any], Any]) -> tuple[float, float]:
     """Return (compile_seconds, mean_steady_seconds).
 
     ``sync`` must force the computation to complete: ``jax.block_until_ready`` for JAX,

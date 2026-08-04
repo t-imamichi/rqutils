@@ -203,16 +203,17 @@ Single-vector LOBPCG API
 
 .. autofunction:: eigenpair_3x3
 """
-from collections.abc import Callable
+
 import logging
 import math
-from typing import Optional
-from numpy.typing import DTypeLike, NDArray
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec, get_abstract_mesh
+from numpy.typing import DTypeLike, NDArray
 
-_SQRT3 = math.sqrt(3.)
+_SQRT3 = math.sqrt(3.0)
 
 
 def ground_locg(
@@ -220,10 +221,10 @@ def ground_locg(
     xinit: jax.Array | int,
     args: tuple = (),
     maxiter: int = 1000,
-    tol: Optional[float] = None,
+    tol: float | None = None,
     vspace: tuple[int, DTypeLike] | None = None,
     debug: bool = False,
-    log_level: int = logging.WARNING
+    log_level: int = logging.WARNING,
 ) -> tuple[float, NDArray, int, bool]:
     r"""Single-vector LOBPCG.
 
@@ -249,42 +250,36 @@ def ground_locg(
         than comparing the third against ``maxiter``, which is ambiguous.
     """
     if callable(mat):
-        return _ground_locg_callable(mat, xinit, args, maxiter, tol, vspace=vspace, debug=debug,
-                                     log_level=log_level)
+        return _ground_locg_callable(
+            mat, xinit, args, maxiter, tol, vspace=vspace, debug=debug, log_level=log_level
+        )
     return _ground_locg_matrix(mat, xinit, maxiter, tol, debug=debug, log_level=log_level)
 
 
-@jax.jit(static_argnames=['maxiter', 'debug', 'log_level'])
+@jax.jit(static_argnames=["maxiter", "debug", "log_level"])
 def _ground_locg_matrix(
     mat: jax.Array,
     xinit: jax.Array,
     maxiter: int,
     tol: jax.Array | float | None,
     debug: bool = False,
-    log_level: int = logging.WARNING
+    log_level: int = logging.WARNING,
 ):
     vspace = None
     if jnp.issubdtype(xinit.dtype, jnp.integer):
         vspace = (mat.shape[1], mat.dtype)
 
     def matvec(x):
-        return jax.lax.dot(mat, x,
-                           precision=(jax.lax.Precision.HIGHEST,) * 2,
-                           out_sharding=jax.typeof(x).sharding)
+        return jax.lax.dot(
+            mat, x, precision=(jax.lax.Precision.HIGHEST,) * 2, out_sharding=jax.typeof(x).sharding
+        )
 
-    return _ground_locg_callable(matvec, xinit, (), maxiter, tol,
-                                 vspace=vspace, debug=debug, log_level=log_level)
+    return _ground_locg_callable(
+        matvec, xinit, (), maxiter, tol, vspace=vspace, debug=debug, log_level=log_level
+    )
 
 
-@jax.jit(
-    static_argnames=[
-        'matvec',
-        'maxiter',
-        'vspace',
-        'debug',
-        'log_level'
-    ]
-)
+@jax.jit(static_argnames=["matvec", "maxiter", "vspace", "debug", "log_level"])
 def _ground_locg_callable(
     matvec: Callable[[jax.Array], jax.Array],
     xinit: jax.Array | int,
@@ -293,20 +288,27 @@ def _ground_locg_callable(
     tol: jax.Array | float | None,
     vspace: tuple[int, DTypeLike] | None = None,
     debug: bool = False,
-    log_level: int = logging.WARNING
+    log_level: int = logging.WARNING,
 ):
     if jnp.issubdtype(xinit.dtype, jnp.integer):
+        if vspace is None:
+            # Without this, the subscripts below raise an opaque "NoneType is not subscriptable".
+            raise ValueError(
+                "vspace (dimension, dtype) is required when xinit is an integer and mat is a "
+                "callable, since the vector space cannot be inferred from a matrix in that case"
+            )
         sharding = None
         if not (mesh := get_abstract_mesh()).empty:
             sharding = PartitionSpec(mesh.axis_names)
-        xinit = (jax.lax.broadcasted_iota(xinit.dtype, (vspace[0],), 0, out_sharding=sharding)
-                 == xinit).astype(vspace[1])
+        xinit = (
+            jax.lax.broadcasted_iota(xinit.dtype, (vspace[0],), 0, out_sharding=sharding) == xinit
+        ).astype(vspace[1])
 
     def normalize(vector, norm=None):
         """Divide by the norm, leaving a zero vector untouched instead of producing NaN."""
         if norm is None:
             norm = jnp.linalg.norm(vector)
-        return vector / jnp.where(norm == 0., 1., norm)
+        return vector / jnp.where(norm == 0.0, 1.0, norm)
 
     def compute_sas(vectors, mvs):
         """Projected matrix over ``vectors``, given their (possibly precomputed) images."""
@@ -322,28 +324,29 @@ def _ground_locg_callable(
         return sas
 
     def diagnostics(xcurr, ycurr, rcurr, theta, kappa=None, reltol=None, converged=None):
-        sas = compute_sas((xcurr, ycurr, rcurr),
-                          tuple(matvec(v, *args) for v in (xcurr, ycurr, rcurr)))
+        sas = compute_sas(
+            (xcurr, ycurr, rcurr), tuple(matvec(v, *args) for v in (xcurr, ycurr, rcurr))
+        )
         axcurr = matvec(xcurr, *args)
         rho = jnp.sum(xcurr.conjugate() * axcurr).real  # turns out to be faster than dot()
 
         if kappa is None:
             kappa = jnp.zeros(3, dtype=xcurr.dtype)
         if reltol is None:
-            reltol = jnp.array(0.)
+            reltol = jnp.array(0.0)
         if converged is None:
             converged = jnp.array(False)
 
         return {
-            'x': xcurr,
-            'y': ycurr,
-            'r': rcurr,
-            'theta': theta,
-            'rho': rho,
-            'kappa': kappa,
-            'sas': sas,
-            'reltol': reltol,
-            'converged': converged
+            "x": xcurr,
+            "y": ycurr,
+            "r": rcurr,
+            "theta": theta,
+            "rho": rho,
+            "kappa": kappa,
+            "sas": sas,
+            "reltol": reltol,
+            "converged": converged,
         }
 
     def body_iter0(xcurr):
@@ -365,7 +368,7 @@ def _ground_locg_callable(
         # sas whose row/col 1 vanish and, for a positive-definite operator, spuriously selects that
         # null direction: theta collapses towards 0 instead of reporting rho, the true answer.
         norm_r = jnp.linalg.norm(rcurr)
-        r_is_zero = norm_r == 0.
+        r_is_zero = norm_r == 0.0
         tmp_p = normalize(rcurr, norm_r)
         # Reuse Ax from body_iter0 rather than recomputing it inside compute_sas.
         sas = compute_sas((xcurr, tmp_p), (axcurr, matvec(tmp_p, *args)))
@@ -374,7 +377,7 @@ def _ground_locg_callable(
         # it. With p excluded, the 2x2 solve collapses onto x alone, returning theta = rho (the
         # Rayleigh quotient of xcurr, already computed in body_iter0 and passed in) and kappa = [1,
         # 0], so xnext == xcurr below and no new search direction is introduced.
-        excluded = jnp.abs(rho) + jnp.abs(rho) + 1.
+        excluded = jnp.abs(rho) + jnp.abs(rho) + 1.0
         sas = jnp.where(r_is_zero, sas.at[1, 1].set(excluded.astype(sas.dtype)), sas)
         theta, kappa = eigenpair_2x2(sas)
         tmp_t = tmp_p * kappa[0] - xcurr * kappa[1]
@@ -390,15 +393,16 @@ def _ground_locg_callable(
         # relevant space, so no further iteration can lower theta. Report convergence immediately.
         converged = r_is_zero
         if debug:
-            diag = diagnostics(xnext, ynext, rnext, theta, jnp.insert(kappa, 1, 0.),
-                               converged=converged)
+            diag = diagnostics(
+                xnext, ynext, rnext, theta, jnp.insert(kappa, 1, 0.0), converged=converged
+            )
             return xnext, ynext, rnext, axnext, theta, converged, diag
         return xnext, ynext, rnext, axnext, theta, converged
 
     def body(state):
         xcurr, ycurr, rcurr, axcurr = state[-4:]
         if log_level <= logging.DEBUG:
-            jax.debug.print('LOCG iteration {}', state[0])
+            jax.debug.print("LOCG iteration {}", state[0])
 
         # Residual basis selection.
         # R is supposed to be already orthogonal to X, but we find that it's necessary to project
@@ -409,24 +413,25 @@ def _ground_locg_callable(
         # by |tmp_p|^2, which for a large positive shift is a spuriously low diagonal that gets
         # selected in place of the true minimizer.
         norm_p = jnp.linalg.norm(tmp_p)
-        p_is_zero = norm_p == 0.
+        p_is_zero = norm_p == 0.0
         tmp_p = normalize(tmp_p, norm_p)
         # Projected eigensolve. xcurr is the previous iteration's xnext, so its image is already
         # known -- three matvecs per iteration instead of four.
-        sas = compute_sas((xcurr, ycurr, tmp_p),
-                          (axcurr, matvec(ycurr, *args), matvec(tmp_p, *args)))
+        sas = compute_sas(
+            (xcurr, ycurr, tmp_p), (axcurr, matvec(ycurr, *args), matvec(tmp_p, *args))
+        )
         # A zeroed tmp_p leaves sas row/col 2 empty, and for a positive-definite A the resulting
         # zero diagonal is the smallest eigenvalue, so Rayleigh-Ritz would pick the null direction
         # and the normalizations below would divide by zero. Lift it out of contention; the
         # p_is_zero case is reported as convergence instead (see below).
         diag_xy = jnp.diagonal(sas).real[:2]
-        excluded = jnp.max(diag_xy) + jnp.sum(jnp.abs(diag_xy)) + 1.
+        excluded = jnp.max(diag_xy) + jnp.sum(jnp.abs(diag_xy)) + 1.0
         sas = jnp.where(p_is_zero, sas.at[2, 2].set(excluded.astype(sas.dtype)), sas)
         theta, kappa = eigenpair_3x3(sas)
         # New vectors
         tmp_s = ycurr * kappa[1] + tmp_p * kappa[2]
         norm_s = jnp.linalg.norm(tmp_s)
-        tmp_t = tmp_s * (kappa[0] / jnp.where(norm_s == 0., 1., norm_s)) - xcurr * norm_s
+        tmp_t = tmp_s * (kappa[0] / jnp.where(norm_s == 0.0, 1.0, norm_s)) - xcurr * norm_s
         tmp_u = xcurr * kappa[0] + tmp_s
         xnext = normalize(tmp_u)
         # tmp_t is a difference of two quantities both nearly parallel to xcurr as norm_s -> 0, so
@@ -470,7 +475,7 @@ def _ground_locg_callable(
         # point of the Rayleigh quotient and no further iteration can lower theta.
         converged = jnp.logical_or(norm_rnext < tol * reltol, p_is_zero)
         if log_level <= logging.DEBUG:
-            jax.debug.print('Residual {}, reltol {}, converged: {}', norm_rnext, reltol, converged)
+            jax.debug.print("Residual {}, reltol {}, converged: {}", norm_rnext, reltol, converged)
 
         state = (state[0] + 1, converged, theta, xnext, ynext, rnext, axnext)
         if debug:
@@ -478,7 +483,7 @@ def _ground_locg_callable(
         return state
 
     if log_level <= logging.DEBUG:
-        jax.debug.print('Performing first LOBPCG steps')
+        jax.debug.print("Performing first LOBPCG steps")
 
     xinit = normalize(xinit)
 
@@ -494,8 +499,9 @@ def _ground_locg_callable(
     # imaginary part of the projected matrix -- a correctness bug for a genuinely complex operator,
     # not merely a noisy warning. Promoting xinit up front means it is never a carry-type workaround
     # to remove later; both problems share the same fix.
-    work_dtype = jnp.result_type(xinit.dtype,
-                                 jax.eval_shape(lambda vec: matvec(vec, *args), xinit).dtype)
+    work_dtype = jnp.result_type(
+        xinit.dtype, jax.eval_shape(lambda vec: matvec(vec, *args), xinit).dtype
+    )
     xinit = xinit.astype(work_dtype)
 
     vs_iter0 = body_iter0(xinit)
@@ -519,8 +525,9 @@ def _ground_locg_callable(
         # No iteration is permitted, so report the seed pair.
         empty = jnp.array(False)
         if debug:
-            diagnostics_out = jax.tree.map(lambda d0, d1: jnp.concatenate([d0, d1], axis=0),
-                                           diag0, diag1)
+            diagnostics_out = jax.tree.map(
+                lambda d0, d1: jnp.concatenate([d0, d1], axis=0), diag0, diag1
+            )
             return rho_init, xinit, 0, empty, diagnostics_out
         return rho_init, xinit, 0, empty
 
@@ -529,17 +536,12 @@ def _ground_locg_callable(
     # known -- and, worse, feed a zeroed search direction into body()'s Rayleigh-Ritz step.
     state = (0, vs_iter1[5], vs_iter1[4]) + vs_iter1[:4]
     if debug:
-        state, diagnostics_out = jax.lax.scan(
-            lambda s, _: body(s), state, length=maxiter
+        state, diagnostics_out = jax.lax.scan(lambda s, _: body(s), state, length=maxiter)
+        diagnostics_out = jax.tree.map(
+            lambda d0, d1, dr: jnp.concatenate([d0, d1, dr], axis=0), diag0, diag1, diagnostics_out
         )
-        diagnostics_out = jax.tree.map(lambda d0, d1, dr: jnp.concatenate([d0, d1, dr], axis=0),
-                                       diag0, diag1, diagnostics_out)
     else:
-        state = jax.lax.while_loop(
-            lambda s: jnp.logical_and(s[0] < maxiter, ~s[1]),
-            body,
-            state
-        )
+        state = jax.lax.while_loop(lambda s: jnp.logical_and(s[0] < maxiter, ~s[1]), body, state)
 
     niter = state[0]
     converged = state[1]
@@ -558,7 +560,7 @@ def _project_out(basis, vector):
         for vb, ip in zip(basis, ips):
             vector -= vb * ip
         norm = jnp.linalg.norm(vector)
-        vector /= jnp.where(norm == 0., 1., norm)
+        vector /= jnp.where(norm == 0.0, 1.0, norm)
 
     # Comments from the original function:
     # ================
@@ -602,10 +604,9 @@ def eigenpair_2x2(mat: jax.Array) -> tuple[jax.Array, jax.Array]:
         The smaller eigenvalue and its normalized eigenvector.
     """
     scale = jnp.max(jnp.abs(mat))
-    scale = jnp.where(scale > 0., scale, 1.).astype(jnp.diagonal(mat).real.dtype)
+    scale = jnp.where(scale > 0.0, scale, 1.0).astype(jnp.diagonal(mat).real.dtype)
     balanced = mat / scale
     d = jnp.diagonal(balanced).real
-    half_tr = jnp.sum(d) * 0.5
     delta = (d[0] - d[1]) * 0.5
     offd = balanced[1, 0]
     rad = jnp.hypot(delta, jnp.abs(offd))
@@ -613,14 +614,15 @@ def eigenpair_2x2(mat: jax.Array) -> tuple[jax.Array, jax.Array]:
     # singular. Row 1 gives [-conj(offd), delta + rad] and row 2 gives [rad - delta, -offd]; the two
     # are parallel, but each cancels when its own pivot is small, so select on the sign of delta.
     vec = jnp.where(
-        delta >= 0.,
+        delta >= 0.0,
         jnp.array([-offd.conjugate(), (delta + rad).astype(mat.dtype)]),
-        jnp.array([(rad - delta).astype(mat.dtype), -offd])
+        jnp.array([(rad - delta).astype(mat.dtype), -offd]),
     )
     # rad == 0 means a multiple of the identity, for which any unit vector is an eigenvector.
     norm = jnp.linalg.norm(vec)
-    vec = jnp.where(norm > 0., vec / jnp.where(norm > 0., norm, 1.),
-                    jnp.array([1., 0.], dtype=mat.dtype))
+    vec = jnp.where(
+        norm > 0.0, vec / jnp.where(norm > 0.0, norm, 1.0), jnp.array([1.0, 0.0], dtype=mat.dtype)
+    )
     # Rayleigh quotient: second order in the eigenvector error, so it recovers full precision where
     # the closed form alone reaches only sqrt(eps).
     return jnp.vdot(vec, jnp.dot(balanced, vec)).real * scale, vec
@@ -639,22 +641,26 @@ def _nullvec_3x3(mat: jax.Array) -> jax.Array:
     # Rank 2 (simple eigenvalue): the null vector is conj(col_i x col_j). Any single pair can be
     # rank deficient, in which case its cross product vanishes and points nowhere useful, so all
     # three pairings are offered.
-    cands = [jnp.cross(mat[:, 0], mat[:, 1]).conjugate(),
-             jnp.cross(mat[:, 1], mat[:, 2]).conjugate(),
-             jnp.cross(mat[:, 2], mat[:, 0]).conjugate()]
+    cands = [
+        jnp.cross(mat[:, 0], mat[:, 1]).conjugate(),
+        jnp.cross(mat[:, 1], mat[:, 2]).conjugate(),
+        jnp.cross(mat[:, 2], mat[:, 0]).conjugate(),
+    ]
     # Rank 1 (degenerate lowest eigenvalue): every cross product is numerical noise and the null
     # space is the orthogonal complement of the largest column; any member of it is an eigenvector.
     col = mat[:, jnp.argmax(jnp.sum(jnp.square(jnp.abs(mat)), axis=0))].conjugate()
     zero = jnp.zeros((), dtype=mat.dtype)
-    cands += [jnp.stack([zero, col[2], -col[1]]),
-              jnp.stack([-col[2], zero, col[0]]),
-              jnp.stack([col[1], -col[0], zero])]
+    cands += [
+        jnp.stack([zero, col[2], -col[1]]),
+        jnp.stack([-col[2], zero, col[0]]),
+        jnp.stack([col[1], -col[0], zero]),
+    ]
     # Rank 0 (a multiple of the identity): every candidate above is zero, so offer an arbitrary
     # unit vector as the last resort. It has residual 0 and wins by default.
-    cands.append(jnp.array([1., 0., 0.], dtype=mat.dtype))
+    cands.append(jnp.array([1.0, 0.0, 0.0], dtype=mat.dtype))
 
     cands = jnp.stack([_normalize_or_zero(c) for c in cands])
-    resid = jnp.linalg.norm(jnp.einsum('ij,cj->ci', mat, cands), axis=1)
+    resid = jnp.linalg.norm(jnp.einsum("ij,cj->ci", mat, cands), axis=1)
     # A candidate that collapsed to zero is not a valid eigenvector; disqualify it.
     resid = jnp.where(jnp.linalg.norm(cands, axis=1) > 0.5, resid, jnp.inf)
     return cands[jnp.argmin(resid)]
@@ -662,7 +668,7 @@ def _nullvec_3x3(mat: jax.Array) -> jax.Array:
 
 def _normalize_or_zero(vector: jax.Array) -> jax.Array:
     norm = jnp.linalg.norm(vector)
-    return vector / jnp.where(norm == 0., 1., norm)
+    return vector / jnp.where(norm == 0.0, 1.0, norm)
 
 
 @jax.jit
@@ -686,26 +692,29 @@ def eigenpair_3x3(mat: jax.Array) -> tuple[jax.Array, jax.Array]:
     """
     eye = jnp.eye(3, dtype=mat.dtype)
     d = jnp.diagonal(mat).real
-    shift = jnp.sum(d) / 3.
+    shift = jnp.sum(d) / 3.0
     scale = jnp.max(jnp.abs(mat))
-    scale = jnp.where(scale > 0., scale, 1.).astype(d.dtype)
+    scale = jnp.where(scale > 0.0, scale, 1.0).astype(d.dtype)
     balanced = (mat - shift * eye) / scale
 
     bd = jnp.diagonal(balanced).real
     modod = jnp.square(jnp.abs(balanced[jnp.array([1, 2, 2]), jnp.array([0, 0, 1])]))
     # Characteristic polynomial of the traceless balanced matrix: x^3 + c1 x + c0.
     c1 = jnp.sum(bd * jnp.roll(bd, 1)) - jnp.sum(modod)
-    c0 = jnp.sum(bd * modod[::-1]) - jnp.prod(bd) - 2. * (
-        balanced[0, 2] * balanced[1, 0] * balanced[2, 1]).real
+    c0 = (
+        jnp.sum(bd * modod[::-1])
+        - jnp.prod(bd)
+        - 2.0 * (balanced[0, 2] * balanced[1, 0] * balanced[2, 1]).real
+    )
     # Both radicands are non-negative for a Hermitian matrix; clamp them against rounding.
-    p = jnp.maximum(-3. * c1, 0.)
-    disc = jnp.maximum(-27. * c1 * c1 * c1 - 182.25 * c0 * c0, 0.)
-    phi = jnp.atan2(jnp.sqrt(disc), -13.5 * c0) / 3.
+    p = jnp.maximum(-3.0 * c1, 0.0)
+    disc = jnp.maximum(-27.0 * c1 * c1 * c1 - 182.25 * c0 * c0, 0.0)
+    phi = jnp.atan2(jnp.sqrt(disc), -13.5 * c0) / 3.0
     cphi = jnp.cos(phi)
     sphi = jnp.sin(phi)
     # Roots are (sqrt(p) / 3) {2 cos(phi), 2 cos(phi -+ 2pi/3)}.
-    xmin = jnp.min(jnp.array([2. * cphi, -cphi - _SQRT3 * sphi, -cphi + _SQRT3 * sphi]))
-    xmin *= jnp.sqrt(p) / 3.
+    xmin = jnp.min(jnp.array([2.0 * cphi, -cphi - _SQRT3 * sphi, -cphi + _SQRT3 * sphi]))
+    xmin *= jnp.sqrt(p) / 3.0
 
     vec = _nullvec_3x3(balanced - xmin * eye)
     # Rayleigh quotient: second order in the eigenvector error, so it recovers full precision where

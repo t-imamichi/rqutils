@@ -12,13 +12,15 @@ Math API
 .. autofunction:: matrix_exp
 .. autofunction:: matrix_angle
 """
-from collections.abc import Callable
+
 import sys
 import tempfile
+from collections.abc import Callable
 from types import ModuleType
+
+import h5py
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
-import h5py
 
 
 def matrix_ufunc(
@@ -27,7 +29,7 @@ def matrix_ufunc(
     hermitian: int | bool = 0,
     with_diagonals: bool = False,
     npmod: ModuleType = np,
-    save_errors: bool = False
+    save_errors: bool = False,
 ) -> NDArray | tuple[NDArray, NDArray]:
     """Apply a unitary-invariant unary matrix operator to an array of normal matrices.
 
@@ -71,18 +73,18 @@ def matrix_ufunc(
         if hermitian in (1, True):
             eigvals, eigcols = npmod.linalg.eigh(mat)
         elif hermitian == -1:
-            eigvals, eigcols = npmod.linalg.eigh(1.j * mat)
-            eigvals = -1.j * eigvals
+            eigvals, eigcols = npmod.linalg.eigh(1.0j * mat)
+            eigvals = -1.0j * eigvals
         else:
             eigvals, eigcols = npmod.linalg.eig(mat)
     except:
         if save_errors:
-            with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as tmpf:
+            with tempfile.NamedTemporaryFile(suffix=".h5", delete=False) as tmpf:
                 pass
-            with h5py.File(tmpf.name, 'w') as out:
-                out.create_dataset('matrices', data=mat)
+            with h5py.File(tmpf.name, "w") as out:
+                out.create_dataset("matrices", data=mat)
 
-            sys.stderr.write(f'Error in eigendecomposition. Matrix saved at {tmpf.name}\n')
+            sys.stderr.write(f"Error in eigendecomposition. Matrix saved at {tmpf.name}\n")
 
         raise
 
@@ -100,11 +102,17 @@ def matrix_exp(
     hermitian: int | bool = 0,
     with_diagonals: bool = False,
     npmod: ModuleType = np,
-    save_errors: bool = False
+    save_errors: bool = False,
 ) -> NDArray:
     """`matrix_ufunc(exp, ...)`"""
-    return matrix_ufunc(npmod.exp, mat, hermitian=hermitian, with_diagonals=with_diagonals,
-                        npmod=npmod, save_errors=save_errors)
+    return matrix_ufunc(
+        npmod.exp,
+        mat,
+        hermitian=hermitian,
+        with_diagonals=with_diagonals,
+        npmod=npmod,
+        save_errors=save_errors,
+    )
 
 
 def matrix_angle(
@@ -112,8 +120,14 @@ def matrix_angle(
     hermitian: int | bool = 0,
     with_diagonals: bool = False,
     npmod: ModuleType = np,
-    save_errors=False
+    save_errors=False,
 ) -> NDArray:
     """`matrix_ufunc(angle, ...)`"""
-    return matrix_ufunc(npmod.angle, mat, hermitian=hermitian, with_diagonals=with_diagonals,
-                        npmod=npmod, save_errors=save_errors)
+    return matrix_ufunc(
+        npmod.angle,
+        mat,
+        hermitian=hermitian,
+        with_diagonals=with_diagonals,
+        npmod=npmod,
+        save_errors=save_errors,
+    )

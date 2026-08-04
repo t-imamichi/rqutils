@@ -132,22 +132,21 @@ Pauli Matrices API
    symmetry
    labels
 """
-from collections.abc import Sequence
-from typing import Optional
-from types import ModuleType
+
 import string
+from collections.abc import Sequence
+from types import ModuleType
+
+import jax
+import jax.numpy as jnp
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from scipy.sparse import csr_array
-import jax
-import jax.numpy as jnp
+
 from rqutils._types import MatrixDimension
 
 
-def paulis(
-    dim: MatrixDimension,
-    sparse: bool = False
-) -> NDArray[np.complex128] | tuple[csr_array]:
+def paulis(dim: MatrixDimension, sparse: bool = False) -> NDArray[np.complex128] | tuple[csr_array]:
     r"""Return an array of generalized Pauli matrices or matrix products of given dimension(s).
 
     Args:
@@ -172,7 +171,7 @@ def paulis(
     subsystems = [pauli_matrices(d, sparse=sparse) for d in dim]
     num_sub = len(subsystems)
     if sparse:
-        raise NotImplementedError('Need an hour')
+        raise NotImplementedError("Need an hour")
     else:
         # Compose Pauli products
         # (d1**2, d1, d1) x (d2**2, d2, d2) -> (d1**2, d2**2, d1*d2, d1*d2)
@@ -180,26 +179,29 @@ def paulis(
         # be and cf are reshaped into 1 dimension each
         chars = string.ascii_letters
         if num_sub * 3 > len(chars):
-            raise NotImplementedError('Too many subsystems - need an implementation using recursive'
-                                      ' np.kron')
+            raise NotImplementedError(
+                "Too many subsystems - need an implementation using recursive np.kron"
+            )
 
         indices_in = []
-        indices_out = [''] * 3
+        indices_out = [""] * 3
         for ichar in range(0, num_sub * 3, 3):
-            indices_in.append(chars[ichar:ichar + 3])
+            indices_in.append(chars[ichar : ichar + 3])
             indices_out[0] += chars[ichar]
             indices_out[1] += chars[ichar + 1]
             indices_out[2] += chars[ichar + 2]
 
-        indices = f'{",".join(indices_in)}->{"".join(indices_out)}'
+        indices = f"{','.join(indices_in)}->{''.join(indices_out)}"
         dim_array = np.asarray(dim)
-        shape = np.concatenate((np.square(dim_array),
-                                np.prod(np.repeat(dim_array[None, :], 2, axis=0), axis=1)))
+        shape = np.concatenate(
+            (np.square(dim_array), np.prod(np.repeat(dim_array[None, :], 2, axis=0), axis=1))
+        )
         matrix_array = np.einsum(indices, *subsystems).reshape(*shape) / (2 ** (num_sub - 1))
 
     matrix_array.setflags(write=False)
     _pauli_products[(dim, sparse)] = matrix_array.copy()
     return matrix_array
+
 
 _pauli_products = {}
 
@@ -221,7 +223,7 @@ def pauli_matrices(dim: int, sparse: bool = False) -> NDArray[np.complex128 | np
         matrices = []
         shape = (dim, dim)
 
-        data = np.full(dim, np.sqrt(2. / dim), dtype=complex)
+        data = np.full(dim, np.sqrt(2.0 / dim), dtype=complex)
         indices = np.arange(dim)
         indptr = np.arange(dim + 1)
         matrices.append(csr_array((data, indices, indptr), shape=shape))
@@ -232,11 +234,11 @@ def pauli_matrices(dim: int, sparse: bool = False) -> NDArray[np.complex128 | np
                 indptr = [0] * (ipos + 1) + [1] * (ishell - ipos)
                 indptr += [2] * (dim - ishell)
 
-                matrices.append(csr_array(([1.+0.j, 1.+0.j], indices, indptr), shape=shape))
-                matrices.append(csr_array(([-1.j, 1.j], indices, indptr), shape=shape))
+                matrices.append(csr_array(([1.0 + 0.0j, 1.0 + 0.0j], indices, indptr), shape=shape))
+                matrices.append(csr_array(([-1.0j, 1.0j], indices, indptr), shape=shape))
 
-            data = np.array([1.] * ishell + [-ishell], dtype=complex)
-            data *= np.sqrt(2. / ishell / (ishell + 1.))
+            data = np.array([1.0] * ishell + [-ishell], dtype=complex)
+            data *= np.sqrt(2.0 / ishell / (ishell + 1.0))
             indices = np.arange(ishell + 1)
             indptr = list(range(ishell + 1)) + [ishell + 1] * (dim - ishell)
             matrices.append(csr_array((data, indices, indptr), shape=shape))
@@ -245,30 +247,33 @@ def pauli_matrices(dim: int, sparse: bool = False) -> NDArray[np.complex128 | np
 
     else:
         # Compose the unnormalized matrices
-        matrices = np.zeros((dim ** 2, dim, dim), dtype=complex)
+        matrices = np.zeros((dim**2, dim, dim), dtype=complex)
 
         matrices[0] = np.diag(np.ones(dim))
         imat = 1
         for ishell in range(1, dim):
             for ipos in range(ishell):
-                matrices[imat, ipos, ishell] = 1.
-                matrices[imat, ishell, ipos] = 1.
+                matrices[imat, ipos, ishell] = 1.0
+                matrices[imat, ishell, ipos] = 1.0
                 imat += 1
-                matrices[imat, ipos, ishell] = -1.j
-                matrices[imat, ishell, ipos] = 1.j
+                matrices[imat, ipos, ishell] = -1.0j
+                matrices[imat, ishell, ipos] = 1.0j
                 imat += 1
 
-            matrices[imat, :ishell + 1, :ishell + 1] = np.diag(np.array([1.] * ishell + [-ishell]))
+            matrices[imat, : ishell + 1, : ishell + 1] = np.diag(
+                np.array([1.0] * ishell + [-ishell])
+            )
             imat += 1
 
         # Normalization
         norm = np.trace(np.matmul(matrices, matrices), axis1=1, axis2=2)
-        matrices *= np.sqrt(2. / norm)[:, None, None]
+        matrices *= np.sqrt(2.0 / norm)[:, None, None]
 
     # Make the matrix immutable
     matrices.setflags(write=False)
     _pauli_matrices[(dim, sparse)] = matrices
     return matrices
+
 
 _pauli_matrices = {}
 
@@ -289,9 +294,7 @@ def paulis_shape(dim: MatrixDimension) -> tuple[int, ...]:
 
 
 def components(
-    matrix: ArrayLike,
-    dim: Optional[MatrixDimension] = None,
-    npmod: ModuleType = np
+    matrix: ArrayLike, dim: MatrixDimension | None = None, npmod: ModuleType = np
 ) -> NDArray[np.complex128]:
     r"""Return the Pauli decomposition coefficients :math:`\nu_{k_1 \dots k_n}` of the matrix.
 
@@ -315,17 +318,17 @@ def components(
             dim = (int(dim),)
 
         if np.prod(dim) != matrix.shape[-1]:
-            raise ValueError(f'Invalid subsystem dimensions {dim}'
-                             f' (prod {np.prod(dim)} != matrix shape {matrix.shape[-1]})')
+            raise ValueError(
+                f"Invalid subsystem dimensions {dim}"
+                f" (prod {np.prod(dim)} != matrix shape {matrix.shape[-1]})"
+            )
 
     basis = paulis(dim)
     return npmod.tensordot(matrix, basis, ((-2, -1), (-1, -2))) * (2 ** (len(dim) - 2))
 
 
 def compose(
-    components: ArrayLike,
-    dim: Optional[MatrixDimension] = None,
-    npmod: ModuleType = np
+    components: ArrayLike, dim: MatrixDimension | None = None, npmod: ModuleType = np
 ) -> NDArray[np.complex128]:
     r"""Compose a matrix from the Pauli components.
 
@@ -343,8 +346,8 @@ def compose(
         elif isinstance(dim, (int, np.integer)):
             dim = (int(dim),)
 
-        if not np.allclose(np.square(dim), components.shape[-len(dim):]):
-            raise ValueError('Components array shape invalid')
+        if not np.allclose(np.square(dim), components.shape[-len(dim) :]):
+            raise ValueError("Components array shape invalid")
 
     basis = paulis(dim)
     comp_axes = list(range(-len(dim), 0))
@@ -366,25 +369,24 @@ def l0_projector(reduced_dim: int, original_dim: int) -> NDArray[np.float64]:
         return cache.copy()
 
     if reduced_dim > original_dim:
-        raise ValueError('Reduced dim greater than original dim')
+        raise ValueError("Reduced dim greater than original dim")
 
-    projector = np.zeros(original_dim ** 2)
+    projector = np.zeros(original_dim**2)
     projector[0] = np.sqrt(reduced_dim / original_dim)
 
     for dim in range(reduced_dim + 1, original_dim + 1):
-        projector[dim ** 2 - 1] = np.sqrt(reduced_dim / dim / (dim - 1))
+        projector[dim**2 - 1] = np.sqrt(reduced_dim / dim / (dim - 1))
 
     projector.setflags(write=False)
     _l0_projectors[(reduced_dim, original_dim)] = projector.copy()
     return projector
 
+
 _l0_projectors = {}
 
 
 def truncate(
-    components: ArrayLike,
-    reduced_dim: MatrixDimension,
-    npmod: ModuleType = np
+    components: ArrayLike, reduced_dim: MatrixDimension, npmod: ModuleType = np
 ) -> NDArray[np.complex128]:
     r"""Truncate a component array of a matrix into the components for a submatrix.
 
@@ -410,7 +412,7 @@ def truncate(
 
     if npmod is np:
         if np.any(reduced_shape > np.asarray(original_shape)):
-            raise ValueError('Reduced dimensions greater than original dimensions')
+            raise ValueError("Reduced dimensions greater than original dimensions")
 
         if np.allclose(reduced_shape, original_shape):
             return components.copy()
@@ -425,26 +427,29 @@ def truncate(
         # |  0  0  1  0  0  0  0  0  0
         # |  0  0  0  1  0  0  0  0  0
 
-        odim = original_dim[idim] # Dimension of the Paulis
-        osh = original_shape[idim] # Number of Paulis
+        odim = original_dim[idim]  # Dimension of the Paulis
+        osh = original_shape[idim]  # Number of Paulis
         rdim = reduced_dim[idim]
         rsh = reduced_shape[idim]
 
         projector_0 = l0_projector(rdim, odim)[None, :]
-        projector_1 = npmod.concatenate((npmod.eye(rsh)[1:],
-                                         npmod.zeros((rsh - 1, osh - rsh))),
-                                        axis=1)
+        projector_1 = npmod.concatenate(
+            (npmod.eye(rsh)[1:], npmod.zeros((rsh - 1, osh - rsh))), axis=1
+        )
         projector = npmod.concatenate((projector_0, projector_1), axis=0)
         projected = npmod.tensordot(projector, components, (1, first_component_axis + idim))
         # After tensordot, the projected axis is at position 0
         return npmod.moveaxis(projected, 0, first_component_axis + idim)
 
     if npmod is jnp:
+
         def loop_body(idim, components):
-            return jax.lax.cond(reduced_dim[idim] == original_dim[idim],
-                                lambda c: c,
-                                lambda c: project_dim(idim, c),
-                                components)
+            return jax.lax.cond(
+                reduced_dim[idim] == original_dim[idim],
+                lambda c: c,
+                lambda c: project_dim(idim, c),
+                components,
+            )
 
         components = jax.lax.fori_loop(0, num_subsystems, loop_body, components)
 
@@ -478,7 +483,7 @@ def symmetry(dim: MatrixDimension) -> NDArray[np.int_]:
 
     for pauli_dim in dim:
         if (sym := _pauli_symmetry.get(pauli_dim)) is None:
-            sym = np.zeros(pauli_dim ** 2, dtype=int)
+            sym = np.zeros(pauli_dim**2, dtype=int)
             imat = 1
             for isub in range(1, pauli_dim):
                 for _ in range(isub):
@@ -512,16 +517,17 @@ def symmetry(dim: MatrixDimension) -> NDArray[np.int_]:
     _symmetries[dim] = fullsym.copy()
     return fullsym
 
+
 _symmetries = {}
 _pauli_symmetry = {}
 
 
 def labels(
     dim: MatrixDimension,
-    symbol: Optional[str | Sequence[str] | Sequence[Sequence[str]]] = None,
-    delimiter: str = '',
+    symbol: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
+    delimiter: str = "",
     norm: bool = True,
-    fmt: str = 'latex'
+    fmt: str = "latex",
 ) -> NDArray[np.str_]:
     r"""Generate the labels for the Pauli matrices of a given dimension.
 
@@ -542,7 +548,7 @@ def labels(
     if symbol is None or isinstance(symbol, str):
         symbol = (symbol,) * len(dim)
 
-    out = np.array('', dtype=str)
+    out = np.array("", dtype=str)
 
     for pauli_dim, sym in zip(dim, symbol):
         if delimiter and len(out.shape) > 0:
@@ -550,40 +556,40 @@ def labels(
 
         if not sym:
             if pauli_dim == 2:
-                labels = ['I', 'X', 'Y', 'Z']
+                labels = ["I", "X", "Y", "Z"]
             elif sym is None:
-                if fmt == 'text':
-                    labels = [f'λ{i}' for i in range(pauli_dim ** 2)]
+                if fmt == "text":
+                    labels = [f"λ{i}" for i in range(pauli_dim**2)]
                 else:
-                    labels = [fr'{{\lambda_{{{i}}}}}' for i in range(pauli_dim ** 2)]
+                    labels = [rf"{{\lambda_{{{i}}}}}" for i in range(pauli_dim**2)]
             else:
-                labels = [str(i) for i in range(pauli_dim ** 2)]
+                labels = [str(i) for i in range(pauli_dim**2)]
         elif isinstance(sym, str):
-            labels = [f'{{{sym}_{{{i}}}}}' for i in range(pauli_dim ** 2)]
+            labels = [f"{{{sym}_{{{i}}}}}" for i in range(pauli_dim**2)]
         else:
-            assert len(sym) == pauli_dim ** 2, 'Invalid length of the symbols array'
-            labels = [f'{{{s}}}' for s in sym]
+            assert len(sym) == pauli_dim**2, "Invalid length of the symbols array"
+            labels = [f"{{{s}}}" for s in sym]
 
-        out = np.char.add(np.repeat(out[..., None], pauli_dim ** 2, axis=-1), labels)
+        out = np.char.add(np.repeat(out[..., None], pauli_dim**2, axis=-1), labels)
 
     if norm and len(dim) >= 2:
         if len(dim) == 2:
-            denom = '2'
-        elif fmt == 'text':
-            denom = f'2**{len(dim) - 1}'
+            denom = "2"
+        elif fmt == "text":
+            denom = f"2**{len(dim) - 1}"
         else:
-            denom = '2^{%d}' % (len(dim) - 1)
+            denom = "2^{%d}" % (len(dim) - 1)  # noqa: UP031 (f-string needs {{}} escapes here)
 
-        if fmt in ('text', 'latex-slash'):
-            post = np.full(out.shape, f'/{denom}')
+        if fmt in ("text", "latex-slash"):
+            post = np.full(out.shape, f"/{denom}")
 
         else:
-            if fmt == 'latex':
-                pre = np.full(out.shape, r'\frac{')
-                post = np.full(out.shape, '}{%s}' % denom)
+            if fmt == "latex":
+                pre = np.full(out.shape, r"\frac{")
+                post = np.full(out.shape, "}{%s}" % denom)  # noqa: UP031
             else:
-                pre = np.full(out.shape, r'\textstyle{\frac{')
-                post = np.full(out.shape, '}{%s}}' % denom)
+                pre = np.full(out.shape, r"\textstyle{\frac{")
+                post = np.full(out.shape, "}{%s}}" % denom)  # noqa: UP031
 
             out = np.char.add(pre, out)
 

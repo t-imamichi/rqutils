@@ -11,27 +11,30 @@ counterpart in check_ground_locg_mlx_static.py is what validated the algorithm i
 Run with:
     uv run python examples/check_ground_locg_mlx_mlx.py
 """
+
 import os
 import sys
-import numpy as np
-import mlx.core as mx
+
 import jax
-jax.config.update('jax_enable_x64', True)
+import mlx.core as mx
+import numpy as np
+
+jax.config.update("jax_enable_x64", True)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _bench_common import generate_problem, build_solver_inputs, dense_reference
+from _bench_common import build_solver_inputs, dense_reference, generate_problem
 from ground_locg_mlx import apply_h_xz_mlx, ground_locg_mlx
 
 ps, cs, states = generate_problem(10, 20, 200, seed=1)
 inputs = build_solver_inputs(ps, cs, states)
 H, ref = dense_reference(inputs)
-print(f'reference ground energy = {ref:.12f}')
+print(f"reference ground energy = {ref:.12f}")
 
 failures = []
-for device, name in ((mx.cpu, 'cpu'), (mx.gpu, 'gpu')):
-    for dtype, dtname, rtol in ((mx.float64, 'f64', 1e-9), (mx.float32, 'f32', 1e-4)):
-        arm = f'mlx-{name}-{dtname}'
-        if name == 'gpu' and dtname == 'f64':
-            print(f'{arm}: skipped (Metal has no float64)')
+for device, name in ((mx.cpu, "cpu"), (mx.gpu, "gpu")):
+    for dtype, dtname, rtol in ((mx.float64, "f64", 1e-9), (mx.float32, "f32", 1e-4)):
+        arm = f"mlx-{name}-{dtname}"
+        if name == "gpu" and dtname == "f64":
+            print(f"{arm}: skipped (Metal has no float64)")
             continue
         try:
             mx.set_default_device(device)
@@ -53,13 +56,15 @@ for device, name in ((mx.cpu, 'cpu'), (mx.gpu, 'gpu')):
             mverr = np.abs(mv - H @ inputs.vinit).max()
 
             eig, _, iters = ground_locg_mlx(apply_h_xz_mlx, v0, args=(xs, dg))
-            ok = abs(eig - ref) < rtol * max(1., abs(ref))
-            print(f'{arm}: eig={eig:.10f} iters={iters} matvec_err={mverr:.2e} '
-                  f'{"OK" if ok else "FAIL"}')
+            ok = abs(eig - ref) < rtol * max(1.0, abs(ref))
+            print(
+                f"{arm}: eig={eig:.10f} iters={iters} matvec_err={mverr:.2e} "
+                f"{'OK' if ok else 'FAIL'}"
+            )
             if not ok:
                 failures.append(arm)
-        except Exception as exc:
-            print(f'{arm}: ERROR {type(exc).__name__}: {exc}')
+        except Exception as exc:  # noqa: BLE001 (a checker must survive any arm's failure)
+            print(f"{arm}: ERROR {type(exc).__name__}: {exc}")
             failures.append(arm)
 
-print('\nFAILURES:', failures if failures else 'none')
+print("\nFAILURES:", failures if failures else "none")

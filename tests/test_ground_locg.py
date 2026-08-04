@@ -9,6 +9,7 @@ That audit's closing warning shapes the design here:
 
 So targeted per-branch tests are the backbone and randomized sweeps are a supplement.
 """
+
 import warnings
 
 import jax.numpy as jnp
@@ -28,8 +29,8 @@ class TestProjectOut:
         The zeroing guard is what item I7's convergence check keys off: a zeroed search direction
         means {x, y} already spans the residual, so no further iteration can lower theta.
         """
-        basis = (jnp.array([1., 0., 0.]), jnp.array([0., 1., 0.]))
-        out = np.asarray(_project_out(basis, jnp.array([1., 1., 0.])))
+        basis = (jnp.array([1.0, 0.0, 0.0]), jnp.array([0.0, 1.0, 0.0]))
+        out = np.asarray(_project_out(basis, jnp.array([1.0, 1.0, 0.0])))
         assert np.array_equal(out, np.zeros(3))
 
     def test_orthogonal_vector_is_not_normalized_to_unity(self):
@@ -44,15 +45,15 @@ class TestProjectOut:
         proving the vector is not renormalized to unity.
         """
         # Orthonormal basis: _project_out subtracts <e_i|v> e_i, leaving exactly [0, 0, 1].
-        basis = (jnp.array([1., 0., 0.]), jnp.array([0., 1., 0.]))
-        out = np.asarray(_project_out(basis, jnp.array([0., 0., 2.])))
+        basis = (jnp.array([1.0, 0.0, 0.0]), jnp.array([0.0, 1.0, 0.0]))
+        out = np.asarray(_project_out(basis, jnp.array([0.0, 0.0, 2.0])))
         assert np.linalg.norm(out) >= 0.99
-        assert np.allclose(out, [0., 0., 1.])
+        assert np.allclose(out, [0.0, 0.0, 1.0])
 
         # Non-orthonormal basis: _project_out subtracts <b|v> b without a Gram solve, so the
         # result falls short of unit norm. This discriminates "masked to >= 0.99" from
         # "renormalized to unity". The result must be strictly less than 1.0.
-        basis = (jnp.array([1., 0., 0.]), jnp.array([0.3, np.sqrt(1. - 0.3 ** 2), 0.]))
+        basis = (jnp.array([1.0, 0.0, 0.0]), jnp.array([0.3, np.sqrt(1.0 - 0.3**2), 0.0]))
         out = np.asarray(_project_out(basis, jnp.array([0.3, 0.4, 1.0])))
         norm = np.linalg.norm(out)
         assert norm >= 0.99, f"Norm {norm} dropped below 0.99"
@@ -65,7 +66,7 @@ def two_by_two(rng, delta_sign):
     ``eigenpair_2x2`` selects which row of the singular shifted matrix yields the null vector on the
     sign of delta, so the two signs are genuinely different code paths and must be tested apart.
     """
-    offd = rng.normal() + 1.j * rng.normal()
+    offd = rng.normal() + 1.0j * rng.normal()
     diag = rng.normal(size=2)
     if np.sign(diag[0] - diag[1]) != delta_sign:
         diag = diag[::-1]
@@ -78,7 +79,7 @@ class TestEigenpair2x2:
     The shipped predecessor returned 2353 NaNs over 40000 random inputs.
     """
 
-    @pytest.mark.parametrize('mat', [np.diag([1., 5.]), np.diag([5., 1.]), np.eye(2)])
+    @pytest.mark.parametrize("mat", [np.diag([1.0, 5.0]), np.diag([5.0, 1.0]), np.eye(2)])
     def test_diagonal_and_identity(self, mat):
         """Old kernel returned NaN here: its eigenvector formula computed 0/0.
 
@@ -91,27 +92,27 @@ class TestEigenpair2x2:
         assert np.all(np.isfinite(np.asarray(eigvec)))
         assert eigval == pytest.approx(lowest(mat), abs=1e-13 * np.abs(mat).max())
         assert rel_resid(mat, eigval, eigvec) < 1e-13
-        assert np.linalg.norm(np.asarray(eigvec)) == pytest.approx(1.)
+        assert np.linalg.norm(np.asarray(eigvec)) == pytest.approx(1.0)
 
     def test_large_shift(self):
         """Item I1: ``tr*tr - 4*det`` cancelled, reaching relative error 5.8e-1 at shift 1e9."""
-        mat = np.array([[1., 0.5], [0.5, 2.]]) + 1e9 * np.eye(2)
+        mat = np.array([[1.0, 0.5], [0.5, 2.0]]) + 1e9 * np.eye(2)
         eigval, eigvec = eigenpair_2x2(jnp.asarray(mat))
         eigval = float(eigval)
         assert eigval == pytest.approx(lowest(mat), rel=1e-13)
         assert rel_resid(mat, eigval, eigvec) < 1e-13
 
-    @pytest.mark.parametrize('exponent', [-160, 160])
+    @pytest.mark.parametrize("exponent", [-160, 160])
     def test_extreme_scale(self, exponent):
         """Item I2: unbalanced intermediates carried 4.9e-2 error at 1e-160 and NaN at 1e160."""
-        mat = np.array([[1., 0.5], [0.5, 2.]]) * 10. ** exponent
+        mat = np.array([[1.0, 0.5], [0.5, 2.0]]) * 10.0**exponent
         eigval, eigvec = eigenpair_2x2(jnp.asarray(mat))
         eigval = float(eigval)
         assert np.isfinite(eigval)
         assert eigval == pytest.approx(lowest(mat), rel=1e-13)
         assert rel_resid(mat, eigval, eigvec) < 1e-13
 
-    @pytest.mark.parametrize('delta_sign', [1., -1.])
+    @pytest.mark.parametrize("delta_sign", [1.0, -1.0])
     def test_both_delta_branches(self, delta_sign):
         """Each sign of delta separately -- the audit's own sign error hid from aggregate sampling.
 
@@ -122,21 +123,21 @@ class TestEigenpair2x2:
         quietly repaired by later iterations.
         """
         rng = np.random.default_rng(20260804)
-        worst_eigval = worst_residual = 0.
+        worst_eigval = worst_residual = 0.0
         for _ in range(2000):
             mat = two_by_two(rng, delta_sign)
             diag = np.diagonal(mat).real
-            assert np.sign((diag[0] - diag[1]) / 2.) == delta_sign  # the branch really is forced
+            assert np.sign((diag[0] - diag[1]) / 2.0) == delta_sign  # the branch really is forced
             eigval, eigvec = eigenpair_2x2(jnp.asarray(mat))
             eigval = float(eigval)
             assert np.isfinite(eigval)
             scale = np.abs(mat).max()
             worst_eigval = max(worst_eigval, abs(eigval - lowest(mat)) / scale)
             worst_residual = max(worst_residual, rel_resid(mat, eigval, eigvec))
-        assert worst_eigval < 1e-13, f'worst relative eigenvalue error {worst_eigval:.2e}'
-        assert worst_residual < 1e-13, f'worst relative residual {worst_residual:.2e}'
+        assert worst_eigval < 1e-13, f"worst relative eigenvalue error {worst_eigval:.2e}"
+        assert worst_residual < 1e-13, f"worst relative residual {worst_residual:.2e}"
 
-    @pytest.mark.parametrize('delta_sign', [1., -1.])
+    @pytest.mark.parametrize("delta_sign", [1.0, -1.0])
     def test_tiny_offdiagonal_relative_to_delta(self, delta_sign):
         """The delta-sign branch only matters when |offd| << |delta|.
 
@@ -151,11 +152,11 @@ class TestEigenpair2x2:
         """
         offd = 1e-6
         if delta_sign > 0:
-            mat = np.array([[1., offd], [offd, -1.]])
+            mat = np.array([[1.0, offd], [offd, -1.0]])
         else:
-            mat = np.array([[-1., offd], [offd, 1.]])
+            mat = np.array([[-1.0, offd], [offd, 1.0]])
         diag = np.diagonal(mat).real
-        assert np.sign((diag[0] - diag[1]) / 2.) == delta_sign
+        assert np.sign((diag[0] - diag[1]) / 2.0) == delta_sign
         eigval, eigvec = eigenpair_2x2(jnp.asarray(mat))
         eigval = float(eigval)
         assert np.isfinite(eigval)
@@ -178,21 +179,21 @@ class TestEigenpair3x3:
         this innocuous input it returned an *exact eigenvalue* alongside an eigenvector with
         residual 0.67 -- so a test asserting only on the eigenvalue would have passed. Assert both.
         """
-        mat = np.diag([5., 6., 1.])
+        mat = np.diag([5.0, 6.0, 1.0])
         eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
         eigval = float(eigval)
         assert eigval == pytest.approx(lowest(mat), abs=1e-13)
         assert rel_resid(mat, eigval, eigvec) < 1e-13
-        assert np.linalg.norm(np.asarray(eigvec)) == pytest.approx(1.)
+        assert np.linalg.norm(np.asarray(eigvec)) == pytest.approx(1.0)
 
     def test_identity_rank_zero(self):
         """Item I3 rank-0 fallback: every cross product vanishes for a multiple of the identity."""
         mat = np.eye(3)
         eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
         eigval = float(eigval)
-        assert eigval == pytest.approx(1., abs=1e-13)
+        assert eigval == pytest.approx(1.0, abs=1e-13)
         assert rel_resid(mat, eigval, eigvec) < 1e-13
-        assert np.linalg.norm(np.asarray(eigvec)) == pytest.approx(1.)
+        assert np.linalg.norm(np.asarray(eigvec)) == pytest.approx(1.0)
 
     def test_degenerate_lowest_rank_one(self):
         """Item I3 rank-1 fallback: a degenerate lowest eigenvalue.
@@ -206,12 +207,12 @@ class TestEigenpair3x3:
         ``test_degenerate_lowest_rank_one_rotated`` below, which forces it). Kept because it still
         documents the axis-aligned case.
         """
-        mat = np.diag([1., 1., 7.])
+        mat = np.diag([1.0, 1.0, 7.0])
         eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
         eigval = float(eigval)
-        assert eigval == pytest.approx(1., abs=1e-13)
+        assert eigval == pytest.approx(1.0, abs=1e-13)
         assert rel_resid(mat, eigval, eigvec) < 1e-13
-        assert np.linalg.norm(np.asarray(eigvec)) == pytest.approx(1.)
+        assert np.linalg.norm(np.asarray(eigvec)) == pytest.approx(1.0)
 
     def test_degenerate_lowest_rank_one_rotated(self):
         """Item I3 rank-1 fallback, actually forced: no axis-aligned vector lies in the null space.
@@ -224,7 +225,7 @@ class TestEigenpair3x3:
         fallback deleted, versus 6.5e-16 for the real code.
         """
         rng = np.random.default_rng(20260804)
-        worst_residual = 0.
+        worst_residual = 0.0
         for _ in range(50):
             lo = rng.normal()
             hi = lo + abs(rng.normal()) + 0.5  # strictly above lo: lo stays the degenerate lowest
@@ -236,7 +237,7 @@ class TestEigenpair3x3:
             assert np.isfinite(eigval)
             assert eigval == pytest.approx(lo, abs=1e-13)
             worst_residual = max(worst_residual, rel_resid(mat, eigval, eigvec))
-        assert worst_residual < 1e-13, f'worst relative residual {worst_residual:.2e}'
+        assert worst_residual < 1e-13, f"worst relative residual {worst_residual:.2e}"
 
     def test_large_shift(self):
         """Item I1: at shift 1e9 the radicand under ``sqrt`` went negative and returned NaN.
@@ -244,34 +245,34 @@ class TestEigenpair3x3:
         Not an exotic input -- this is the ordinary case for a physical Hamiltonian, which is rarely
         traceless, and is exactly what ``sqd.py`` feeds this solver.
         """
-        mat = np.diag([1., 2., 3.]) + 1e9 * np.eye(3)
+        mat = np.diag([1.0, 2.0, 3.0]) + 1e9 * np.eye(3)
         eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
         eigval = float(eigval)
         assert np.isfinite(eigval)
         assert eigval == pytest.approx(lowest(mat), rel=1e-13)
         assert rel_resid(mat, eigval, eigvec) < 1e-13
 
-    @pytest.mark.parametrize('exponent', [-160, 150])
+    @pytest.mark.parametrize("exponent", [-160, 150])
     def test_extreme_scale(self, exponent):
         """Item I2: ``c0`` is cubic in the entries, so unbalanced it overflows or underflows.
 
         Measured on the old kernel: relative error 7.8e-1 at 1e-160, NaN at 1e150.
         """
-        mat = np.diag([1., 2., 3.]) * 10. ** exponent
+        mat = np.diag([1.0, 2.0, 3.0]) * 10.0**exponent
         eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
         eigval = float(eigval)
         assert np.isfinite(eigval)
         assert eigval == pytest.approx(lowest(mat), rel=1e-13)
         assert rel_resid(mat, eigval, eigvec) < 1e-13
 
-    @pytest.mark.parametrize('complex_', [True, False])
+    @pytest.mark.parametrize("complex_", [True, False])
     def test_random_sweep(self, complex_):
         """Aggregate accuracy over seeded random input. Supplements the targeted cases above.
 
         The old kernel produced 4066 NaNs in 20000 such matrices.
         """
         rng = np.random.default_rng(20260804)
-        worst_eigval = worst_residual = 0.
+        worst_eigval = worst_residual = 0.0
         for _ in range(2000):
             mat = herm(3, rng, complex_=complex_)
             eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
@@ -281,8 +282,8 @@ class TestEigenpair3x3:
             scale = np.abs(mat).max()
             worst_eigval = max(worst_eigval, abs(eigval - lowest(mat)) / scale)
             worst_residual = max(worst_residual, rel_resid(mat, eigval, eigvec))
-        assert worst_eigval < 1e-13, f'worst relative eigenvalue error {worst_eigval:.2e}'
-        assert worst_residual < 1e-13, f'worst relative residual {worst_residual:.2e}'
+        assert worst_eigval < 1e-13, f"worst relative eigenvalue error {worst_eigval:.2e}"
+        assert worst_residual < 1e-13, f"worst relative residual {worst_residual:.2e}"
 
 
 class TestDtypes:
@@ -298,19 +299,23 @@ class TestDtypes:
     *tolerance* derivation for it but left the state dtype inconsistent.
     """
 
-    @pytest.mark.parametrize('operator_dtype,xinit_dtype', [
-        (jnp.float64, jnp.float64),
-        (jnp.float32, jnp.float32),
-        (jnp.float64, jnp.float32),
-        (jnp.complex128, jnp.float32),
-        (jnp.complex128, jnp.float64),
-    ])
+    @pytest.mark.parametrize(
+        "operator_dtype,xinit_dtype",
+        [
+            (jnp.float64, jnp.float64),
+            (jnp.float32, jnp.float32),
+            (jnp.float64, jnp.float32),
+            (jnp.complex128, jnp.float32),
+            (jnp.complex128, jnp.float64),
+        ],
+    )
     def test_dtype_combinations_solve(self, operator_dtype, xinit_dtype):
         rng = np.random.default_rng(20260804)
         mat = herm(60, rng, complex_=False)
         xinit = rng.normal(size=60)
-        eigval, eigvec, _, converged = ground_locg(jnp.asarray(mat, dtype=operator_dtype),
-                                                  jnp.asarray(xinit, dtype=xinit_dtype))
+        eigval, eigvec, _, converged = ground_locg(
+            jnp.asarray(mat, dtype=operator_dtype), jnp.asarray(xinit, dtype=xinit_dtype)
+        )
         assert bool(converged)
         assert np.all(np.isfinite(np.asarray(eigvec)))
         # float32 arithmetic reaches only ~1e-6 relative; float64 operators reach ~1e-13.
@@ -346,7 +351,7 @@ class TestDtypes:
         mat = herm(30, rng, complex_=True)  # genuinely complex off-diagonal, not just complex dtype
         xinit = rng.normal(size=30)  # real float64, deliberately not complex
         with warnings.catch_warnings():
-            warnings.simplefilter('error')
+            warnings.simplefilter("error")
             eigval, eigvec, _, converged = ground_locg(
                 jnp.asarray(mat, dtype=jnp.complex128), jnp.asarray(xinit, dtype=jnp.float64)
             )
@@ -366,8 +371,9 @@ class TestDtypes:
         rng = np.random.default_rng(20260804)
         mat = herm(10, rng, complex_=True)
         xinit = rng.normal(size=10)
-        _, eigvec, _, _ = ground_locg(jnp.asarray(mat, dtype=jnp.complex128),
-                                      jnp.asarray(xinit, dtype=jnp.float64), maxiter=0)
+        _, eigvec, _, _ = ground_locg(
+            jnp.asarray(mat, dtype=jnp.complex128), jnp.asarray(xinit, dtype=jnp.float64), maxiter=0
+        )
         assert np.asarray(eigvec).dtype == np.complex128
 
 
@@ -389,8 +395,8 @@ class TestGroundLocg:
     near convergence for a large-shift operator; nobody has constructed one yet.
     """
 
-    @pytest.mark.parametrize('shift', [0., 1e3, -1e3, 1e6, 1e9])
-    @pytest.mark.parametrize('complex_', [True, False])
+    @pytest.mark.parametrize("shift", [0.0, 1e3, -1e3, 1e6, 1e9])
+    @pytest.mark.parametrize("complex_", [True, False])
     def test_solves_and_converges(self, shift, complex_):
         """Three assertions per case, each keyed to a different audit item.
 
@@ -410,14 +416,14 @@ class TestGroundLocg:
         scale = np.abs(mat).max()
         xinit = rng.normal(size=200)
         if complex_:
-            xinit = xinit + 0.j
-        eigval, eigvec, _, converged = ground_locg(jnp.asarray(mat), jnp.asarray(xinit))
+            xinit = xinit + 0.0j
+        eigval, _, _, converged = ground_locg(jnp.asarray(mat), jnp.asarray(xinit))
         eigval = float(eigval)
 
-        assert bool(converged), 'solver exhausted maxiter (item I4)'
+        assert bool(converged), "solver exhausted maxiter (item I4)"
         assert abs(eigval - reference) / scale < 1e-12
         assert eigval > reference - 1e-8 * scale, (
-            f'theta {eigval!r} is below the true minimum {reference!r} (item I5)'
+            f"theta {eigval!r} is below the true minimum {reference!r} (item I5)"
         )
 
     def test_maxiter_too_small_reports_not_converged(self):
@@ -428,8 +434,9 @@ class TestGroundLocg:
         """
         rng = np.random.default_rng(20260804)
         mat = herm(60, rng, complex_=False)
-        eigval, _, niter, converged = ground_locg(jnp.asarray(mat),
-                                                  jnp.asarray(rng.normal(size=60)), maxiter=5)
+        eigval, _, niter, converged = ground_locg(
+            jnp.asarray(mat), jnp.asarray(rng.normal(size=60)), maxiter=5
+        )
         assert not bool(converged)
         assert int(niter) == 5
         assert np.isfinite(float(eigval))
@@ -504,12 +511,13 @@ class TestGroundLocg:
         rng = np.random.default_rng(20260804)
         mat = herm(40, rng, complex_=False)
         maxiter = 12
-        result = ground_locg(jnp.asarray(mat), jnp.asarray(rng.normal(size=40)),
-                             maxiter=maxiter, debug=True)
+        result = ground_locg(
+            jnp.asarray(mat), jnp.asarray(rng.normal(size=40)), maxiter=maxiter, debug=True
+        )
         assert len(result) == 5
         diagnostics = result[4]
-        for key in ('x', 'y', 'r', 'theta', 'rho', 'kappa', 'sas', 'reltol', 'converged'):
-            assert np.shape(diagnostics[key])[0] == maxiter + 2, f'{key} row count'
+        for key in ("x", "y", "r", "theta", "rho", "kappa", "sas", "reltol", "converged"):
+            assert np.shape(diagnostics[key])[0] == maxiter + 2, f"{key} row count"
 
 
 class TestZeroResidualAfterSeedStep:
@@ -549,7 +557,7 @@ class TestZeroResidualAfterSeedStep:
         assert float(eigval) == pytest.approx(1e9, rel=1e-13)
         assert np.asarray(eigvec) == pytest.approx([1.0])
 
-    @pytest.mark.parametrize('index', [0, 5])
+    @pytest.mark.parametrize("index", [0, 5])
     def test_diagonal_operator_one_hot_xinit(self, index):
         """A one-hot ``xinit`` against a diagonal operator is an exact eigenvector at any index.
 
@@ -557,11 +565,11 @@ class TestZeroResidualAfterSeedStep:
         position 0, but the audit's own reproduction used index 0, so an interior index is added to
         make sure the guard is not accidentally position-dependent.
         """
-        mat = jnp.diag(jnp.arange(1., 61.))
+        mat = jnp.diag(jnp.arange(1.0, 61.0))
         eigval, eigvec, niter, converged = ground_locg(mat, jnp.asarray(index))
         assert bool(converged)
         assert int(niter) == 0
-        assert float(eigval) == pytest.approx(float(index) + 1., abs=1e-13)
+        assert float(eigval) == pytest.approx(float(index) + 1.0, abs=1e-13)
         expected = np.zeros(60)
-        expected[index] = 1.
+        expected[index] = 1.0
         assert np.asarray(eigvec) == pytest.approx(expected)

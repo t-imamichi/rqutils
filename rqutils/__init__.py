@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # MIT License
 
 # Copyright (c) 2026 ICEPP, The University of Tokyo
@@ -23,6 +22,9 @@
 """Random quantum utilities."""
 
 from importlib.metadata import version
+
 __version__ = version(__name__)
 
 from ._types import MatrixDimension
+
+__all__ = ["MatrixDimension", "__version__"]

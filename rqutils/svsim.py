@@ -22,17 +22,21 @@ Usage examples can be found at
 .. autoclass:: CircuitXZ
 .. autofunction:: to_circuitxz
 """
+
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Optional, Any
-import numpy as np
-from numpy.typing import NDArray
+from typing import Any
+
 import jax
 import jax.numpy as jnp
-from jax.tree_util import register_dataclass
+import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec, get_abstract_mesh
+from jax.tree_util import register_dataclass
+from numpy.typing import NDArray
+
 try:
     from qiskit.circuit import QuantumCircuit
+
     HAS_QISKIT = True
 except ImportError:
     HAS_QISKIT = False
@@ -42,11 +46,13 @@ except ImportError:
 @dataclass
 class CircuitXZ:
     """Symplectic (XZ) representation of a series of rotation gates."""
+
     x: np.ndarray[tuple[int], np.dtype[np.int64]]
     z: np.ndarray[tuple[int], np.dtype[np.int64]]
     cos: np.ndarray[tuple[int], np.dtype[np.floating]]
     sin: np.ndarray[tuple[int], np.dtype[np.floating]]
-    num_qubits: int = field(metadata={'static': True})
+    num_qubits: int = field(metadata={"static": True})
+
 
 type GateSpec = tuple[str, int | Sequence[int]] | tuple[str, int | Sequence[int], Any]
 type CircuitInput = CircuitXZ | list[GateSpec]
@@ -57,7 +63,7 @@ if HAS_QISKIT:
 def svsim(
     circuit: CircuitInput,
     initial_state: NDArray[np.complex128] | int = 0,
-    out_sharding: Optional[NamedSharding | PartitionSpec] = None
+    out_sharding: NamedSharding | PartitionSpec | None = None,
 ) -> jax.Array:
     """Simulate the quantum circuit.
 
@@ -70,12 +76,12 @@ def svsim(
     A gate specifier is a 2-tuple ``(name, qubit)`` (for nonparametric gates) or a 3-tuple
     ``(name, qubit, angle)`` (rotation gates). The gate name must be one of ``x``, ``y``, ``z``,
     ``cz``, ``rx``, ``ry``, ``rz``, or ``rzz``.
-    
+
     Args:
         circuit: Quantum circuit to simulate.
         initial_state: Initial state vector or the one-hot index.
         out_sharding: Manual specification of the sharding of the final state vector.
-    
+
     Returns:
         Final state vector as a (sharded) JAX Array.
     """
@@ -85,41 +91,33 @@ def svsim(
     return do_svsim(circuit, initial_state, out_sharding)
 
 
-@jax.jit(static_argnames=['out_sharding'])
+@jax.jit(static_argnames=["out_sharding"])
 def do_svsim(
     circuit: CircuitXZ,
     initial_state: NDArray[np.complex128] | int = 0,
-    out_sharding: Optional[NamedSharding | PartitionSpec] = None
+    out_sharding: NamedSharding | PartitionSpec | None = None,
 ) -> jax.Array:
     """JIT-Compiled core of the simulator."""
     if out_sharding is None and not (mesh := get_abstract_mesh()).empty:
         out_sharding = PartitionSpec(mesh.axis_names)
 
-    indices = jnp.arange(2 ** circuit.num_qubits, dtype=np.int64, out_sharding=out_sharding)
+    indices = jnp.arange(2**circuit.num_qubits, dtype=np.int64, out_sharding=out_sharding)
 
     if len(initial_state.shape) == 0:
         initial_state = (indices == initial_state).astype(np.complex128)
 
     def apply_gate(state, gate):
-        signs = 1. - 2. * (jnp.bitwise_count(indices & gate.z) & 1)
+        signs = 1.0 - 2.0 * (jnp.bitwise_count(indices & gate.z) & 1)
         xstate = jax.lax.cond(
             jnp.all(gate.x == 0),
             lambda: state,
-            lambda: state.at[indices ^ gate.x].get(out_sharding=out_sharding)
+            lambda: state.at[indices ^ gate.x].get(out_sharding=out_sharding),
         )
-        out = 1.j * gate.sin * signs * xstate
-        out = jax.lax.cond(
-            gate.cos == 0.,
-            lambda: out,
-            lambda: out + gate.cos * state
-        )
+        out = 1.0j * gate.sin * signs * xstate
+        out = jax.lax.cond(gate.cos == 0.0, lambda: out, lambda: out + gate.cos * state)
         return out, None
 
-    return jax.lax.scan(
-        apply_gate,
-        initial_state,
-        circuit
-    )[0]
+    return jax.lax.scan(apply_gate, initial_state, circuit)[0]
 
 
 def to_circuitxz(circuit: CircuitInput) -> CircuitXZ:
@@ -130,6 +128,7 @@ def to_circuitxz(circuit: CircuitInput) -> CircuitXZ:
     num_qubits = None
 
     if HAS_QISKIT and isinstance(circuit, QuantumCircuit):
+
         def qidx(qubits):
             if isinstance(qubits, tuple):
                 return np.array(list(map(circuit.qregs[0].index, qubits)))
@@ -138,12 +137,14 @@ def to_circuitxz(circuit: CircuitInput) -> CircuitXZ:
 
         gate_specs = []
         for datum in circuit.data:
-            if (op := datum.operation).name == 'cz':
-                gate_specs.extend([
-                    ('rzz', qidx(datum.qubits), np.pi / 2.),
-                    ('rz', qidx(datum.qubits[0]), -np.pi / 2.),
-                    ('rz', qidx(datum.qubits[1]), -np.pi / 2.)
-                ])
+            if (op := datum.operation).name == "cz":
+                gate_specs.extend(
+                    [
+                        ("rzz", qidx(datum.qubits), np.pi / 2.0),
+                        ("rz", qidx(datum.qubits[0]), -np.pi / 2.0),
+                        ("rz", qidx(datum.qubits[1]), -np.pi / 2.0),
+                    ]
+                )
             elif op.params:
                 gate_specs.append((op.name, qidx(datum.qubits), op.params[0]))
             else:
@@ -151,7 +152,6 @@ def to_circuitxz(circuit: CircuitInput) -> CircuitXZ:
 
         num_qubits = circuit.num_qubits
         circuit = gate_specs
-        
 
     xarr = np.zeros(len(circuit), dtype=np.int64)
     zarr = np.zeros(len(circuit), dtype=np.int64)
@@ -159,29 +159,37 @@ def to_circuitxz(circuit: CircuitInput) -> CircuitXZ:
     sinarr = np.zeros(len(circuit), dtype=np.float64)
     qmax = 0
     for igate, gate in enumerate(circuit):
-        match gate[0]:
-            case 'x':
-                spec = (1, 0, 'pi')
-            case 'y':
-                spec = (1, 1, 'pi')
-            case 'z':
-                spec = (0, 1, 'pi')
-            case 'rx':
-                spec = (1, 0, gate[2])
-            case 'ry':
-                spec = (1, 1, gate[2])
-            case 'rz':
-                spec = (0, 1, gate[2])
-            case 'rzz':
-                spec = (0, 1, gate[2])
+        # Unpack rather than index: GateSpec is a union of a 2-tuple and a 3-tuple, and a
+        # parameterized gate must carry its angle. Indexing gate[2] directly would raise a bare
+        # IndexError further down, with nothing to say which gate was malformed.
+        name, qubit_spec, *rest = gate
+        if name in ("rx", "ry", "rz", "rzz"):
+            if not rest:
+                raise ValueError(f"Gate {name} requires an angle as its third element")
+            angle = rest[0]
+        match name:
+            case "x":
+                spec = (1, 0, "pi")
+            case "y":
+                spec = (1, 1, "pi")
+            case "z":
+                spec = (0, 1, "pi")
+            case "rx":
+                spec = (1, 0, angle)
+            case "ry":
+                spec = (1, 1, angle)
+            case "rz":
+                spec = (0, 1, angle)
+            case "rzz":
+                spec = (0, 1, angle)
             case _:
-                raise ValueError(f'Unsupported gate name {gate[0]}')
+                raise ValueError(f"Unsupported gate name {name}")
 
-        qubits = np.asarray(gate[1])
+        qubits = np.asarray(qubit_spec)
         xarr[igate] = np.sum(np.array(spec[0], dtype=np.int64) << qubits)
         zarr[igate] = np.sum(np.array(spec[1], dtype=np.int64) << qubits)
-        if spec[2] == 'pi':
-            sinarr[igate] = -1.
+        if spec[2] == "pi":
+            sinarr[igate] = -1.0
         else:
             cosarr[igate] = np.cos(-spec[2] * 0.5)
             sinarr[igate] = np.sin(-spec[2] * 0.5)

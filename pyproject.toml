@@ -27,9 +27,10 @@ dependencies = [
 [project.optional-dependencies]
 mpl = ["matplotlib"]
 qutip = ["qutip"]
-qiskit = ["qiskit"]
+qiskit = ["qiskit[visualization]"]
 docs = ["sphinx", "sphinx-rtd-theme"]
-test = ["pytest"]
+dev = ["pytest", "ruff", "ty"]
+mlx = ["mlx"]
 
 [project.urls]
 Homepage = "https://github.com/UTokyo-ICEPP/rqutils"
@@ -39,3 +40,36 @@ Documentation = "https://rqutils.readthedocs.io/en/latest/index.html"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+# The notebooks under tests/ are interactive scratchpads that get their names from IPython magics
+# (`%aimport rqutils.paulis`), which ruff cannot see -- so every use reads as F821 undefined-name.
+exclude = [".venv", "*.ipynb"]
+
+[tool.ty.src]
+exclude = ["**/*.ipynb"]
+
+[tool.ty.rules]
+# JAX ships almost no type information and `jax.jit` converts arguments before a function body runs,
+# so ty cannot see that a Python int reaching an `x.dtype` is an Array by then. numpy's stubs are
+# stricter than this library's dtype-generic `npmod` convention allows: every `ArrayLike.shape` and
+# every `einsum`/`prod` overload reads as an error. These were reviewed individually -- the
+# structural findings they hid (a None subscript, a missing tuple element, a Number-ABC default)
+# are fixed in the code; what remains is tool limitation, not defect. Revisit when JAX ships stubs.
+unresolved-attribute = "ignore"
+no-matching-overload = "ignore"
+invalid-argument-type = "ignore"
+invalid-return-type = "ignore"
+not-subscriptable = "ignore"
+unsupported-operator = "ignore"
+# `type X = A | B` followed by `X |= C` under a HAS_* guard is the library's documented pattern for
+# optional dependencies (see CLAUDE.md); ty reads the augmented assignment as rebinding the alias.
+invalid-assignment = "ignore"
+# mlx (darwin-only extra) and mpi4py (declared nowhere, installed manually) are optional at runtime.
+unresolved-import = "ignore"
+# Unpacking a value whose declared type is a union of scalar and sequence (qprint's terms list,
+# sqd's variable-length return tuple). The runtime shapes are correct; the annotations are looser
+# than the code. Tightening them is a worthwhile separate change, not a lint fix.
+not-iterable = "ignore"
+

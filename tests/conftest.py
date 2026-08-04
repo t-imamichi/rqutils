@@ -4,17 +4,19 @@
 module imports ``rqutils``. This is load-bearing rather than incidental: without x64 JAX silently
 produces float32/complex64 and every tolerance in this suite is wrong by nine orders of magnitude.
 """
-import jax
-jax.config.update('jax_enable_x64', True)
 
-import numpy as np  # noqa: E402  (must follow the x64 config)
+import jax
+
+jax.config.update("jax_enable_x64", True)
+
+import numpy as np
 
 
 def herm(n, rng, complex_=True):
     """Return a random ``(n, n)`` Hermitian matrix drawn from ``rng``."""
     mat = rng.normal(size=(n, n))
     if complex_:
-        mat = mat + 1.j * rng.normal(size=(n, n))
+        mat = mat + 1.0j * rng.normal(size=(n, n))
     return mat + mat.conjugate().T
 
 

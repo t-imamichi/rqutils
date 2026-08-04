@@ -152,25 +152,28 @@ SQD API
 .. autofunction:: sqd
 .. autofunction:: hproj
 """
-from collections.abc import Sequence
+
 import logging
 import time
+from collections.abc import Sequence
 from numbers import Number
-from typing import Optional
-import numpy as np
-from numpy.typing import NDArray
-from scipy.sparse import csr_array, coo_array
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import PartitionSpec, get_abstract_mesh
-from rqutils.paulis.symplectic import PauliSumXZ
+from numpy.typing import NDArray
+from scipy.sparse import coo_array, csr_array
+
 from rqutils.ground_locg import ground_locg
+from rqutils.paulis.symplectic import PauliSumXZ
 
 LOG = logging.getLogger(__name__)
 
 type HamiltonianInput = PauliSumXZ | tuple[Sequence[str], Sequence[Number]]
 try:
     from qiskit.quantum_info import SparsePauliOp
+
     HamiltonianInput |= SparsePauliOp
 except ImportError:
     pass
@@ -181,14 +184,14 @@ type StateList = np.ndarray[tuple[int, int], np.dtype[np.uint8]]
 def sqd(
     hamiltonian: HamiltonianInput,
     states: StateList,
-    states_size: Optional[int] = None,
+    states_size: int | None = None,
     return_eigvec: bool = True,
-    cache_level: tuple[int, int] = (1, 0)
+    cache_level: tuple[int, int] = (1, 0),
 ) -> float | tuple[float, Vector, StateList]:
     r"""Perform a sample-based quantum diagonalization of the Hamiltonian.
 
     The Hamiltonian can be given in three different forms:
-    
+
     * A tuple of two lists, where the first list enumerates the Pauli strings :math:`Q` as strs and
       the second contains the coefficients :math:`\alpha`.
     * Qiskit SparsePauliOp
@@ -222,12 +225,12 @@ def sqd(
     if states_size is None:
         states_size = states.shape[0]
     if states_size < states.shape[0]:
-        raise ValueError('states_size smaller than the states array length')
+        raise ValueError("states_size smaller than the states array length")
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian, force_real=True, add_padding=True)
 
     if not (mesh := get_abstract_mesh()).empty and (resid := states_size % mesh.size) != 0:
-        LOG.debug('Adjusting states_size to make the array divisible by %d', mesh.size)
+        LOG.debug("Adjusting states_size to make the array divisible by %d", mesh.size)
         states_size += mesh.size - resid
 
     # Need an extra left zero bit to distinguish fill-in states from the inputs after
@@ -236,27 +239,25 @@ def sqd(
     # Perhaps write a new ufunc if this becomes too slow for very large input?
     states_p = np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
 
-    LOG.debug('Starting SQD with array size %s', states_size)
+    LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
     result = run_sqd(hamiltonian, states_p, states_size, return_eigvec, cache_level)
-    LOG.info('Found ground eigenpair in %f seconds.', time.time() - start)
+    LOG.info("Found ground eigenpair in %f seconds.", time.time() - start)
     eigval = float(result[0])
     if return_eigvec:
         eigvec, states_u, subspace_dim = result[1:]
-        basis_states = np.unpackbits(states_u[:subspace_dim], axis=-1)[:, 1:1 + states.shape[1]]
+        basis_states = np.unpackbits(states_u[:subspace_dim], axis=-1)[:, 1 : 1 + states.shape[1]]
         return (eigval, np.array(eigvec[:subspace_dim]), basis_states)
     return eigval
 
 
 def hproj(
-    hamiltonian: HamiltonianInput,
-    states: StateList,
-    unique_states: bool = False
+    hamiltonian: HamiltonianInput, states: StateList, unique_states: bool = False
 ) -> csr_array:
     """Return the Hamiltonian projected onto the given subspace.
 
     The Hamiltonian can be given in three different forms:
-    
+
     * A tuple of two lists, where the first list enumerates the Pauli strings :math:`Q` as strs and
       the second contains the coefficients :math:`\alpha`.
     * Qiskit SparsePauliOp
@@ -296,14 +297,14 @@ def hproj(
     return csr_array(coo_array((data, (rows, cols))))
 
 
-@jax.jit(static_argnames=['states_size', 'return_eigvec', 'cache_level', 'log_level'])
+@jax.jit(static_argnames=["states_size", "return_eigvec", "cache_level", "log_level"])
 def run_sqd(
     hamiltonian: PauliSumXZ,
     states_p: StateList,
     states_size: int,
     return_eigvec: bool,
     cache_level: tuple[int, int] = (1, 0),
-    log_level: int = logging.INFO
+    log_level: int = logging.INFO,
 ) -> tuple[float] | tuple[float, jax.Array, jax.Array, int]:
     """JIT-compiled part of the SQD function."""
     sharding = None
@@ -311,43 +312,39 @@ def run_sqd(
         sharding = PartitionSpec(mesh.axis_names)
 
     if log_level <= logging.DEBUG:
-        jax.debug.print('Uniquifying states (size {})', states_size)
+        jax.debug.print("Uniquifying states (size {})", states_size)
 
     states_u = uniquify_states(states_p, states_size)
 
     if cache_level[0] == 1:
         if log_level <= logging.DEBUG:
-            jax.debug.print('Precomputing xsources')
+            jax.debug.print("Precomputing xsources")
 
-        xsources = jax.lax.scan(
-            lambda _, x: (None, get_xsource(x, states_u)),
-            None,
-            hamiltonian.x
-        )[1]
+        xsources = jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, hamiltonian.x)[
+            1
+        ]
         if sharding:
             # We will not be performing sorts on states any more - shard the array
             if log_level <= logging.DEBUG:
-                jax.debug.print('Sharding states array')
+                jax.debug.print("Sharding states array")
 
             states_u = jax.reshard(states_u, sharding)
 
     if cache_level[1] == 1:
         if log_level <= logging.DEBUG:
-            jax.debug.print('Precomputing sign bits of diagonals')
+            jax.debug.print("Precomputing sign bits of diagonals")
 
         diag_signs = jax.lax.scan(
-            lambda _, z: (None, get_diag_signs(z, states_u)),
-            None,
-            hamiltonian.z
+            lambda _, z: (None, get_diag_signs(z, states_u)), None, hamiltonian.z
         )[1]
     elif cache_level[1] == 2:
         if log_level <= logging.DEBUG:
-            jax.debug.print('Precomputing diagonals')
+            jax.debug.print("Precomputing diagonals")
 
         diagonals = jax.lax.scan(
             lambda _, v: (None, get_diagonal(v[0], v[1], states_u)),
             None,
-            (hamiltonian.z, hamiltonian.c)
+            (hamiltonian.z, hamiltonian.c),
         )[1]
 
     match cache_level:
@@ -389,16 +386,12 @@ def run_sqd(
         ).astype(hamiltonian.c.dtype)
 
     if log_level <= logging.DEBUG:
-        jax.debug.print('Generating vinit')
+        jax.debug.print("Generating vinit")
 
-    vinit = jax.lax.cond(
-        jnp.all(hamiltonian.x[0] == 0),
-        vinit_from_min_diag,
-        vinit_nodiag
-    )
+    vinit = jax.lax.cond(jnp.all(hamiltonian.x[0] == 0), vinit_from_min_diag, vinit_nodiag)
 
     if log_level <= logging.DEBUG:
-        jax.debug.print(f'Starting minimization with cache_level {cache_level}')
+        jax.debug.print(f"Starting minimization with cache_level {cache_level}")
 
     eigval, eigvec, _, _ = ground_locg(matvec, vinit, args=args, log_level=log_level)
     result = (eigval,)
@@ -411,11 +404,8 @@ def run_sqd(
     return result
 
 
-@jax.jit(static_argnames=['states_size'])
-def uniquify_states(
-    states_p: StateList,
-    states_size: int
-) -> StateList:
+@jax.jit(static_argnames=["states_size"])
+def uniquify_states(states_p: StateList, states_size: int) -> StateList:
     """A stripped-down implementation of jnp.unique.
 
     The returned array will have shape (states_size, states_p.shape[1]). If states_size is greater
@@ -431,25 +421,18 @@ def uniquify_states(
     total_unique = jnp.sum(is_unique, dtype=np.int32) + 1
     # This cumsum(bincount(cumsum)) accounts for the uniqueness of the 0th element
     idx_unique = jnp.cumsum(
-        jnp.bincount(
-            jnp.cumsum(is_unique, dtype=np.int32),
-            length=states_size
-        ),
-        dtype=np.int32
+        jnp.bincount(jnp.cumsum(is_unique, dtype=np.int32), length=states_size), dtype=np.int32
     )
     # Finally flag out filler slots by setting total_unique: to -1
     if states_size != states_p.shape[0]:
         iota = jax.lax.broadcasted_iota(np.int32, (states_size,), 0)
     idx_unique = jnp.where(iota < total_unique, idx_unique, -1)
     # With wrap_negative_indices=False we'll have 255 for filler slots
-    return states_srt.at[idx_unique].get(mode='fill', fill_value=255, wrap_negative_indices=False)
+    return states_srt.at[idx_unique].get(mode="fill", fill_value=255, wrap_negative_indices=False)
 
 
 @jax.jit
-def get_xsource(
-    xsignature: NDArray[np.uint8],
-    states: StateList
-) -> jax.Array:
+def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
     """Return an index array into the source of an X operation.
 
     Let `V` be a vector of complex or float values with shape `[N]`, `S` be a lex-sorted 2-d array
@@ -486,56 +469,45 @@ def get_xsource(
     source_idx = jnp.where(
         jnp.all(jnp.equal(joined_sorted[:-1], joined_sorted[1:]), axis=1),  # T[k] == T[k+1]
         idx_sorted[1:] - size,  # I[k+1] - N
-        invalid
+        invalid,
     )
     # Stripped-down jnp.nonzero implementation (with dtype control; othersize int64 is used
     # unnecessarily)
     tposition = jnp.cumsum(
-        jnp.bincount(
-            jnp.cumsum(idx_sorted < size, dtype=np.int32),
-            length=size
-        ),
-        dtype=np.int32
+        jnp.bincount(jnp.cumsum(idx_sorted < size, dtype=np.int32), length=size), dtype=np.int32
     )
-    xsource = source_idx.at[tposition].get(mode='fill', fill_value=invalid)
+    xsource = source_idx.at[tposition].get(mode="fill", fill_value=invalid)
     if not (mesh := get_abstract_mesh()).empty:
         xsource = jax.reshard(xsource, PartitionSpec(mesh.axis_names))
     return xsource
 
 
 @jax.jit
-def get_diag_signs(
-    zsignatures: NDArray[np.uint8],
-    states: StateList
-) -> jax.Array:
+def get_diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Array:
     """Return the packed sign bits."""
+
     def get_signs(carry, zsignature):
         out, ibyte, ibit = carry
         sign_bits = jnp.sum(jnp.bitwise_count(states & zsignature), axis=1, dtype=np.uint8) & 1
         # bits and bytes are counted from the left
         out = out.at[:, ibyte].add(sign_bits << (7 - ibit), out_sharding=jax.typeof(out).sharding)
-        ibyte, ibit = jax.lax.cond(
-            ibit == 7,
-            lambda: (ibyte + 1, 0),
-            lambda: (ibyte, ibit + 1)
-        )
+        ibyte, ibit = jax.lax.cond(ibit == 7, lambda: (ibyte + 1, 0), lambda: (ibyte, ibit + 1))
         return (out, ibyte, ibit), None
 
     num_bytes = np.ceil(zsignatures.shape[0] / 8).astype(int)
-    init = jnp.zeros((states.shape[0], num_bytes), dtype=np.uint8,
-                     out_sharding=jax.typeof(states).sharding)
+    init = jnp.zeros(
+        (states.shape[0], num_bytes), dtype=np.uint8, out_sharding=jax.typeof(states).sharding
+    )
     return jax.lax.scan(get_signs, (init, 0, 0), zsignatures)[0][0]
 
 
 @jax.jit
-def compute_diagonal(
-    diag_signs: NDArray[np.uint8],
-    coeffs: NDArray[np.inexact]
-) -> jax.Array:
+def compute_diagonal(diag_signs: NDArray[np.uint8], coeffs: NDArray[np.inexact]) -> jax.Array:
     """Compute the diagonals from the sign bits and coefficients."""
+
     def cond_fn(val):
         iterm = val[1]
-        return jnp.logical_and(iterm < coeffs.shape[0], jnp.not_equal(coeffs[iterm], 0.))
+        return jnp.logical_and(iterm < coeffs.shape[0], jnp.not_equal(coeffs[iterm], 0.0))
 
     def add_diag(val):
         diagonal, iterm = val
@@ -543,32 +515,32 @@ def compute_diagonal(
         ibyte = iterm // 8
         ibit = iterm & 255
         signed = (diag_signs[:, ibyte] >> (7 - ibit)) & 1
-        signs = 1. - 2. * signed
+        signs = 1.0 - 2.0 * signed
         return diagonal + coeff * signs, iterm + 1
 
-    init = jnp.zeros(diag_signs.shape[0], dtype=coeffs.dtype,
-                     out_sharding=jax.typeof(diag_signs).sharding)
+    init = jnp.zeros(
+        diag_signs.shape[0], dtype=coeffs.dtype, out_sharding=jax.typeof(diag_signs).sharding
+    )
     return jax.lax.while_loop(cond_fn, add_diag, (init, 0))[0]
 
 
 @jax.jit
 def get_diagonal(
-    zsignatures: NDArray[np.uint8],
-    coeffs: NDArray[np.inexact],
-    states: StateList
+    zsignatures: NDArray[np.uint8], coeffs: NDArray[np.inexact], states: StateList
 ) -> jax.Array:
     """Return the fully composed diagonals for one X signature."""
+
     # Null terms are removed with hamiltonian.simplify() so we iterate until we hit coeff=0
     def cond_fn(val):
         iterm = val[1]
-        return jnp.logical_and(iterm < coeffs.shape[0], jnp.not_equal(coeffs[iterm], 0.))
+        return jnp.logical_and(iterm < coeffs.shape[0], jnp.not_equal(coeffs[iterm], 0.0))
 
     def add_diag(val):
         diagonal, iterm = val
         zsignature = zsignatures[iterm]
         coeff = coeffs[iterm]
         signed = jnp.sum(jnp.bitwise_count(states & zsignature), axis=1, dtype=np.uint8) & 1
-        signs = 1. - 2. * signed
+        signs = 1.0 - 2.0 * signed
         return diagonal + coeff * signs, iterm + 1
 
     init = jnp.zeros(states.shape[0], dtype=coeffs.dtype, out_sharding=jax.typeof(states).sharding)
@@ -577,13 +549,15 @@ def get_diagonal(
 
 @jax.jit
 def apply_xgrp(
-    xsource: NDArray[np.int32],
-    diagonal: NDArray[np.inexact],
-    vec: NDArray[np.inexact]
+    xsource: NDArray[np.int32], diagonal: NDArray[np.inexact], vec: NDArray[np.inexact]
 ) -> jax.Array:
     """Gather vector entries from the source indices and multiply them with diagonals."""
-    xvec = vec.at[..., xsource].get(mode='fill', fill_value=0., wrap_negative_indices=False,
-                                    out_sharding=jax.typeof(vec).sharding)
+    xvec = vec.at[..., xsource].get(
+        mode="fill",
+        fill_value=0.0,
+        wrap_negative_indices=False,
+        out_sharding=jax.typeof(vec).sharding,
+    )
     return xvec * diagonal
 
 
@@ -593,9 +567,10 @@ def apply_h(
     xsignatures: NDArray[np.uint8],
     zsignatures: NDArray[np.uint8],
     coeffs: NDArray[np.inexact],
-    states: StateList
+    states: StateList,
 ) -> jax.Array:
     """Return Hv using X and Z signatures and Pauli coefficients."""
+
     def fn(out, val):
         xpat, zpats, cs = val
         xsource = get_xsource(xpat, states)
@@ -611,7 +586,7 @@ def apply_h_s_cached(
     xsignatures: NDArray[np.uint8],
     states: StateList,
     diag_signs: NDArray[np.uint8],
-    coeffs: NDArray[np.inexact]
+    coeffs: NDArray[np.inexact],
 ) -> jax.Array:
     def fn(out, val):
         xpat, signs, cs = val
@@ -627,9 +602,10 @@ def apply_h_z_cached(
     vec: NDArray[np.inexact],
     xsignatures: NDArray[np.uint8],
     states: StateList,
-    diagonals: NDArray[np.inexact]
+    diagonals: NDArray[np.inexact],
 ) -> jax.Array:
     """Return Hv using precomputed xsources and diagonals data."""
+
     def fn(out, val):
         xsource = get_xsource(val[0], states)
         return out + apply_xgrp(xsource, val[1], vec), None
@@ -643,9 +619,10 @@ def apply_h_x_cached(
     xsources: NDArray[np.int32],
     zsignatures: NDArray[np.uint8],
     coeffs: NDArray[np.inexact],
-    states: StateList
+    states: StateList,
 ) -> jax.Array:
     """Return Hv using precomputed xsources and diagonals data."""
+
     def fn(out, val):
         xsource, zpats, cs = val
         diagonal = get_diagonal(zpats, cs, states)
@@ -659,9 +636,10 @@ def apply_h_xs_cached(
     vec: NDArray[np.inexact],
     xsources: NDArray[np.int32],
     diag_signs: NDArray[np.uint8],
-    coeffs: NDArray[np.inexact]
+    coeffs: NDArray[np.inexact],
 ) -> jax.Array:
     """Return Hv using precomputed xsources and diagonals data."""
+
     def fn(out, val):
         xsource, dsigns, cs = val
         diagonal = compute_diagonal(dsigns, cs)
@@ -672,13 +650,11 @@ def apply_h_xs_cached(
 
 @jax.jit
 def apply_h_xz_cached(
-    vec: NDArray[np.inexact],
-    xsources: NDArray[np.int32],
-    diagonals: NDArray[np.inexact]
+    vec: NDArray[np.inexact], xsources: NDArray[np.int32], diagonals: NDArray[np.inexact]
 ) -> jax.Array:
     """Return Hv using precomputed xsources and diagonals data."""
     return jax.lax.scan(
         lambda out, val: (out + apply_xgrp(val[0], val[1], vec), None),
         jnp.zeros_like(vec),
-        (xsources, diagonals)
+        (xsources, diagonals),
     )[0]

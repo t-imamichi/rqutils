@@ -23,17 +23,20 @@ Symplectic Pauli sum representation API
 
 .. autoclass:: PauliSumXZ
 """
+
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
-import warnings
-import numpy as np
-from numpy.typing import NDArray
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.tree_util import register_dataclass
-from jax.sharding import PartitionSpec, get_abstract_mesh
+from numpy.typing import NDArray
+
 try:
     from qiskit.quantum_info import SparsePauliOp
+
     HAS_QISKIT = True
 except ImportError:
     HAS_QISKIT = False
@@ -43,24 +46,22 @@ except ImportError:
 @dataclass(frozen=True)
 class PauliSumXZ:
     """Symplectic (XZ) representation of a sum of Pauli strings."""
+
     x: np.ndarray[tuple[int, int], np.dtype[np.uint8]]
     z: np.ndarray[tuple[int, int, int], np.dtype[np.uint8]]
     c: np.ndarray[tuple[int, int], np.dtype[np.inexact]]
-    num_qubits: int = field(metadata={'static': True})
+    num_qubits: int = field(metadata={"static": True})
 
     @classmethod
     def from_paulisum(
-        cls,
-        paulisum: Any,
-        force_real: bool = False,
-        add_padding: bool = False
-    ) -> 'PauliSumXZ':
+        cls, paulisum: Any, force_real: bool = False, add_padding: bool = False
+    ) -> "PauliSumXZ":
         if isinstance(paulisum, tuple):  # ([paulis], [coeffs])
             paulis, coeffs = paulisum
             if len(paulis) != len(coeffs):
-                raise ValueError('Lengths of Pauli and coeff lists do not match')
-            if len(set(len(p) for p in paulis)) != 1:
-                raise ValueError('Pauli strings have non-uniform lengths')
+                raise ValueError("Lengths of Pauli and coeff lists do not match")
+            if len({len(p) for p in paulis}) != 1:
+                raise ValueError("Pauli strings have non-uniform lengths")
 
             coeffs = np.array(coeffs)
             # Sort and consolidate the pauli strings and coefficients
@@ -71,14 +72,15 @@ class PauliSumXZ:
             paulis, indices = np.unique(paulis, axis=0, return_inverse=True)
             masks = (indices[None, :] == np.arange(paulis.shape[0])[:, None]).astype(int)
             coeffs = masks @ coeffs
-            xbits = np.logical_or(paulis == 'X', paulis == 'Y')
-            zbits = np.logical_or(paulis == 'Y', paulis == 'Z')
+            xbits = np.logical_or(paulis == "X", paulis == "Y")
+            zbits = np.logical_or(paulis == "Y", paulis == "Z")
             num_qubits = paulis.shape[1]
 
         elif HAS_QISKIT and isinstance(paulisum, SparsePauliOp):
-            if not np.allclose(paulisum.coeffs.imag, 0.):
-                raise ValueError('Coefficients of Paulis must be real for the Hamiltonian to be'
-                                ' Hermitian.')
+            if not np.allclose(paulisum.coeffs.imag, 0.0):
+                raise ValueError(
+                    "Coefficients of Paulis must be real for the Hamiltonian to be Hermitian."
+                )
 
             # Remove null terms
             paulisum = paulisum.simplify()
@@ -88,11 +90,11 @@ class PauliSumXZ:
             num_qubits = paulisum.num_qubits
 
         else:
-            raise ValueError('Unsupported input type')
+            raise ValueError("Unsupported input type")
 
         if force_real:
-            if np.any(coeffs.imag != 0.):
-                warnings.warn('Found nonzero imaginary part when force_real=True')
+            if np.any(coeffs.imag != 0.0):
+                warnings.warn("Found nonzero imaginary part when force_real=True")
             coeffs = coeffs.real
 
         # Find unique X signatures together with correspondence pointers
@@ -105,13 +107,13 @@ class PauliSumXZ:
         for isig, xsig in enumerate(xsignatures):
             ipaulis = np.nonzero(indices == isig)[0]
             zsigs = zbits[ipaulis].astype(np.uint8)
-            zsignatures[isig, :counts[isig]] = zsigs
+            zsignatures[isig, : counts[isig]] = zsigs
             # Multiply the coeffs by (-i)^{n_zx}
             iphases = np.sum(xsig & zsigs, axis=1) & 3
-            phases = np.array([1., -1.j, -1., 1.j])[iphases]
-            phcoeffs[isig, :counts[isig]] = coeffs[ipaulis] * phases
+            phases = np.array([1.0, -1.0j, -1.0, 1.0j])[iphases]
+            phcoeffs[isig, : counts[isig]] = coeffs[ipaulis] * phases
 
-        if np.all(phcoeffs.imag == 0.):
+        if np.all(phcoeffs.imag == 0.0):
             phcoeffs = phcoeffs.real
 
         if add_padding:
@@ -129,9 +131,10 @@ class PauliSumXZ:
         return self.x, self.z, self.c
 
     def matmul(self, rhs: NDArray):
-        if rhs.shape[0] != 2 ** self.num_qubits:
-            raise ValueError(f'RHS axis 0 size {rhs.shape[0]} is incompatible with'
-                             f' num_qubits={self.num_qubits}')
+        if rhs.shape[0] != 2**self.num_qubits:
+            raise ValueError(
+                f"RHS axis 0 size {rhs.shape[0]} is incompatible with num_qubits={self.num_qubits}"
+            )
 
         indices = jnp.arange(rhs.shape[0], dtype=np.int32, out_sharding=jax.typeof(rhs).sharding)
         powers = 256 ** jnp.arange(self.x.shape[1])[::-1]
@@ -141,7 +144,7 @@ class PauliSumXZ:
 
         def apply_xgrp(out, data):
             xsig, zsigs, coeffs = data
-            signs = 1. - 2. * (jnp.bitwise_count(indices & zsigs[:, None]) & 1)
+            signs = 1.0 - 2.0 * (jnp.bitwise_count(indices & zsigs[:, None]) & 1)
             diags = jnp.sum(coeffs[..., None] * signs, axis=0)
             diags = jnp.expand_dims(diags, tuple(np.arange(1, rhs.ndim) + 1))
             out += rhs.at[indices ^ xsig].get(out_sharding=jax.typeof(rhs).sharding) * diags

@@ -16,7 +16,7 @@ uv run --extra mpl   python ...   # matplotlib, for qprint(output='mpl')
 uv run --extra qutip python ...   # qutip Qobj input to qprint
 ```
 
-Extras: `mpl`, `qutip`, `qiskit`, `docs`. `mpi4py` is imported by `examples/` but declared nowhere — install it manually if you need the multi-process path.
+Extras: `mpl`, `qutip`, `qiskit`, `docs`, `dev` (pytest + ruff + ty), `mlx` (darwin only). `mpi4py` is imported by `examples/` but declared nowhere — install it manually if you need the multi-process path.
 
 Docs (regenerates `docs/source/apidoc/` via `sphinx-apidoc`, which is **not** committed):
 
@@ -25,13 +25,30 @@ cd docs && uv run --extra docs make html    # output in docs/build/html
 cd docs && uv run --extra docs make clean   # also removes source/apidoc
 ```
 
-Pre-commit only runs whitespace/EOF/YAML/large-file hooks — there is no linter or type-checker configured. Line width in practice is 100 chars.
+## Linting and type checking
+
+```bash
+uv run --extra dev ruff check rqutils/ tests/ examples/     # lint
+uv run --extra dev ruff format rqutils/ tests/ examples/    # format (line width 100)
+uv run --extra dev ty check rqutils/ tests/ examples/       # type check
+```
+
+All three are clean; keep them that way. Config lives in `[tool.ruff]` / `[tool.ty.rules]` in
+`pyproject.toml`, and every suppression there carries the reason it exists — read those comments
+before adding another. Notebooks are excluded from both tools: they get their names from IPython
+magics (`%aimport rqutils.paulis`) that static analysis cannot see.
+
+Several `[tool.ty.rules]` categories are set to `ignore` because JAX ships almost no type
+information and numpy's stubs are stricter than this library's dtype-generic `npmod` convention
+allows. Those were triaged individually rather than blanket-disabled — prefer fixing a real finding
+in the code over widening the ignore list. Pre-commit runs only whitespace/EOF/YAML/large-file
+hooks; it does not run ruff or ty.
 
 ## Testing
 
 ```bash
-uv run --extra test pytest              # whole suite
-uv run --extra test pytest -v -x        # verbose, stop at first failure
+uv run --extra dev pytest              # whole suite
+uv run --extra dev pytest -v -x        # verbose, stop at first failure
 ```
 
 `tests/test_ground_locg.py` covers `rqutils/ground_locg.py` only — the other six modules have no

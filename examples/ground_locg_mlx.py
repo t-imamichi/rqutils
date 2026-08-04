@@ -22,8 +22,9 @@ Four structural differences from the JAX version, all forced by MLX:
 The analytic 2x2/3x3 Rayleigh-Ritz step carries over directly, which is what makes this port
 feasible at all -- MLX has no ``eigh``.
 """
-import numpy as np
+
 import mlx.core as mx
+import numpy as np
 
 
 def apply_h_xz_mlx(vec, xsources, diagonals):
@@ -86,8 +87,8 @@ def apply_h_xz_mlx_chunked(vec, xsources, diagonals, chunk=16):
     num_groups = xsources.shape[0]
     out = mx.zeros_like(vec)
     for start in range(0, num_groups, chunk):
-        xc = xsources[start:start + chunk]
-        dc = diagonals[start:start + chunk]
+        xc = xsources[start : start + chunk]
+        dc = diagonals[start : start + chunk]
         gathered = mx.take(vec, xc.reshape(-1)).reshape(xc.shape)
         out = out + mx.sum(gathered * dc, axis=0)
     return out
@@ -117,10 +118,10 @@ def _get_metal_matvec_kernel():
     global _METAL_MATVEC_KERNEL
     if _METAL_MATVEC_KERNEL is None:
         _METAL_MATVEC_KERNEL = mx.fast.metal_kernel(
-            name='sqd_apply_h_xz',
-            input_names=['vec', 'xsources', 'diagonals', 'n_groups', 'n_states'],
-            output_names=['out'],
-            source=_METAL_MATVEC_SOURCE
+            name="sqd_apply_h_xz",
+            input_names=["vec", "xsources", "diagonals", "n_groups", "n_states"],
+            output_names=["out"],
+            source=_METAL_MATVEC_SOURCE,
         )
     return _METAL_MATVEC_KERNEL
 
@@ -160,25 +161,26 @@ def apply_h_xz_mlx_metal(vec, xsources, diagonals, threadgroup=256):
     """
     if vec.dtype != mx.float32:
         raise ValueError(
-            f'apply_h_xz_mlx_metal requires float32 (Metal has no float64), got {vec.dtype}. '
-            'Use apply_h_xz_mlx_chunked for the f64 arms.'
+            f"apply_h_xz_mlx_metal requires float32 (Metal has no float64), got {vec.dtype}. "
+            "Use apply_h_xz_mlx_chunked for the f64 arms."
         )
 
     num_groups, num_states = xsources.shape
     kernel = _get_metal_matvec_kernel()
     outputs = kernel(
         inputs=[vec, xsources, diagonals, num_groups, num_states],
-        template=[('T', mx.float32)],
+        template=[("T", mx.float32)],
         grid=(num_states, 1, 1),
         threadgroup=(min(threadgroup, num_states), 1, 1),
         output_shapes=[(num_states,)],
-        output_dtypes=[mx.float32]
+        output_dtypes=[mx.float32],
     )
     return outputs[0]
 
 
-def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None,
-                    compile_body=False, compile_chunk=10):
+def ground_locg_mlx(
+    mat, xinit, args=(), maxiter=1000, tol=None, compile_body=False, compile_chunk=10
+):
     """Single-vector LOBPCG in MLX.
 
     Args:
@@ -206,7 +208,7 @@ def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None,
         (eigenvalue, eigenvector, iterations).
     """
     xinit = mx.array(xinit)
-    check_convergence = tol != 0.
+    check_convergence = tol != 0.0
     if tol is None:
         # Compare the dtype object directly rather than parsing its repr: this works
         # identically under real MLX and under the numpy shim used by the static check.
@@ -231,7 +233,7 @@ def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None,
 
     # Iteration 1: two-vector Rayleigh-Ritz over {x, r}.
     norm_r = mx.linalg.norm(rcurr)
-    tmp_p = rcurr / mx.where(norm_r == 0., mx.array(1., norm_r.dtype), norm_r)
+    tmp_p = rcurr / mx.where(norm_r == 0.0, mx.array(1.0, norm_r.dtype), norm_r)
     theta, kappa = rayleigh_ritz(xcurr, tmp_p)
     tmp_t = tmp_p * kappa[0] - xcurr * kappa[1]
     tmp_u = xcurr * kappa[0] + tmp_p * kappa[1]
@@ -283,7 +285,7 @@ def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None,
         # is not an option, since mx.compile traces a fixed array-in/array-out computation and
         # has no equivalent of jax.lax.while_loop/cond to make that branch part of the graph.
         def chunk_body(xcurr, ycurr, rcurr):
-            theta = mx.array(0., xcurr.dtype)
+            theta = mx.array(0.0, xcurr.dtype)
             axnext = xcurr
             for _ in range(compile_chunk):
                 theta, xcurr, ycurr, rcurr, axnext = iter_body(xcurr, ycurr, rcurr)
@@ -331,7 +333,7 @@ def _project_out(basis, vector):
         for vb, ip in zip(basis, ips):
             vector = vector - vb * ip
         norm = mx.linalg.norm(vector)
-        vector = vector / mx.where(norm == 0., mx.array(1., norm.dtype), norm)
+        vector = vector / mx.where(norm == 0.0, mx.array(1.0, norm.dtype), norm)
 
     for _ in range(2):
         ips = [mx.sum(vb * vector) for vb in basis]
@@ -355,10 +357,10 @@ def eigenpair_2x2(mat):
     off = mat[1, 0]
     det = d[0] * d[1] - off * off
     tr = d[0] + d[1]
-    eigval = (tr - mx.sqrt(tr * tr - 4. * det)) * 0.5
+    eigval = (tr - mx.sqrt(tr * tr - 4.0 * det)) * 0.5
     first = (d[1] - eigval + off) / (d[0] - eigval + off)
-    eigvec = mx.stack([first, mx.array(-1., first.dtype)])
-    return eigval, eigvec / mx.sqrt(first * first + 1.)
+    eigvec = mx.stack([first, mx.array(-1.0, first.dtype)])
+    return eigval, eigvec / mx.sqrt(first * first + 1.0)
 
 
 def eigenpair_3x3(mat):
@@ -385,18 +387,15 @@ def eigenpair_3x3(mat):
     c1 = mx.sum(d * mx.stack([d[2], d[0], d[1]])) - mx.sum(modod)
     c0 = mx.sum(d * mx.stack([modod[2], modod[1], modod[0]]))
     c0 = c0 - d[0] * d[1] * d[2]
-    c0 = c0 - 2. * (mat[0, 2] * mat[1, 0] * mat[2, 1])
-    p = c2 * c2 - 3. * c1
+    c0 = c0 - 2.0 * (mat[0, 2] * mat[1, 0] * mat[2, 1])
+    p = c2 * c2 - 3.0 * c1
     q = -13.5 * c0 - c2 * c2 * c2 + 4.5 * c2 * c1
-    phi = mx.arctan2(
-        mx.sqrt(27. * (0.25 * c1 * c1 * (p - c1) + c0 * (q + 6.75 * c0))),
-        q
-    ) / 3.
+    phi = mx.arctan2(mx.sqrt(27.0 * (0.25 * c1 * c1 * (p - c1) + c0 * (q + 6.75 * c0))), q) / 3.0
     cphi = mx.cos(phi)
     sphi = mx.sin(phi)
-    root3 = float(np.sqrt(3.))
-    xmin = mx.min(mx.stack([2. * cphi, -cphi - root3 * sphi, -cphi + root3 * sphi]))
-    eigval = mx.sqrt(p) / 3. * xmin - c2 / 3.
+    root3 = float(np.sqrt(3.0))
+    xmin = mx.min(mx.stack([2.0 * cphi, -cphi - root3 * sphi, -cphi + root3 * sphi]))
+    eigval = mx.sqrt(p) / 3.0 * xmin - c2 / 3.0
     v0 = mx.stack([mat[0, 1], mat[1, 1] - eigval, mat[2, 1]])
     v1 = mx.stack([mat[0, 2], mat[1, 2], mat[2, 2] - eigval])
     eigvec = mx.linalg.cross(v0, v1)
