@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 from conftest import herm, lowest, rel_resid, symmetrize
 
-from rqutils.ground_locg import _project_out, eigenpair_2x2
+from rqutils.ground_locg import _project_out, eigenpair_2x2, eigenpair_3x3
 
 
 class TestProjectOut:
@@ -128,6 +128,97 @@ class TestEigenpair2x2:
             eigval, eigvec = eigenpair_2x2(jnp.asarray(mat))
             eigval = float(eigval)
             assert np.isfinite(eigval)
+            scale = np.abs(mat).max()
+            worst_eigval = max(worst_eigval, abs(eigval - lowest(mat)) / scale)
+            worst_residual = max(worst_residual, rel_resid(mat, eigval, eigvec))
+        assert worst_eigval < 1e-13, f'worst relative eigenvalue error {worst_eigval:.2e}'
+        assert worst_residual < 1e-13, f'worst relative residual {worst_residual:.2e}'
+
+
+class TestEigenpair3x3:
+    """Lowest eigenpair of a 3x3 Hermitian matrix, via Cardano's method.
+
+    The shipped predecessor returned 4066 NaNs over 20000 random inputs, and a wrong eigenvector
+    1148 times in 5000.
+    """
+
+    def test_rank_deficient_column_pair(self):
+        """Item I3, the sharpest case in the audit: diag(5, 6, 1).
+
+        The old kernel took the null vector as ``cross(mat[:, 1], mat[:, 2])``. When that particular
+        pair is rank deficient the cross product vanishes and the result points nowhere useful. On
+        this innocuous input it returned an *exact eigenvalue* alongside an eigenvector with
+        residual 0.67 -- so a test asserting only on the eigenvalue would have passed. Assert both.
+        """
+        mat = np.diag([5., 6., 1.])
+        eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
+        eigval = float(eigval)
+        assert eigval == pytest.approx(lowest(mat), abs=1e-13)
+        assert rel_resid(mat, eigval, eigvec) < 1e-13
+        assert np.linalg.norm(np.asarray(eigvec)) == pytest.approx(1.)
+
+    def test_identity_rank_zero(self):
+        """Item I3 rank-0 fallback: every cross product vanishes for a multiple of the identity."""
+        mat = np.eye(3)
+        eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
+        eigval = float(eigval)
+        assert eigval == pytest.approx(1., abs=1e-13)
+        assert rel_resid(mat, eigval, eigvec) < 1e-13
+        assert np.linalg.norm(np.asarray(eigvec)) == pytest.approx(1.)
+
+    def test_degenerate_lowest_rank_one(self):
+        """Item I3 rank-1 fallback: a degenerate lowest eigenvalue.
+
+        Every cross product is numerical noise here; the null space is the orthogonal complement of
+        the largest column, and any member of it is a valid eigenvector.
+        """
+        mat = np.diag([1., 1., 7.])
+        eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
+        eigval = float(eigval)
+        assert eigval == pytest.approx(1., abs=1e-13)
+        assert rel_resid(mat, eigval, eigvec) < 1e-13
+        assert np.linalg.norm(np.asarray(eigvec)) == pytest.approx(1.)
+
+    def test_large_shift(self):
+        """Item I1: at shift 1e9 the radicand under ``sqrt`` went negative and returned NaN.
+
+        Not an exotic input -- this is the ordinary case for a physical Hamiltonian, which is rarely
+        traceless, and is exactly what ``sqd.py`` feeds this solver.
+        """
+        mat = np.diag([1., 2., 3.]) + 1e9 * np.eye(3)
+        eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
+        eigval = float(eigval)
+        assert np.isfinite(eigval)
+        assert eigval == pytest.approx(lowest(mat), rel=1e-13)
+        assert rel_resid(mat, eigval, eigvec) < 1e-13
+
+    @pytest.mark.parametrize('exponent', [-160, 150])
+    def test_extreme_scale(self, exponent):
+        """Item I2: ``c0`` is cubic in the entries, so unbalanced it overflows or underflows.
+
+        Measured on the old kernel: relative error 7.8e-1 at 1e-160, NaN at 1e150.
+        """
+        mat = np.diag([1., 2., 3.]) * 10. ** exponent
+        eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
+        eigval = float(eigval)
+        assert np.isfinite(eigval)
+        assert eigval == pytest.approx(lowest(mat), rel=1e-13)
+        assert rel_resid(mat, eigval, eigvec) < 1e-13
+
+    @pytest.mark.parametrize('complex_', [True, False])
+    def test_random_sweep(self, complex_):
+        """Aggregate accuracy over seeded random input. Supplements the targeted cases above.
+
+        The old kernel produced 4066 NaNs in 20000 such matrices.
+        """
+        rng = np.random.default_rng(20260804)
+        worst_eigval = worst_residual = 0.
+        for _ in range(2000):
+            mat = herm(3, rng, complex_=complex_)
+            eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
+            eigval = float(eigval)
+            assert np.isfinite(eigval)
+            assert np.all(np.isfinite(np.asarray(eigvec)))
             scale = np.abs(mat).max()
             worst_eigval = max(worst_eigval, abs(eigval - lowest(mat)) / scale)
             worst_residual = max(worst_residual, rel_resid(mat, eigval, eigvec))
