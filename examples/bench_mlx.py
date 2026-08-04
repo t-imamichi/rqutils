@@ -387,7 +387,8 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _bench_common import timeit
-    from ground_locg_mlx import (
+
+    from rqutils.ground_locg_mlx import (
         apply_h_xz_mlx,
         apply_h_xz_mlx_chunked,
         apply_h_xz_mlx_metal,
@@ -481,7 +482,7 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
         )
 
     _, solve_s = timeit(solve, options.repeat, sync)
-    eigval, _, iters = solve()
+    eigval, _, iters, _ = solve()
 
     return {
         "arm": arm,

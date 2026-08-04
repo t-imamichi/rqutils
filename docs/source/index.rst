@@ -24,6 +24,7 @@ Installation
    Pretty-printing quantum objects (state vectors and operators) <apidoc/rqutils.qprint>
    Scalable state vector simulator <apidoc/rqutils.svsim>
    Ground state solver (LOBPCG) <apidoc/rqutils.ground_locg>
+   Ground state solver (LOBPCG) on MLX <apidoc/rqutils.ground_locg_mlx>
    Sample-based quantum diagonalization <apidoc/rqutils.sqd>
    Miscellaneous math functions <apidoc/rqutils.math>
    Generalized Pauli (Gell-Mann) matrices <apidoc/rqutils.paulis.general>

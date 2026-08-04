@@ -63,7 +63,7 @@ eigenvalue (the audit's I3 returned an exact eigenvalue with a garbage eigenvect
 
 ## Architecture
 
-Seven independent modules under `rqutils/`; nothing but `sqd.py → {paulis/symplectic.py, ground_locg.py}` and `qprint.py → paulis/general.py` couples them.
+Eight largely independent modules under `rqutils/`; nothing but `sqd.py → {paulis/symplectic.py, ground_locg.py}` and `qprint.py → paulis/general.py` couples them. `ground_locg_mlx.py` imports nothing from the package and nothing imports it.
 
 **Two unrelated Pauli representations — do not confuse them:**
 
@@ -75,7 +75,9 @@ Seven independent modules under `rqutils/`; nothing but `sqd.py → {paulis/symp
 - States carry **one extra zero pad bit at position 0** before `packbits`, so the Hamiltonian must be built with `add_padding=True`. Filler slots produced by uniquification are `255`, detected via `states_u[:, 0] >> 7`.
 - `cache_level=(source_indices, diagonals)` selects among six matvec kernels trading memory for speed; `states_size` exists solely to pin array shapes and prevent JIT recompilation.
 
-**`ground_locg.py`** — single-vector (block-size-1) LOBPCG specialization used as `sqd`'s eigensolver, with the Rayleigh–Ritz step solved analytically (`eigenpair_2x2`, `eigenpair_3x3` via Cardano) instead of via `eigh`, to keep memory down for huge vectors. It is sharding-transparent **only if the `mat` callable preserves output sharding** — that contract is why every `apply_*` in `sqd.py` passes `out_sharding=jax.typeof(vec).sharding`.
+**`ground_locg.py`** — single-vector (block-size-1) LOBPCG specialization used as `sqd`'s eigensolver, with the Rayleigh–Ritz step solved analytically (`eigenpair_2x2`, `eigenpair_3x3` via Cardano) instead of via `eigh`, to keep memory down for huge vectors. It is sharding-transparent **only if the `mat` callable preserves output sharding** — that contract is why every `apply_*` in `sqd.py` passes `out_sharding=jax.typeof(vec).sharding`. Every guard in it is load-bearing and was measured: `docs/locg.md` catalogues seven defects (I1–I7) that each failed *silently*, returning a plausible wrong number rather than raising. Don't "simplify" the balancing, the re-orthogonalizations, or the zero-direction masks.
+
+**`ground_locg_mlx.py`** — an MLX port of the above plus `sqd.py`'s cached matvec, for Apple GPUs. **It duplicates the algorithm deliberately; when you change one, change both.** It is real-symmetric only (MLX has no complex128, Metal no float64) and raises on complex input rather than silently dropping imaginary parts. `mlx` is a darwin-only extra, so importing this module without it raises `ImportError`. MLX cannot initialize without a Metal device, so headless verification goes through `examples/check_ground_locg_mlx_static.py`, which re-executes the module's source against a numpy shim; `examples/check_ground_locg_mlx_mlx.py` is the real-device counterpart.
 
 **`svsim.py`** — JAX state-vector simulator. Gates are compiled to the same symplectic `CircuitXZ` (x, z, cos, sin) form and applied by a single `jax.lax.scan`, so only `x, y, z, cz, rx, ry, rz, rzz` are supported; transpile to `basis_gates=['rx','ry','rz','rzz']` first.
 

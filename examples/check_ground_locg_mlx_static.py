@@ -8,7 +8,7 @@ Run with:
     uv run python examples/check_ground_locg_mlx_static.py
 
 This script does NOT require MLX or a Metal device: it substitutes a numpy shim for
-`mlx.core` and re-executes examples/ground_locg_mlx.py's own source text against that shim.
+`mlx.core` and re-executes rqutils/ground_locg_mlx.py's own source text against that shim.
 See examples/check_ground_locg_mlx_mlx.py for the real-MLX counterpart, which requires a
 Metal device and cannot run headless.
 """
@@ -22,7 +22,8 @@ import types
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(HERE, "ground_locg_mlx.py")
+# The module under test lives in the package; HERE is examples/, so go up one level.
+SRC = os.path.join(os.path.dirname(HERE), "rqutils", "ground_locg_mlx.py")
 with open(SRC) as source_file:
     source = source_file.read()
 
@@ -63,6 +64,14 @@ for fn in (
     "concatenate",
     "min",
     "max",
+    # Added when the port was synced with the hardened JAX algorithms: balancing needs eye/sign,
+    # the rank-aware null-vector search needs argmax, and the zero-direction guards need
+    # zeros_like/logical_or.
+    "eye",
+    "sign",
+    "argmax",
+    "logical_or",
+    "matmul",
 ):
     if hasattr(np, fn):
         setattr(shim, fn, getattr(np, fn))
@@ -156,7 +165,7 @@ assert err < 1e-12, f"apply_h_xz_mlx disagrees with H @ v by {err}"
 print(f"OK  matvec matches H @ v (max err {err:.2e})")
 
 # 3b. full solve must reach the reference eigenvalue
-eigval, eigvec, iters = ground_locg_mlx(
+eigval, eigvec, iters, converged = ground_locg_mlx(
     apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals)
 )
 assert abs(eigval - ref) < 1e-9 * max(1.0, abs(ref)), f"solver got {eigval}, reference {ref}"
@@ -164,7 +173,7 @@ assert 0 < iters <= 1000, f"implausible iteration count {iters}"
 print(f"OK  solve: eig={eigval:.12f} ref={ref:.12f} iters={iters}")
 
 # 3c. tol=0. must run exactly maxiter iterations (fixed-iteration mode)
-_, _, fixed_iters = ground_locg_mlx(
+_, _, fixed_iters, _ = ground_locg_mlx(
     apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals), maxiter=100, tol=0.0
 )
 assert fixed_iters == 100, f"tol=0. ran {fixed_iters} iterations, expected exactly 100"
@@ -212,10 +221,10 @@ else:
 # flow this port adds is numerically sound. Use tol=0. (fixed-iteration) first: no convergence
 # check happens at all, so the compiled body must reproduce the uncompiled tol=0. trajectory
 # exactly (same ops, same order).
-eigval_default, _, iters_default = ground_locg_mlx(
+eigval_default, _, iters_default, _ = ground_locg_mlx(
     apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals), maxiter=100, tol=0.0
 )
-eigval_compiled, _, iters_compiled = ground_locg_mlx(
+eigval_compiled, _, iters_compiled, _ = ground_locg_mlx(
     apply_h_xz_mlx,
     inputs.vinit,
     args=(inputs.xsources, inputs.diagonals),
@@ -237,7 +246,7 @@ print(
 # 3f. compile_body=True with convergence checking (chunked between compile_chunk iterations)
 # must still reach the reference eigenvalue, and compile_body=False must be completely
 # unaffected by compile_body's existence (same call as 3b, repeated to prove no state leaks).
-eigval_chunked_conv, _, iters_chunked_conv = ground_locg_mlx(
+eigval_chunked_conv, _, iters_chunked_conv, _ = ground_locg_mlx(
     apply_h_xz_mlx,
     inputs.vinit,
     args=(inputs.xsources, inputs.diagonals),
@@ -252,7 +261,7 @@ print(
     f"eig={eigval_chunked_conv:.12f} iters={iters_chunked_conv}"
 )
 
-eigval_default2, _, iters_default2 = ground_locg_mlx(
+eigval_default2, _, iters_default2, _ = ground_locg_mlx(
     apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals)
 )
 assert iters_default2 == iters, (

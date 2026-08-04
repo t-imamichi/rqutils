@@ -22,7 +22,8 @@ import numpy as np
 jax.config.update("jax_enable_x64", True)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _bench_common import build_solver_inputs, dense_reference, generate_problem
-from ground_locg_mlx import apply_h_xz_mlx, ground_locg_mlx
+
+from rqutils.ground_locg_mlx import apply_h_xz_mlx, ground_locg_mlx
 
 ps, cs, states = generate_problem(10, 20, 200, seed=1)
 inputs = build_solver_inputs(ps, cs, states)
@@ -55,7 +56,7 @@ for device, name in ((mx.cpu, "cpu"), (mx.gpu, "gpu")):
             mv = np.asarray(apply_h_xz_mlx(v0, xs, dg), dtype=np.float64)
             mverr = np.abs(mv - H @ inputs.vinit).max()
 
-            eig, _, iters = ground_locg_mlx(apply_h_xz_mlx, v0, args=(xs, dg))
+            eig, _, iters, _ = ground_locg_mlx(apply_h_xz_mlx, v0, args=(xs, dg))
             ok = abs(eig - ref) < rtol * max(1.0, abs(ref))
             print(
                 f"{arm}: eig={eig:.10f} iters={iters} matvec_err={mverr:.2e} "

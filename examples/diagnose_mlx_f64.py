@@ -25,7 +25,13 @@ import numpy as np
 jax.config.update("jax_enable_x64", True)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _bench_common import build_solver_inputs, dense_reference, generate_problem
-from ground_locg_mlx import _project_out, apply_h_xz_mlx, eigenpair_2x2, eigenpair_3x3
+
+from rqutils.ground_locg_mlx import (
+    _project_out,
+    apply_h_xz_mlx,
+    eigenpair_2x2,
+    eigenpair_3x3,
+)
 
 mx.set_default_device(mx.cpu)
 F64 = mx.float64
