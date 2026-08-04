@@ -27,6 +27,12 @@ _PAULI_MATRICES = {
     "Z": np.diag([1.0, -1.0]).astype(np.complex128),
 }
 
+# Above this subspace dimension, dense_reference's (N, N) float64 matrix stops being
+# allocatable: 200 MB at N=5000, 7.2 GB at N=30000, 80 GB at N=1e5. The sparse path takes over
+# there. Chosen above the bench default --num-states 4000 so existing invocations keep using
+# the dense path and stay bit-for-bit reproducible.
+DENSE_REFERENCE_MAX_DIM = 5000
+
 
 @dataclass
 class SolverInputs:
@@ -186,6 +192,52 @@ def dense_reference(inputs: SolverInputs) -> tuple[np.ndarray, float]:
         "impossible for even-Y (real) input -- see _bench_common.build_solver_inputs."
     )
     return matrix, float(np.linalg.eigvalsh(matrix)[0])
+
+
+def sparse_reference(inputs: SolverInputs) -> float:
+    """Ground energy of the projected Hamiltonian via sparse eigsh, for large subspaces.
+
+    ``dense_reference`` allocates an (N, N) float64 matrix, which is 80 GB at N=1e5. The
+    operator is sparse by construction -- ``np.add.at`` over J X-groups, so at most J*N
+    nonzeros -- so the same eigenvalue is reachable without ever densifying it.
+
+    An independent algorithm in an independent library, not a second run of the solver under
+    test: CLAUDE.md records bugs where every internal code path agreed on the same wrong number,
+    so self-consistency is not an acceptable reference.
+
+    Raises:
+        SystemExit: If eigsh fails to converge or returns a non-finite value. An unconverged
+            reference must fail the gate loudly -- a NaN eigenvalue once passed this benchmark's
+            gate silently, because every IEEE 754 NaN comparison is false.
+    """
+    import scipy.sparse
+    import scipy.sparse.linalg
+
+    dim = inputs.subspace_dim
+    rows = np.tile(np.arange(dim), inputs.xsources.shape[0])
+    cols = inputs.xsources.reshape(-1)
+    data = inputs.diagonals.reshape(-1)
+    # coo_matrix sums duplicate (row, col) entries, matching dense_reference's np.add.at.
+    matrix = scipy.sparse.coo_matrix((data, (rows, cols)), shape=(dim, dim)).tocsr()
+
+    try:
+        # 'SA' = smallest algebraic. Not 'SM' (smallest magnitude), which would return the
+        # eigenvalue nearest zero rather than the ground state.
+        eigvals = scipy.sparse.linalg.eigsh(
+            matrix, k=1, which="SA", return_eigenvectors=False, tol=0.0
+        )
+    except scipy.sparse.linalg.ArpackNoConvergence as exc:
+        raise SystemExit(
+            f"gate failed: sparse_reference eigsh did not converge at N={dim} ({exc}); the "
+            "reference eigenvalue is unusable, so no timing row may be reported"
+        ) from exc
+    value = float(eigvals[0])
+    if not np.isfinite(value):
+        raise SystemExit(
+            f"gate failed: sparse_reference returned non-finite {value} at N={dim}. Every NaN "
+            "comparison is false, so this must be rejected explicitly rather than compared"
+        )
+    return value
 
 
 def brute_force_reference(
