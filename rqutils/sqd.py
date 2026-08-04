@@ -304,7 +304,15 @@ def hproj(
     rows = np.tile(np.arange(states.shape[0])[None, :], (columns.shape[0], 1))[valid]
     data = np.array(elements[valid])
     cols = np.array(columns[valid])
-    return csr_array(coo_array((data, (rows, cols))))
+    # shape= is mandatory here, not cosmetic: without it scipy infers the extent from the largest
+    # index present, so a trailing basis state that no term couples into is dropped and the matrix
+    # comes back too small (measured 41x41 for a 53-state subspace with local two-site js
+    # operators). That truncation is silent -- the result is still symmetric, so eigvalsh returns a
+    # plausible wrong ground energy. When nothing at all survives, the index arrays are empty and
+    # scipy cannot infer any extent, raising instead ("cannot infer dimensions from zero sized
+    # index arrays"); the projection is legitimately the zero matrix in that case.
+    dim = states.shape[0]
+    return csr_array(coo_array((data, (rows, cols)), shape=(dim, dim)))
 
 
 def _spread_seed(

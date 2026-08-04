@@ -175,6 +175,47 @@ class TestHproj:
         assert matrix.shape == expected.shape
         assert np.abs(matrix - expected.real).max() < 1e-12
 
+    def test_shape_is_subspace_dim_when_top_column_unreachable(self):
+        """``coo_array((data, (rows, cols)))`` was built with no ``shape=``.
+
+        scipy then infers the extent from the largest index actually present, so any trailing
+        basis state that no term couples into is dropped from the matrix entirely. Here qubit-0
+        flip couples states 0<->1 but the partner of the highest state is absent from the
+        subspace, so its column never appears: measured (2, 2) for a 3-state subspace before the
+        fix. The same shortfall was seen as 41x41 for a 53-state subspace with this repo's local
+        two-site ``js`` operators.
+
+        This failed *silently* -- a truncated matrix is still a valid symmetric matrix, so
+        ``eigvalsh`` returns a plausible wrong ground energy rather than raising. The reference
+        is the dense Kronecker projection, which shares no code with the packing path.
+        """
+        strings = ["IIIIIX"]
+        coeffs = np.array([1.0])
+        states = np.array(
+            [[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 1], [1, 0, 0, 0, 0, 0]], dtype=np.uint8
+        )
+        matrix = hproj((strings, coeffs.tolist()), states)
+        assert matrix.shape == (3, 3), "trailing uncoupled basis state was dropped"
+        expected = project_dense(strings, coeffs, states)
+        assert np.abs(matrix.toarray() - expected.real).max() < 1e-12
+
+    def test_empty_projection_returns_zero_matrix(self):
+        """No in-subspace matrix element at all must give a zero matrix, not a raise.
+
+        With zero surviving elements both index arrays are empty, and scipy cannot infer any
+        extent from them: measured ``ValueError: cannot infer dimensions from zero sized index
+        arrays`` before the fix. A fully off-diagonal operator on a subspace closed under none of
+        its terms is a legitimate (if degenerate) input -- the projection is genuinely zero.
+        """
+        strings = ["XXXXXX"]
+        coeffs = np.array([1.0])
+        states = np.array([[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 1]], dtype=np.uint8)
+        matrix = hproj((strings, coeffs.tolist()), states)
+        assert matrix.shape == (2, 2)
+        assert matrix.nnz == 0
+        expected = project_dense(strings, coeffs, states)
+        assert np.abs(matrix.toarray() - expected.real).max() < 1e-12
+
     def test_is_symmetric(self):
         """A real Hermitian projection must come back exactly symmetric.
 

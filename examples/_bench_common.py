@@ -177,8 +177,14 @@ def apply_h_xz_chunked(
 def dense_reference(inputs: SolverInputs) -> tuple[np.ndarray, float]:
     """Build the projected Hamiltonian densely from the solver inputs and diagonalize it.
 
-    Used instead of ``rqutils.sqd.hproj``, which raises a shape-mismatch TypeError: it builds
-    the Hamiltonian with add_padding=True but packs the states without the pad bit.
+    Deliberately independent of ``rqutils.sqd.hproj`` rather than a wrapper around it: a benchmark
+    gate must not be a second run of the code under test. Past bugs in this package had every
+    internal path agreeing on the same wrong number, so self-consistency proves nothing here.
+
+    (This once carried a note that ``hproj`` was unusable because it raised a shape-mismatch
+    TypeError -- it built the Hamiltonian with add_padding=True but packed the states without the
+    pad bit. That bug and a missing ``shape=`` on its ``coo_array`` are both fixed; the reason to
+    keep this separate is independence, not breakage.)
     """
     dim = inputs.subspace_dim
     matrix = np.zeros((dim, dim), dtype=np.float64)
