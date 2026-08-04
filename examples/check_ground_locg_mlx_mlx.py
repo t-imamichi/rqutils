@@ -64,6 +64,22 @@ for device, name in ((mx.cpu, "cpu"), (mx.gpu, "gpu")):
             )
             if not ok:
                 failures.append(arm)
+
+            # sas='metal' is f32-only (Metal has no float64), so only exercise it on
+            # the f32 arms. This is the ONLY check that can establish the Metal source
+            # actually compiles and that its barriers are correct -- the numpy shim
+            # cannot.
+            if dtname == "f32":
+                eig_sas, _, iters_sas, _ = ground_locg_mlx(
+                    apply_h_xz_mlx, v0, args=(xs, dg), sas="metal"
+                )
+                ok_sas = abs(eig_sas - ref) < rtol * max(1.0, abs(ref))
+                print(
+                    f"{arm} sas=metal: eig={eig_sas:.10f} iters={iters_sas} "
+                    f"{'OK' if ok_sas else 'FAIL'}"
+                )
+                if not ok_sas:
+                    failures.append(f"{arm}-sas-metal")
         except Exception as exc:  # noqa: BLE001 (a checker must survive any arm's failure)
             print(f"{arm}: ERROR {type(exc).__name__}: {exc}")
             failures.append(arm)
