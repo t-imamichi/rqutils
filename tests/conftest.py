@@ -95,6 +95,67 @@ def lowest_projected(pauli_strings, coeffs, states):
     return float(np.linalg.eigvalsh(project_dense(pauli_strings, coeffs, states))[0].real)
 
 
+def gate_unitary(name, qubits, num_qubits, angle=None):
+    """Return the ``2**num_qubits`` unitary for one ``svsim`` gate spec.
+
+    Built from Kronecker products of the 2x2 Paulis, independent of both ``rqutils.svsim`` and
+    qiskit. ``qubits`` are indices in ``svsim``'s convention, where qubit ``q`` is bit ``q`` of the
+    statevector index (bit 0 = least significant), i.e. the reverse of the Pauli-string character
+    order used by :func:`dense_pauli_sum`.
+
+    ``x``/``y``/``z`` are the bare Pauli gates. The rotations are ``exp(-i * angle * P / 2)``,
+    matching Qiskit's ``rx``/``ry``/``rz``/``rzz``.
+    """
+    letters = {"x": "X", "y": "Y", "z": "Z", "rx": "X", "ry": "Y", "rz": "Z", "rzz": "Z"}
+    if name not in letters:
+        raise ValueError(f"unsupported gate {name}")
+    qubits = np.atleast_1d(np.asarray(qubits))
+    # Build the Pauli operator as a tensor product over all qubits, identity except on `qubits`.
+    # Index bit q is qubit q, and np.kron's first factor is the MOST significant bit, so the
+    # per-qubit factors go in reverse qubit order.
+    factors = []
+    for qubit in reversed(range(num_qubits)):
+        factors.append(_PAULI_MATRICES[letters[name] if qubit in qubits else "I"])
+    operator = factors[0]
+    for factor in factors[1:]:
+        operator = np.kron(operator, factor)
+    if name in ("x", "y", "z"):
+        return operator
+    identity = np.eye(2**num_qubits, dtype=np.complex128)
+    return np.cos(angle / 2.0) * identity - 1.0j * np.sin(angle / 2.0) * operator
+
+
+def simulate_dense(gate_specs, num_qubits, initial_state=0):
+    """Apply ``gate_specs`` to a statevector by dense matrix multiplication.
+
+    The independent reference for :func:`rqutils.svsim.svsim`: it shares no code with the
+    symplectic ``CircuitXZ`` representation or the ``lax.scan`` kernel under test.
+    """
+    state = np.zeros(2**num_qubits, dtype=np.complex128)
+    if np.ndim(initial_state) == 0:
+        state[int(initial_state)] = 1.0
+    else:
+        state = np.asarray(initial_state, dtype=np.complex128).copy()
+    for spec in gate_specs:
+        name, qubits, *rest = spec
+        state = gate_unitary(name, qubits, num_qubits, *rest) @ state
+    return state
+
+
+def phaseless_distance(first, second):
+    """Return the distance between two state vectors, minimized over a global phase.
+
+    ``1 - |<a|b>| / (|a| |b|)`` -- zero exactly when the two agree up to a global phase. Used where
+    a global phase is genuinely unobservable; assert exact equality instead wherever it is not.
+    """
+    first = np.asarray(first).ravel()
+    second = np.asarray(second).ravel()
+    norms = np.linalg.norm(first) * np.linalg.norm(second)
+    if norms == 0.0:
+        return 0.0 if np.linalg.norm(first) == np.linalg.norm(second) else 1.0
+    return float(1.0 - abs(np.vdot(first, second)) / norms)
+
+
 def real_pauli_strings(num_qubits, count, rng, letters="IXYZ"):
     """Return ``count`` distinct Pauli strings with an even number of Ys.
 

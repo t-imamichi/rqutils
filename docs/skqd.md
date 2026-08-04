@@ -2,6 +2,20 @@
 
 Assessment date: 2026-08-03. Investigated against branch `metal` (`a822a22`).
 
+> **Status update (2026-08-04): the blocker described below is fixed.** `CircuitXZ.sin` was widened
+> to complex128 and `i * (-i)^popcount(x & z)` is now folded into it in `to_circuitxz`, so
+> `do_svsim` no longer multiplies by a bare `1.j`. Every supported gate now matches
+> `qiskit.quantum_info.Statevector` exactly (not merely up to a global phase), the 6-qubit 4-rep
+> Trotter step included; `cz` is the one exception, correct only up to a uniform `exp(i*pi/4)` that
+> its `rzz`+`rz` decomposition cannot express. Two further problems found while fixing it: `x` and
+> `z` had carried a `-i` global phase relative to the bare Paulis (independent of the phase bug, and
+> `y` matched Qiskit only because the two errors cancelled), and `cz` is rejected as a raw gate spec
+> despite being listed in the docstring. `tests/test_svsim.py` covers all of it -- 67 tests,
+> verified to catch each defect by reverting the fix in place. The `examples/svsim.py` masking
+> problem is fixed too: it now checks *which* states carry amplitude, not just how many.
+>
+> The rest of this document is the original assessment, kept for its measurements and reasoning.
+
 ## Short answer
 
 Yes — the library is close to purpose-built for it, and `sqd.py` handles more of SKQD than SQD
@@ -58,7 +72,8 @@ real-valued in practice) or add a separate `phase` field to `CircuitXZ`.
   near 32–40 qubits on HPC, well below `sqd`'s own $N \le 2^{31}$ subspace limit. Fine for
   algorithm validation; not a route to a hardware-scale demo.
 - **`rqutils/sqd.py:544`** (`iterm & 255` where `iterm & 7` is intended) only affects
-  `cache_level[1] == 1`, which is not the default `(1, 0)` — not a blocker.
+  `cache_level[1] == 1`, which is not the default `(1, 0)` — not a blocker. *(Fixed 2026-08-04,
+  along with two initial-vector bugs that did affect the default path; see `tests/test_sqd.py`.)*
 - SKQD does not need SQD's self-consistent configuration recovery, so nothing is missing there.
 
 ## Scope of this investigation

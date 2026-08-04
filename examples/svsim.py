@@ -25,6 +25,7 @@ from argparse import ArgumentParser
 import h5py
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import AxisType
 from qiskit import QuantumCircuit, transpile
 
@@ -73,9 +74,22 @@ circuit = transpile(
 # Run the simulation (state vector is sharded automatically)
 final_state = svsim(circuit)
 
-# How many nonzero elements are in the final state?
-num_nonzero = jnp.sum(jnp.logical_not(jnp.isclose(final_state, 0.0)))
-logger.info("Number of nonzero elements in the GHZ state: %d", num_nonzero)
+# Check the result. Counting nonzero elements is not enough on its own: this script used to assert
+# only "num_nonzero == 2", which passed while the two populated states were |0...0> and |0...01>
+# rather than |0...0> and |1...1> -- it reported a GHZ state it had not produced, and so masked the
+# missing symplectic phase described in docs/skqd.md. Check WHICH states carry the amplitude.
+nonzero = jnp.nonzero(jnp.logical_not(jnp.isclose(final_state, 0.0)))[0]
+logger.info("Number of nonzero elements in the GHZ state: %d", nonzero.shape[0])
+expected_indices = (0, 2**options.num_qubits - 1)
+if nonzero.shape[0] != 2 or tuple(int(i) for i in nonzero) != expected_indices:
+    raise RuntimeError(
+        f"not a GHZ state: expected amplitude on indices {expected_indices} "
+        f"(|0...0> and |1...1>), got {[int(i) for i in nonzero]}"
+    )
+amplitudes = final_state[jnp.asarray(expected_indices)]
+if not np.allclose(np.abs(np.asarray(amplitudes)), 1.0 / np.sqrt(2.0), atol=1e-8):
+    raise RuntimeError(f"GHZ amplitudes are not 1/sqrt(2): {np.asarray(amplitudes)}")
+logger.info("Verified GHZ state: amplitudes %s", np.asarray(amplitudes))
 
 # Write the output
 if options.gpus == "mpi":
