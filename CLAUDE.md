@@ -29,7 +29,20 @@ Pre-commit only runs whitespace/EOF/YAML/large-file hooks — there is no linter
 
 ## Testing
 
-**There is no pytest suite.** `tests/` contains three Jupyter notebooks (`paulis.ipynb`, `qprint.ipynb`, `sqd.ipynb`) used as interactive scratchpads. To verify a change, write a throwaway `uv run python -c ...` script or run the matching `examples/` script. Don't claim tests pass — there are none to run.
+```bash
+uv run --extra test pytest              # whole suite
+uv run --extra test pytest -v -x        # verbose, stop at first failure
+```
+
+`tests/test_ground_locg.py` covers `rqutils/ground_locg.py` only — the other six modules have no
+automated tests yet, so for those still write a throwaway `uv run python -c ...` script or run the
+matching `examples/` script. `tests/` also contains three Jupyter notebooks (`paulis.ipynb`,
+`qprint.ipynb`, `sqd.ipynb`) used as interactive scratchpads; pytest does not collect them.
+
+`tests/conftest.py` enables `jax_enable_x64` before any `rqutils` import — every tolerance in the
+suite depends on it. Tests are organized by defect and keyed to the audit items in `docs/locg.md`;
+when adding one, name the item it locks down and assert on the eigenvector residual as well as the
+eigenvalue (the audit's I3 returned an exact eigenvalue with a garbage eigenvector).
 
 ## Architecture
 

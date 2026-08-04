@@ -463,6 +463,14 @@ def _ground_locg_callable(
 
     xinit = normalize(xinit)
 
+    # The projected matrix inherits xinit's dtype at the seed step but the operator's inside the
+    # loop, so a lower-precision xinit makes while_loop's carry types disagree on theta. Promote up
+    # front. eval_shape reads the operator dtype without spending a matrix-vector product, and
+    # astype on a matching dtype is a no-op, so the common path is unaffected.
+    work_dtype = jnp.result_type(xinit.dtype,
+                                 jax.eval_shape(lambda vec: matvec(vec, *args), xinit).dtype)
+    xinit = xinit.astype(work_dtype)
+
     vs_iter0 = body_iter0(xinit)
     if debug:
         diag0 = jax.tree.map(lambda a: jnp.expand_dims(a, 0), vs_iter0[-1])
@@ -473,7 +481,8 @@ def _ground_locg_callable(
     if tol is None:
         # Derive the tolerance from the operator, not from the initial guess: a float32 xinit on a
         # complex128 problem would otherwise silently loosen this by nine orders of magnitude.
-        tol = float(jnp.finfo(jnp.result_type(xinit.dtype, vs_iter0[2].dtype)).eps)
+        # work_dtype above is already that promotion.
+        tol = float(jnp.finfo(work_dtype).eps)
 
     vs_iter1 = body_iter1(vs_iter0[0], vs_iter0[1], vs_iter0[2])
     if debug:
