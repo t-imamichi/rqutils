@@ -279,6 +279,39 @@ uv run --extra mlx python examples/bench_mlx.py --arm mlx-gpu-f32 \
     --num-qubits 14 --num-paulis 100 --num-states <N>
 ```
 
+## Implementation status (as merged)
+
+Implemented in eleven commits, `6049457..9be9a80`. Everything except the two
+items below is done, gate-green (ruff / ruff format / ty / 357 pytest), and
+reviewed. `sas="ops"` and `--sas ops` remain the defaults, so the new path is
+unreachable unless explicitly requested and merging carries no regression risk
+to existing measured results.
+
+**Two obligations remain, both requiring a Metal device:**
+
+1. **Nothing has ever compiled or executed either Metal kernel.** The numpy shim
+   validates the caller contract by reimplementing the intended indexing in
+   Python; it never reads the kernels' `source` string, so it is blind to a
+   defect in the Metal text itself. Run
+   `uv run --extra mlx python examples/check_ground_locg_mlx_mlx.py` first —
+   expect `FAILURES: none`, with `sas=metal` and `metal-both` lines for
+   `mlx-cpu-f32` and `mlx-gpu-f32`. Until that passes, treat the kernel as
+   unproven.
+2. **The N sweep above.** Success criterion 6 is unmet by construction.
+
+Two findings from review worth carrying into the sweep:
+
+* No `mlx-*` arm has ever run at `subspace_dim > 5000`, so `_time_mlx`'s
+  `matrix @ matvec_probe` against a sparse CSR reference is untested on that
+  path (textually identical to the verified `_time_jax` site, so low risk).
+  Make that combination one of the sweep points rather than testing large N
+  only on JAX.
+* A **pre-existing** latent bound in `apply_h_xz_mlx_metal` (not introduced by
+  this work): its flat index `j * n_states + i` reaches `J*N`, which overflows
+  32-bit Metal `uint` at N=1e7 once J > 429. Outside the documented J≈100
+  regime, but relevant if the sweep pushes both N and J hard. The sas kernel's
+  own index reaches only `3N-1` and is safe past N≈1.4e9.
+
 ## Success criteria
 
 1. `check_ground_locg_mlx_static.py` passes, including the new sas cases, on a
