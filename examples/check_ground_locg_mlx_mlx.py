@@ -23,7 +23,11 @@ jax.config.update("jax_enable_x64", True)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _bench_common import build_solver_inputs, dense_reference, generate_problem
 
-from rqutils.ground_locg_mlx import apply_h_xz_mlx, ground_locg_mlx
+from rqutils.ground_locg_mlx import (
+    apply_h_xz_mlx,
+    apply_h_xz_mlx_metal,
+    ground_locg_mlx,
+)
 
 ps, cs, states = generate_problem(10, 20, 200, seed=1)
 inputs = build_solver_inputs(ps, cs, states)
@@ -80,6 +84,21 @@ for device, name in ((mx.cpu, "cpu"), (mx.gpu, "gpu")):
                 )
                 if not ok_sas:
                     failures.append(f"{arm}-sas-metal")
+
+                # Both custom Metal kernels active at once: apply_h_xz_mlx_metal for
+                # matvec + sas="metal" for Rayleigh-Ritz. This is the configuration the
+                # benchmark measures and the only one where both kernels are resident
+                # together.
+                eig_both, _, iters_both, _ = ground_locg_mlx(
+                    apply_h_xz_mlx_metal, v0, args=(xs, dg), sas="metal"
+                )
+                ok_both = abs(eig_both - ref) < rtol * max(1.0, abs(ref))
+                print(
+                    f"{arm} metal-both: eig={eig_both:.10f} iters={iters_both} "
+                    f"{'OK' if ok_both else 'FAIL'}"
+                )
+                if not ok_both:
+                    failures.append(f"{arm}-metal-both")
         except Exception as exc:  # noqa: BLE001 (a checker must survive any arm's failure)
             print(f"{arm}: ERROR {type(exc).__name__}: {exc}")
             failures.append(arm)
