@@ -230,8 +230,19 @@ def apply_h_xz_mlx_metal(vec, xsources, diagonals, threadgroup=256):
     return outputs[0]
 
 
+# Threadgroup memory arrays need a compile-time-constant size in Metal -- they cannot be sized by
+# the runtime `lanes` value, since MLX generates the kernel's signature from input_names/
+# output_names plus a fixed table of attributes, with no way to thread a runtime size into a
+# `threadgroup` declaration. So `partials` is declared with this literal size, and the Python
+# wrapper below must raise rather than silently clamp if a caller's `threadgroup` would exceed it.
+_METAL_SAS_MAX_THREADGROUP = 256
+
 _METAL_SAS_SOURCE = """
     // One threadgroup per (i, j) pair with i <= j; one thread per stride-slice of the vectors.
+    // Fixed-size threadgroup memory: see _METAL_SAS_MAX_THREADGROUP above for why this must be a
+    // compile-time literal rather than `lanes`. Only the first `lanes` slots are ever touched.
+    threadgroup T partials[_METAL_SAS_MAX_THREADGROUP_LITERAL_];
+
     uint pair = threadgroup_position_in_grid.x;
     uint lane = thread_position_in_threadgroup.x;
     uint lanes = threads_per_threadgroup.x;
@@ -276,7 +287,7 @@ _METAL_SAS_SOURCE = """
         out[i * n_basis + j] = partials[0];
         out[j * n_basis + i] = partials[0];
     }
-"""
+""".replace("_METAL_SAS_MAX_THREADGROUP_LITERAL_", str(_METAL_SAS_MAX_THREADGROUP))
 
 _METAL_SAS_KERNEL = None
 
@@ -290,7 +301,6 @@ def _get_metal_sas_kernel():
             input_names=["vectors", "mvs", "n_basis", "n_states"],
             output_names=["out"],
             source=_METAL_SAS_SOURCE,
-            header="#include <metal_stdlib>\n",
         )
     return _METAL_SAS_KERNEL
 
@@ -321,7 +331,9 @@ def _compute_sas_metal(vectors, mvs, threadgroup=256):
         vectors: Basis vectors, a tuple of 2 or 3 arrays of shape ``(N,)``, float32.
         mvs: Their images under A, same length and shapes, float32.
         threadgroup: Maximum threads per threadgroup. Rounded down to a power of two so the
-            tree reduction halves exactly.
+            tree reduction halves exactly, and must not exceed
+            :data:`_METAL_SAS_MAX_THREADGROUP` -- the kernel's ``partials`` array is sized by
+            that literal at compile time, not by this runtime value.
 
     Returns:
         The ``(n, n)`` matrix of ``<v_i | A | v_j>``, exactly symmetric.
@@ -329,6 +341,7 @@ def _compute_sas_metal(vectors, mvs, threadgroup=256):
     Raises:
         ValueError: If the inputs are not float32, since Metal has no float64.
         ValueError: If ``vectors`` and ``mvs`` differ in length, or the length is not 2 or 3.
+        ValueError: If ``threadgroup`` exceeds :data:`_METAL_SAS_MAX_THREADGROUP`.
     """
     if len(vectors) != len(mvs):
         raise ValueError(f"vectors and mvs must have equal length, got {len(vectors)}/{len(mvs)}")
@@ -342,6 +355,17 @@ def _compute_sas_metal(vectors, mvs, threadgroup=256):
                     f"_compute_sas_metal requires float32 (Metal has no float64), got "
                     f"{array.dtype} in {name}. Use _compute_sas for the f64 arms."
                 )
+    # The kernel's `partials` threadgroup array is declared with a compile-time-constant size
+    # (see _METAL_SAS_MAX_THREADGROUP above); raise loudly rather than silently clamping, since a
+    # silent clamp here would mean the caller's requested threadgroup size is not what actually
+    # ran, which is exactly the class of "plausible wrong number" bug this repo's guards exist to
+    # prevent.
+    if threadgroup > _METAL_SAS_MAX_THREADGROUP:
+        raise ValueError(
+            f"threadgroup={threadgroup} exceeds _METAL_SAS_MAX_THREADGROUP="
+            f"{_METAL_SAS_MAX_THREADGROUP}, the compile-time size of the kernel's `partials` "
+            "threadgroup array"
+        )
 
     num_states = vectors[0].shape[0]
     stacked_v = mx.stack(vectors)
@@ -355,10 +379,9 @@ def _compute_sas_metal(vectors, mvs, threadgroup=256):
     while lanes * 2 <= min(threadgroup, num_states):
         lanes *= 2
 
-    # No output initialization is needed (and no `init_value=` is passed -- that kwarg is not in
-    # MLX 0.32.0's documented call signature): the pairs (i, j) with i <= j cover every slot of
-    # the (n, n) output once the j > i writes are mirrored, so every element is written before it
-    # is read. Do not "fix" this by zero-filling first; that would add back a launch.
+    # No output initialization is needed: the pairs (i, j) with i <= j cover every slot of the
+    # (n, n) output once the j > i writes are mirrored, so every element is written before it is
+    # read. Do not "fix" this by zero-filling first; that would add back a launch.
     kernel = _get_metal_sas_kernel()
     outputs = kernel(
         inputs=[stacked_v, stacked_m, num_basis, num_states],

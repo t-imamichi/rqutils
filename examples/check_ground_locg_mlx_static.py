@@ -86,11 +86,14 @@ shim.finfo = np.finfo
 def _shim_metal_kernel(name, input_names, output_names, source, **kwargs):
     """Stand in for mx.fast.metal_kernel by interpreting each kernel's arithmetic in numpy.
 
-    Dispatches on `name`: this module now has two kernels. Reproducing their per-thread and
-    per-threadgroup indexing here lets the static check verify the CALLERS (shapes, dtypes, grid
-    setup, flat row-major indexing, threadgroup rounding) without a Metal device. It does NOT
-    verify that the Metal source compiles, that the barriers are correct, or that it is right on
-    device -- only the user's real-hardware run can.
+    Dispatches on `name`: this module now has two kernels. Each closure below is an independent
+    numpy reimplementation of the kernel's *intended* per-thread/per-threadgroup indexing -- it
+    does not read the `source` argument at all. So it can catch a divergence between the CALLER's
+    contract (shapes, dtypes, grid/threadgroup setup, flat row-major indexing) and that intent,
+    but it is blind to a bug in the Metal source text itself (e.g. a transposed index inside
+    `source`): such a bug would not change what this shim computes, since the shim never looks at
+    `source`. It also cannot verify that the Metal source compiles, that the barriers are
+    correct, or that it is right on device -- only the user's real-hardware run can.
     """
 
     def call_matvec(inputs, output_dtypes=None, **kw):
@@ -116,10 +119,12 @@ def _shim_metal_kernel(name, input_names, output_names, source, **kwargs):
         )
         assert lanes & (lanes - 1) == 0, f"threadgroup {lanes} is not a power of two"
         out = np.zeros((num_basis, num_basis), dtype=np.dtype(output_dtypes[0]))
-        # Reproduce the kernel's own pair-unranking scan, strided partial sums, and tree
-        # reduction -- not just the mathematical result -- so an indexing error here shows up.
+        # Reproduce the kernel's *intended* pair-unranking scan, strided partial sums, and tree
+        # reduction -- not just the mathematical result -- so a mismatch between the caller's
+        # grid/threadgroup contract and that intent shows up here. This is independent of
+        # `source`, so it cannot catch a bug written into the Metal source text itself.
         pairs = [(a, b) for a in range(num_basis) for b in range(a, num_basis)]
-        for pair, (i, j) in enumerate(pairs):
+        for i, j in pairs:
             partials = np.zeros(lanes, dtype=np.dtype(output_dtypes[0]))
             for lane in range(lanes):
                 acc = np.dtype(output_dtypes[0]).type(0)
@@ -332,6 +337,45 @@ for nbasis in (2, 3):
     print(
         f"OK  _compute_sas_metal n={nbasis} matches _compute_sas ({err_sas:.2e}) and "
         f"direct v@m ({err_direct:.2e}), exactly symmetric"
+    )
+
+# 3h continued: the loop above uses mvs = H @ v for real symmetric H, so v_i . mv_j ==
+# v_j . mv_i mathematically -- a transposed `vectors[j]*mvs[i]` bug in the kernel source would be
+# invisible even on real hardware with that data, and the (direct + direct.T) * 0.5 above
+# symmetrizes away the only remaining signal in the shim comparison too. Use genuinely asymmetric
+# mvs (independent random vectors, not images of any operator) to break that degeneracy: now
+# v_i . mv_j != v_j . mv_i in general, so a transposed index would show up.
+#
+# The kernel only ever promises the i <= j inner products (both triangles get the *same* write),
+# so the right assertion is against those specific dot products, not against a full v @ M matrix:
+# out[i, j] == out[j, i] == v_i . mv_j for every i <= j -- exactly what the docstring claims.
+rng_asym = np.random.default_rng(23)
+for nbasis in (2, 3):
+    vecs_a = [rng_asym.normal(size=inputs.subspace_dim).astype(np.float32) for _ in range(nbasis)]
+    mvs_a = [rng_asym.normal(size=inputs.subspace_dim).astype(np.float32) for _ in range(nbasis)]
+    got_asym = np.asarray(_compute_sas_metal(tuple(vecs_a), tuple(mvs_a)))
+
+    asym2 = np.abs(got_asym - got_asym.T).max()
+    assert asym2 == 0.0, f"n={nbasis} (asymmetric mvs): output not exactly symmetric ({asym2})"
+
+    scale_a = max(1.0, np.abs(np.stack(vecs_a)).max() * np.abs(np.stack(mvs_a)).max() * 100)
+    for i in range(nbasis):
+        for j in range(i, nbasis):
+            want_ij = float(vecs_a[i] @ mvs_a[j])
+            err_ij = abs(float(got_asym[i, j]) - want_ij)
+            assert err_ij < 1e-4 * scale_a, (
+                f"n={nbasis} (asymmetric mvs): out[{i},{j}]={got_asym[i, j]} disagrees with "
+                f"v_{i}.mv_{j}={want_ij} by {err_ij}"
+            )
+            err_ji = abs(float(got_asym[j, i]) - want_ij)
+            assert err_ji < 1e-4 * scale_a, (
+                f"n={nbasis} (asymmetric mvs): out[{j},{i}]={got_asym[j, i]} disagrees with "
+                f"v_{i}.mv_{j}={want_ij} by {err_ji} -- both triangles must equal v_i.mv_j, "
+                "not v_j.mv_i"
+            )
+    print(
+        f"OK  _compute_sas_metal n={nbasis} with asymmetric mvs: out[i,j]==out[j,i]==v_i.mv_j "
+        "for all i<=j (discriminates a transposed index)"
     )
 
 # The float64 guard must fire, mirroring apply_h_xz_mlx_metal's (Metal has no float64).
