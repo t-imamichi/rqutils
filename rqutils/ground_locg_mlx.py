@@ -50,14 +50,41 @@ Five structural differences, all forced by MLX:
 The analytic 2x2/3x3 Rayleigh-Ritz step carries over directly, which is what makes this port
 feasible at all -- MLX has no ``eigh``.
 
+Beyond the port itself, this module also adds two custom Metal kernels via
+``mx.fast.metal_kernel``, selected by :func:`ground_locg_mlx`'s ``sas`` parameter:
+:func:`apply_h_xz_mlx_metal` fuses the matvec's gather-multiply-accumulate into one GPU launch
+(the op-graph path, :func:`apply_h_xz_mlx`/:func:`apply_h_xz_mlx_chunked`, needs several), and
+the private ``_compute_sas_metal`` fuses the Rayleigh-Ritz inner products the same way -- 16 op
+launches (measured) collapsing to 1. Both kernels are float32-only, since Metal has no float64;
+the default ``sas="ops"`` op-graph path is unchanged from before the parameter existed and
+remains the only route for an f64 solve. This is additional surface area, not a structural
+difference forced by the port -- it introduces no new numerics, only a fused execution strategy
+for the same inner products :func:`_compute_sas` already computes, so it does not belong in the
+list above. Its speed effect relative to the op-graph path is unmeasured: this machine has no
+Metal device (see Verification below), so only the launch count is known, not any wall-clock
+ratio.
+
+This is also the one place this port deliberately diverges from :mod:`rqutils.ground_locg`
+without a JAX-side counterpart, and thus an exception to the "when you change one, change both"
+rule above: a fused Metal kernel adds no algebraic content over the op-graph computation it
+replaces -- it is a fused execution strategy for an existing quantity, not new numerics -- and
+Metal's float64-less hardware is exactly what this port targets, so there is no float64 JAX path
+this fusion could be mirrored onto.
+
 Verification
 ============
 
 MLX cannot initialize without a Metal device, which rules out headless testing. Two checkers
 cover the gap: ``examples/check_ground_locg_mlx_static.py`` re-executes this module's source
 against a numpy shim bound to the name ``mx`` (no MLX, no GPU -- this is what validates the
-algorithm), and ``examples/check_ground_locg_mlx_mlx.py`` runs the real thing on both devices
-and both precisions.
+algorithm and the caller-facing contract), and ``examples/check_ground_locg_mlx_mlx.py`` runs
+the real thing on both devices and both precisions, but requires a real Metal device and has
+not been run.
+
+Neither checker exercises the two Metal kernels' actual ``source`` strings. The numpy shim
+reimplements the intended per-thread indexing in Python/numpy rather than compiling and running
+the Metal C++ text, so it is blind to a bug in that text itself, and the real-device checker has
+never been run for lack of hardware. **No Metal kernel in this module has ever been executed.**
 
 MLX LOBPCG API
 ==============
