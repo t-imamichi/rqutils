@@ -112,4 +112,46 @@ out = subprocess.run(
 assert out.returncode != 0, "--sas bogus was accepted"
 print("OK  --sas bogus rejected")
 
+# 7. The sparse reference path: above DENSE_REFERENCE_MAX_DIM (5000), dense_reference's (N, N)
+# array stops being allocatable at large N, so the gate must fall back to sparse_reference and
+# say so. --num-qubits 13 keeps 2**13=8192 comfortably above --num-states 8000 (states are drawn
+# with replacement, so the realized subspace_dim is a bit below 8000) while staying above
+# BRUTE_FORCE_MAX_QUBITS (12), which auto-skips the slow 2^n cross-check -- --skip-brute-force
+# also makes that skip explicit. --num-paulis 20 (rather than the default 100) keeps the sparse
+# operator small enough (J*N nonzeros) to build and eigsh quickly.
+out = subprocess.run(
+    [
+        "uv",
+        "run",
+        "python",
+        BENCH,
+        "--arm",
+        "jax-cpu-f64",
+        "--num-qubits",
+        "13",
+        "--num-paulis",
+        "20",
+        "--num-states",
+        "8000",
+        "--repeat",
+        "1",
+        "--fixed-iters",
+        "20",
+        "--skip-brute-force",
+        "--json",
+    ],
+    capture_output=True,
+    text=True,
+    check=False,
+)
+assert out.returncode == 0, f"sparse-reference arm failed its gate:\n{out.stdout}\n{out.stderr}"
+row = json.loads(out.stdout)
+row = row["results"][0] if "results" in row else row
+assert row["status"] == "ok", row
+assert row["reference_path"] == "sparse", (
+    f"expected the sparse reference path above DENSE_REFERENCE_MAX_DIM, got "
+    f"{row.get('reference_path')!r}: {row}"
+)
+print(f"OK  sparse reference path used and passed its gate (dim>5000, eig={row['eigval']:.10f})")
+
 print("\nJAX-SIDE CHECKS PASSED (MLX arms still unverified)")

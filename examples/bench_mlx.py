@@ -212,10 +212,12 @@ def run_arm(arm, options):
 
     import numpy as np
     from _bench_common import (
+        DENSE_REFERENCE_MAX_DIM,
         brute_force_reference,
         build_solver_inputs,
         dense_reference,
         generate_problem,
+        sparse_reference,
     )
 
     if framework == "jax" and device == "metal":
@@ -260,7 +262,35 @@ def run_arm(arm, options):
     # whose setup precision differs is not solving byte-identical arrays to the rest.
     setup_precision = "f32" if device == "metal" else "f64"
 
-    matrix, reference = dense_reference(inputs)
+    # dense_reference allocates an (N, N) float64 array: 200 MB at N=5000, 7.2 GB at N=30000,
+    # 80 GB at N=1e5. Above DENSE_REFERENCE_MAX_DIM that stops being allocatable, so the
+    # reference eigenvalue instead comes from sparse_reference (independent eigsh on a CSR
+    # operator), and `matrix` becomes a scipy.sparse CSR matrix rather than a dense ndarray --
+    # `matrix @ matvec_probe` below (and in _time_jax/_time_mlx) works identically either way,
+    # since scipy.sparse's `@` with a dense vector returns a dense ndarray. At or below the
+    # threshold this is an explicit no-op: existing invocations (the bench default is
+    # --num-states 4000, below the 5000 threshold) keep calling dense_reference exactly as
+    # before and stay bit-for-bit reproducible.
+    reference_path = "dense"
+    if inputs.subspace_dim > DENSE_REFERENCE_MAX_DIM:
+        reference_path = "sparse"
+        # Mirrors sparse_reference's own CSR construction (examples/_bench_common.py) rather
+        # than sharing code with it: sparse_reference's public signature is
+        # `sparse_reference(inputs) -> float` (already relied on by
+        # examples/check_bench_common.py), so it has no way to also hand back the matrix it
+        # built internally without changing that signature. Duplicating the four-line
+        # construction here is smaller and less risky than reshaping an already-tested
+        # function's interface for a second caller.
+        import scipy.sparse
+
+        dim = inputs.subspace_dim
+        rows = np.tile(np.arange(dim), inputs.xsources.shape[0])
+        cols = inputs.xsources.reshape(-1)
+        data = inputs.diagonals.reshape(-1)
+        matrix = scipy.sparse.coo_matrix((data, (rows, cols)), shape=(dim, dim)).tocsr()
+        reference = sparse_reference(inputs)
+    else:
+        matrix, reference = dense_reference(inputs)
     brute_force_note = None
     skip_brute_force = options.skip_brute_force
     if not skip_brute_force and options.num_qubits > BRUTE_FORCE_MAX_QUBITS:
@@ -360,6 +390,7 @@ def run_arm(arm, options):
         )
 
     result["reference"] = reference
+    result["reference_path"] = reference_path
     result["setup_precision"] = setup_precision
     result["brute_force_note"] = brute_force_note
     result["setup_s"] = setup_s
@@ -658,6 +689,8 @@ def report(results, as_json):
             opt += " compile_body"
         if row.get("sas") == "metal":
             opt += " sas=metal"
+        if row.get("reference_path") == "sparse":
+            opt += " reference=sparse"
         print(
             f"{row['arm']:<15}{row['setup_s']:>9.4f}{row['compile_s']:>10.4f}"
             f"{row['fixed_s']:>10.4f}{row['per_it_ms']:>11.3f}{row['solve_s']:>10.4f}"
@@ -689,6 +722,13 @@ def report(results, as_json):
             print(f"NOTE [{row['arm']}]: {row['brute_force_note']}")
         if row.get("compile_body_note"):
             print(f"NOTE [{row['arm']}]: {row['compile_body_note']}")
+        if row.get("reference_path") == "sparse":
+            print(
+                f"NOTE [{row['arm']}]: reference eigenvalue came from sparse_reference (scipy "
+                "sparse eigsh), not dense_reference -- the subspace dimension exceeded "
+                "DENSE_REFERENCE_MAX_DIM, above which the dense (N, N) reference matrix is not "
+                "allocatable."
+            )
 
 
 def main():
