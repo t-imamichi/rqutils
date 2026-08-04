@@ -9,6 +9,8 @@ That audit's closing warning shapes the design here:
 
 So targeted per-branch tests are the backbone and randomized sweeps are a supplement.
 """
+import warnings
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -134,6 +136,32 @@ class TestEigenpair2x2:
         assert worst_eigval < 1e-13, f'worst relative eigenvalue error {worst_eigval:.2e}'
         assert worst_residual < 1e-13, f'worst relative residual {worst_residual:.2e}'
 
+    @pytest.mark.parametrize('delta_sign', [1., -1.])
+    def test_tiny_offdiagonal_relative_to_delta(self, delta_sign):
+        """The delta-sign branch only matters when |offd| << |delta|.
+
+        ``two_by_two`` above never generates an off-diagonal/delta ratio below 2.4e-2, so it cannot
+        exercise the regime this branch exists for. Reviewer-measured: removing the branch entirely
+        (using only the ``delta >= 0`` row unconditionally) gives residual 8.9e-11 on
+        ``[[-1, 1e-6], [1e-6, 1]]`` (the delta < 0 case; the delta > 0 case happens to keep using the
+        surviving row and stays accurate). The real code reaches ~1e-22 on both signs here, so 1e-10
+        would slip right past the mutant -- verified directly: 8.9e-11 < 1e-10. Use the same 1e-13
+        relative tolerance as the rest of this class, four orders of magnitude below the mutant's
+        residual and comfortably above the real code's.
+        """
+        offd = 1e-6
+        if delta_sign > 0:
+            mat = np.array([[1., offd], [offd, -1.]])
+        else:
+            mat = np.array([[-1., offd], [offd, 1.]])
+        diag = np.diagonal(mat).real
+        assert np.sign((diag[0] - diag[1]) / 2.) == delta_sign
+        eigval, eigvec = eigenpair_2x2(jnp.asarray(mat))
+        eigval = float(eigval)
+        assert np.isfinite(eigval)
+        assert eigval == pytest.approx(lowest(mat), rel=1e-13)
+        assert rel_resid(mat, eigval, eigvec) < 1e-13
+
 
 class TestEigenpair3x3:
     """Lowest eigenpair of a 3x3 Hermitian matrix, via Cardano's method.
@@ -171,6 +199,12 @@ class TestEigenpair3x3:
 
         Every cross product is numerical noise here; the null space is the orthogonal complement of
         the largest column, and any member of it is a valid eigenvector.
+
+        This axis-aligned matrix does NOT actually reach the rank-1 fallback: for diag(1, 1, 7) the
+        rank-0 constant candidate [1, 0, 0] happens to already be a true eigenvector and wins the
+        residual selection outright, so this case alone leaves the rank-1 branch unexercised (see
+        ``test_degenerate_lowest_rank_one_rotated`` below, which forces it). Kept because it still
+        documents the axis-aligned case.
         """
         mat = np.diag([1., 1., 7.])
         eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
@@ -178,6 +212,31 @@ class TestEigenpair3x3:
         assert eigval == pytest.approx(1., abs=1e-13)
         assert rel_resid(mat, eigval, eigvec) < 1e-13
         assert np.linalg.norm(np.asarray(eigvec)) == pytest.approx(1.)
+
+    def test_degenerate_lowest_rank_one_rotated(self):
+        """Item I3 rank-1 fallback, actually forced: no axis-aligned vector lies in the null space.
+
+        ``diag(1, 1, 7)`` does not reach the rank-1 fallback in ``_nullvec_3x3`` (the rank-0 constant
+        candidate wins by accident), so deleting the fallback entirely still leaves all other tests
+        green. Rotating the degenerate matrix by a random orthogonal Q removes that accident: no
+        candidate other than the rank-1 orthogonal-complement construction can land in the null
+        space. Reviewer-measured over 200 such draws: worst relative residual 2.2e-01 with the
+        fallback deleted, versus 6.5e-16 for the real code.
+        """
+        rng = np.random.default_rng(20260804)
+        worst_residual = 0.
+        for _ in range(50):
+            lo = rng.normal()
+            hi = lo + abs(rng.normal()) + 0.5  # strictly above lo: lo stays the degenerate lowest
+            axes = np.array([lo, lo, hi])
+            q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+            mat = q @ np.diag(axes) @ q.T
+            eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
+            eigval = float(eigval)
+            assert np.isfinite(eigval)
+            assert eigval == pytest.approx(lo, abs=1e-13)
+            worst_residual = max(worst_residual, rel_resid(mat, eigval, eigvec))
+        assert worst_residual < 1e-13, f'worst relative residual {worst_residual:.2e}'
 
     def test_large_shift(self):
         """Item I1: at shift 1e9 the radicand under ``sqrt`` went negative and returned NaN.
@@ -244,6 +303,7 @@ class TestDtypes:
         (jnp.float32, jnp.float32),
         (jnp.float64, jnp.float32),
         (jnp.complex128, jnp.float32),
+        (jnp.complex128, jnp.float64),
     ])
     def test_dtype_combinations_solve(self, operator_dtype, xinit_dtype):
         rng = np.random.default_rng(20260804)
@@ -270,9 +330,64 @@ class TestDtypes:
         from_f32 = float(ground_locg(mat, jnp.asarray(xinit, dtype=jnp.float32))[0])
         assert from_f32 == pytest.approx(from_f64, rel=1e-12)
 
+    def test_complex_operator_real_xinit_emits_no_warnings(self):
+        """A complex128 operator with a real float64 ``xinit`` is a natural, previously-working call.
+
+        Before the ``work_dtype`` promotion in ``_ground_locg_callable``, this path emitted
+        ``FutureWarning: cannot safely cast complex128 to float64`` and ``ComplexWarning: Casting
+        complex values discards the imaginary part`` from ``compute_sas``'s scatter, and silently
+        discarded the imaginary part of the projected matrix -- a real bug, not just a noisy warning,
+        since a genuinely complex Hamiltonian's off-diagonal imaginary parts would be dropped from the
+        Rayleigh-Ritz step. The promotion added for the dtype-mismatch crash (see ``TestDtypes``'s
+        class docstring) fixes this as a side effect. Guard both properties: no warnings, and a
+        genuinely complex (non-Hermitian-as-real) operator still solves correctly.
+        """
+        rng = np.random.default_rng(20260804)
+        mat = herm(30, rng, complex_=True)  # genuinely complex off-diagonal, not just complex dtype
+        xinit = rng.normal(size=30)  # real float64, deliberately not complex
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            eigval, eigvec, _, converged = ground_locg(
+                jnp.asarray(mat, dtype=jnp.complex128), jnp.asarray(xinit, dtype=jnp.float64)
+            )
+        assert bool(converged)
+        assert float(eigval) == pytest.approx(lowest(mat), rel=1e-12)
+        assert rel_resid(mat, float(eigval), np.asarray(eigvec)) < 1e-12
+
+    def test_maxiter_zero_complex_operator_promotes_eigenvector_dtype(self):
+        """Documents a visible consequence of the promotion: ``maxiter=0``'s eigenvector dtype.
+
+        ``_ground_locg_callable`` returns the promoted ``xinit`` verbatim when ``maxiter=0``, so a
+        complex128 operator with a real float64 ``xinit`` now gets back a complex128 eigenvector
+        (all-real-valued, but complex dtype) instead of float64. This is the flip side of the fix
+        above being deliberate rather than accidental: the imaginary part is no longer discarded
+        anywhere in the pipeline, including trivially at ``maxiter=0``.
+        """
+        rng = np.random.default_rng(20260804)
+        mat = herm(10, rng, complex_=True)
+        xinit = rng.normal(size=10)
+        _, eigvec, _, _ = ground_locg(jnp.asarray(mat, dtype=jnp.complex128),
+                                      jnp.asarray(xinit, dtype=jnp.float64), maxiter=0)
+        assert np.asarray(eigvec).dtype == np.complex128
+
 
 class TestGroundLocg:
-    """End-to-end LOBPCG solves."""
+    """End-to-end LOBPCG solves.
+
+    Coverage gap, recorded honestly rather than silently: items I5 (x/y orthogonality loss in
+    ``body()``) and I6 (``_project_out``'s non-unit-norm postcondition, in the ``p_is_zero`` branch
+    of ``body()`` specifically, as opposed to ``TestProjectOut`` which covers ``_project_out`` in
+    isolation) have NO end-to-end mutation coverage in this suite. A mutation-testing pass confirmed
+    that deleting *both* re-orthogonalization loops in ``body()`` (the I5 fix) leaves every test
+    below passing -- the ``herm(200) + shift*I`` fixtures below converge in ~63 iterations and simply
+    do not induce the x/y collapse the audit measured (worst observed |<x|y>| 1.7e-16 with the
+    fix deleted, versus the audit's 1.0 at shift 1e9). The ``eigval > reference - 1e-8*scale``
+    assertion in ``test_solves_and_converges`` below was, before this comment, believed to cover I5;
+    it does not -- it was actually passing only because ``test_xinit_scale_invariance``'s old
+    bit-exact-equality assertion happened to also break under the same mutant (see that test and
+    Finding 2 of the 2026-08-04 review). Reproducing I5 for real needs a fixture that drives |s| -> 0
+    near convergence for a large-shift operator; nobody has constructed one yet.
+    """
 
     @pytest.mark.parametrize('shift', [0., 1e3, -1e3, 1e6, 1e9])
     @pytest.mark.parametrize('complex_', [True, False])
@@ -283,10 +398,11 @@ class TestGroundLocg:
         which made the convergence test unsatisfiable: the solver never converged and always burned
         ``maxiter``. Fixing that sign alone was a 24-33x iteration reduction.
 
-        Item I5, the audit's most serious finding -- loss of x/y orthogonality made the standard
-        Rayleigh-Ritz step return a theta *beneath* the true minimum (observed 6.0e8 against a true
-        minimum of 1.0e9), which is impossible for a genuine Rayleigh quotient. A caller checking
-        only "is it finite" would have accepted it.
+        The eigval-below-reference assertion below is *aimed at* item I5, the audit's most serious
+        finding (loss of x/y orthogonality making the standard Rayleigh-Ritz step return a theta
+        *beneath* the true minimum -- observed 6.0e8 against a true minimum of 1.0e9, impossible for
+        a genuine Rayleigh quotient). It is kept as a sanity check but does NOT actually discriminate
+        the I5 mutant on these fixtures -- see the class docstring above.
         """
         rng = np.random.default_rng(20260804)
         mat = herm(200, rng, complex_=complex_) + shift * np.eye(200)
@@ -350,11 +466,23 @@ class TestGroundLocg:
         assert float(eigval) == pytest.approx(lowest(mat), rel=1e-12)
 
     def test_xinit_scale_invariance(self):
-        """``xinit`` is normalized on entry, so its magnitude cannot matter."""
+        """``xinit`` is normalized on entry, so its eigenvalue is insensitive to ``|xinit|``.
+
+        Not bit-exact: an earlier version of this test asserted ``==`` on the floats, which passes
+        only by coincidence. Measured directly: at a fixed seed, scale 1e8 happens to agree bit-for-
+        bit with scale 1 (both exact powers of two), but 1e7, 1e9, 3.0, 7.0, and 1e-8 all differ by
+        3.5e-15 to 7.1e-15 relative to max|mat|. Sweeping 13 seeds x 5 matrix sizes (10-200) x 8
+        scales (1e-8 to 1e9) puts the worst observed relative spread at 4.9e-15. This assertion uses
+        1e-12, about 200x that margin, so it is insensitive to JAX/XLA version or backend changes
+        while still catching a genuine scale-dependence regression.
+        """
         rng = np.random.default_rng(20260804)
         mat = jnp.asarray(herm(60, rng, complex_=False))
         xinit = jnp.asarray(rng.normal(size=60))
-        assert float(ground_locg(mat, xinit * 1e8)[0]) == float(ground_locg(mat, xinit)[0])
+        scale_of_mat = float(jnp.abs(mat).max())
+        val_1 = float(ground_locg(mat, xinit)[0])
+        val_scaled = float(ground_locg(mat, xinit * 1e8)[0])
+        assert abs(val_scaled - val_1) / scale_of_mat < 1e-12
 
     def test_xinit_not_mutated(self):
         """Despite the in-place-looking ``xinit = normalize(xinit)``, JAX arrays are immutable."""
@@ -382,3 +510,58 @@ class TestGroundLocg:
         diagnostics = result[4]
         for key in ('x', 'y', 'r', 'theta', 'rho', 'kappa', 'sas', 'reltol', 'converged'):
             assert np.shape(diagnostics[key])[0] == maxiter + 2, f'{key} row count'
+
+
+class TestZeroResidualAfterSeedStep:
+    """``body_iter1`` must guard a zeroed post-seed residual the same way ``body()`` does.
+
+    ``body()`` (the main iteration) masks its projected matrix's search-direction diagonal and folds
+    a zeroed direction into ``converged`` -- see items I6/I7 in ``docs/locg.md``. ``body_iter1`` (the
+    one-shot seed step run before the main loop) had no equivalent guard: when the residual after
+    ``body_iter0`` is exactly zero, xinit is already an eigenvector and the ``{x, p}`` projected
+    matrix has a vanishing row/column 1, which ``eigenpair_2x2`` would otherwise resolve into
+    selecting the null direction and collapsing theta towards 0 rather than reporting the correct
+    Rayleigh quotient.
+
+    This is not a contrived corner case: ``sqd.py`` seeds ``vinit`` as an exact one-hot vector at the
+    minimum-diagonal index whenever the Hamiltonian is diagonal (``jnp.all(hamiltonian.x[0] == 0)``),
+    which is exactly this input shape -- a one-hot vector against a diagonal operator is an exact
+    eigenvector, giving an exactly-zero residual after the seed step.
+
+    These fixtures also give end-to-end coverage of items I6 and I7 (the zeroed-search-direction
+    guard and convergence-on-exhausted-search-space), which no other fixture in this suite reaches:
+    ``p_is_zero``/the residual-is-zero condition is never True in any of the random or shifted-``herm``
+    fixtures elsewhere in this file, since those all use generic, non-eigenvector initial guesses.
+    """
+
+    def test_one_by_one(self):
+        eigval, eigvec, niter, converged = ground_locg(jnp.array([[3.0]]), jnp.array([1.0]))
+        assert bool(converged)
+        assert int(niter) == 0
+        assert float(eigval) == pytest.approx(3.0, abs=1e-13)
+        assert np.asarray(eigvec) == pytest.approx([1.0])
+
+    def test_one_by_one_large_magnitude(self):
+        """The large-magnitude case: theta must be the operator's value, not a value near 0."""
+        eigval, eigvec, niter, converged = ground_locg(jnp.array([[1e9]]), jnp.array([1.0]))
+        assert bool(converged)
+        assert int(niter) == 0
+        assert float(eigval) == pytest.approx(1e9, rel=1e-13)
+        assert np.asarray(eigvec) == pytest.approx([1.0])
+
+    @pytest.mark.parametrize('index', [0, 5])
+    def test_diagonal_operator_one_hot_xinit(self, index):
+        """A one-hot ``xinit`` against a diagonal operator is an exact eigenvector at any index.
+
+        Index 0 and an interior index (5) are both covered: nothing in ``body_iter1`` singles out
+        position 0, but the audit's own reproduction used index 0, so an interior index is added to
+        make sure the guard is not accidentally position-dependent.
+        """
+        mat = jnp.diag(jnp.arange(1., 61.))
+        eigval, eigvec, niter, converged = ground_locg(mat, jnp.asarray(index))
+        assert bool(converged)
+        assert int(niter) == 0
+        assert float(eigval) == pytest.approx(float(index) + 1., abs=1e-13)
+        expected = np.zeros(60)
+        expected[index] = 1.
+        assert np.asarray(eigvec) == pytest.approx(expected)

@@ -357,10 +357,25 @@ def _ground_locg_callable(
             return xnext, rnext, ax, rho, diag
         return xnext, rnext, ax, rho
 
-    def body_iter1(xcurr, rcurr, axcurr):
-        tmp_p = normalize(rcurr)
+    def body_iter1(xcurr, rcurr, axcurr, rho):
+        # Same zero-search-direction guard as body(), adapted from 3x3 to this step's 2x2 projected
+        # matrix (basis {x, p} rather than {x, y, p}). An exactly-zero residual means xcurr is
+        # already an eigenvector -- e.g. sqd.py's diagonal-Hamiltonian path seeds xinit as the exact
+        # one-hot ground state, so this is not a corner case. Without the guard, eigenpair_2x2 sees a
+        # sas whose row/col 1 vanish and, for a positive-definite operator, spuriously selects that
+        # null direction: theta collapses towards 0 instead of reporting rho, the true answer.
+        norm_r = jnp.linalg.norm(rcurr)
+        r_is_zero = norm_r == 0.
+        tmp_p = normalize(rcurr, norm_r)
         # Reuse Ax from body_iter0 rather than recomputing it inside compute_sas.
         sas = compute_sas((xcurr, tmp_p), (axcurr, matvec(tmp_p, *args)))
+        # Lift the p diagonal out of contention, exactly as body() does for sas[2, 2]: the excluded
+        # value is larger in magnitude than any entry already in play, so Rayleigh-Ritz cannot pick
+        # it. With p excluded, the 2x2 solve collapses onto x alone, returning theta = rho (the
+        # Rayleigh quotient of xcurr, already computed in body_iter0 and passed in) and kappa = [1,
+        # 0], so xnext == xcurr below and no new search direction is introduced.
+        excluded = jnp.abs(rho) + jnp.abs(rho) + 1.
+        sas = jnp.where(r_is_zero, sas.at[1, 1].set(excluded.astype(sas.dtype)), sas)
         theta, kappa = eigenpair_2x2(sas)
         tmp_t = tmp_p * kappa[0] - xcurr * kappa[1]
         tmp_u = xcurr * kappa[0] + tmp_p * kappa[1]
@@ -371,10 +386,14 @@ def _ground_locg_callable(
         ynext = normalize(tmp_t)
         axnext = matvec(xnext, *args)
         rnext = axnext - theta * xnext
+        # As in body(): a zeroed residual means {x} (here, in place of {x, y}) already spans the
+        # relevant space, so no further iteration can lower theta. Report convergence immediately.
+        converged = r_is_zero
         if debug:
-            diag = diagnostics(xnext, ynext, rnext, theta, jnp.insert(kappa, 1, 0.))
-            return xnext, ynext, rnext, axnext, theta, diag
-        return xnext, ynext, rnext, axnext, theta
+            diag = diagnostics(xnext, ynext, rnext, theta, jnp.insert(kappa, 1, 0.),
+                               converged=converged)
+            return xnext, ynext, rnext, axnext, theta, converged, diag
+        return xnext, ynext, rnext, axnext, theta, converged
 
     def body(state):
         xcurr, ycurr, rcurr, axcurr = state[-4:]
@@ -467,6 +486,14 @@ def _ground_locg_callable(
     # loop, so a lower-precision xinit makes while_loop's carry types disagree on theta. Promote up
     # front. eval_shape reads the operator dtype without spending a matrix-vector product, and
     # astype on a matching dtype is a no-op, so the common path is unaffected.
+    #
+    # This promotion is also deliberately what fixes a second, independent problem for a complex
+    # operator paired with a real xinit -- e.g. complex128 mat with float64 xinit, a natural and
+    # previously-working way to call this function. Without it, xinit stayed real through
+    # compute_sas's scatter, which raised FutureWarning/ComplexWarning and silently discarded the
+    # imaginary part of the projected matrix -- a correctness bug for a genuinely complex operator,
+    # not merely a noisy warning. Promoting xinit up front means it is never a carry-type workaround
+    # to remove later; both problems share the same fix.
     work_dtype = jnp.result_type(xinit.dtype,
                                  jax.eval_shape(lambda vec: matvec(vec, *args), xinit).dtype)
     xinit = xinit.astype(work_dtype)
@@ -484,7 +511,7 @@ def _ground_locg_callable(
         # work_dtype above is already that promotion.
         tol = float(jnp.finfo(work_dtype).eps)
 
-    vs_iter1 = body_iter1(vs_iter0[0], vs_iter0[1], vs_iter0[2])
+    vs_iter1 = body_iter1(vs_iter0[0], vs_iter0[1], vs_iter0[2], rho_init)
     if debug:
         diag1 = jax.tree.map(lambda a: jnp.expand_dims(a, 0), vs_iter1[-1])
 
@@ -497,7 +524,10 @@ def _ground_locg_callable(
             return rho_init, xinit, 0, empty, diagnostics_out
         return rho_init, xinit, 0, empty
 
-    state = (0, jnp.array(False), vs_iter1[4]) + vs_iter1[:4]
+    # body_iter1's own converged flag (a zeroed post-seed residual) must seed the loop state rather
+    # than a hardcoded False, or while_loop would spend an iteration re-deriving what is already
+    # known -- and, worse, feed a zeroed search direction into body()'s Rayleigh-Ritz step.
+    state = (0, vs_iter1[5], vs_iter1[4]) + vs_iter1[:4]
     if debug:
         state, diagnostics_out = jax.lax.scan(
             lambda s, _: body(s), state, length=maxiter
