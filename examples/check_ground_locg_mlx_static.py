@@ -84,25 +84,16 @@ shim.finfo = np.finfo
 
 
 def _shim_metal_kernel(name, input_names, output_names, source, **kwargs):
-    """Stand in for mx.fast.metal_kernel by interpreting the kernel's arithmetic in numpy.
+    """Stand in for mx.fast.metal_kernel by interpreting each kernel's arithmetic in numpy.
 
-    The real kernel computes out[i] = sum_j vec[xsources[j*N + i]] * diagonals[j*N + i] with one
-    thread per output element. Reproducing that here lets the static check verify the CALLER
-    (shapes, dtypes, grid setup, flat row-major indexing) without a Metal device. It does NOT
-    verify that the Metal source compiles or is correct -- only the user's real-hardware run can,
-    which is why apply_h_xz_mlx_metal's arithmetic was separately validated by simulating the
-    per-thread indexing in numpy (max abs diff 2.7e-15 vs apply_h_xz_cached).
+    Dispatches on `name`: this module now has two kernels. Reproducing their per-thread and
+    per-threadgroup indexing here lets the static check verify the CALLERS (shapes, dtypes, grid
+    setup, flat row-major indexing, threadgroup rounding) without a Metal device. It does NOT
+    verify that the Metal source compiles, that the barriers are correct, or that it is right on
+    device -- only the user's real-hardware run can.
     """
 
-    def call(
-        inputs,
-        template=None,
-        grid=None,
-        threadgroup=None,
-        output_shapes=None,
-        output_dtypes=None,
-        **kw,
-    ):
+    def call_matvec(inputs, output_dtypes=None, **kw):
         vec, xsources, diagonals, num_groups, num_states = inputs
         xs_flat = np.asarray(xsources).reshape(-1)
         dg_flat = np.asarray(diagonals).reshape(-1)
@@ -113,7 +104,41 @@ def _shim_metal_kernel(name, input_names, output_names, source, **kwargs):
             out = out + vec_np[xs_flat[off : off + num_states]] * dg_flat[off : off + num_states]
         return [out]
 
-    return call
+    def call_sas(inputs, grid=None, threadgroup=None, output_dtypes=None, **kw):
+        vectors, mvs, num_basis, num_states = inputs
+        vec_np = np.asarray(vectors).reshape(-1)
+        mv_np = np.asarray(mvs).reshape(-1)
+        lanes = threadgroup[0]
+        num_pairs = num_basis * (num_basis + 1) // 2
+        assert grid[0] == num_pairs * lanes, (
+            f"grid {grid[0]} != num_pairs*lanes {num_pairs * lanes}: the caller must launch one "
+            "threadgroup per (i, j) pair"
+        )
+        assert lanes & (lanes - 1) == 0, f"threadgroup {lanes} is not a power of two"
+        out = np.zeros((num_basis, num_basis), dtype=np.dtype(output_dtypes[0]))
+        # Reproduce the kernel's own pair-unranking scan, strided partial sums, and tree
+        # reduction -- not just the mathematical result -- so an indexing error here shows up.
+        pairs = [(a, b) for a in range(num_basis) for b in range(a, num_basis)]
+        for pair, (i, j) in enumerate(pairs):
+            partials = np.zeros(lanes, dtype=np.dtype(output_dtypes[0]))
+            for lane in range(lanes):
+                acc = np.dtype(output_dtypes[0]).type(0)
+                for k in range(lane, num_states, lanes):
+                    acc += vec_np[i * num_states + k] * mv_np[j * num_states + k]
+                partials[lane] = acc
+            half = lanes // 2
+            while half > 0:
+                partials[:half] += partials[half : half * 2]
+                half //= 2
+            out[i, j] = partials[0]
+            out[j, i] = partials[0]
+        return [out]
+
+    if name == "sqd_apply_h_xz":
+        return call_matvec
+    if name == "sqd_compute_sas":
+        return call_sas
+    raise AssertionError(f"no shim implementation for Metal kernel {name!r}")
 
 
 shim.fast = types.SimpleNamespace(metal_kernel=_shim_metal_kernel)
@@ -273,5 +298,49 @@ print(
     "OK  default path (compile_body=False) unaffected -- byte-identical to the pre-existing "
     f"behaviour (iters={iters_default2})"
 )
+
+# 3h. _compute_sas_metal's CALLER logic and arithmetic, for both basis sizes. Same standing
+# caveat as 3g: the shim interprets the kernel in numpy, so this validates indexing, shapes,
+# grid setup and the both-triangles symmetry claim -- NOT that the Metal source compiles.
+_compute_sas = module._compute_sas
+_compute_sas_metal = module._compute_sas_metal
+
+rng_sas = np.random.default_rng(11)
+for nbasis in (2, 3):
+    vecs = [rng_sas.normal(size=inputs.subspace_dim) for _ in range(nbasis)]
+    mvs = [np.asarray(apply_h_xz_mlx(vv, inputs.xsources, inputs.diagonals)) for vv in vecs]
+    want = np.asarray(_compute_sas(tuple(vecs), tuple(mvs)))
+    vecs32 = [vv.astype(np.float32) for vv in vecs]
+    mvs32 = [mm.astype(np.float32) for mm in mvs]
+    got_sas = np.asarray(_compute_sas_metal(tuple(vecs32), tuple(mvs32)))
+
+    assert got_sas.shape == (nbasis, nbasis), f"n={nbasis}: shape {got_sas.shape}"
+    # Exact symmetry, not symmetry-to-tolerance: thread 0 writes the same value to both
+    # triangles, so the two must be bit-identical. This is stronger than the op-graph path's
+    # (sas + sas.T) * 0.5, which averages two values differing by rounding.
+    asym = np.abs(got_sas - got_sas.T).max()
+    assert asym == 0.0, f"n={nbasis}: output not exactly symmetric (|S - S.T| = {asym})"
+    err_sas = np.abs(got_sas - want).max()
+    scale = max(1.0, np.abs(want).max())
+    assert err_sas < 1e-4 * scale, f"n={nbasis}: disagrees with _compute_sas by {err_sas}"
+
+    # Independent reference: the inner products computed directly, not via either code path.
+    direct = np.array([[vv @ mm for mm in mvs] for vv in vecs])
+    direct = (direct + direct.T) * 0.5
+    err_direct = np.abs(got_sas - direct).max()
+    assert err_direct < 1e-4 * scale, f"n={nbasis}: disagrees with direct v@m by {err_direct}"
+    print(
+        f"OK  _compute_sas_metal n={nbasis} matches _compute_sas ({err_sas:.2e}) and "
+        f"direct v@m ({err_direct:.2e}), exactly symmetric"
+    )
+
+# The float64 guard must fire, mirroring apply_h_xz_mlx_metal's (Metal has no float64).
+try:
+    _compute_sas_metal((vecs[0], vecs[1]), (mvs[0], mvs[1]))
+except ValueError as exc:
+    assert "float32" in str(exc), f"unexpected guard message: {exc}"
+    print("OK  _compute_sas_metal rejects float64 input (Metal has no float64)")
+else:
+    raise AssertionError("_compute_sas_metal accepted float64 input -- guard did not fire")
 
 print("\nALL STATIC CHECKS PASSED (numpy shim; MLX itself still unverified)")

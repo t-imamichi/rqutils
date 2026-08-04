@@ -230,6 +230,148 @@ def apply_h_xz_mlx_metal(vec, xsources, diagonals, threadgroup=256):
     return outputs[0]
 
 
+_METAL_SAS_SOURCE = """
+    // One threadgroup per (i, j) pair with i <= j; one thread per stride-slice of the vectors.
+    uint pair = threadgroup_position_in_grid.x;
+    uint lane = thread_position_in_threadgroup.x;
+    uint lanes = threads_per_threadgroup.x;
+
+    // Unrank `pair` into (i, j) with i <= j. n_basis is 2 or 3, so a short scan is cheaper
+    // than any closed form and avoids integer-sqrt rounding concerns entirely.
+    uint i = 0;
+    uint j = 0;
+    uint seen = 0;
+    for (uint a = 0; a < n_basis; ++a) {
+        for (uint b = a; b < n_basis; ++b) {
+            if (seen == pair) {
+                i = a;
+                j = b;
+            }
+            seen += 1;
+        }
+    }
+
+    // Strided partial sum in a register. Stride `lanes` keeps adjacent lanes on adjacent
+    // addresses, so these loads coalesce.
+    T acc = 0;
+    for (uint k = lane; k < n_states; k += lanes) {
+        acc += vectors[i * n_states + k] * mvs[j * n_states + k];
+    }
+    partials[lane] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction over the threadgroup. `lanes` is a power of two (the caller rounds down),
+    // so the halving is exact and no lane reads past the written region.
+    for (uint half = lanes / 2; half > 0; half /= 2) {
+        if (lane < half) {
+            partials[lane] += partials[lane + half];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0) {
+        // Write BOTH triangles with the identical value, so the result is exactly symmetric by
+        // construction and no separate symmetrization op is needed. For i == j this writes the
+        // same slot twice, which is harmless.
+        out[i * n_basis + j] = partials[0];
+        out[j * n_basis + i] = partials[0];
+    }
+"""
+
+_METAL_SAS_KERNEL = None
+
+
+def _get_metal_sas_kernel():
+    """Build (once) the fused Rayleigh-Ritz inner-product kernel."""
+    global _METAL_SAS_KERNEL
+    if _METAL_SAS_KERNEL is None:
+        _METAL_SAS_KERNEL = mx.fast.metal_kernel(
+            name="sqd_compute_sas",
+            input_names=["vectors", "mvs", "n_basis", "n_states"],
+            output_names=["out"],
+            source=_METAL_SAS_SOURCE,
+            header="#include <metal_stdlib>\n",
+        )
+    return _METAL_SAS_KERNEL
+
+
+def _compute_sas_metal(vectors, mvs, threadgroup=256):
+    """Return the (n x n) matrix of <v_i | A | v_j> in a single fused Metal launch.
+
+    The op-graph :func:`_compute_sas` costs 16 op launches per iteration (measured) to produce
+    nine numbers, of which only six are distinct. This computes all six distinct inner products
+    in one launch: one threadgroup per (i, j) pair with i <= j, a strided per-thread partial sum,
+    then a threadgroup-memory tree reduction.
+
+    Thread 0 of each threadgroup writes **both** ``out[i*n + j]`` and ``out[j*n + i]``, so the
+    result is exactly symmetric by construction -- stronger than the op-graph path's
+    ``(sas + sas.T) * 0.5``, which averages two values that differ by rounding -- and the
+    symmetrization op disappears rather than merely being fused.
+
+    The tree reduction changes summation order relative to ``mx.sum``. For dot products of
+    unit-norm vectors this is benign and typically *more* accurate than sequential summation
+    (error growing as log n rather than n), but it is a change: see
+    ``examples/check_ground_locg_mlx_static.py`` case 3h, which pins agreement with both the
+    op-graph path and a direct ``v @ m``.
+
+    Metal has no float64, so this path is f32-only, exactly like :func:`apply_h_xz_mlx_metal`.
+    The f64 arms must keep using :func:`_compute_sas`.
+
+    Args:
+        vectors: Basis vectors, a tuple of 2 or 3 arrays of shape ``(N,)``, float32.
+        mvs: Their images under A, same length and shapes, float32.
+        threadgroup: Maximum threads per threadgroup. Rounded down to a power of two so the
+            tree reduction halves exactly.
+
+    Returns:
+        The ``(n, n)`` matrix of ``<v_i | A | v_j>``, exactly symmetric.
+
+    Raises:
+        ValueError: If the inputs are not float32, since Metal has no float64.
+        ValueError: If ``vectors`` and ``mvs`` differ in length, or the length is not 2 or 3.
+    """
+    if len(vectors) != len(mvs):
+        raise ValueError(f"vectors and mvs must have equal length, got {len(vectors)}/{len(mvs)}")
+    num_basis = len(vectors)
+    if num_basis not in (2, 3):
+        raise ValueError(f"_compute_sas_metal supports a basis of 2 or 3, got {num_basis}")
+    for name, arrays in (("vectors", vectors), ("mvs", mvs)):
+        for array in arrays:
+            if array.dtype != mx.float32:
+                raise ValueError(
+                    f"_compute_sas_metal requires float32 (Metal has no float64), got "
+                    f"{array.dtype} in {name}. Use _compute_sas for the f64 arms."
+                )
+
+    num_states = vectors[0].shape[0]
+    stacked_v = mx.stack(vectors)
+    stacked_m = mx.stack(mvs)
+    num_pairs = num_basis * (num_basis + 1) // 2
+
+    # Round the threadgroup size down to a power of two: the tree reduction halves `lanes` until
+    # it reaches 1, which only visits every written lane exactly once if it starts as a power of
+    # two. Also cap it at num_states so no lane sits idle with nothing to accumulate.
+    lanes = 1
+    while lanes * 2 <= min(threadgroup, num_states):
+        lanes *= 2
+
+    # No output initialization is needed (and no `init_value=` is passed -- that kwarg is not in
+    # MLX 0.32.0's documented call signature): the pairs (i, j) with i <= j cover every slot of
+    # the (n, n) output once the j > i writes are mirrored, so every element is written before it
+    # is read. Do not "fix" this by zero-filling first; that would add back a launch.
+    kernel = _get_metal_sas_kernel()
+    outputs = kernel(
+        inputs=[stacked_v, stacked_m, num_basis, num_states],
+        template=[("T", mx.float32)],
+        # grid is in THREADS, not threadgroups: one threadgroup of `lanes` threads per pair.
+        grid=(num_pairs * lanes, 1, 1),
+        threadgroup=(lanes, 1, 1),
+        output_shapes=[(num_basis, num_basis)],
+        output_dtypes=[mx.float32],
+    )
+    return outputs[0]
+
+
 def ground_locg_mlx(
     mat, xinit, args=(), maxiter=1000, tol=None, compile_body=False, compile_chunk=10
 ):
