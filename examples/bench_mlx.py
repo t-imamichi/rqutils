@@ -26,10 +26,16 @@ work per arm, so a clean speed comparison) and time-to-convergence with its iter
 (what production actually pays). Reporting both makes it visible when fp32 is faster per
 iteration but needs more iterations.
 
+Both are the MINIMUM over ``--repeat`` samples, not the mean: timing noise is one-sided, so the
+minimum is the least-contaminated estimate and is what makes two runs comparable. A run whose
+samples spread by more than 25% prints a warning to stderr and should not be quoted. The
+``first_s`` column is a single unrepeatable sample and is indicative only -- see ``timeit`` in
+``_bench_common.py``.
+
 CAVEAT -- MLX per-call graph reconstruction is not subtracted out. ``ground_locg_mlx`` is
 plain Python: every timed call re-walks the iteration loop and re-constructs MLX's op graph
 from scratch, in Python, before any device work happens. ``ground_locg`` (the JAX original)
-is ``@jax.jit``: tracing happens once and is reported in ``compile_s``, and every subsequent
+is ``@jax.jit``: tracing happens once and is reported in ``first_s``, and every subsequent
 timed call dispatches an already-compiled executable with no further Python-level graph
 construction. So the MLX arms' ``fixed_s`` / ``per_it_ms`` / ``solve_s`` numbers include a
 per-call Python graph-construction cost that the JAX arms' numbers do not pay in the same
@@ -602,8 +608,11 @@ def report(results, as_json):
         print(json.dumps({"results": results}, indent=2))
         return
 
+    # first_s rather than compile_s: it is one unrepeatable sample (see timeit's docstring), so
+    # naming it after compilation overstates what it measures. The JSON key stays `compile_s` for
+    # backward compatibility with recorded results.
     header = (
-        f"{'arm':<15}{'setup_s':>9}{'compile_s':>10}{'fixed_s':>10}{'per_it_ms':>11}"
+        f"{'arm':<15}{'setup_s':>9}{'first_s*':>10}{'fixed_s':>10}{'per_it_ms':>11}"
         f"{'solve_s':>10}{'iters':>7}{'matvec_err':>12}  {'eigval':<15}  options"
     )
     print(header)
@@ -623,6 +632,15 @@ def report(results, as_json):
             f"{row['arm']:<15}{row['setup_s']:>9.4f}{row['compile_s']:>10.4f}"
             f"{row['fixed_s']:>10.4f}{row['per_it_ms']:>11.3f}{row['solve_s']:>10.4f}"
             f"{row['iters']:>7d}{row['matvec_err']:>12.2e}  {row['eigval']:<15.10f}  {opt}"
+        )
+
+    if any(row.get("status") == "ok" for row in results):
+        print(
+            "* first_s is ONE unrepeatable sample (compilation happens once per process), so it "
+            "carries whatever\n  else the machine was doing at that instant. Observed varying 53x "
+            "between two runs of the same\n  command whose per_it_ms agreed to 3% and whose results "
+            "were bit-identical. Indicative only --\n  never compare it across runs or frameworks. "
+            "per_it_ms/solve_s are minimum-of-repeat and are comparable."
         )
 
     # Disclosure footnotes (I2, I3): a silently skipped correctness check or a silently

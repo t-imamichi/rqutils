@@ -8,6 +8,7 @@ This module must not import mlx at module level -- the JAX-only arms run in proc
 mlx may be unavailable.
 """
 
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -210,20 +211,59 @@ def brute_force_reference(
     return float(np.linalg.eigvalsh(projected)[0].real)
 
 
+# A steady-state spread wider than this fraction of the minimum means the machine was doing
+# something else while we measured, so the number should not be compared against another run.
+_SPREAD_WARN = 0.25
+
+# ...but only once the work is long enough for that ratio to mean anything. Below this, timer
+# granularity and scheduler jitter dominate: a 0.4 ms sample next to a 0.2 ms one is a 100%
+# "spread" that says nothing about machine load. The benchmark's own per-iteration figures are
+# milliseconds and its fixed_s values tens of milliseconds, so this floor only silences the
+# sub-millisecond smoke-test calls (e.g. check_bench_common.py's) that were never comparable
+# across runs anyway.
+_SPREAD_WARN_MIN_SECONDS = 5e-3
+
+
 def timeit(fn: Callable[[], Any], repeat: int, sync: Callable[[Any], Any]) -> tuple[float, float]:
-    """Return (compile_seconds, mean_steady_seconds).
+    """Return (first_call_seconds, best_steady_seconds).
 
     ``sync`` must force the computation to complete: ``jax.block_until_ready`` for JAX,
     ``mx.eval`` for MLX. Without it both frameworks return before the work is done -- MLX is
     lazy and JAX is async -- and the measurement is meaningless.
+
+    The steady-state figure is the MINIMUM of ``repeat`` samples, not the mean. Noise is
+    one-sided -- the machine can steal time from a sample but never give it back -- so the
+    minimum is the least-contaminated estimate of the work's actual cost, and it is what makes
+    two runs comparable. If the samples spread by more than 25% of the minimum, a warning goes to
+    stderr: that run was disturbed and its timings should not be quoted against another.
+    (Previously this returned the mean, so figures recorded before this change are very slightly
+    higher and are not exactly comparable.)
+
+    THE FIRST VALUE IS A SINGLE SAMPLE AND CANNOT BE REPEATED. Compilation happens once per
+    process, so there is no way to average it. It therefore includes not just tracing/compilation
+    but whatever else the machine was doing at that instant -- shader-cache population, thermal
+    state, contention from sibling benchmark subprocesses. It has been observed varying 53x
+    (20.39 s vs 0.38 s) between two runs of the *same* command whose steady-state numbers agreed
+    to 3% and whose results were bit-identical. Treat it as indicative of magnitude only, never
+    as a measurement to compare across runs or frameworks.
     """
     start = time.perf_counter()
     sync(fn())
-    compile_time = time.perf_counter() - start
+    first_call_time = time.perf_counter() - start
 
     times = []
     for _ in range(repeat):
         start = time.perf_counter()
         sync(fn())
         times.append(time.perf_counter() - start)
-    return compile_time, float(np.mean(times))
+
+    best = float(np.min(times))
+    if len(times) > 1 and best >= _SPREAD_WARN_MIN_SECONDS:
+        spread = (float(np.max(times)) - best) / best
+        if spread > _SPREAD_WARN:
+            sys.stderr.write(
+                f"WARNING: steady-state timing spread {spread:.0%} over {len(times)} samples "
+                f"(min {best * 1e3:.3f} ms, max {max(times) * 1e3:.3f} ms). The machine was busy; "
+                "do not compare this run's timings against another.\n"
+            )
+    return first_call_time, best
