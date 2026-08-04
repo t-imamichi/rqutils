@@ -401,10 +401,65 @@ eig_met, _, it_met, _ = ground_locg_mlx(
 )
 assert it_ops == it_met == 30, f"iteration counts differ: {it_ops} vs {it_met}"
 scale_eig = max(1.0, abs(eig_ops))
-assert abs(eig_met - eig_ops) < 1e-4 * scale_eig, (
+# Measured exact agreement (0.0) under the shim, where both paths reduce to the same float32
+# numpy arithmetic on this small problem -- tightened from an earlier 1e-4*scale, which would
+# have passed a genuine ~4e-4 kernel defect. This numerical check is defence-in-depth on top of
+# the call-spy check below, which is what actually proves the two branches are wired up.
+assert abs(eig_met - eig_ops) < 1e-8 * scale_eig, (
     f"sas='metal' changed the fixed-iteration eigenvalue: {eig_met} vs {eig_ops}"
 )
 print(f"OK  sas='metal' tracks sas='ops' (eig {eig_met:.6f} vs {eig_ops:.6f}, {it_met} iters)")
+
+# 3i continued: the check above proves "metal doesn't diverge from ops", but not that sas="metal"
+# actually dispatches to _compute_sas_metal -- under the shim the two paths agree to the bit on
+# this problem, so a mis-wired call site (e.g. both branches hardcoded to _compute_sas) would
+# pass it silently. Wrap each module-level function with a counting spy and confirm sas="metal"
+# calls only the metal implementation, and sas="ops" only the ops implementation. The binding
+# `compute_sas = _compute_sas_metal if sas == "metal" else _compute_sas` reads these module
+# globals at call time, so patching module._compute_sas / module._compute_sas_metal intercepts it.
+_orig_compute_sas = module._compute_sas
+_orig_compute_sas_metal = module._compute_sas_metal
+_spy_counts = {"ops": 0, "metal": 0}
+
+
+def _spy_ops(*a, **k):
+    _spy_counts["ops"] += 1
+    return _orig_compute_sas(*a, **k)
+
+
+def _spy_metal(*a, **k):
+    _spy_counts["metal"] += 1
+    return _orig_compute_sas_metal(*a, **k)
+
+
+module._compute_sas = _spy_ops
+module._compute_sas_metal = _spy_metal
+try:
+    _spy_counts["ops"] = 0
+    _spy_counts["metal"] = 0
+    ground_locg_mlx(
+        apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, tol=0.0, sas="metal"
+    )
+    assert _spy_counts["metal"] > 0 and _spy_counts["ops"] == 0, (
+        f"sas='metal' did not dispatch exclusively to _compute_sas_metal: {_spy_counts}"
+    )
+    metal_calls_for_2_iters = _spy_counts["metal"]
+
+    _spy_counts["ops"] = 0
+    _spy_counts["metal"] = 0
+    ground_locg_mlx(
+        apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, tol=0.0, sas="ops"
+    )
+    assert _spy_counts["ops"] > 0 and _spy_counts["metal"] == 0, (
+        f"sas='ops' did not dispatch exclusively to _compute_sas: {_spy_counts}"
+    )
+finally:
+    module._compute_sas = _orig_compute_sas
+    module._compute_sas_metal = _orig_compute_sas_metal
+print(
+    f"OK  sas='metal'/sas='ops' dispatch exclusively to their own implementation "
+    f"({metal_calls_for_2_iters} metal calls, 0 ops calls, for 2 iterations)"
+)
 
 # sas="metal" must refuse float64 rather than silently running a different kernel.
 try:
@@ -441,5 +496,46 @@ else:
     raise AssertionError("_compute_sas_metal accepted threadgroup=512 -- guard did not fire")
 _ = _compute_sas_metal(tuple(vecs32_tg[:2]), tuple(mvs32_tg[:2]), threadgroup=256)
 print("OK  _compute_sas_metal still works at threadgroup=256")
+
+# 3j. The r_is_zero / seed_converged guard (ground_locg_mlx.py:503-517): a one-hot xinit against a
+# diagonal operator is an exact eigenvector, so the residual after the seed step is exactly zero.
+# Without the guard, eigenpair_2x2 sees a sas_mat whose row/col 1 (the p direction) vanishes and
+# selects that null direction, collapsing theta towards 0 instead of reporting the true diagonal
+# entry. Ports tests/test_ground_locg.py::TestZeroResidualAfterSeedStep's
+# test_diagonal_operator_one_hot_xinit fixture -- this path had zero coverage in either MLX
+# checker despite being renamed (sas -> sas_mat) in this task. sqd.py's diagonal-Hamiltonian path
+# produces exactly this input shape, so it is not a contrived corner case.
+diag = np.arange(1.0, 61.0)
+diag32 = diag.astype(np.float32)
+
+
+def _diag_matvec(vec, dvec):
+    return vec * dvec
+
+
+index = 7
+for dtype_name, dvec, sas_kw in (
+    ("float64/ops", diag, "ops"),
+    ("float32/metal", diag32, "metal"),
+):
+    one_hot = np.zeros(60, dtype=dvec.dtype)
+    one_hot[index] = 1.0
+    eig_seed, vec_seed, iters_seed, converged_seed = ground_locg_mlx(
+        _diag_matvec, one_hot, args=(dvec,), sas=sas_kw
+    )
+    assert converged_seed is True, f"{dtype_name}: not converged at the seed step"
+    assert iters_seed == 0, f"{dtype_name}: expected 0 iterations, got {iters_seed}"
+    err_eig = abs(eig_seed - diag[index])
+    assert err_eig < 1e-5, (
+        f"{dtype_name}: eig={eig_seed}, expected diag[{index}]={diag[index]} (err {err_eig})"
+    )
+    expected_vec = np.zeros(60)
+    expected_vec[index] = 1.0
+    err_vec = np.abs(np.asarray(vec_seed) - expected_vec).max()
+    assert err_vec < 1e-5, f"{dtype_name}: eigenvector drifted from the one-hot seed by {err_vec}"
+    print(
+        f"OK  r_is_zero guard ({dtype_name}): one-hot seed at index {index} against a diagonal "
+        f"operator converges in 0 iterations with eig={eig_seed}"
+    )
 
 print("\nALL STATIC CHECKS PASSED (numpy shim; MLX itself still unverified)")
