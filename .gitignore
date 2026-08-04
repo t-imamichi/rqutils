@@ -50,6 +50,7 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.ruff_cache/
 
 # Translations
 *.mo
@@ -134,3 +135,12 @@ dmypy.json
 
 # emacs
 *~
+
+# uv
+uv.lock
+
+# macOS
+.DS_Store
+
+# Claude
+.superpowers/
