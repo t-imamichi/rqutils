@@ -264,6 +264,9 @@ the sandbox. **No performance number will be recorded here without a real
 measurement behind it**; the table below is left with empty cells rather than
 estimates.
 
+(Correctness on hardware has since been confirmed by two device runs — see
+"Correctness on real hardware" below. Only the *timing* below is still open.)
+
 | N | J | `--sas ops` per_it_ms | `--sas metal` per_it_ms | speedup | gate |
 |---|---|---|---|---|---|
 | 893 | 100 | | | | |
@@ -279,25 +282,84 @@ uv run --extra mlx python examples/bench_mlx.py --arm mlx-gpu-f32 \
     --num-qubits 14 --num-paulis 100 --num-states <N>
 ```
 
-## Implementation status (as merged)
+## Correctness on real hardware — CONFIRMED
 
-Implemented in eleven commits, `6049457..9be9a80`. Everything except the two
-items below is done, gate-green (ruff / ruff format / ty / 357 pytest), and
-reviewed. `sas="ops"` and `--sas ops` remain the defaults, so the new path is
-unreachable unless explicitly requested and merging carries no regression risk
-to existing measured results.
+The kernel compiles and is numerically correct on a real Metal device. Two runs
+of `examples/check_ground_locg_mlx_mlx.py` were needed.
 
-**Two obligations remain, both requiring a Metal device:**
+**Run 1 failed to build the kernel**, and the cause is the most transferable
+finding in this document: `half` is a **reserved built-in scalar type in Metal
+Shading Language** (16-bit float), so the tree reduction's
+`for (uint half = lanes / 2; ...)` failed with
 
-1. **Nothing has ever compiled or executed either Metal kernel.** The numpy shim
-   validates the caller contract by reimplementing the intended indexing in
-   Python; it never reads the kernels' `source` string, so it is blind to a
-   defect in the Metal text itself. Run
-   `uv run --extra mlx python examples/check_ground_locg_mlx_mlx.py` first —
-   expect `FAILURES: none`, with `sas=metal` and `metal-both` lines for
-   `mlx-cpu-f32` and `mlx-gpu-f32`. Until that passes, treat the kernel as
-   unproven.
-2. **The N sweep above.** Success criterion 6 is unmet by construction.
+```
+error: cannot combine with previous 'type-name' declaration specifier
+```
+
+plus eight cascading errors from that single line. Renamed to `stride` in
+`482b5aa`.
+
+Nothing headless could have caught this, and it is worth being precise about
+why, because three separate layers of verification passed it:
+
+* The numpy shim reimplements the kernel's indexing *in Python*, where `half` is
+  an ordinary identifier. It never compiles the Metal text, so it is blind by
+  construction.
+* A review specifically re-derived the kernel against MLX 0.32.0's own C++
+  signature generator and cleared the threadgroup-size invariant, barrier
+  uniformity under divergence, the attribute table, exact output coverage, and
+  index overflow — without flagging a reserved-word collision. It was not in
+  anyone's threat model.
+* An *earlier* review had already caught one fatal compile error in this same
+  kernel by reading (threadgroup memory used but never declared), which likely
+  created false confidence that careful reading was sufficient.
+
+A regression check now guards it: case `3l` in
+`examples/check_ground_locg_mlx_static.py` scans both kernels' `source` strings
+for identifiers colliding with MSL reserved type and qualifier names. It is the
+only check in that file that reads `source` directly rather than the shim's
+reimplementation, comments are stripped first (the prose legitimately discusses
+`half` to explain this bug), and it was verified to fail when `half` is
+reintroduced. The same run's `-Wsign-compare` warnings were also fixed:
+`n_basis`/`n_states` arrive as `const constant int32_t` because MLX passes
+Python ints as int32.
+
+**Run 2 passed cleanly**, at n=10 / 20 paulis / 200 states (N=200), reference
+ground energy `-2.496495741801`:
+
+| arm | eigenvalue | iters | verdict |
+|---|---|---|---|
+| `mlx-cpu-f64` | -2.4964957418 | 89 | OK (matvec_err exactly 0.00e+00) |
+| `mlx-cpu-f32` | -2.4964947701 | 26 | OK |
+| `mlx-cpu-f32` `sas=metal` | -2.4964950085 | 26 | **OK** |
+| `mlx-cpu-f32` `metal-both` | -2.4964947701 | 26 | **OK** |
+| `mlx-gpu-f32` | -2.4964950085 | 26 | OK |
+| `mlx-gpu-f32` `sas=metal` | -2.4964947701 | 26 | **OK** |
+| `mlx-gpu-f32` `metal-both` | -2.4964947701 | 26 | **OK** |
+
+`FAILURES: none`. Every f32 arm converges in **exactly 26 iterations**, matching
+the POC's recorded f32 behaviour, and the fused-kernel eigenvalues land on the
+same two values the op-graph path produces (`-2.4964947701` /
+`-2.4964950085` — the two orderings of f32 rounding, not a systematic error).
+`metal-both` — both custom kernels resident in one process, the configuration
+the benchmark measures — matches the op-graph value bit-for-bit, so the fusions
+compose without drift.
+
+This discharges the correctness obligation. **The performance obligation is
+still open:** the sweep below has not been run, so no speed claim exists.
+
+## Implementation status
+
+Implemented in twelve commits, `6049457..482b5aa`, gate-green (ruff / ruff
+format / ty / 357 pytest) and reviewed. `sas="ops"` and `--sas ops` remain the
+defaults, so the new path is unreachable unless explicitly requested and merging
+carries no regression risk to existing measured results.
+
+**One obligation remains, requiring a Metal device:** the N sweep. Success
+criterion 6 is unmet.
+
+Re-run `uv run --extra mlx python examples/check_ground_locg_mlx_mlx.py` after
+any edit to either kernel's source: it is the only check that compiles them.
 
 Two findings from review worth carrying into the sweep:
 
