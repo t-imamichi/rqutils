@@ -505,6 +505,10 @@ print("OK  _compute_sas_metal still works at threadgroup=256")
 # test_diagonal_operator_one_hot_xinit fixture -- this path had zero coverage in either MLX
 # checker despite being renamed (sas -> sas_mat) in this task. sqd.py's diagonal-Hamiltonian path
 # produces exactly this input shape, so it is not a contrived corner case.
+#
+# Index 0 and an interior index (5) are both covered, mirroring the JAX fixture's parametrize:
+# nothing in the seed step singles out position 0, but the original audit's reproduction used
+# index 0, so an interior index guards against the guard being accidentally position-dependent.
 diag = np.arange(1.0, 61.0)
 diag32 = diag.astype(np.float32)
 
@@ -513,29 +517,102 @@ def _diag_matvec(vec, dvec):
     return vec * dvec
 
 
-index = 7
-for dtype_name, dvec, sas_kw in (
-    ("float64/ops", diag, "ops"),
-    ("float32/metal", diag32, "metal"),
-):
-    one_hot = np.zeros(60, dtype=dvec.dtype)
-    one_hot[index] = 1.0
-    eig_seed, vec_seed, iters_seed, converged_seed = ground_locg_mlx(
-        _diag_matvec, one_hot, args=(dvec,), sas=sas_kw
-    )
-    assert converged_seed is True, f"{dtype_name}: not converged at the seed step"
-    assert iters_seed == 0, f"{dtype_name}: expected 0 iterations, got {iters_seed}"
-    err_eig = abs(eig_seed - diag[index])
-    assert err_eig < 1e-5, (
-        f"{dtype_name}: eig={eig_seed}, expected diag[{index}]={diag[index]} (err {err_eig})"
-    )
-    expected_vec = np.zeros(60)
-    expected_vec[index] = 1.0
-    err_vec = np.abs(np.asarray(vec_seed) - expected_vec).max()
-    assert err_vec < 1e-5, f"{dtype_name}: eigenvector drifted from the one-hot seed by {err_vec}"
-    print(
-        f"OK  r_is_zero guard ({dtype_name}): one-hot seed at index {index} against a diagonal "
-        f"operator converges in 0 iterations with eig={eig_seed}"
-    )
+for index in (0, 5):
+    for dtype_name, dvec, sas_kw in (
+        ("float64/ops", diag, "ops"),
+        ("float32/metal", diag32, "metal"),
+    ):
+        one_hot = np.zeros(60, dtype=dvec.dtype)
+        one_hot[index] = 1.0
+        eig_seed, vec_seed, iters_seed, converged_seed = ground_locg_mlx(
+            _diag_matvec, one_hot, args=(dvec,), sas=sas_kw
+        )
+        assert converged_seed is True, f"{dtype_name} index={index}: not converged at seed step"
+        assert iters_seed == 0, f"{dtype_name} index={index}: expected 0 iters, got {iters_seed}"
+        err_eig = abs(eig_seed - diag[index])
+        assert err_eig < 1e-5, (
+            f"{dtype_name} index={index}: eig={eig_seed}, expected diag[{index}]={diag[index]} "
+            f"(err {err_eig})"
+        )
+        expected_vec = np.zeros(60)
+        expected_vec[index] = 1.0
+        err_vec = np.abs(np.asarray(vec_seed) - expected_vec).max()
+        assert err_vec < 1e-5, (
+            f"{dtype_name} index={index}: eigenvector drifted from the one-hot seed by {err_vec}"
+        )
+        print(
+            f"OK  r_is_zero guard ({dtype_name}): one-hot seed at index {index} against a "
+            f"diagonal operator converges in 0 iterations with eig={eig_seed}"
+        )
+
+# 3k. Large-magnitude seed-guard cases. 3j's diagonal entries are O(1-60), so a theta collapsed
+# towards 0 by a defeated guard and the true theta are hard to tell apart numerically. At 1e9 they
+# are unmistakable -- this is what actually discriminates a scaling bug in the guard's `excluded =
+# mx.abs(rho) * 2.0 + 1.0` (ground_locg_mlx.py:511): that expression's `+ 1.0` term is negligible
+# at rho~1e9 and dominant at rho~8, so a scaling error there would be invisible in 3j alone.
+# Mirrors tests/test_ground_locg.py::TestZeroResidualAfterSeedStep::test_one_by_one_large_magnitude.
+#
+# 1x1 case, sas="ops" (float64): the JAX fixture uses rel=1e-13. float64 has ~15-16 significant
+# decimal digits, so 1e-13 leaves comfortable headroom above eps (~2.2e-16) for the Rayleigh
+# quotient's rounding.
+eig_1x1, vec_1x1, iters_1x1, converged_1x1 = ground_locg_mlx(
+    _diag_matvec, np.array([1.0]), args=(np.array([1e9]),), sas="ops"
+)
+assert converged_1x1 is True, "1x1 large-magnitude (ops): not converged at seed step"
+assert iters_1x1 == 0, f"1x1 large-magnitude (ops): expected 0 iters, got {iters_1x1}"
+rel_err_1x1 = abs(eig_1x1 - 1e9) / 1e9
+assert rel_err_1x1 < 1e-13, f"1x1 large-magnitude (ops): rel err {rel_err_1x1}, eig={eig_1x1}"
+err_vec_1x1 = abs(float(np.asarray(vec_1x1)[0]) - 1.0)
+assert err_vec_1x1 < 1e-13, f"1x1 large-magnitude (ops): eigenvector drifted by {err_vec_1x1}"
+print(
+    f"OK  1x1 large-magnitude seed guard (ops, float64): eig={eig_1x1:.1f} "
+    f"(rel err {rel_err_1x1:.1e})"
+)
+
+# 1x1 case, sas="metal" (float32): float32 has ~7 significant decimal digits (eps ~1.19e-7), so a
+# float64-scale rel=1e-13 tolerance is unmeetable by construction -- assert against what f32
+# arithmetic can actually deliver instead (a small multiple of eps), not a borrowed f64 bound.
+eig_1x1_f32, _, iters_1x1_f32, converged_1x1_f32 = ground_locg_mlx(
+    _diag_matvec,
+    np.array([1.0], dtype=np.float32),
+    args=(np.array([1e9], dtype=np.float32),),
+    sas="metal",
+)
+assert converged_1x1_f32 is True, "1x1 large-magnitude (metal): not converged at seed step"
+assert iters_1x1_f32 == 0, f"1x1 large-magnitude (metal): expected 0 iters, got {iters_1x1_f32}"
+rel_err_1x1_f32 = abs(eig_1x1_f32 - 1e9) / 1e9
+assert rel_err_1x1_f32 < 1e-5, (
+    f"1x1 large-magnitude (metal): rel err {rel_err_1x1_f32}, eig={eig_1x1_f32}"
+)
+print(
+    f"OK  1x1 large-magnitude seed guard (metal, float32): eig={eig_1x1_f32:.1f} "
+    f"(rel err {rel_err_1x1_f32:.1e})"
+)
+
+# Large-magnitude diagonal/one-hot case: same shape as 3j but scaled by 1e9, so the seed-step
+# guard's excluded-diagonal arithmetic runs at rho~O(1e9-6e10) instead of rho~O(1-60).
+diag_big = diag * 1e9
+diag_big32 = diag_big.astype(np.float32)
+for index in (0, 5):
+    for dtype_name, dvec, sas_kw, rel_tol in (
+        ("float64/ops", diag_big, "ops", 1e-12),
+        ("float32/metal", diag_big32, "metal", 1e-5),
+    ):
+        one_hot = np.zeros(60, dtype=dvec.dtype)
+        one_hot[index] = 1.0
+        eig_big, _, iters_big, converged_big = ground_locg_mlx(
+            _diag_matvec, one_hot, args=(dvec,), sas=sas_kw
+        )
+        assert converged_big is True, f"{dtype_name} index={index}: large-mag not converged"
+        assert iters_big == 0, f"{dtype_name} index={index}: large-mag expected 0 iters"
+        rel_err_big = abs(eig_big - diag_big[index]) / abs(diag_big[index])
+        assert rel_err_big < rel_tol, (
+            f"{dtype_name} index={index}: large-mag eig={eig_big}, expected "
+            f"diag_big[{index}]={diag_big[index]} (rel err {rel_err_big})"
+        )
+        print(
+            f"OK  large-magnitude diagonal seed guard ({dtype_name}): index={index} "
+            f"eig={eig_big:.3e} (rel err {rel_err_big:.1e})"
+        )
 
 print("\nALL STATIC CHECKS PASSED (numpy shim; MLX itself still unverified)")
