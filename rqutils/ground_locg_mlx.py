@@ -60,9 +60,17 @@ the default ``sas="ops"`` op-graph path is unchanged from before the parameter e
 remains the only route for an f64 solve. This is additional surface area, not a structural
 difference forced by the port -- it introduces no new numerics, only a fused execution strategy
 for the same inner products :func:`_compute_sas` already computes, so it does not belong in the
-list above. Its speed effect relative to the op-graph path is unmeasured: this machine has no
-Metal device (see Verification below), so only the launch count is known, not any wall-clock
-ratio.
+list above.
+
+**The two kernels landed on opposite sides of the same argument.** Fusing the matvec was a large
+win; fusing the Rayleigh-Ritz inner products measured *slower* than the op-graph path
+(0.697 vs 0.593 ms/iter at N~800) and ``sas="ops"`` therefore remains the default. The
+difference is output parallelism: the matvec has N outputs and launches one thread each, while
+the Rayleigh-Ritz step has nine, so its kernel launches a fixed six threadgroups regardless of N
+and under-parallelizes a reduction that MLX's own kernels spread across the whole GPU. Fewer
+launches did not compensate. ``_compute_sas_metal``'s docstring carries the numbers; the full
+sweep, including why N above ~4000 is unmeasurable under fp32, is in
+``docs/superpowers/specs/2026-08-04-metal-sas-kernel-design.md``.
 
 This is also the one place this port deliberately diverges from :mod:`rqutils.ground_locg`
 without a JAX-side counterpart, and thus an exception to the "when you change one, change both"
@@ -347,10 +355,28 @@ def _get_metal_sas_kernel():
 def _compute_sas_metal(vectors, mvs, threadgroup=256):
     """Return the (n x n) matrix of <v_i | A | v_j> in a single fused Metal launch.
 
-    The op-graph :func:`_compute_sas` costs 16 op launches per iteration (measured) to produce
-    nine numbers, of which only six are distinct. This computes all six distinct inner products
-    in one launch: one threadgroup per (i, j) pair with i <= j, a strided per-thread partial sum,
-    then a threadgroup-memory tree reduction.
+    **Measured SLOWER than the op-graph :func:`_compute_sas` -- do not switch the default to
+    this.** Retained because it is correct, tested, and a verified negative result worth not
+    rediscovering. ``sas="ops"`` is the faster path and stays the default.
+
+    The op-graph path costs 16 op launches per iteration (measured) to produce nine numbers, of
+    which only six are distinct. This computes all six distinct inner products in one launch: one
+    threadgroup per (i, j) pair with i <= j, a strided per-thread partial sum, then a
+    threadgroup-memory tree reduction.
+
+    Why the launch-count argument fails here, and why the same argument *succeeded* for
+    :func:`apply_h_xz_mlx_metal`: this kernel launches **one threadgroup per pair -- six, for
+    n=3 -- regardless of N**, so serial work per thread grows linearly with N (3.1 steps at
+    N=800, 45.1 at N=11533) while parallelism stays pinned at 1536 threads. The op-graph path
+    calls MLX's own reduction kernels, which spread a reduction across the whole GPU. Trading 15
+    launches for a drastically under-parallelized reduction loses at every measurable N. The
+    matvec kernel avoids this because it has N outputs and launches one thread per output
+    element; the Rayleigh-Ritz step has nine outputs, so there is no output parallelism to
+    exploit. Measured on an M-series GPU at N~800: 0.697 ms/iter versus 0.593 ms/iter for the
+    op-graph path, against a launch-count model that predicted 0.419 ms. See
+    ``docs/superpowers/specs/2026-08-04-metal-sas-kernel-design.md`` for the full sweep, and note
+    that N above ~4000 is unmeasurable here because fp32 fails the solver's convergence gate
+    while Metal offers no float64.
 
     Thread 0 of each threadgroup writes **both** ``out[i*n + j]`` and ``out[j*n + i]``, so the
     result is exactly symmetric by construction -- stronger than the op-graph path's

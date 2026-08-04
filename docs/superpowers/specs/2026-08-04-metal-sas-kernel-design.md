@@ -267,12 +267,72 @@ estimates.
 (Correctness on hardware has since been confirmed by two device runs — see
 "Correctness on real hardware" below. Only the *timing* below is still open.)
 
-| N | J | `--sas ops` per_it_ms | `--sas metal` per_it_ms | speedup | gate |
-|---|---|---|---|---|---|
-| 893 | 100 | | | | |
-| ~4 000 | 100 | | | | |
-| ~20 000 | 100 | | | | |
-| larger, if fp32 converges | 100 | | | | |
+### Measured — the optimization does NOT pay off
+
+`mlx-gpu-f32`, `--matvec metal --compile-body`, J≈100, n=14, `--repeat 15`.
+Rows that tripped the benchmark's own steady-state spread guard (>25%) are
+reported as unusable rather than quoted, per this repo's rule that a warned run
+must not be compared:
+
+| N requested | subspace_dim | `--sas ops` | `--sas metal` | ratio |
+|---|---|---|---|---|
+| 893 | ~800 | 0.593 ms | 0.697 ms | **1.18× SLOWER** |
+| 2 000 | ~1 800 | 0.730 ms | *unusable (196% spread)* | — |
+| 4 000 | 3 571 | 0.593 ms | *unusable (35% spread)* | — |
+| 20 000 | 11 533 | gate failed | gate failed | — |
+
+**One clean paired comparison exists, and the fused kernel loses it.** An earlier
+sweep on a busy machine produced contradictory ratios (1.47× faster at N=893,
+2.32× slower at N=4000) with 48–186% spreads; those numbers are discarded
+entirely.
+
+Two secondary observations pinning down what was actually measured:
+
+* `ops` costs **0.593 ms at both N=893 and N=4000** — identical to three digits
+  across a 4.5× problem-size increase. Per-iteration cost is not tracking N, so
+  this regime is still dominated by fixed dispatch overhead rather than work.
+* N=20 000 fails the gate on *both* arms at ~1.2e-4 relative error against
+  `rtol=1e-4`, with the two arms agreeing to 7 digits. `jax-cpu-f64` converges to
+  the correct value there (841 iterations, matvec_err 1.2e-14), so this is the
+  **documented fp32 convergence ceiling**, not a kernel defect. Metal is
+  fp32-only, so the large-N regime this design called "the decisive measurement"
+  is unreachable by this kernel in principle.
+
+### Why it loses: fixed occupancy
+
+The launch-count model predicted the win and was wrong by 0.278 ms in the wrong
+direction (predicted 0.419 ms, measured 0.697 ms). The mechanism is structural,
+not a tuning miss:
+
+`_compute_sas_metal` launches **one threadgroup per (i, j) pair — six, for
+n=3 — regardless of N.** Serial work per thread grows linearly with N while
+parallelism stays pinned:
+
+| N | threadgroups | total threads | serial steps per thread |
+|---|---|---|---|
+| 800 | 6 | 1 536 | 3.1 |
+| 3 571 | 6 | 1 536 | 13.9 |
+| 11 533 | 6 | 1 536 | 45.1 |
+
+The op-graph path instead calls MLX's own reduction kernels, which are tuned to
+spread a reduction across the whole GPU. So the fusion trades 15 launches for a
+drastically under-parallelized reduction, and at every measurable N the
+reduction loses more than the launches save.
+
+This is exactly why the *matvec* fusion succeeded where this one fails:
+`apply_h_xz_mlx_metal` launches one thread **per output element** (46
+threadgroups at N=11 533), because it has N outputs. The Rayleigh–Ritz step has
+**nine**. There is no output parallelism to exploit, which is the same property
+that made this quantity cheap in op-count terms and expensive in launch terms.
+
+**Conclusion: keep `sas="ops"` as the default — it is the faster path.** The
+`sas="metal"` kernel is correct, tested, and retained as a verified negative
+result plus a starting point should the occupancy problem be addressed (e.g.
+splitting each pair's reduction across many threadgroups with a second
+combining pass, which reintroduces launches and is unlikely to win at these N).
+The design's own prediction — "a plausible outcome is a solid win at N≈10³
+shading toward noise at N≈10⁵" — was too optimistic: it is a loss at N≈10³ and
+unmeasurable beyond N≈4×10³ because fp32 will not converge.
 
 Command (to be run on hardware):
 
@@ -355,24 +415,27 @@ format / ty / 357 pytest) and reviewed. `sas="ops"` and `--sas ops` remain the
 defaults, so the new path is unreachable unless explicitly requested and merging
 carries no regression risk to existing measured results.
 
-**One obligation remains, requiring a Metal device:** the N sweep. Success
-criterion 6 is unmet.
+All six success criteria are now met, including criterion 6 — the sweep ran and
+returned a negative result, which is a met criterion, not a failed one.
 
 Re-run `uv run --extra mlx python examples/check_ground_locg_mlx_mlx.py` after
 any edit to either kernel's source: it is the only check that compiles them.
 
-Two findings from review worth carrying into the sweep:
+Loose ends, none blocking:
 
-* No `mlx-*` arm has ever run at `subspace_dim > 5000`, so `_time_mlx`'s
-  `matrix @ matvec_probe` against a sparse CSR reference is untested on that
-  path (textually identical to the verified `_time_jax` site, so low risk).
-  Make that combination one of the sweep points rather than testing large N
-  only on JAX.
+* The sparse gate path **is** now exercised (`reference_path: "sparse"` at
+  `subspace_dim=11533`, agreeing with the dense-equivalent reference to
+  1.9e-15) — but only on `jax-cpu-f64`. No `mlx-*` arm has completed a run
+  above the threshold, because fp32 fails the gate there. `_time_mlx`'s
+  `matrix @ matvec_probe` against a CSR reference therefore remains untested,
+  and is untestable until fp32 convergence at large N is addressed.
 * A **pre-existing** latent bound in `apply_h_xz_mlx_metal` (not introduced by
   this work): its flat index `j * n_states + i` reaches `J*N`, which overflows
   32-bit Metal `uint` at N=1e7 once J > 429. Outside the documented J≈100
-  regime, but relevant if the sweep pushes both N and J hard. The sas kernel's
-  own index reaches only `3N-1` and is safe past N≈1.4e9.
+  regime. The sas kernel's own index reaches only `3N-1`, safe past N≈1.4e9.
+* `--repeat 15` still left 2 of 6 rows above the spread guard on an otherwise
+  idle machine, so this benchmark needs either more samples or a quieter host
+  to resolve differences at the 0.1 ms scale.
 
 ## Success criteria
 
