@@ -29,7 +29,7 @@ mpl = ["matplotlib"]
 qutip = ["qutip"]
 qiskit = ["qiskit[visualization]"]
 docs = ["sphinx", "sphinx-rtd-theme"]
-dev = ["pytest", "ruff", "ty"]
+dev = ["pytest", "pytest-xdist", "pytest-sugar", "ruff", "ty"]
 mlx = ["mlx"]
 
 [project.urls]
