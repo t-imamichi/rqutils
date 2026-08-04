@@ -396,7 +396,14 @@ def _compute_sas_metal(vectors, mvs, threadgroup=256):
 
 
 def ground_locg_mlx(
-    mat, xinit, args=(), maxiter=1000, tol=None, compile_body=False, compile_chunk=10
+    mat,
+    xinit,
+    args=(),
+    maxiter=1000,
+    tol=None,
+    compile_body=False,
+    compile_chunk=10,
+    sas="ops",
 ):
     """Single-vector LOBPCG in MLX.
 
@@ -420,6 +427,12 @@ def ground_locg_mlx(
             instead of paying it every time. In fixed-iteration mode (``tol=0.``) no
             convergence check happens at all, so the compiled body runs start-to-finish with no
             per-iteration sync regardless of this value -- see the fixed-iteration branch below.
+        sas: Which Rayleigh-Ritz inner-product implementation to use. ``"ops"`` (default) is
+            the portable op-graph :func:`_compute_sas`, and reproduces this function's
+            behaviour exactly as it was before this parameter existed. ``"metal"`` uses the
+            fused single-launch :func:`_compute_sas_metal`, which requires float32 (Metal has
+            no float64) and so raises on an f64 solve. The choice is made once here rather than
+            per iteration, so it cannot introduce a per-iteration device sync.
 
     Returns:
         ``(eigenvalue, eigenvector, iterations, converged)``. Check the fourth value rather than
@@ -428,6 +441,8 @@ def ground_locg_mlx(
 
     Raises:
         ValueError: If ``xinit`` is complex. Every kernel here assumes real symmetric input.
+        ValueError: If ``sas`` is not ``"ops"`` or ``"metal"``, or if ``sas="metal"`` is
+            combined with a non-float32 ``xinit``.
     """
     xinit = mx.array(xinit)
     # Test the dtype's name rather than comparing against mx.complex64: this holds under real MLX
@@ -442,6 +457,19 @@ def ground_locg_mlx(
             "and the eigenpair kernels here omit the conjugations the complex case requires; use "
             "rqutils.ground_locg (JAX) for a complex-Hermitian operator."
         )
+    if sas not in ("ops", "metal"):
+        raise ValueError(f"sas must be 'ops' or 'metal', got {sas!r}")
+    if sas == "metal" and xinit.dtype != mx.float32:
+        # Fail here rather than at the first iteration's kernel call, so the error names the
+        # parameter the caller actually set. Metal has no float64.
+        raise ValueError(
+            f"sas='metal' requires float32 (Metal has no float64), got {xinit.dtype}. Use "
+            "sas='ops' for an f64 solve."
+        )
+    # Bind the implementation once, before iterating: the dtype is fixed for the whole solve, so
+    # a per-iteration dispatch would buy nothing and might force a device sync inside the
+    # compiled body (see the design doc -- unverified, and avoided rather than risked).
+    compute_sas = _compute_sas_metal if sas == "metal" else _compute_sas
     check_convergence = tol != 0.0
     if tol is None:
         # Compare the dtype object directly rather than parsing its repr: this works
@@ -469,25 +497,25 @@ def ground_locg_mlx(
     #
     # The zero-residual guard mirrors the JAX version's body_iter1: an exactly-zero residual means
     # xinit is already an eigenvector (sqd.py's diagonal-Hamiltonian path seeds exactly that), and
-    # without the guard eigenpair_2x2 sees a sas whose row/col 1 vanish and selects that null
+    # without the guard eigenpair_2x2 sees a sas_mat whose row/col 1 vanish and selects that null
     # direction, collapsing theta towards 0 instead of reporting rho -- the true answer.
     norm_r = mx.linalg.norm(rcurr)
     r_is_zero = bool(float(norm_r) == 0.0)
     tmp_p = normalize(rcurr, norm_r)
-    # Reuse ax from iteration 0 rather than recomputing it inside _compute_sas.
-    sas = _compute_sas((xcurr, tmp_p), (ax, matvec(tmp_p)))
+    # Reuse ax from iteration 0 rather than recomputing it inside compute_sas.
+    sas_mat = compute_sas((xcurr, tmp_p), (ax, matvec(tmp_p)))
     if r_is_zero:
         # Lift the p diagonal out of contention so Rayleigh-Ritz cannot pick the null direction.
         # With p excluded the 2x2 solve collapses onto x alone, giving theta = rho and kappa =
         # [1, 0], so xcurr is unchanged and no new search direction is introduced.
         excluded = mx.abs(rho) * 2.0 + 1.0
-        sas = sas + mx.stack(
+        sas_mat = sas_mat + mx.stack(
             [
-                mx.stack([mx.array(0.0, sas.dtype), mx.array(0.0, sas.dtype)]),
-                mx.stack([mx.array(0.0, sas.dtype), excluded - sas[1, 1]]),
+                mx.stack([mx.array(0.0, sas_mat.dtype), mx.array(0.0, sas_mat.dtype)]),
+                mx.stack([mx.array(0.0, sas_mat.dtype), excluded - sas_mat[1, 1]]),
             ]
         )
-    theta, kappa = eigenpair_2x2(sas)
+    theta, kappa = eigenpair_2x2(sas_mat)
     tmp_t = tmp_p * kappa[0] - xcurr * kappa[1]
     tmp_u = xcurr * kappa[0] + tmp_p * kappa[1]
     xcurr = normalize(tmp_u)
@@ -506,23 +534,23 @@ def ground_locg_mlx(
         tmp_p = _project_out((xcurr, ycurr), rcurr)
         # _project_out guarantees only |tmp_p| >= 0.99, but the Rayleigh-Ritz step below solves a
         # standard eigenproblem and so assumes an orthonormal basis: a short tmp_p scales
-        # sas[2, 2] by |tmp_p|^2, which for a large positive shift is a spuriously low diagonal
+        # sas_mat[2, 2] by |tmp_p|^2, which for a large positive shift is a spuriously low diagonal
         # that gets selected in place of the true minimizer (item I6).
         norm_p = mx.linalg.norm(tmp_p)
         p_is_zero = norm_p == 0.0
         tmp_p = normalize(tmp_p, norm_p)
         # xcurr's image is already known from the previous iteration -- three matvecs, not four.
-        sas = _compute_sas((xcurr, ycurr, tmp_p), (axcurr, matvec(ycurr), matvec(tmp_p)))
-        # A zeroed tmp_p leaves sas row/col 2 empty, and for a positive-definite A that zero
+        sas_mat = compute_sas((xcurr, ycurr, tmp_p), (axcurr, matvec(ycurr), matvec(tmp_p)))
+        # A zeroed tmp_p leaves sas_mat row/col 2 empty, and for a positive-definite A that zero
         # diagonal is the smallest eigenvalue, so Rayleigh-Ritz would pick the null direction and
         # the normalizations below would divide by zero. Lift it out of contention (item I7); the
         # p_is_zero case is reported as convergence by the caller.
-        diag_xy = mx.stack([sas[0, 0], sas[1, 1]])
+        diag_xy = mx.stack([sas_mat[0, 0], sas_mat[1, 1]])
         excluded = mx.max(diag_xy) + mx.sum(mx.abs(diag_xy)) + 1.0
-        mask = mx.zeros_like(sas)
+        mask = mx.zeros_like(sas_mat)
         mask[2, 2] = 1.0
-        sas = mx.where(p_is_zero, sas * (1.0 - mask) + excluded * mask, sas)
-        theta, kappa = eigenpair_3x3(sas)
+        sas_mat = mx.where(p_is_zero, sas_mat * (1.0 - mask) + excluded * mask, sas_mat)
+        theta, kappa = eigenpair_3x3(sas_mat)
         tmp_s = ycurr * kappa[1] + tmp_p * kappa[2]
         norm_s = mx.linalg.norm(tmp_s)
         tmp_t = tmp_s * (kappa[0] / mx.where(norm_s == 0.0, mx.array(1.0, norm_s.dtype), norm_s))

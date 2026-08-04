@@ -387,4 +387,59 @@ except ValueError as exc:
 else:
     raise AssertionError("_compute_sas_metal accepted float64 input -- guard did not fire")
 
+# 3i. sas="metal" must be a strict no-op on the trajectory relative to sas="ops" under the
+# shim, where both reduce to numpy arithmetic. Fixed-iteration mode (tol=0.) so no convergence
+# check can mask a divergence: same ops, same order, same iteration count.
+inputs32_v = inputs.vinit.astype(np.float32)
+xs32_i = inputs.xsources.astype(np.int32)
+dg32_i = inputs.diagonals.astype(np.float32)
+eig_ops, _, it_ops, _ = ground_locg_mlx(
+    apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=30, tol=0.0, sas="ops"
+)
+eig_met, _, it_met, _ = ground_locg_mlx(
+    apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=30, tol=0.0, sas="metal"
+)
+assert it_ops == it_met == 30, f"iteration counts differ: {it_ops} vs {it_met}"
+scale_eig = max(1.0, abs(eig_ops))
+assert abs(eig_met - eig_ops) < 1e-4 * scale_eig, (
+    f"sas='metal' changed the fixed-iteration eigenvalue: {eig_met} vs {eig_ops}"
+)
+print(f"OK  sas='metal' tracks sas='ops' (eig {eig_met:.6f} vs {eig_ops:.6f}, {it_met} iters)")
+
+# sas="metal" must refuse float64 rather than silently running a different kernel.
+try:
+    ground_locg_mlx(
+        apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals), sas="metal"
+    )
+except ValueError as exc:
+    assert "float32" in str(exc), f"unexpected guard message: {exc}"
+    print("OK  ground_locg_mlx(sas='metal') rejects float64 input")
+else:
+    raise AssertionError("ground_locg_mlx(sas='metal') accepted float64 -- guard did not fire")
+
+# An unknown sas value must fail loudly, not fall through to a default.
+try:
+    ground_locg_mlx(apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, sas="bogus")
+except ValueError as exc:
+    assert "bogus" in str(exc), f"unexpected message: {exc}"
+    print("OK  ground_locg_mlx rejects an unknown sas value")
+else:
+    raise AssertionError("ground_locg_mlx accepted sas='bogus'")
+
+# _compute_sas_metal must refuse a threadgroup exceeding _METAL_SAS_MAX_THREADGROUP (256), since
+# the kernel's `partials` threadgroup array is sized by that literal at compile time. Mirrors the
+# float64-guard case above in style.
+_METAL_SAS_MAX_THREADGROUP = module._METAL_SAS_MAX_THREADGROUP
+vecs32_tg = [vv.astype(np.float32) for vv in vecs]
+mvs32_tg = [mm.astype(np.float32) for mm in mvs]
+try:
+    _compute_sas_metal(tuple(vecs32_tg[:2]), tuple(mvs32_tg[:2]), threadgroup=512)
+except ValueError as exc:
+    assert "256" in str(exc), f"unexpected guard message: {exc}"
+    print("OK  _compute_sas_metal rejects threadgroup=512 (exceeds _METAL_SAS_MAX_THREADGROUP)")
+else:
+    raise AssertionError("_compute_sas_metal accepted threadgroup=512 -- guard did not fire")
+_ = _compute_sas_metal(tuple(vecs32_tg[:2]), tuple(mvs32_tg[:2]), threadgroup=256)
+print("OK  _compute_sas_metal still works at threadgroup=256")
+
 print("\nALL STATIC CHECKS PASSED (numpy shim; MLX itself still unverified)")
