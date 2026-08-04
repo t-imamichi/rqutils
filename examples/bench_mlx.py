@@ -12,11 +12,14 @@ therefore not solving byte-identical arrays to every other arm. This is disclose
 JAX's platform and x64 flag are process-global and must be set before importing jax, so each
 JAX arm needs its own process. --all re-executes this script once per arm and collates.
 
+``mlx`` is a darwin-only extra and the problem generator needs qiskit, so both must be requested:
+
 .. code-block:: sh
 
-    uv run python examples/bench_mlx.py --arm mlx-gpu-f32
-    uv run python examples/bench_mlx.py --all --num-qubits 10
-    uv run python examples/bench_mlx.py --all --num-qubits 10 --json > results.json
+    uv run --extra mlx --extra qiskit python examples/bench_mlx.py --arm mlx-gpu-f32
+    uv run --extra mlx --extra qiskit python examples/bench_mlx.py --all --num-qubits 10
+    uv run --extra mlx --extra qiskit python examples/bench_mlx.py --all --num-qubits 10 \
+        --json > results.json
 
 Two metrics are reported per arm: per-iteration cost at a fixed iteration count (identical
 work per arm, so a clean speed comparison) and time-to-convergence with its iteration count
@@ -70,6 +73,39 @@ BRUTE_FORCE_MAX_QUBITS = 12
 # factor. Both margins stay far below "the matvec is just wrong" territory (mismatches from a
 # real bug, e.g. bad mx.take indexing, show up as order-1 errors, not order-1e-6/1e-15).
 MATVEC_ATOL = {"f64": 1e-9, "f32": 1e-4}
+
+# Convergence tolerance passed to the solver, by precision. `None` means "use the dtype epsilon",
+# the solver's own default.
+#
+# f32 needs an explicit, tighter value. The solver's convergence test is
+#
+#     norm(r) < tol * (norm(Ax) + |theta|) * N * 10
+#
+# whose threshold scales LINEARLY IN N. That is inherited from
+# jax.experimental.sparse.linalg.lobpcg_standard and is harmless in f64 -- at N=3571 it still
+# demands norm(r) < 9e-11 -- but eps(f32) is 2e9x larger than eps(f64), so the same formula lets an
+# f32 solve stop at norm(r) ~ 5e-2 and declare victory while still far from the minimum. Measured
+# with tol=None (i.e. eps), seed 1, both frameworks:
+#
+#     n=10 p=20  s=200  N= 181: rel err 2.9e-07 in  26 iters  -- passes the gate
+#     n=12 p=100 s=1000 N= 893: rel err 3.6e-05 in  42 iters  -- passes, but only just
+#     n=10 p=100 s=4000 N=1001: rel err 2.6e-04 in  60 iters  -- FAILS rtol=1e-4
+#     n=14 p=100 s=4000 N=3571: rel err 5.4e-03 in  29 iters  -- FAILS badly
+#
+# Note the iteration count FALLING as the problem grows: the solver is not running out of
+# precision, it is being told to stop earlier. This is a property of the stopping rule, not of the
+# MLX port or of f32 arithmetic -- `jax-cpu-f32`, the reference implementation, reproduces the
+# n=10/100/4000 failure to three significant figures (2.57e-04 vs MLX's 2.58e-04).
+#
+# 1e-8 was chosen by sweeping the four sizes above: it passes everywhere with the worst case at
+# 1.7e-05 (a 6x margin under rtol=1e-4) for ~2x the iterations. 1e-9 buys another 3 orders of
+# accuracy for ~60% more iterations again, which this benchmark does not need.
+#
+# CAVEAT for comparing against previously recorded f32 numbers: this changes f32 iteration counts
+# (e.g. 60 -> 114 at n=10/100/4000), so `solve_s` and `iters` for f32 arms are NOT comparable with
+# runs recorded before this constant existed. `per_it_ms` (fixed-iteration mode, tol=0.0) is
+# unaffected, since that path does no convergence checking at all.
+SOLVE_TOL = {"f64": None, "f32": 1e-8}
 
 
 def parse_args(argv=None):
@@ -362,7 +398,9 @@ def _time_jax(arm, inputs, precision, options, matrix, matvec_probe):
     compile_s, fixed_s = timeit(fixed, options.repeat, jax.block_until_ready)
 
     def solve():
-        return ground_locg(matvec_fn, vinit, args=(xsources, diagonals))
+        # SOLVE_TOL[precision] rather than the solver default: see its definition for why f32
+        # needs an explicit tolerance (the convergence threshold scales linearly in N).
+        return ground_locg(matvec_fn, vinit, args=(xsources, diagonals), tol=SOLVE_TOL[precision])
 
     _, solve_s = timeit(solve, options.repeat, jax.block_until_ready)
     eigval, _, iters, _ = solve()
@@ -477,8 +515,15 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
     compile_s, fixed_s = timeit(fixed, options.repeat, sync)
 
     def solve():
+        # SOLVE_TOL[precision] rather than the solver default, symmetrically with the jax arms:
+        # the N-scaled convergence threshold is a property of the shared algorithm, not of either
+        # backend, so both must use the same tolerance or the comparison is not like-for-like.
         return ground_locg_mlx(
-            matvec_fn, vinit, args=(xsources, diagonals), compile_body=options.compile_body
+            matvec_fn,
+            vinit,
+            args=(xsources, diagonals),
+            tol=SOLVE_TOL[precision],
+            compile_body=options.compile_body,
         )
 
     _, solve_s = timeit(solve, options.repeat, sync)
