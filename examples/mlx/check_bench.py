@@ -72,45 +72,66 @@ assert out.returncode == 0, out.stderr
 assert "per_it_ms" in out.stdout and "jax-cpu-f64" in out.stdout, out.stdout
 print("OK  text report renders")
 
-# 6. --sas: a JAX arm must refuse it (MLX-only kernel), and the flag must be accepted by the
-# parser. Driven through subprocess like every other check here -- importing bench.py would
-# pull in mlx.core and need a Metal device, which is exactly what this file avoids.
+# 6. --matvec: a JAX arm must refuse "metal" (MLX-only kernel). Driven through subprocess like
+# every other check here -- importing bench.py would pull in mlx.core and need a Metal device,
+# which is exactly what this file avoids.
 out = subprocess.run(
-    BASE + ["--arm", "jax-cpu-f32", "--sas", "metal"], capture_output=True, text=True, check=False
-)
-assert out.returncode != 0, f"jax-cpu-f32 accepted --sas metal:\n{out.stdout}"
-assert "sas" in (out.stdout + out.stderr), (
-    f"rejection did not mention sas:\n{out.stdout}\n{out.stderr}"
-)
-print("OK  --sas metal refused for a jax arm")
-
-# --sas ops must be an explicit no-op: same eigenvalue as omitting the flag entirely, proving
-# the default path is untouched.
-out_default = subprocess.run(
-    BASE + ["--arm", "jax-cpu-f64", "--json"], capture_output=True, text=True, check=False
-)
-out_ops = subprocess.run(
-    BASE + ["--arm", "jax-cpu-f64", "--sas", "ops", "--json"],
+    BASE + ["--arm", "jax-cpu-f32", "--matvec", "metal"],
     capture_output=True,
     text=True,
     check=False,
 )
-assert out_ops.returncode == 0, f"--sas ops rejected for a jax arm:\n{out_ops.stderr}"
+assert out.returncode != 0, f"jax-cpu-f32 accepted --matvec metal:\n{out.stdout}"
+assert "metal" in (out.stdout + out.stderr), (
+    f"rejection did not mention metal:\n{out.stdout}\n{out.stderr}"
+)
+print("OK  --matvec metal refused for a jax arm")
+
+# --chunk must be honoured and must not change the answer: the chunked gather is now the default
+# matvec for both frameworks, so a chunk-size-dependent eigenvalue would mean an indexing bug in
+# the one code path every arm goes through. Nothing else here exercises --chunk.
+out_default = subprocess.run(
+    BASE + ["--arm", "jax-cpu-f64", "--json"], capture_output=True, text=True, check=False
+)
+out_chunk8 = subprocess.run(
+    BASE + ["--arm", "jax-cpu-f64", "--matvec", "chunked", "--chunk", "8", "--json"],
+    capture_output=True,
+    text=True,
+    check=False,
+)
+assert out_chunk8.returncode == 0, f"--chunk 8 rejected for a jax arm:\n{out_chunk8.stderr}"
 row_default = json.loads(out_default.stdout)
 row_default = row_default["results"][0] if "results" in row_default else row_default
-row_ops = json.loads(out_ops.stdout)
-row_ops = row_ops["results"][0] if "results" in row_ops else row_ops
-assert row_ops["eigval"] == row_default["eigval"], (
-    f"--sas ops changed a jax arm's eigenvalue: {row_ops['eigval']} vs {row_default['eigval']}"
+row_chunk8 = json.loads(out_chunk8.stdout)
+row_chunk8 = row_chunk8["results"][0] if "results" in row_chunk8 else row_chunk8
+assert row_chunk8["status"] == "ok", row_chunk8
+assert row_chunk8["chunk"] == 8, f"--chunk 8 not recorded in the result row: {row_chunk8}"
+assert abs(row_chunk8["eigval"] - row_default["eigval"]) < 1e-9, (
+    f"--chunk 8 changed the eigenvalue: {row_chunk8['eigval']} vs {row_default['eigval']}"
 )
-print("OK  --sas ops is a no-op for a jax arm (identical eigenvalue)")
+print("OK  --chunk 8 passes its gate and leaves the eigenvalue unchanged")
 
-# An unknown --sas value must be rejected by argparse rather than falling through to a default.
+# An unknown --matvec value must be rejected by argparse rather than falling through to a default.
 out = subprocess.run(
-    BASE + ["--arm", "jax-cpu-f64", "--sas", "bogus"], capture_output=True, text=True, check=False
+    BASE + ["--arm", "jax-cpu-f64", "--matvec", "bogus"],
+    capture_output=True,
+    text=True,
+    check=False,
 )
-assert out.returncode != 0, "--sas bogus was accepted"
-print("OK  --sas bogus rejected")
+assert out.returncode != 0, "--matvec bogus was accepted"
+print("OK  --matvec bogus rejected")
+
+# The removed flags must be gone from the parser, not silently ignored: a stale script passing
+# --sas/--eig/--compile-body should fail loudly rather than appear to have configured something.
+for dead_flag in ("--sas", "--eig", "--compile-body"):
+    out = subprocess.run(
+        BASE + ["--arm", "jax-cpu-f64", dead_flag, "metal"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert out.returncode != 0, f"{dead_flag} is still accepted by the parser"
+print("OK  --sas/--eig/--compile-body are rejected (collapsed into --matvec and the arm name)")
 
 # 7. The sparse reference path: above DENSE_REFERENCE_MAX_DIM (5000), dense_reference's (N, N)
 # array stops being allocatable at large N, so the gate must fall back to sparse_reference and

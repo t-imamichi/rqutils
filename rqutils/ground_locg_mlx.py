@@ -51,34 +51,6 @@ Five structural differences, all forced by MLX:
 The analytic 2x2/3x3 Rayleigh-Ritz step carries over directly, which is what makes this port
 feasible at all.
 
-**On ``mx.linalg.eigh``.** Earlier versions of this docstring said "MLX has no ``eigh``". That is
-no longer true -- ``mx.linalg.eigh`` exists (checked against the installed MLX) and takes exactly
-the input this solver produces: real symmetric, lower triangle, eigenvalues returned in ascending
-order, so ``w[0]``/``v[:, 0]`` would *be* the ground pair. It is nonetheless not used, for a
-measured reason rather than an absent feature:
-
-* An equivalent experiment is already on record. ``docs/superpowers/specs/2026-08-03-mlx-sqd-poc-design.md``
-  moved this eigensolve to the host with ``np.linalg.eigh``, replacing 35 op launches with 2 device
-  syncs, and it measured **1.37x slower** (0.910 vs 0.664 ms/iter) -- reverted in ``4dc8510``. The
-  lesson recorded there is that a sync costs ~389 us, ~53x a kernel launch, because it *drains*
-  MLX's pipeline: every queued op must retire before the CPU can read a value, destroying the async
-  overlap. Any eigensolve that crosses the device boundary per iteration inherits that cost, whether
-  it is spelled ``np.linalg.eigh`` or ``mx.linalg.eigh`` on a CPU stream. (MLX's own docstring
-  example for ``eigh`` passes ``stream=mx.cpu`` explicitly, which is suggestive but not proof of a
-  CPU-only implementation -- this has not been verified on a device.)
-* Even if it does execute on Metal with no sync, the comparison is one general ``eigh`` launch
-  against :func:`eigenpair_3x3_metal`'s single fused launch, which is already at the launch floor
-  and hand-specialized to nine numbers. Break-even is the optimistic case, against a **measured
-  1.75x** that would be given up.
-
-So the analytic route is kept on performance grounds, not for lack of an alternative. What ``eigh``
-*would* buy is accuracy: it is ~2x10^7 times more accurate than the Cardano formulation on the
-near-degenerate matrices a converging LOBPCG produces (1.8e-15 vs 3.6e-08), which is the documented
-cause of ``mlx-cpu-f64`` needing 217 iterations where JAX's f64 needs 89. An ``eigh``-backed option
-confined to the f64 CPU arm -- which can use no Metal kernel and crosses no device boundary -- is
-therefore an unexplored and plausibly *large* win via fewer iterations rather than faster ones. It
-is not implemented here, and would need measuring on real hardware before being believed.
-
 A sixth difference is not structural but a performance consequence of the same asymmetry, and it
 is why several expressions here look less like their JAX counterparts than a straight
 transcription would: **in JAX an unrolled Python loop over scalars is free, and in MLX it is
@@ -89,126 +61,57 @@ of this port's entire per-iteration op count. The Rayleigh-Ritz step here theref
 whole-array forms -- one broadcast cross product for all three orthogonal-complement candidates,
 one ``(7, 3)`` normalization, ``mx.diagonal``/``mx.roll`` instead of element-by-element
 ``mx.stack`` -- and hoists its dtype-dependent constants into :data:`_CONST_CACHE` instead of
-rebuilding them every iteration. Each of those was verified *bit-identical* to the form it
-replaced, not merely close: they change only how many ops are launched, never the arithmetic.
-:func:`_compute_sas` likewise takes all n^2 inner products from one stacked matmul instead of n^2
-reductions plus n+1 stacks (14.2 -> 2.3 ops), which is *also* more accurate than what it replaced
--- see its docstring. Measured with ``examples/count_mlx_ops.py``, the LOBPCG body went from 116 to
-65.0 op constructions per iteration (-44%) with the eigenvalue and iteration count unchanged. In
-wall-clock terms the first 116 -> 76.3 of that was measured at **about 1.05-1.10x** on
-``mlx-cpu-f64`` -- the arm that isolates this work, since Metal's lack of float64 means none of the
-fused kernels can run there (2.928 -> 2.689 ms/iter, controlled, uncompiled; a 3.9% noise floor on
-this arm is why the range rather than the ratio). Small but real, and consistent with the
-mechanism: this removes Python-level op construction, which the cost model ranks third, on a
-backend with no kernel-launch latency to reclaim. Expect less under ``compile_body``, which already
-amortizes graph construction. **The further 76.3 -> 65.0 from the ``_compute_sas`` matmul is
-backend-dependent, and instructively so:** flat on the MLX CPU backend (2.742 -> 2.725 ms/iter,
-0.6%, inside that arm's 3.9% noise floor) but worth **~1.17x on the GPU** (0.265 -> 0.224-0.227
-ms/iter, measured across four independent processes agreeing to 1.3%). The mechanism explains both
-halves: on the GPU each ``mx.sum`` is its own kernel launch, so collapsing 9 reductions plus 4.5
-stacks into one matmul removes ~12 launches, whereas the CPU backend has no launches to remove and
-the reductions were never the bottleneck at N~1000. Fewer ops is not automatically less time -- it
-is less time exactly where launch count dominates, which is what the cost model already says. The
-accuracy improvement (see :func:`_compute_sas`) is independent of all of this and holds on every
-backend. This is the
-one respect in which "when you change one, change both" should *not* be applied mechanically:
-porting these batched forms back to JAX would be churn, since XLA already fuses what they
-hand-fuse. The algebra is what must stay in step, not the op granularity.
+rebuilding them every iteration. Each was verified *bit-identical* to the form it replaced, not
+merely close. Measured with ``examples/mlx/count_ops.py``, the LOBPCG body went from 116 to 65.0 op
+constructions per iteration, and to 32.5 under ``device="gpu"``. This is the one respect in which
+"when you change one, change both" should *not* be applied mechanically: porting these batched
+forms back to JAX would be churn, since XLA already fuses what they hand-fuse. **The algebra is
+what must stay in step, not the op granularity.**
 
-Beyond the port itself, this module also adds three custom Metal kernels via
-``mx.fast.metal_kernel``, selected by :func:`ground_locg_mlx`'s ``sas`` and ``eig`` parameters and
-by the caller's choice of matvec: :func:`apply_h_xz_mlx_metal` fuses the matvec's
-gather-multiply-accumulate into one GPU launch (the op-graph path,
-:func:`apply_h_xz_mlx`/:func:`apply_h_xz_mlx_chunked`, needs several), the private
-``_compute_sas_metal`` fuses the Rayleigh-Ritz inner products the same way -- 16 op launches
-(measured) collapsing to 1 -- and :func:`eigenpair_3x3_metal` fuses the whole 3x3 eigensolve. All
-three are float32-only, since Metal has no float64; the default ``sas="ops"``/``eig="ops"``
-op-graph paths are unchanged from before those parameters existed and remain the only route for an
-f64 solve. This is additional surface area, not a structural difference forced by the port -- it
-introduces no new numerics, only fused execution strategies for quantities the op-graph functions
-already compute, so it does not belong in the list above.
+Performance, and the measurements behind it
+===========================================
 
-**The kernels landed on opposite sides of the same argument, and the discriminator is output
-parallelism -- not launch count.** Fusing the matvec was a large win; fusing the Rayleigh-Ritz
-inner products measured *slower* than the op-graph path (0.697 vs 0.593 ms/iter at N~800) and
-``sas="ops"`` therefore remains the default. The matvec has N outputs and launches one thread
-each, while the Rayleigh-Ritz reduction has nine, so its kernel launches a fixed six threadgroups
-regardless of N and under-parallelizes a reduction that MLX's own kernels spread across the whole
-GPU. Fewer launches did not compensate. ``_compute_sas_metal``'s docstring carries the numbers;
-the full sweep, including why N above ~4000 is unmeasurable under fp32, is in
-``docs/superpowers/specs/2026-08-04-metal-sas-kernel-design.md``.
+:func:`ground_locg_mlx` takes a single ``device`` parameter. ``device="gpu"`` selects two fused
+Metal kernels -- :func:`_apply_h_xz_metal` for the matvec and :func:`_eigenpair_3x3_metal` for the
+Rayleigh-Ritz eigensolve -- and requires float32, since Metal has no float64. ``device="cpu"`` runs
+the portable op-graph path, which is the **only** route for an f64 solve. ``mx.compile`` is applied
+unconditionally in both cases; it was the single largest measured win (2.71x) and is no longer
+selectable.
 
-A third kernel, :func:`eigenpair_3x3_metal` (``eig="metal"``), fuses the entire 3x3 eigensolve --
-balancing, Cardano, the rank-aware seven-candidate null-vector search, and the closing Rayleigh
-quotient -- into one launch. It sits on the *winning* side of that argument for a reason the
-``_compute_sas`` result makes precise: the eigensolve does not scale with N at all, so it has no
-reduction to under-parallelize. It is ~34 launches whose entire content is scalar arithmetic on
-nine numbers, which one thread does in registers. Measured with ``examples/count_mlx_ops.py``, it
-takes the LOBPCG body from 65.0 to 32.5 op constructions per iteration (-50%), the eigensolve
-itself going from 34.5 ops to exactly 1 launch. It is fp32-only like the others, and inherits --
-does not introduce -- Cardano's near-degeneracy fragility.
-
-This is also the one place this port deliberately diverges from :mod:`rqutils.ground_locg`
-without a JAX-side counterpart, and thus an exception to the "when you change one, change both"
-rule above: a fused Metal kernel adds no algebraic content over the op-graph computation it
-replaces -- it is a fused execution strategy for an existing quantity, not new numerics -- and
-Metal's float64-less hardware is exactly what this port targets, so there is no float64 JAX path
-this fusion could be mirrored onto.
+The measured wins, the two verified *negative* results (a fused Rayleigh-Ritz reduction that ran
+slower, and a host-side per-iteration ``eigh`` that ran 1.37x slower), the full op-count history
+with its backend split, and the cost model that explains all of them are in
+``docs/mlx-metal-kernels.md``. **Read that before proposing a fusion, a host-side eigensolve, or an
+"obvious" simplification here** -- several of the obvious ones were already tried and measured to
+lose. The short version of the transferable lesson: whether fusing wins is decided by **output
+parallelism, not launch count**.
 
 Verification
 ============
 
-MLX cannot initialize without a Metal device, which rules out headless testing. Two checkers
-cover the gap: ``examples/check_ground_locg_mlx_static.py`` re-executes this module's source
-against a numpy shim bound to the name ``mx`` (no MLX, no GPU -- this is what validates the
-algorithm and the caller-facing contract), and ``examples/check_ground_locg_mlx_mlx.py`` runs
-the real thing on both devices and both precisions, which requires a real Metal device (see the
-device status below -- it has now been run).
+MLX cannot initialize without a Metal device, which rules out headless testing.
+``examples/mlx/check_solver_headless.py`` re-executes this module's source against a numpy shim
+bound to the name ``mx`` (no MLX, no GPU -- this is what validates the algorithm and the
+caller-facing contract), and ``examples/mlx/check_solver_device.py`` runs the real thing on both
+devices and both precisions, which requires a real Metal device.
 
-Neither checker exercises the Metal kernels' actual ``source`` strings. The numpy shim
-reimplements the intended per-thread indexing in Python/numpy rather than compiling and running
-the Metal C++ text, so it is blind to a bug in that text itself.
-
-**Device status, as of 2026-08-05.** ``apply_h_xz_mlx_metal`` and ``_compute_sas_metal`` have now
-been executed on a real Metal device (Apple M1, 7-core GPU) via ``examples/bench_mlx.py --arm
-mlx-gpu-f32 --matvec metal --compile-body``: the run passed every correctness gate, with
-``matvec_err`` 1.69e-06 (the documented fp32 floor, matching the JAX f32 reference) and the
-eigenvalue agreeing with the recorded reference. So the MSL text of those two is validated, and
-the GPU measured 2.13x faster than MLX's CPU backend (0.452 vs 0.961 ms/iter).
-
-:func:`eigenpair_3x3_metal` has **also now been validated on the same M1**, via
-``examples/check_ground_locg_mlx_mlx.py`` (all 12 arms pass, ``FAILURES: none``) and
-``examples/bench_mlx.py --eig metal``. Its ``metal::sqrt``/``cos``/``sin``/``atan2`` calls compile,
-and on-device it agrees with ``numpy.linalg.eigh`` to 2.98e-07 (GPU) and 4.00e-07 (CPU) over 40
-random symmetric matrices. It is the first kernel here to call math functions at all, so two static
-guards were added to cover what the shim cannot: ``check_ground_locg_mlx_static.py`` asserts that
-every kernel source qualifies its math calls with ``metal::`` (MLX emits no
-``using namespace metal;``, so an unqualified call fails to compile) alongside the pre-existing
-MSL-reserved-identifier check that the ``half`` incident motivated. Both guards were verified to
-fire by breaking them deliberately.
-
-**Measured, controlled (M1, n=12/p=100/s=1000, ``--matvec metal --compile-body``, only ``--eig``
-differing):** 0.465 -> 0.265 ms/iter (**1.75x**) and 0.0465 -> 0.0275 s to converge (**1.69x**),
-with the eigenvalue **bit-identical** (-5.3960399628) and the iteration count unchanged at 70. The
-end-to-end and per-iteration gains agree because ``iters`` does not move, and the 1.75x exceeds
-what the -50% launch reduction alone predicts -- the fused kernel also removes ~34 intermediate
-allocations per iteration, not just the launches. Note this win is *on top of* ``compile_body``,
-which already amortizes graph construction. (That measurement was taken when the body stood at
-77.3 -> 44.3 ops; the ratio is the same -50% now that ``_compute_sas`` has brought both ends down
-to 65.0 -> 32.5, so the timing figures still apply.)
+Neither exercises the Metal kernels' actual ``source`` strings: the shim reimplements the intended
+per-thread indexing in numpy rather than compiling the Metal C++ text, so it is blind to a bug in
+that text itself. Two static guards cover part of that gap -- every kernel source must qualify its
+math calls with ``metal::``, and none may declare an MSL-reserved identifier -- and both were
+verified to fire by breaking them deliberately. See ``docs/mlx-metal-kernels.md`` for the device
+validation status.
 
 MLX LOBPCG API
 ==============
 
 .. autofunction:: ground_locg_mlx
 
+.. autofunction:: apply_h_xz
+
 .. autofunction:: eigenpair_2x2
 
 .. autofunction:: eigenpair_3x3
-
-.. autofunction:: apply_h_xz_mlx
-
-.. autofunction:: eigenpair_3x3_metal
 """
 
 import math
@@ -218,17 +121,25 @@ import numpy as np
 
 _SQRT3 = math.sqrt(3.0)
 
+# How many LOBPCG iterations run inside one compiled call before control returns to Python for a
+# convergence check. Only relevant when `tol != 0.`; a fixed-iteration solve never checks and so
+# never syncs. Checking after every iteration (chunk of 1) would sync as often as an uncompiled loop
+# and defeat the point of compiling, so this trades a slightly coarser iteration count for ~10x
+# fewer syncs -- see ground_locg_mlx's Returns section for what "coarser" costs. A module constant
+# rather than a parameter: 10 was the default nothing in the tree ever overrode.
+_COMPILE_CHUNK = 10
+
 # Per-dtype constant cache.
 #
 # Every `mx.array(...)` call constructs a fresh array -- a host-to-device allocation and, in the
 # lazy graph, another node -- so the scalar and small-vector constants the eigenpair kernels need
 # were being rebuilt on every iteration. `eigenpair_3x3` alone constructed 7 of them per call
-# (measured with examples/count_mlx_ops.py --by-op), which made it the single largest op-count
+# (measured with examples/mlx/count_ops.py --by-op), which made it the single largest op-count
 # contributor in the LOBPCG body. They depend only on the dtype, which is fixed for a whole solve,
 # so they are built once per dtype here and reused.
 #
 # Keyed by the dtype object rather than its name so this works identically under real MLX and under
-# the numpy shim in examples/check_ground_locg_mlx_static.py, whose dtypes are numpy types.
+# the numpy shim in examples/mlx/check_solver_headless.py, whose dtypes are numpy types.
 # Unbounded in principle, bounded by {float32, float64} in practice -- this module rejects complex
 # input and Metal has no float64, so at most two entries are ever created.
 _CONST_CACHE = {}
@@ -300,28 +211,20 @@ def normalize(vector, norm=None):
     return vector / mx.where(norm == 0.0, _consts(norm.dtype)["one"], norm)
 
 
-def apply_h_xz_mlx(vec, xsources, diagonals):
-    """Return Hv from precomputed X sources and diagonals.
+def apply_h_xz(vec, xsources, diagonals, chunk=16):
+    """Return Hv from precomputed X sources and diagonals, via chunked batched gather.
 
     Mirrors ``rqutils.sqd.apply_h`` at ``cache_level=(1, 2)``. ``xsources`` must already be
-    sanitized (no
-    negative entries, with the corresponding diagonals zeroed) -- see
-    ``_bench_common.build_solver_inputs``.
-    """
-    out = mx.zeros_like(vec)
-    for igroup in range(xsources.shape[0]):
-        out = out + mx.take(vec, xsources[igroup]) * diagonals[igroup]
-    return out
+    sanitized (no negative entries, with the corresponding diagonals zeroed) -- see
+    ``examples/mlx/_bench_common.build_solver_inputs``.
 
-
-def apply_h_xz_mlx_chunked(vec, xsources, diagonals, chunk=16):
-    """Return Hv via chunked batched gather -- the MLX counterpart of ``apply_h_xz_mlx``.
-
-    ``apply_h_xz_mlx`` above loops over the J X-groups doing one ``take``+multiply+add per
-    group -- 3J Python-level MLX op constructions per matvec. Since ``xsources``/``diagonals``
-    are dense ``(J, N)`` arrays, groups can instead be processed in chunks: gather a whole chunk
-    with one flat ``take``, reshape, and reduce with a single weighted sum, cutting the op count
-    from ``3*J`` to roughly ``3*ceil(J/chunk)``.
+    The obvious formulation loops over the J X-groups doing one ``take``+multiply+add per group,
+    which is 3J Python-level MLX op constructions per matvec. Since ``xsources``/``diagonals`` are
+    dense ``(J, N)`` arrays, groups are instead processed in chunks: gather a whole chunk with one
+    flat ``take``, reshape, and reduce with a single weighted sum, cutting the op count from
+    ``3*J`` to roughly ``3*ceil(J/chunk)``. The group-at-a-time version is gone -- it measured
+    8.106 ms/iter against 4.393 for this one, the slowest of every configuration tried
+    (``docs/mlx-metal-kernels.md``).
 
     ``chunk`` bounds the size of the gathered temporary to ``chunk * N`` elements, rather than
     the full ``(J, N)`` a fully-batched (``chunk=J``) version would materialize -- at the large N
@@ -341,12 +244,12 @@ def apply_h_xz_mlx_chunked(vec, xsources, diagonals, chunk=16):
     32        12   (25x fewer)          32*N
     ========  ========================  ===================
 
-    See ``examples/_bench_common.apply_h_xz_chunked`` for the JAX equivalent used by the JAX
+    See ``examples/mlx/_bench_common.apply_h_xz_chunked`` for the JAX equivalent used by the JAX
     arms of the benchmark -- batching the gather is applied symmetrically to both frameworks so
     the comparison stays about the solver loop, not about who has the better matvec.
 
-    Verified (design doc, Optimization 1): max abs diff vs the unchunked loop matvec is
-    <= 2.7e-15 for chunk in {1, 4, 8, 16, 32, 50, 100, 128}, and matches ``H @ v`` to 1.8e-15.
+    Verified (design doc, Optimization 1): max abs diff across chunk in
+    {1, 4, 8, 16, 32, 50, 100, 128} is <= 2.7e-15, and every chunk matches ``H @ v`` to 1.8e-15.
 
     Args:
         vec: The vector to multiply, shape ``(N,)``.
@@ -356,7 +259,7 @@ def apply_h_xz_mlx_chunked(vec, xsources, diagonals, chunk=16):
             is a plain Python int controlling how many groups are unrolled per flat gather.
 
     Returns:
-        ``H @ vec``, algebraically identical to ``apply_h_xz_mlx``.
+        ``H @ vec``.
     """
     num_groups = xsources.shape[0]
     out = mx.zeros_like(vec)
@@ -414,13 +317,16 @@ def _get_metal_matvec_kernel():
     )
 
 
-def apply_h_xz_mlx_metal(vec, xsources, diagonals, threadgroup=256):
+def _apply_h_xz_metal(vec, xsources, diagonals, threadgroup=256):
     """Return Hv via a single fused custom Metal kernel.
 
-    Both ``apply_h_xz_mlx`` and ``apply_h_xz_mlx_chunked`` express the matvec as a sequence of
-    MLX ops, so each one launches its own kernel and materializes a full intermediate array.
-    This version computes ``out[i] = sum_j vec[xsources[j, i]] * diagonals[j, i]`` in one launch
-    with the accumulator held in a per-thread register, so there are no intermediates at all.
+    :func:`apply_h_xz` expresses the matvec as a sequence of MLX ops, so each one launches its own
+    kernel and materializes a full intermediate array. This version computes
+    ``out[i] = sum_j vec[xsources[j, i]] * diagonals[j, i]`` in one launch with the accumulator
+    held in a per-thread register, so there are no intermediates at all.
+
+    Selected by ``ground_locg_mlx(..., device="gpu")``; private because ``device`` is the supported
+    way to reach it.
 
     One thread owns one output element, which means no atomics are needed: thread ``i`` is the
     only writer of ``out[i]``.
@@ -443,15 +349,15 @@ def apply_h_xz_mlx_metal(vec, xsources, diagonals, threadgroup=256):
         threadgroup: Threads per threadgroup. 256 is a reasonable default on Apple GPUs.
 
     Returns:
-        ``H @ vec``, algebraically identical to ``apply_h_xz_mlx``.
+        ``H @ vec``, algebraically identical to :func:`apply_h_xz`.
 
     Raises:
         ValueError: If ``vec`` is not float32, since Metal has no float64.
     """
     if vec.dtype != mx.float32:
         raise ValueError(
-            f"apply_h_xz_mlx_metal requires float32 (Metal has no float64), got {vec.dtype}. "
-            "Use apply_h_xz_mlx_chunked for the f64 arms."
+            f"_apply_h_xz_metal requires float32 (Metal has no float64), got {vec.dtype}. "
+            "Use apply_h_xz with device='cpu' for the f64 arms."
         )
 
     num_groups, num_states = xsources.shape
@@ -467,201 +373,11 @@ def apply_h_xz_mlx_metal(vec, xsources, diagonals, threadgroup=256):
     return outputs[0]
 
 
-# Threadgroup memory arrays need a compile-time-constant size in Metal -- they cannot be sized by
-# the runtime `lanes` value, since MLX generates the kernel's signature from input_names/
-# output_names plus a fixed table of attributes, with no way to thread a runtime size into a
-# `threadgroup` declaration. So `partials` is declared with this literal size, and the Python
-# wrapper below must raise rather than silently clamp if a caller's `threadgroup` would exceed it.
-_METAL_SAS_MAX_THREADGROUP = 256
-
-_METAL_SAS_SOURCE = """
-    // One threadgroup per (i, j) pair with i <= j; one thread per stride-slice of the vectors.
-    // Fixed-size threadgroup memory: see _METAL_SAS_MAX_THREADGROUP above for why this must be a
-    // compile-time literal rather than `lanes`. Only the first `lanes` slots are ever touched.
-    threadgroup T partials[_METAL_SAS_MAX_THREADGROUP_LITERAL_];
-
-    uint pair = threadgroup_position_in_grid.x;
-    uint lane = thread_position_in_threadgroup.x;
-    uint lanes = threads_per_threadgroup.x;
-
-    // Unrank `pair` into (i, j) with i <= j. n_basis is 2 or 3, so a short scan is cheaper
-    // than any closed form and avoids integer-sqrt rounding concerns entirely.
-    // n_basis/n_states arrive as `const constant int32_t` (MLX passes Python ints as int32), so
-    // the loop counters are int too: comparing a uint counter against them is a signedness
-    // mismatch that Metal warns on (-Wsign-compare). Both are small positive counts.
-    int nbasis = n_basis;
-    int nstates = n_states;
-
-    int i = 0;
-    int j = 0;
-    int seen = 0;
-    for (int a = 0; a < nbasis; ++a) {
-        for (int b = a; b < nbasis; ++b) {
-            if (seen == (int)pair) {
-                i = a;
-                j = b;
-            }
-            seen += 1;
-        }
-    }
-
-    // Strided partial sum in a register. Stride `lanes` keeps adjacent lanes on adjacent
-    // addresses, so these loads coalesce.
-    T acc = 0;
-    for (int k = (int)lane; k < nstates; k += (int)lanes) {
-        acc += vectors[i * nstates + k] * mvs[j * nstates + k];
-    }
-    partials[lane] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Tree reduction over the threadgroup. `lanes` is a power of two (the caller rounds down),
-    // so the halving is exact and no lane reads past the written region.
-    //
-    // NOTE: the stride variable must NOT be named `half` -- that is a reserved built-in scalar
-    // type in Metal Shading Language (16-bit float), so `uint half = ...` fails to compile with
-    // "cannot combine with previous 'type-name' declaration specifier" and cascades into eight
-    // further errors. Neither the numpy shim nor any static check can catch this, since Python
-    // has no such reserved word; it was found only by a real-device run.
-    for (uint stride = lanes / 2; stride > 0; stride /= 2) {
-        if (lane < stride) {
-            partials[lane] += partials[lane + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (lane == 0) {
-        // Write BOTH triangles with the identical value, so the result is exactly symmetric by
-        // construction and no separate symmetrization op is needed. For i == j this writes the
-        // same slot twice, which is harmless.
-        out[i * nbasis + j] = partials[0];
-        out[j * nbasis + i] = partials[0];
-    }
-""".replace("_METAL_SAS_MAX_THREADGROUP_LITERAL_", str(_METAL_SAS_MAX_THREADGROUP))
-
-
-def _get_metal_sas_kernel():
-    """Build (once) the fused Rayleigh-Ritz inner-product kernel."""
-    return _get_kernel(
-        "sqd_compute_sas",
-        ["vectors", "mvs", "n_basis", "n_states"],
-        ["out"],
-        _METAL_SAS_SOURCE,
-    )
-
-
-def _compute_sas_metal(vectors, mvs, threadgroup=256):
-    """Return the (n x n) matrix of <v_i | A | v_j> in a single fused Metal launch.
-
-    **Measured SLOWER than the op-graph :func:`_compute_sas` -- do not switch the default to
-    this.** Retained because it is correct, tested, and a verified negative result worth not
-    rediscovering. ``sas="ops"`` is the faster path and stays the default.
-
-    The op-graph path costs 16 op launches per iteration (measured) to produce nine numbers, of
-    which only six are distinct. This computes all six distinct inner products in one launch: one
-    threadgroup per (i, j) pair with i <= j, a strided per-thread partial sum, then a
-    threadgroup-memory tree reduction.
-
-    Why the launch-count argument fails here, and why the same argument *succeeded* for
-    :func:`apply_h_xz_mlx_metal`: this kernel launches **one threadgroup per pair -- six, for
-    n=3 -- regardless of N**, so serial work per thread grows linearly with N (3.1 steps at
-    N=800, 45.1 at N=11533) while parallelism stays pinned at 1536 threads. The op-graph path
-    calls MLX's own reduction kernels, which spread a reduction across the whole GPU. Trading 15
-    launches for a drastically under-parallelized reduction loses at every measurable N. The
-    matvec kernel avoids this because it has N outputs and launches one thread per output
-    element; the Rayleigh-Ritz step has nine outputs, so there is no output parallelism to
-    exploit. Measured on an M-series GPU at N~800: 0.697 ms/iter versus 0.593 ms/iter for the
-    op-graph path, against a launch-count model that predicted 0.419 ms. See
-    ``docs/superpowers/specs/2026-08-04-metal-sas-kernel-design.md`` for the full sweep, and note
-    that N above ~4000 is unmeasurable here because fp32 fails the solver's convergence gate
-    while Metal offers no float64.
-
-    Thread 0 of each threadgroup writes **both** ``out[i*n + j]`` and ``out[j*n + i]``, so the
-    result is exactly symmetric by construction -- stronger than the op-graph path's
-    ``(sas + sas.T) * 0.5``, which averages two values that differ by rounding -- and the
-    symmetrization op disappears rather than merely being fused.
-
-    The tree reduction changes summation order relative to ``mx.sum``. For dot products of
-    unit-norm vectors this is benign and typically *more* accurate than sequential summation
-    (error growing as log n rather than n), but it is a change: see
-    ``examples/check_ground_locg_mlx_static.py`` case 3h, which pins agreement with both the
-    op-graph path and a direct ``v @ m``.
-
-    Metal has no float64, so this path is f32-only, exactly like :func:`apply_h_xz_mlx_metal`.
-    The f64 arms must keep using :func:`_compute_sas`.
-
-    Args:
-        vectors: Basis vectors, a tuple of 2 or 3 arrays of shape ``(N,)``, float32.
-        mvs: Their images under A, same length and shapes, float32.
-        threadgroup: Maximum threads per threadgroup. Rounded down to a power of two so the
-            tree reduction halves exactly, and must not exceed
-            :data:`_METAL_SAS_MAX_THREADGROUP` -- the kernel's ``partials`` array is sized by
-            that literal at compile time, not by this runtime value.
-
-    Returns:
-        The ``(n, n)`` matrix of ``<v_i | A | v_j>``, exactly symmetric.
-
-    Raises:
-        ValueError: If the inputs are not float32, since Metal has no float64.
-        ValueError: If ``vectors`` and ``mvs`` differ in length, or the length is not 2 or 3.
-        ValueError: If ``threadgroup`` exceeds :data:`_METAL_SAS_MAX_THREADGROUP`.
-    """
-    if len(vectors) != len(mvs):
-        raise ValueError(f"vectors and mvs must have equal length, got {len(vectors)}/{len(mvs)}")
-    num_basis = len(vectors)
-    if num_basis not in (2, 3):
-        raise ValueError(f"_compute_sas_metal supports a basis of 2 or 3, got {num_basis}")
-    for name, arrays in (("vectors", vectors), ("mvs", mvs)):
-        for array in arrays:
-            if array.dtype != mx.float32:
-                raise ValueError(
-                    f"_compute_sas_metal requires float32 (Metal has no float64), got "
-                    f"{array.dtype} in {name}. Use _compute_sas for the f64 arms."
-                )
-    # The kernel's `partials` threadgroup array is declared with a compile-time-constant size
-    # (see _METAL_SAS_MAX_THREADGROUP above); raise loudly rather than silently clamping, since a
-    # silent clamp here would mean the caller's requested threadgroup size is not what actually
-    # ran, which is exactly the class of "plausible wrong number" bug this repo's guards exist to
-    # prevent.
-    if threadgroup > _METAL_SAS_MAX_THREADGROUP:
-        raise ValueError(
-            f"threadgroup={threadgroup} exceeds _METAL_SAS_MAX_THREADGROUP="
-            f"{_METAL_SAS_MAX_THREADGROUP}, the compile-time size of the kernel's `partials` "
-            "threadgroup array"
-        )
-
-    num_states = vectors[0].shape[0]
-    stacked_v = mx.stack(vectors)
-    stacked_m = mx.stack(mvs)
-    num_pairs = num_basis * (num_basis + 1) // 2
-
-    # Round the threadgroup size down to a power of two: the tree reduction halves `lanes` until
-    # it reaches 1, which only visits every written lane exactly once if it starts as a power of
-    # two. Also cap it at num_states so no lane sits idle with nothing to accumulate.
-    lanes = 1
-    while lanes * 2 <= min(threadgroup, num_states):
-        lanes *= 2
-
-    # No output initialization is needed: the pairs (i, j) with i <= j cover every slot of the
-    # (n, n) output once the j > i writes are mirrored, so every element is written before it is
-    # read. Do not "fix" this by zero-filling first; that would add back a launch.
-    kernel = _get_metal_sas_kernel()
-    outputs = kernel(
-        inputs=[stacked_v, stacked_m, num_basis, num_states],
-        template=[("T", mx.float32)],
-        # grid is in THREADS, not threadgroups: one threadgroup of `lanes` threads per pair.
-        grid=(num_pairs * lanes, 1, 1),
-        threadgroup=(lanes, 1, 1),
-        output_shapes=[(num_basis, num_basis)],
-        output_dtypes=[mx.float32],
-    )
-    return outputs[0]
-
-
 _METAL_EIG3_SOURCE = """
     // ONE thread does the whole 3x3 eigensolve. There is no output parallelism to exploit -- the
     // result is one eigenvalue plus a 3-vector -- so this kernel exists purely to collapse ~34 op
     // launches into 1, exactly the tradeoff that made the fused matvec a win and the fused
-    // Rayleigh-Ritz reduction a loss (see _compute_sas_metal). Here there is no reduction to
+    // Rayleigh-Ritz reduction a loss (docs/mlx-metal-kernels.md). Here there is no reduction to
     // under-parallelize: the op-graph version launches 34 kernels to do scalar arithmetic on nine
     // numbers, and every one of those launches is pure overhead.
     if (thread_position_in_grid.x > 0) {
@@ -837,22 +553,24 @@ def _get_metal_eig3_kernel():
     )
 
 
-def eigenpair_3x3_metal(mat):
+def _eigenpair_3x3_metal(mat):
     """Lowest eigenpair of a real symmetric 3x3 matrix in a single fused Metal launch.
 
     Algebraically the same computation as :func:`eigenpair_3x3` composed with
     :func:`_nullvec_3x3` -- balance, Cardano, the rank-aware seven-candidate null-vector search,
     and the closing Rayleigh quotient -- transcribed into one kernel so that ~34 op launches per
-    LOBPCG iteration (measured: 44% of the whole body, ``examples/count_mlx_ops.py``) become one.
+    LOBPCG iteration (measured: 44% of the whole body, ``examples/mlx/count_ops.py``) become one.
+    Measured 1.75x per-iteration and 1.69x end-to-end with a bit-identical eigenvalue.
 
-    **Why fusing wins here when it lost for the Rayleigh-Ritz reduction.**
-    :func:`_compute_sas_metal` is a verified negative result: it under-parallelized an O(N)
-    reduction that MLX's own kernels spread across the GPU, so trading 15 launches for that was a
-    loss at every measurable N. This kernel has the opposite profile. Its work does not scale with
-    N at all -- it is scalar arithmetic on nine numbers -- so there is nothing to parallelize and
-    nothing to under-parallelize. A single thread doing ~34 ops' worth of register arithmetic
-    replaces ~34 kernel launches whose *only* content is that same arithmetic. The launch-count
-    argument applies cleanly precisely because there is no reduction to lose.
+    Selected by ``ground_locg_mlx(..., device="gpu")``; private because ``device`` is the supported
+    way to reach it.
+
+    **Why fusing wins here when it lost for the Rayleigh-Ritz reduction.** Its work does not scale
+    with N at all -- it is scalar arithmetic on nine numbers -- so there is nothing to parallelize
+    and nothing to *under*-parallelize. A single thread doing ~34 ops' worth of register arithmetic
+    replaces ~34 kernel launches whose only content is that same arithmetic. The fused
+    Rayleigh-Ritz reduction had the opposite profile and measured slower; see
+    ``docs/mlx-metal-kernels.md`` before fusing anything else here.
 
     Every guard from the op-graph version is reproduced deliberately, not incidentally:
 
@@ -872,7 +590,7 @@ def eigenpair_3x3_metal(mat):
     degenerate (measured 3.6e-08 versus ``eigh``'s 1.8e-15), and ``rqutils.ground_locg``'s JAX
     original exhibits *bit-identical* error on the same matrices. This kernel is that same
     formulation, so an f32 solve using it is subject to the same fragility as an f32 solve without
-    it -- see ``docs/superpowers/specs/2026-08-03-mlx-sqd-poc-design.md``, which traces
+    it -- see ``docs/mlx-metal-kernels.md``, which traces
     ``mlx-cpu-f64``'s 652-iteration count to exactly this.
 
     Args:
@@ -888,8 +606,8 @@ def eigenpair_3x3_metal(mat):
     """
     if mat.dtype != mx.float32:
         raise ValueError(
-            f"eigenpair_3x3_metal requires float32 (Metal has no float64), got {mat.dtype}. "
-            "Use eigenpair_3x3 for the f64 arms."
+            f"_eigenpair_3x3_metal requires float32 (Metal has no float64), got {mat.dtype}. "
+            "Use device='cpu' for the f64 arms."
         )
     kernel = _get_metal_eig3_kernel()
     outputs = kernel(
@@ -907,74 +625,50 @@ def eigenpair_3x3_metal(mat):
     return outputs[0][0], outputs[1]
 
 
-def ground_locg_mlx(
-    mat,
-    xinit,
-    args=(),
-    maxiter=1000,
-    tol=None,
-    compile_body=False,
-    compile_chunk=10,
-    sas="ops",
-    eig="ops",
-):
+def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None, device="cpu"):
     """Single-vector LOBPCG in MLX.
 
     Args:
-        mat: Callable mapping ``(vec, *args)`` to ``A @ vec``.
+        mat: Callable mapping ``(vec, *args)`` to ``A @ vec``. Pair it with ``device``:
+            :func:`apply_h_xz` for ``device="cpu"``, :func:`_apply_h_xz_metal` for
+            ``device="gpu"``. This function never substitutes a matvec of its own.
         xinit: Initial vector. Must have nonvanishing overlap with the ground state.
         args: Extra arguments forwarded to ``mat``.
         maxiter: Maximum gradient-descent iterations.
         tol: Convergence tolerance. ``None`` uses the dtype epsilon. ``0.`` disables the
-            check, running exactly ``maxiter`` iterations with no per-iteration device sync.
-        compile_body: If True, wrap the per-iteration body in ``mx.compile`` so the ~1260
-            MLX ops it constructs are traced once instead of on every call. Opt-in and OFF by
-            default: with ``compile_body=False`` this function's behaviour, including its
-            exact iteration count, is unchanged from before this parameter existed.
-        compile_chunk: When ``compile_body`` is True, the number of raw iterations the compiled
-            body runs before control returns to Python for a convergence check. MLX has no
-            ``while_loop``/``cond``, so checking convergence at all forces a ``float()``
-            device sync; checking after every single iteration (chunk=1) would sync exactly as
-            often as the uncompiled path and defeat the point of compiling. Running a chunk of
-            iterations per compiled call amortizes that sync over ``compile_chunk`` iterations
-            instead of paying it every time. In fixed-iteration mode (``tol=0.``) no
-            convergence check happens at all, so the compiled body runs start-to-finish with no
-            per-iteration sync regardless of this value -- see the fixed-iteration branch below.
-        sas: Which Rayleigh-Ritz inner-product implementation to use. ``"ops"`` (default) is
-            the portable op-graph :func:`_compute_sas`, and reproduces this function's
-            behaviour exactly as it was before this parameter existed. ``"metal"`` uses the
-            fused single-launch :func:`_compute_sas_metal`, which requires float32 (Metal has
-            no float64) and so raises on an f64 solve. The choice is made once here rather than
-            per iteration, so it cannot introduce a per-iteration device sync.
+            check, running exactly ``maxiter`` iterations with no device sync at all.
+        device: Which implementation of the Rayleigh-Ritz eigensolve to use. ``"cpu"`` (default)
+            is the portable op-graph :func:`eigenpair_3x3`, and is the **only** route for a
+            float64 solve. ``"gpu"`` is the fused single-launch :func:`_eigenpair_3x3_metal`,
+            which requires float32 since Metal has no float64. Bound once here rather than per
+            iteration, so it cannot introduce a per-iteration device sync.
 
-            Note that ``"metal"`` is a **measured performance loss** and is retained only as a
-            verified negative result -- see :func:`_compute_sas_metal`. Do not enable it
-            expecting a speedup.
-        eig: Which 3x3 eigensolve to use for the Rayleigh-Ritz step. ``"ops"`` (default) is the
-            portable op-graph :func:`eigenpair_3x3`, and reproduces this function's behaviour
-            exactly as it was before this parameter existed. ``"metal"`` uses the fused
-            single-launch :func:`eigenpair_3x3_metal`, which requires float32 and so raises on
-            an f64 solve. Unlike ``sas="metal"`` this is expected to *win*, because the
-            eigensolve has no N-scaling reduction to under-parallelize -- it is ~34 launches of
-            pure scalar arithmetic. Bound once here, for the same reason as ``sas``.
+            Two things this parameter deliberately does *not* do. It does not inspect or replace
+            ``mat`` -- see above. And it does not call ``mx.set_default_device``: array placement
+            is the caller's job, and silently mutating process-global state the caller already
+            manages would be worse than making them do it. ``device`` names which kernels this
+            solve uses, not where its arrays live.
 
     Returns:
         ``(eigenvalue, eigenvector, iterations, converged)``. Check the fourth value rather than
         comparing the third against ``maxiter``, which is ambiguous when convergence happens on
         the final permitted iteration.
 
+        One caveat on ``iterations`` when ``tol != 0.``: the convergence test runs at
+        ``_COMPILE_CHUNK`` boundaries, so a solve that terminates because its search direction
+        zeroed out mid-chunk reports the boundary count rather than the exact iteration. Never
+        wrong -- a zeroed direction means no further iteration can lower the eigenvalue, so the
+        remainder of the chunk is wasted work, not incorrect work -- but ``iterations`` can round
+        up to a multiple of ``_COMPILE_CHUNK`` in that case.
+
     Raises:
         ValueError: If ``xinit`` is complex. Every kernel here assumes real symmetric input.
-        ValueError: If ``sas`` is not ``"ops"`` or ``"metal"``, or if ``sas="metal"`` is
+        ValueError: If ``device`` is not ``"cpu"`` or ``"gpu"``, or if ``device="gpu"`` is
             combined with a non-float32 ``xinit``.
-        ValueError: If ``eig`` is not ``"ops"`` or ``"metal"``, or if ``eig="metal"`` is
-            combined with a non-float32 ``xinit``.
-        ValueError: If ``compile_chunk`` is less than 1, which would make the chunked
-            convergence-checking loop fail to advance and spin forever.
     """
     xinit = mx.array(xinit)
     # Test the dtype's name rather than comparing against mx.complex64: this holds under real MLX
-    # and under the numpy shim in examples/check_ground_locg_mlx_static.py, which defines only the
+    # and under the numpy shim in examples/mlx/check_solver_headless.py, which defines only the
     # dtypes the port actually uses.
     if "complex" in str(xinit.dtype):
         # The kernels below drop the .conjugate() calls their JAX counterparts need, so complex
@@ -985,34 +679,23 @@ def ground_locg_mlx(
             "and the eigenpair kernels here omit the conjugations the complex case requires; use "
             "rqutils.ground_locg (JAX) for a complex-Hermitian operator."
         )
-    if sas not in ("ops", "metal"):
-        raise ValueError(f"sas must be 'ops' or 'metal', got {sas!r}")
-    if sas == "metal" and xinit.dtype != mx.float32:
-        # Fail here rather than at the first iteration's kernel call, so the error names the
-        # parameter the caller actually set. Metal has no float64.
+    if device not in ("cpu", "gpu"):
+        raise ValueError(f"device must be 'cpu' or 'gpu', got {device!r}")
+    if device == "gpu" and xinit.dtype != mx.float32:
+        # Validate HERE, not inside _eigenpair_3x3_metal, for three reasons. The message can name
+        # the parameter the caller actually set. It fires before the seed step spends three
+        # matvecs. And decisively: the seed_converged early return below exits without entering
+        # the loop at all, so a guard pushed down into the kernel would never fire on a
+        # diagonal-operator seed and an f64 device='gpu' call would silently succeed -- exactly the
+        # "plausible wrong configuration accepted quietly" class this module's guards exist for.
         raise ValueError(
-            f"sas='metal' requires float32 (Metal has no float64), got {xinit.dtype}. Use "
-            "sas='ops' for an f64 solve."
+            f"device='gpu' requires float32 (Metal has no float64), got {xinit.dtype}. Use "
+            "device='cpu' for an f64 solve."
         )
-    if eig not in ("ops", "metal"):
-        raise ValueError(f"eig must be 'ops' or 'metal', got {eig!r}")
-    if eig == "metal" and xinit.dtype != mx.float32:
-        raise ValueError(
-            f"eig='metal' requires float32 (Metal has no float64), got {xinit.dtype}. Use "
-            "eig='ops' for an f64 solve."
-        )
-    if compile_chunk < 1:
-        # The chunked convergence-checking loop advances by `this_chunk = min(compile_chunk,
-        # maxiter - niter)`, so a non-positive chunk makes `niter += this_chunk` a no-op and
-        # `while niter < maxiter` spins forever -- a silent hang rather than a wrong answer, but
-        # the same class of failure the rest of this module's guards exist to prevent. Reject it
-        # here instead, where the message can name the parameter.
-        raise ValueError(f"compile_chunk must be >= 1, got {compile_chunk}")
     # Bind the implementation once, before iterating: the dtype is fixed for the whole solve, so
     # a per-iteration dispatch would buy nothing and might force a device sync inside the
     # compiled body (see the design doc -- unverified, and avoided rather than risked).
-    compute_sas = _compute_sas_metal if sas == "metal" else _compute_sas
-    solve_eig3 = eigenpair_3x3_metal if eig == "metal" else eigenpair_3x3
+    solve_eig3 = _eigenpair_3x3_metal if device == "gpu" else eigenpair_3x3
     check_convergence = tol != 0.0
     if tol is None:
         # Compare the dtype object directly rather than parsing its repr: this works
@@ -1050,7 +733,7 @@ def ground_locg_mlx(
     r_is_zero = float(norm_r) == 0.0
     tmp_p = normalize(rcurr, norm_r)
     # Reuse ax from iteration 0 rather than recomputing it inside compute_sas.
-    sas_mat = compute_sas((xcurr, tmp_p), (ax, matvec(tmp_p)))
+    sas_mat = _compute_sas((xcurr, tmp_p), (ax, matvec(tmp_p)))
     if r_is_zero:
         # Lift the p diagonal out of contention so Rayleigh-Ritz cannot pick the null direction.
         # With p excluded the 2x2 solve collapses onto x alone, giving theta = rho and kappa =
@@ -1088,7 +771,7 @@ def ground_locg_mlx(
         p_is_zero = norm_p == 0.0
         tmp_p = normalize(tmp_p, norm_p)
         # xcurr's image is already known from the previous iteration -- three matvecs, not four.
-        sas_mat = compute_sas((xcurr, ycurr, tmp_p), (axcurr, matvec(ycurr), matvec(tmp_p)))
+        sas_mat = _compute_sas((xcurr, ycurr, tmp_p), (axcurr, matvec(ycurr), matvec(tmp_p)))
         # A zeroed tmp_p leaves sas_mat row/col 2 empty, and for a positive-definite A that zero
         # diagonal is the smallest eigenvalue, so Rayleigh-Ritz would pick the null direction and
         # the normalizations below would divide by zero. Lift it out of contention (item I7); the
@@ -1141,7 +824,7 @@ def ground_locg_mlx(
         # ONE float() sync, not two: the comparison is folded into a single on-device subtraction
         # and only its sign is read back. `norm(r) < tol * reltol` as two separate float() calls
         # drains the MLX pipeline twice per iteration, and syncs are the top item in this repo's
-        # cost model (see docs/superpowers/specs/2026-08-03-mlx-sqd-poc-design.md). Exactly
+        # cost model (see docs/mlx-metal-kernels.md). Exactly
         # equivalent -- 0 disagreements over 400k random magnitude pairs spanning 1e-30..1e10 in
         # both f32 and f64, since tol is a Python float and both operands are non-negative.
         return float(mx.linalg.norm(rcurr) - tol * reltol) < 0.0
@@ -1151,66 +834,62 @@ def ground_locg_mlx(
     if seed_converged:
         # {x} already spans the residual; the loop cannot improve on the seed pair.
         return float(theta), xcurr, 0, True
-    if not compile_body:
-        for niter in range(1, maxiter + 1):
-            theta, xcurr, ycurr, rcurr, axnext, p_is_zero = iter_body(xcurr, ycurr, rcurr, axnext)
-            if check_convergence and converged(theta, rcurr, axnext, p_is_zero):
-                is_converged = True
-                break
-    elif not check_convergence:
-        # Fixed-iteration mode: no convergence check at all, so the compiled body can run every
-        # requested iteration with zero per-iteration device sync -- the clean per-iteration
-        # speed measurement the design calls for. mx.compile traces iter_body's op graph once
-        # (over the (xcurr, ycurr, rcurr, axcurr) array tree) instead of once per maxiter call.
+    # Compilation is unconditional. mx.compile was the single largest measured win here (2.71x on
+    # the MLX CPU backend) and its trajectory was pinned bit-for-bit against the uncompiled one
+    # before that path was removed, so there was no configuration in which not compiling was right.
+    # What remains is the ONE distinction that is not a performance knob: whether a convergence
+    # check happens at all. MLX has no while_loop/cond, so a convergence check is necessarily a
+    # Python branch on a synced value, and mx.compile traces a fixed array-in/array-out computation
+    # that cannot contain one. Hence two loop shapes rather than one.
+    if not check_convergence:
+        # tol=0.: no convergence check, so the compiled body runs every requested iteration with
+        # ZERO device syncs -- the clean per-iteration measurement the benchmark reads. Compile
+        # iter_body directly rather than a chunk: maxiter need not be a multiple of _COMPILE_CHUNK,
+        # and with no sync to amortize there is nothing for chunking to buy.
         compiled_body = mx.compile(iter_body)
         for niter in range(1, maxiter + 1):
             theta, xcurr, ycurr, rcurr, axnext, _p_is_zero = compiled_body(
                 xcurr, ycurr, rcurr, axnext
             )
     else:
-        # Convergence checking mode with compilation: run compile_chunk raw iterations inside a
-        # single compiled function, then sync once to check convergence, instead of syncing
-        # after every single iteration. A compiled chunk-of-iterations body is what amortizes
-        # the unavoidable float()-sync cost over compile_chunk iterations rather than paying it
-        # every time -- compiling a body that itself contains a Python-level convergence branch
-        # is not an option, since mx.compile traces a fixed array-in/array-out computation and
-        # has no equivalent of jax.lax.while_loop/cond to make that branch part of the graph.
+        # Run _COMPILE_CHUNK iterations inside one compiled function, then sync once to check
+        # convergence. This amortizes the unavoidable float()-sync over _COMPILE_CHUNK iterations
+        # rather than paying it every iteration; syncs are the top item in this repo's cost model
+        # (~389 us, ~53x a kernel launch -- see docs/mlx-metal-kernels.md).
         def chunk_body(xcurr, ycurr, rcurr, axcurr):
-            # No theta/p_is_zero initializers: compile_chunk >= 1 is validated above, so the loop
-            # always runs at least once and any initial value would be dead. (They were not merely
-            # redundant -- a zero-trip loop would have returned them, reporting theta = 0.)
+            # No theta/p_is_zero initializers: _COMPILE_CHUNK is a module constant of 10, so the
+            # loop always runs at least once and any initial value would be dead. (They were not
+            # merely redundant -- a zero-trip loop would have returned them, reporting theta = 0.)
             #
-            # NOTE, and a real semantic difference from the uncompiled path: only the LAST
-            # iteration's p_is_zero survives, so a zeroed search direction arising mid-chunk is not
-            # reported. The uncompiled branch above checks it every iteration. Both still converge
-            # -- p_is_zero means no further iteration can lower theta, so the remaining iterations
-            # of the chunk are wasted work, not wrong work, and the flag is re-derived on the next
-            # chunk. Widening the compiled signature to an OR-accumulated flag would fix it, at the
-            # cost of an extra array in the traced carry. Left as is deliberately: this is a
-            # behaviour question, not a cleanup one, and `compile_body` is opt-in and off by
-            # default.
-            for _ in range(compile_chunk):
+            # NOTE, a real behaviour consequence: only the LAST iteration's p_is_zero survives, so
+            # a zeroed search direction arising mid-chunk is not reported until the next boundary.
+            # Still correct, never wrong -- p_is_zero means no further iteration can lower theta, so
+            # the rest of the chunk is wasted work rather than wrong work, is_converged is still
+            # True, and only the reported niter can round up (see this function's Returns section).
+            # Widening the compiled signature to an OR-accumulated flag would make niter exact at
+            # the cost of an extra array in the traced carry; that trade was declined deliberately.
+            for _ in range(_COMPILE_CHUNK):
                 theta, xcurr, ycurr, rcurr, axcurr, p_is_zero = iter_body(
                     xcurr, ycurr, rcurr, axcurr
                 )
             return theta, xcurr, ycurr, rcurr, axcurr, p_is_zero
 
         compiled_chunk = mx.compile(chunk_body)
-        # `range`, not a hand-advanced `while niter < maxiter`. The old shape derived its progress
-        # from `this_chunk = min(compile_chunk, maxiter - niter)` and advanced by it three lines
-        # later, so a non-positive compile_chunk made the advance a no-op and the loop spun forever.
-        # Here Python's own range semantics guarantee termination -- step=0 raises, a negative step
-        # yields an empty range -- which demotes the compile_chunk guard above from load-bearing to
-        # merely defensive (it stays, for the error message).
-        for start in range(0, maxiter, compile_chunk):
-            this_chunk = min(compile_chunk, maxiter - start)
-            if this_chunk == compile_chunk:
+        # `range`, not a hand-advanced `while niter < maxiter`: the old shape derived its progress
+        # from `this_chunk = min(chunk, maxiter - niter)` and advanced by it three lines later, so a
+        # non-positive chunk made the advance a no-op and the loop spun forever. Python's own range
+        # semantics guarantee termination instead. That hang is now unconstructible anyway --
+        # _COMPILE_CHUNK is a module constant -- which is why the guard that used to validate it is
+        # gone, but keep this form rather than reintroducing the hand-advanced one.
+        for start in range(0, maxiter, _COMPILE_CHUNK):
+            this_chunk = min(_COMPILE_CHUNK, maxiter - start)
+            if this_chunk == _COMPILE_CHUNK:
                 theta, xcurr, ycurr, rcurr, axnext, p_is_zero = compiled_chunk(
                     xcurr, ycurr, rcurr, axnext
                 )
             else:
-                # Final partial chunk: fall back to the uncompiled body so niter lands exactly
-                # on maxiter, matching the uncompiled path's semantics one iteration at a time.
+                # Final partial chunk: run the body uncompiled so niter lands exactly on maxiter
+                # rather than overshooting it.
                 for _ in range(this_chunk):
                     theta, xcurr, ycurr, rcurr, axnext, p_is_zero = iter_body(
                         xcurr, ycurr, rcurr, axnext
@@ -1232,7 +911,7 @@ def _compute_sas(vectors, mvs):
 
     All n^2 inner products come from ONE stacked ``(n, N) @ (N, n)`` matmul rather than n^2
     separate ``mx.sum(v1 * mv)`` reductions plus n+1 ``mx.stack`` calls -- 9 sums and 4.5 stacks
-    per iteration at n=3 (measured, ``examples/count_mlx_ops.py --by-op``) collapsing to 3 ops.
+    per iteration at n=3 (measured, ``examples/mlx/count_ops.py --by-op``) collapsing to 3 ops.
 
     This is *more* accurate than the form it replaces, not merely faster: against a longdouble
     reference over 3000 random unit-norm triples at N=900, the matmul is exact (0.0 max error)
@@ -1251,7 +930,7 @@ def _compute_sas(vectors, mvs):
     One visible consequence, expected and benign: because the accumulation order changes, **f32
     eigenvalues shift in their last one or two digits** relative to runs recorded before this
     change (e.g. -5.3960409164 versus -5.3960399628, ~1.8e-7 relative, against an f32 eps of
-    1.19e-7), and the f32 arms no longer agree digit-for-digit across ``sas``/``eig`` combinations.
+    1.19e-7), and the f32 arms no longer agree digit-for-digit across device settings.
     Iteration counts are unchanged and the correctness gate passes with a >500x margin at
     ``rtol=1e-4``. f64 is unaffected at the printed precision. Do not treat an f32 last-digit
     difference against a pre-matmul recorded value as a regression.
@@ -1382,7 +1061,7 @@ def _nullvec_3x3(mat):
     # Stack FIRST, then normalize the whole (7, 3) block in one pass. Normalizing candidate by
     # candidate -- what the JAX original does, and what this port copied -- costs 3 op launches per
     # candidate, 21 per iteration (measured: 18% of the whole LOBPCG body, see
-    # examples/count_mlx_ops.py). In JAX that loop is free because XLA fuses it into the surrounding
+    # examples/mlx/count_ops.py). In JAX that loop is free because XLA fuses it into the surrounding
     # jit; in MLX every op is its own launch, so the identical source shape has a completely
     # different cost. The batched form is *bit-identical* to the per-candidate one, not merely close
     # -- verified at 0.0 max abs difference over 2000 random triples spanning scales 1e-12..1e12

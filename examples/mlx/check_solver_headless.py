@@ -29,12 +29,16 @@ SRC = os.path.join(ROOT, "rqutils", "ground_locg_mlx.py")
 with open(SRC) as source_file:
     source = source_file.read()
 
-# 1. It must parse, and must define the two public functions.
+# 1. It must parse, and must define the public surface plus the two device="gpu" kernels.
 tree = ast.parse(source)
 defined = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
-for name in ("apply_h_xz_mlx", "ground_locg_mlx"):
+for name in ("apply_h_xz", "ground_locg_mlx", "_apply_h_xz_metal", "_eigenpair_3x3_metal"):
     assert name in defined, f"{name} not defined in {SRC}"
-print("OK  module parses and defines both public functions")
+# The variants that measured slower are gone; assert their ABSENCE so a well-meaning revert has to
+# argue with a failing check rather than slipping back in. See docs/mlx-metal-kernels.md.
+for name in ("apply_h_xz_mlx", "apply_h_xz_mlx_chunked", "_compute_sas_metal"):
+    assert name not in defined, f"{name} is back in {SRC} -- it was removed as a measured loss"
+print("OK  module parses, defines its public surface, and has not regrown the removed variants")
 
 # 2. Build a numpy shim exposing the mlx.core surface the port uses.
 shim = types.ModuleType("mx")
@@ -113,38 +117,6 @@ def _shim_metal_kernel(name, input_names, output_names, source, **kwargs):
             out = out + vec_np[xs_flat[off : off + num_states]] * dg_flat[off : off + num_states]
         return [out]
 
-    def call_sas(inputs, grid=None, threadgroup=None, output_dtypes=None, **kw):
-        vectors, mvs, num_basis, num_states = inputs
-        vec_np = np.asarray(vectors).reshape(-1)
-        mv_np = np.asarray(mvs).reshape(-1)
-        lanes = threadgroup[0]
-        num_pairs = num_basis * (num_basis + 1) // 2
-        assert grid[0] == num_pairs * lanes, (
-            f"grid {grid[0]} != num_pairs*lanes {num_pairs * lanes}: the caller must launch one "
-            "threadgroup per (i, j) pair"
-        )
-        assert lanes & (lanes - 1) == 0, f"threadgroup {lanes} is not a power of two"
-        out = np.zeros((num_basis, num_basis), dtype=np.dtype(output_dtypes[0]))
-        # Reproduce the kernel's *intended* pair-unranking scan, strided partial sums, and tree
-        # reduction -- not just the mathematical result -- so a mismatch between the caller's
-        # grid/threadgroup contract and that intent shows up here. This is independent of
-        # `source`, so it cannot catch a bug written into the Metal source text itself.
-        pairs = [(a, b) for a in range(num_basis) for b in range(a, num_basis)]
-        for i, j in pairs:
-            partials = np.zeros(lanes, dtype=np.dtype(output_dtypes[0]))
-            for lane in range(lanes):
-                acc = np.dtype(output_dtypes[0]).type(0)
-                for k in range(lane, num_states, lanes):
-                    acc += vec_np[i * num_states + k] * mv_np[j * num_states + k]
-                partials[lane] = acc
-            half = lanes // 2
-            while half > 0:
-                partials[:half] += partials[half : half * 2]
-                half //= 2
-            out[i, j] = partials[0]
-            out[j, i] = partials[0]
-        return [out]
-
     def call_eig3(inputs, grid=None, threadgroup=None, output_dtypes=None, **kw):
         (mat,) = inputs
         m = np.asarray(mat)
@@ -205,8 +177,6 @@ def _shim_metal_kernel(name, input_names, output_names, source, **kwargs):
 
     if name == "sqd_apply_h_xz":
         return call_matvec
-    if name == "sqd_compute_sas":
-        return call_sas
     if name == "sqd_eigenpair_3x3":
         return call_eig3
     raise AssertionError(f"no shim implementation for Metal kernel {name!r}")
@@ -233,13 +203,17 @@ sys.modules["mlx.core"] = shim
 exec(compile(source, SRC, "exec"), module.__dict__)  # noqa: S102
 print("OK  module executes against the numpy shim")
 
-apply_h_xz_mlx = module.apply_h_xz_mlx
+apply_h_xz = module.apply_h_xz
 ground_locg_mlx = module.ground_locg_mlx
 
 sig = inspect.signature(ground_locg_mlx)
-for param in ("mat", "xinit", "args", "maxiter", "tol"):
+for param in ("mat", "xinit", "args", "maxiter", "tol", "device"):
     assert param in sig.parameters, f"ground_locg_mlx missing parameter {param}"
-print("OK  ground_locg_mlx signature matches ground_locg")
+# The option surface collapsed to `device`; assert the removed knobs are GONE, not just unused. A
+# parameter that quietly reappears would re-split the arms this refactor merged.
+for param in ("sas", "eig", "compile_body", "compile_chunk"):
+    assert param not in sig.parameters, f"ground_locg_mlx regrew the removed parameter {param}"
+print("OK  ground_locg_mlx signature is (mat, xinit, args, maxiter, tol, device) -- no extra knobs")
 
 # 3. Numerics, against the same problem Task 1 verified.
 import jax
@@ -252,323 +226,116 @@ ps, cs, states = generate_problem(10, 20, 200, seed=1)
 inputs = build_solver_inputs(ps, cs, states)
 H, ref = dense_reference(inputs)
 
-# 3a. matvec must equal H @ v
+# 3a. matvec must equal H @ v. The single most load-bearing check in this file: an independent
+# dense reference, not self-consistency.
 rng = np.random.default_rng(7)
 v = rng.normal(size=inputs.subspace_dim)
-got = np.asarray(apply_h_xz_mlx(v, inputs.xsources, inputs.diagonals))
+got = np.asarray(apply_h_xz(v, inputs.xsources, inputs.diagonals))
 err = np.abs(got - H @ v).max()
-assert err < 1e-12, f"apply_h_xz_mlx disagrees with H @ v by {err}"
+assert err < 1e-12, f"apply_h_xz disagrees with H @ v by {err}"
 print(f"OK  matvec matches H @ v (max err {err:.2e})")
 
 # 3b. full solve must reach the reference eigenvalue
 eigval, eigvec, iters, converged = ground_locg_mlx(
-    apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals)
+    apply_h_xz, inputs.vinit, args=(inputs.xsources, inputs.diagonals)
 )
 assert abs(eigval - ref) < 1e-9 * max(1.0, abs(ref)), f"solver got {eigval}, reference {ref}"
 assert 0 < iters <= 1000, f"implausible iteration count {iters}"
 print(f"OK  solve: eig={eigval:.12f} ref={ref:.12f} iters={iters}")
 
-# 3c. tol=0. must run exactly maxiter iterations (fixed-iteration mode)
+# 3c. tol=0. must run exactly maxiter iterations. This is now also the check that pins the
+# fixed-iteration COMPILED branch, since compilation is unconditional -- it used to exercise the
+# uncompiled path, which no longer exists.
 _, _, fixed_iters, _ = ground_locg_mlx(
-    apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals), maxiter=100, tol=0.0
+    apply_h_xz, inputs.vinit, args=(inputs.xsources, inputs.diagonals), maxiter=100, tol=0.0
 )
 assert fixed_iters == 100, f"tol=0. ran {fixed_iters} iterations, expected exactly 100"
-print("OK  tol=0. gives fixed-iteration mode")
+print("OK  tol=0. gives fixed-iteration mode (compiled body, zero syncs)")
 
-# 3d. apply_h_xz_mlx_chunked must agree with apply_h_xz_mlx and with H @ v, for several chunk
-# sizes -- this is the restructured-control-flow check for Optimization 1 (chunked matvec). The
-# shim's mx.take/mx.sum are plain numpy, so this exercises the chunking logic itself, not MLX
-# kernels.
-apply_h_xz_mlx_chunked = module.apply_h_xz_mlx_chunked
+# 3d. The chunked gather must agree with H @ v at every chunk size, and all chunk sizes must agree
+# with each other. The second half matters because chunking is pure index arithmetic -- a reshape or
+# flat-take bug would show up as a chunk-size-dependent answer while any single chunk still looked
+# plausible. (This used to compare against a separate unchunked loop matvec, which is now gone; the
+# cross-chunk comparison recovers that signal without it.)
+per_chunk = {}
 for chunk in (1, 4, 8, 16, 32, 128):
-    got_chunked = np.asarray(apply_h_xz_mlx_chunked(v, inputs.xsources, inputs.diagonals, chunk))
-    err_vs_loop = np.abs(got_chunked - got).max()
+    got_chunked = np.asarray(apply_h_xz(v, inputs.xsources, inputs.diagonals, chunk))
+    per_chunk[chunk] = got_chunked
     err_vs_h = np.abs(got_chunked - H @ v).max()
-    assert err_vs_loop < 1e-9, f"chunk={chunk}: disagrees with loop matvec by {err_vs_loop}"
     assert err_vs_h < 1e-9, f"chunk={chunk}: disagrees with H @ v by {err_vs_h}"
-print("OK  apply_h_xz_mlx_chunked matches apply_h_xz_mlx and H @ v for chunk in {1,4,8,16,32,128}")
+spread = max(np.abs(per_chunk[c] - per_chunk[1]).max() for c in per_chunk)
+assert spread < 1e-9, f"chunk sizes disagree with each other by {spread}"
+print(f"OK  apply_h_xz matches H @ v for chunk in {{1,4,8,16,32,128}} (cross-chunk {spread:.2e})")
 
 # 3g. apply_h_xz_mlx_metal's CALLER logic: correct flat row-major indexing, shapes, grid setup,
 # and the float32-only guard. The shim interprets the kernel's arithmetic in numpy, so this
 # checks that the call is wired up correctly -- it CANNOT check that the Metal source compiles
 # or is numerically right on device. Only the user's real-hardware run establishes that.
-apply_h_xz_mlx_metal = module.apply_h_xz_mlx_metal
+_apply_h_xz_metal = module._apply_h_xz_metal
 xs32 = inputs.xsources.astype(np.int32)
 got_metal = np.asarray(
-    apply_h_xz_mlx_metal(v.astype(np.float32), xs32, inputs.diagonals.astype(np.float32))
+    _apply_h_xz_metal(v.astype(np.float32), xs32, inputs.diagonals.astype(np.float32))
 )
 err_metal = np.abs(got_metal - (H @ v)).max()
 assert err_metal < 1e-3, f"metal kernel caller logic disagrees with H @ v by {err_metal}"
-print(f"OK  apply_h_xz_mlx_metal caller logic matches H @ v (f32, max err {err_metal:.2e})")
+print(f"OK  _apply_h_xz_metal caller logic matches H @ v (f32, max err {err_metal:.2e})")
 
 # The float64 guard must fire rather than silently producing a wrong-precision result: Metal
-# has no float64, so an f64 arm must be routed to the chunked path instead.
+# has no float64, so an f64 arm must use apply_h_xz with device="cpu" instead.
 try:
-    apply_h_xz_mlx_metal(v, xs32, inputs.diagonals)
+    _apply_h_xz_metal(v, xs32, inputs.diagonals)
 except ValueError as exc:
     assert "float32" in str(exc), f"unexpected guard message: {exc}"
-    print("OK  apply_h_xz_mlx_metal rejects float64 input (Metal has no float64)")
+    print("OK  _apply_h_xz_metal rejects float64 input (Metal has no float64)")
 else:
-    raise AssertionError("apply_h_xz_mlx_metal accepted float64 input -- guard did not fire")
+    raise AssertionError("_apply_h_xz_metal accepted float64 input -- guard did not fire")
 
-# 3e. compile_body=True must produce the restructured control flow's eigenvalue, and must NOT
-# alter default (compile_body=False) behaviour. The shim stubs mx.compile as identity, so this
-# does not validate real MLX compilation -- only that the chunked-convergence-check control
-# flow this port adds is numerically sound. Use tol=0. (fixed-iteration) first: no convergence
-# check happens at all, so the compiled body must reproduce the uncompiled tol=0. trajectory
-# exactly (same ops, same order).
-eigval_default, _, iters_default, _ = ground_locg_mlx(
-    apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals), maxiter=100, tol=0.0
+# 3f. Fixed-iteration REGRESSION PIN.
+#
+# This case used to assert that compile_body=True matched compile_body=False bit-for-bit. That
+# comparison is no longer expressible: compilation is unconditional and the uncompiled path is
+# gone. Rather than drop the coverage, the literal below was captured from the pre-refactor
+# `compile_body=True, tol=0.0` run and is now pinned directly -- strictly stronger than the old
+# self-consistency check, since a self-comparison passes even if BOTH sides drift together.
+#
+# The shim stubs mx.compile as identity, so this validates the control flow, not real MLX
+# compilation. If this fires, the collapsed loop changed the trajectory; do not update the literal
+# without understanding why.
+_PINNED_FIXED_EIG = -2.496495741801  # 100 iterations, tol=0.0, f64, seed=1 problem
+eigval_fixed, _, iters_fixed, _ = ground_locg_mlx(
+    apply_h_xz, inputs.vinit, args=(inputs.xsources, inputs.diagonals), maxiter=100, tol=0.0
 )
-eigval_compiled, _, iters_compiled, _ = ground_locg_mlx(
-    apply_h_xz_mlx,
-    inputs.vinit,
-    args=(inputs.xsources, inputs.diagonals),
-    maxiter=100,
-    tol=0.0,
-    compile_body=True,
+assert iters_fixed == 100, f"fixed-iteration ran {iters_fixed} iterations, expected 100"
+assert abs(eigval_fixed - _PINNED_FIXED_EIG) < 1e-11, (
+    f"fixed-iteration eigenvalue drifted: {eigval_fixed:.12f} vs pinned {_PINNED_FIXED_EIG:.12f}"
 )
-assert iters_compiled == iters_default == 100, (
-    f"compile_body fixed-iteration mismatch: {iters_compiled} vs {iters_default}"
-)
-assert abs(eigval_compiled - eigval_default) < 1e-12, (
-    f"compile_body changed the fixed-iteration eigenvalue: {eigval_compiled} vs {eigval_default}"
-)
-print(
-    "OK  compile_body=True, tol=0. matches compile_body=False bit-for-bit "
-    f"(eig={eigval_compiled:.12f}, iters={iters_compiled})"
-)
+print(f"OK  fixed-iteration eigenvalue matches the pinned pre-refactor value ({eigval_fixed:.12f})")
 
-# 3f. compile_body=True with convergence checking (chunked between compile_chunk iterations)
-# must still reach the reference eigenvalue, and compile_body=False must be completely
-# unaffected by compile_body's existence (same call as 3b, repeated to prove no state leaks).
-eigval_chunked_conv, _, iters_chunked_conv, _ = ground_locg_mlx(
-    apply_h_xz_mlx,
-    inputs.vinit,
-    args=(inputs.xsources, inputs.diagonals),
-    compile_body=True,
-    compile_chunk=10,
-)
-assert abs(eigval_chunked_conv - ref) < 1e-9 * max(1.0, abs(ref)), (
-    f"compile_body=True with convergence checking got {eigval_chunked_conv}, reference {ref}"
-)
-print(
-    f"OK  compile_body=True with chunked convergence checking: "
-    f"eig={eigval_chunked_conv:.12f} iters={iters_chunked_conv}"
-)
-
+# 3g. Two successive default solves must agree exactly -- no state leaks through _CONST_CACHE,
+# _INDEX_CACHE or _KERNEL_CACHE, all of which are module-level mutable dicts populated on first use.
 eigval_default2, _, iters_default2, _ = ground_locg_mlx(
-    apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals)
+    apply_h_xz, inputs.vinit, args=(inputs.xsources, inputs.diagonals)
 )
 assert iters_default2 == iters, (
-    f"default (compile_body=False) iteration count changed after exercising compile_body: "
-    f"{iters_default2} vs original {iters} -- compile_body must be a strict no-op when unset"
+    f"repeated default solve changed its iteration count: {iters_default2} vs {iters} -- "
+    "something in the module-level caches is not idempotent"
 )
 assert abs(eigval_default2 - eigval) < 1e-12
-print(
-    "OK  default path (compile_body=False) unaffected -- byte-identical to the pre-existing "
-    f"behaviour (iters={iters_default2})"
-)
+print(f"OK  repeated default solve is identical (iters={iters_default2}) -- caches are idempotent")
 
-# 3h. _compute_sas_metal's CALLER logic and arithmetic, for both basis sizes. Same standing
-# caveat as 3g: the shim interprets the kernel in numpy, so this validates indexing, shapes,
-# grid setup and the both-triangles symmetry claim -- NOT that the Metal source compiles.
+# Shared fixtures for the cases below: the op-graph Rayleigh-Ritz helper, and an f32 copy of the
+# problem (device='gpu' is float32-only, since Metal has no float64).
 _compute_sas = module._compute_sas
-_compute_sas_metal = module._compute_sas_metal
-
-rng_sas = np.random.default_rng(11)
-for nbasis in (2, 3):
-    vecs = [rng_sas.normal(size=inputs.subspace_dim) for _ in range(nbasis)]
-    mvs = [np.asarray(apply_h_xz_mlx(vv, inputs.xsources, inputs.diagonals)) for vv in vecs]
-    want = np.asarray(_compute_sas(tuple(vecs), tuple(mvs)))
-    vecs32 = [vv.astype(np.float32) for vv in vecs]
-    mvs32 = [mm.astype(np.float32) for mm in mvs]
-    got_sas = np.asarray(_compute_sas_metal(tuple(vecs32), tuple(mvs32)))
-
-    assert got_sas.shape == (nbasis, nbasis), f"n={nbasis}: shape {got_sas.shape}"
-    # Exact symmetry, not symmetry-to-tolerance: thread 0 writes the same value to both
-    # triangles, so the two must be bit-identical. This is stronger than the op-graph path's
-    # (sas + sas.T) * 0.5, which averages two values differing by rounding.
-    asym = np.abs(got_sas - got_sas.T).max()
-    assert asym == 0.0, f"n={nbasis}: output not exactly symmetric (|S - S.T| = {asym})"
-    err_sas = np.abs(got_sas - want).max()
-    scale = max(1.0, np.abs(want).max())
-    assert err_sas < 1e-4 * scale, f"n={nbasis}: disagrees with _compute_sas by {err_sas}"
-
-    # Independent reference: the inner products computed directly, not via either code path.
-    direct = np.array([[vv @ mm for mm in mvs] for vv in vecs])
-    direct = (direct + direct.T) * 0.5
-    err_direct = np.abs(got_sas - direct).max()
-    assert err_direct < 1e-4 * scale, f"n={nbasis}: disagrees with direct v@m by {err_direct}"
-    print(
-        f"OK  _compute_sas_metal n={nbasis} matches _compute_sas ({err_sas:.2e}) and "
-        f"direct v@m ({err_direct:.2e}), exactly symmetric"
-    )
-
-# 3h continued: the loop above uses mvs = H @ v for real symmetric H, so v_i . mv_j ==
-# v_j . mv_i mathematically -- a transposed `vectors[j]*mvs[i]` bug in the kernel source would be
-# invisible even on real hardware with that data, and the (direct + direct.T) * 0.5 above
-# symmetrizes away the only remaining signal in the shim comparison too. Use genuinely asymmetric
-# mvs (independent random vectors, not images of any operator) to break that degeneracy: now
-# v_i . mv_j != v_j . mv_i in general, so a transposed index would show up.
-#
-# The kernel only ever promises the i <= j inner products (both triangles get the *same* write),
-# so the right assertion is against those specific dot products, not against a full v @ M matrix:
-# out[i, j] == out[j, i] == v_i . mv_j for every i <= j -- exactly what the docstring claims.
-rng_asym = np.random.default_rng(23)
-for nbasis in (2, 3):
-    vecs_a = [rng_asym.normal(size=inputs.subspace_dim).astype(np.float32) for _ in range(nbasis)]
-    mvs_a = [rng_asym.normal(size=inputs.subspace_dim).astype(np.float32) for _ in range(nbasis)]
-    got_asym = np.asarray(_compute_sas_metal(tuple(vecs_a), tuple(mvs_a)))
-
-    asym2 = np.abs(got_asym - got_asym.T).max()
-    assert asym2 == 0.0, f"n={nbasis} (asymmetric mvs): output not exactly symmetric ({asym2})"
-
-    scale_a = max(1.0, np.abs(np.stack(vecs_a)).max() * np.abs(np.stack(mvs_a)).max() * 100)
-    for i in range(nbasis):
-        for j in range(i, nbasis):
-            want_ij = float(vecs_a[i] @ mvs_a[j])
-            err_ij = abs(float(got_asym[i, j]) - want_ij)
-            assert err_ij < 1e-4 * scale_a, (
-                f"n={nbasis} (asymmetric mvs): out[{i},{j}]={got_asym[i, j]} disagrees with "
-                f"v_{i}.mv_{j}={want_ij} by {err_ij}"
-            )
-            err_ji = abs(float(got_asym[j, i]) - want_ij)
-            assert err_ji < 1e-4 * scale_a, (
-                f"n={nbasis} (asymmetric mvs): out[{j},{i}]={got_asym[j, i]} disagrees with "
-                f"v_{i}.mv_{j}={want_ij} by {err_ji} -- both triangles must equal v_i.mv_j, "
-                "not v_j.mv_i"
-            )
-    print(
-        f"OK  _compute_sas_metal n={nbasis} with asymmetric mvs: out[i,j]==out[j,i]==v_i.mv_j "
-        "for all i<=j (discriminates a transposed index)"
-    )
-
-# The float64 guard must fire, mirroring apply_h_xz_mlx_metal's (Metal has no float64).
-try:
-    _compute_sas_metal((vecs[0], vecs[1]), (mvs[0], mvs[1]))
-except ValueError as exc:
-    assert "float32" in str(exc), f"unexpected guard message: {exc}"
-    print("OK  _compute_sas_metal rejects float64 input (Metal has no float64)")
-else:
-    raise AssertionError("_compute_sas_metal accepted float64 input -- guard did not fire")
-
-# 3i. sas="metal" must be a strict no-op on the trajectory relative to sas="ops" under the
-# shim, where both reduce to numpy arithmetic. Fixed-iteration mode (tol=0.) so no convergence
-# check can mask a divergence: same ops, same order, same iteration count.
 inputs32_v = inputs.vinit.astype(np.float32)
 xs32_i = inputs.xsources.astype(np.int32)
 dg32_i = inputs.diagonals.astype(np.float32)
-eig_ops, _, it_ops, _ = ground_locg_mlx(
-    apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=30, tol=0.0, sas="ops"
-)
-eig_met, _, it_met, _ = ground_locg_mlx(
-    apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=30, tol=0.0, sas="metal"
-)
-assert it_ops == it_met == 30, f"iteration counts differ: {it_ops} vs {it_met}"
-scale_eig = max(1.0, abs(eig_ops))
-# Measured exact agreement (0.0) under the shim, where both paths reduce to the same float32
-# numpy arithmetic on this small problem -- tightened from an earlier 1e-4*scale, which would
-# have passed a genuine ~4e-4 kernel defect. This numerical check is defence-in-depth on top of
-# the call-spy check below, which is what actually proves the two branches are wired up.
-assert abs(eig_met - eig_ops) < 1e-8 * scale_eig, (
-    f"sas='metal' changed the fixed-iteration eigenvalue: {eig_met} vs {eig_ops}"
-)
-print(f"OK  sas='metal' tracks sas='ops' (eig {eig_met:.6f} vs {eig_ops:.6f}, {it_met} iters)")
-
-# 3i continued: the check above proves "metal doesn't diverge from ops", but not that sas="metal"
-# actually dispatches to _compute_sas_metal -- under the shim the two paths agree to the bit on
-# this problem, so a mis-wired call site (e.g. both branches hardcoded to _compute_sas) would
-# pass it silently. Wrap each module-level function with a counting spy and confirm sas="metal"
-# calls only the metal implementation, and sas="ops" only the ops implementation. The binding
-# `compute_sas = _compute_sas_metal if sas == "metal" else _compute_sas` reads these module
-# globals at call time, so patching module._compute_sas / module._compute_sas_metal intercepts it.
-_orig_compute_sas = module._compute_sas
-_orig_compute_sas_metal = module._compute_sas_metal
-_spy_counts = {"ops": 0, "metal": 0}
-
-
-def _spy_ops(*a, **k):
-    _spy_counts["ops"] += 1
-    return _orig_compute_sas(*a, **k)
-
-
-def _spy_metal(*a, **k):
-    _spy_counts["metal"] += 1
-    return _orig_compute_sas_metal(*a, **k)
-
-
-module._compute_sas = _spy_ops
-module._compute_sas_metal = _spy_metal
-try:
-    _spy_counts["ops"] = 0
-    _spy_counts["metal"] = 0
-    ground_locg_mlx(
-        apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, tol=0.0, sas="metal"
-    )
-    assert _spy_counts["metal"] > 0 and _spy_counts["ops"] == 0, (
-        f"sas='metal' did not dispatch exclusively to _compute_sas_metal: {_spy_counts}"
-    )
-    metal_calls_for_2_iters = _spy_counts["metal"]
-
-    _spy_counts["ops"] = 0
-    _spy_counts["metal"] = 0
-    ground_locg_mlx(
-        apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, tol=0.0, sas="ops"
-    )
-    assert _spy_counts["ops"] > 0 and _spy_counts["metal"] == 0, (
-        f"sas='ops' did not dispatch exclusively to _compute_sas: {_spy_counts}"
-    )
-finally:
-    module._compute_sas = _orig_compute_sas
-    module._compute_sas_metal = _orig_compute_sas_metal
-print(
-    f"OK  sas='metal'/sas='ops' dispatch exclusively to their own implementation "
-    f"({metal_calls_for_2_iters} metal calls, 0 ops calls, for 2 iterations)"
-)
-
-# sas="metal" must refuse float64 rather than silently running a different kernel.
-try:
-    ground_locg_mlx(
-        apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals), sas="metal"
-    )
-except ValueError as exc:
-    assert "float32" in str(exc), f"unexpected guard message: {exc}"
-    print("OK  ground_locg_mlx(sas='metal') rejects float64 input")
-else:
-    raise AssertionError("ground_locg_mlx(sas='metal') accepted float64 -- guard did not fire")
-
-# An unknown sas value must fail loudly, not fall through to a default.
-try:
-    ground_locg_mlx(apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, sas="bogus")
-except ValueError as exc:
-    assert "bogus" in str(exc), f"unexpected message: {exc}"
-    print("OK  ground_locg_mlx rejects an unknown sas value")
-else:
-    raise AssertionError("ground_locg_mlx accepted sas='bogus'")
-
-# _compute_sas_metal must refuse a threadgroup exceeding _METAL_SAS_MAX_THREADGROUP (256), since
-# the kernel's `partials` threadgroup array is sized by that literal at compile time. Mirrors the
-# float64-guard case above in style.
-_METAL_SAS_MAX_THREADGROUP = module._METAL_SAS_MAX_THREADGROUP
-vecs32_tg = [vv.astype(np.float32) for vv in vecs]
-mvs32_tg = [mm.astype(np.float32) for mm in mvs]
-try:
-    _compute_sas_metal(tuple(vecs32_tg[:2]), tuple(mvs32_tg[:2]), threadgroup=512)
-except ValueError as exc:
-    assert "256" in str(exc), f"unexpected guard message: {exc}"
-    print("OK  _compute_sas_metal rejects threadgroup=512 (exceeds _METAL_SAS_MAX_THREADGROUP)")
-else:
-    raise AssertionError("_compute_sas_metal accepted threadgroup=512 -- guard did not fire")
-_ = _compute_sas_metal(tuple(vecs32_tg[:2]), tuple(mvs32_tg[:2]), threadgroup=256)
-print("OK  _compute_sas_metal still works at threadgroup=256")
 
 # 3k. eigenpair_3x3_metal must agree with the op-graph eigenpair_3x3 on the matrix classes the
 # solver actually produces, INCLUDING the rank-deficient and near-degenerate ones the seven-
 # candidate search and the balancing exist for. This is the check that discriminates a transcription
 # error in the fused kernel's algorithm: a wrong permutation in the characteristic polynomial, a
 # dropped balancing step, or a tie-breaking difference in the argmax/argmin scans.
-eigenpair_3x3_metal = module.eigenpair_3x3_metal
+_eigenpair_3x3_metal = module._eigenpair_3x3_metal
 eigenpair_3x3_ops = module.eigenpair_3x3
 _rng_eig = np.random.default_rng(20260805)
 
@@ -612,7 +379,7 @@ _worst_eig = 0.0
 _worst_case = None
 for _label, _mat in _eig_cases:
     _th_ops, _kp_ops = eigenpair_3x3_ops(_mat)
-    _th_met, _kp_met = eigenpair_3x3_metal(_mat)
+    _th_met, _kp_met = _eigenpair_3x3_metal(_mat)
     assert np.isfinite(_th_met), f"{_label}: metal eigenvalue is not finite ({_th_met})"
     assert np.all(np.isfinite(_kp_met)), f"{_label}: metal eigenvector is not finite ({_kp_met})"
     # Compare eigenvalues, which are basis-independent. The eigenvectors can legitimately differ
@@ -634,7 +401,7 @@ for _label, _mat in _eig_cases:
     _resid = np.linalg.norm(_mat @ _kp_met - float(_th_met) * _kp_met) / _mnorm
     assert _resid < 1e-4, f"{_label}: |Av - theta v|/|A| = {_resid:.2e} -- not an eigenpair"
 print(
-    f"OK  eigenpair_3x3_metal matches eigenpair_3x3 on {len(_eig_cases)} matrices spanning "
+    f"OK  _eigenpair_3x3_metal matches eigenpair_3x3 on {len(_eig_cases)} matrices spanning "
     f"generic/large-trace/degenerate/identity/zero (worst rel {_worst_eig:.2e} on {_worst_case}), "
     "and every returned pair satisfies |Av - theta v| ~ 0"
 )
@@ -644,44 +411,47 @@ print(
 # agree with each other on a sign or root-selection error.
 _worst_vs_eigh = 0.0
 for _label, _mat in _eig_cases:
-    _th_met, _ = eigenpair_3x3_metal(_mat)
+    _th_met, _ = _eigenpair_3x3_metal(_mat)
     _ref = float(np.linalg.eigvalsh(_mat.astype(np.float64)).min())
     _err = abs(float(_th_met) - _ref) / max(1.0, abs(_ref))
     _worst_vs_eigh = max(_worst_vs_eigh, _err)
     assert _err < 1e-4, f"{_label}: metal {_th_met} is not the minimum eigenvalue {_ref}"
 print(
-    f"OK  eigenpair_3x3_metal returns the MINIMUM eigenvalue (vs numpy eigh, worst rel "
+    f"OK  _eigenpair_3x3_metal returns the MINIMUM eigenvalue (vs numpy eigh, worst rel "
     f"{_worst_vs_eigh:.2e}) -- independent of the shared Cardano formulation"
 )
 
 # eigenpair_3x3_metal must refuse float64 rather than silently narrowing.
 try:
-    eigenpair_3x3_metal(np.eye(3, dtype=np.float64))
+    _eigenpair_3x3_metal(np.eye(3, dtype=np.float64))
 except ValueError as exc:
     assert "float32" in str(exc), f"unexpected guard message: {exc}"
-    print("OK  eigenpair_3x3_metal rejects float64 input (Metal has no float64)")
+    print("OK  _eigenpair_3x3_metal rejects float64 input (Metal has no float64)")
 else:
-    raise AssertionError("eigenpair_3x3_metal accepted float64 input -- guard did not fire")
+    raise AssertionError("_eigenpair_3x3_metal accepted float64 input -- guard did not fire")
 
-# 3l. eig="metal" end-to-end: same trajectory as eig="ops" in fixed-iteration mode, and dispatch
-# proven by a call spy (the numerical check alone would pass a mis-wired call site, exactly as for
-# sas above).
+# 3i. device="gpu" end-to-end: same trajectory as device="cpu" in fixed-iteration mode, and
+# dispatch proven by a call spy. The spy is not redundant with the numerical check -- under the shim
+# both eigensolves reduce to the same numpy arithmetic and agree to the bit, so a mis-wired binding
+# (device="gpu" silently running the op-graph path) passes the numerical check silently. The spy is
+# what actually proves the two branches are wired to different implementations.
 eig_e_ops, _, it_e_ops, _ = ground_locg_mlx(
-    apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=30, tol=0.0, eig="ops"
+    apply_h_xz, inputs32_v, args=(xs32_i, dg32_i), maxiter=30, tol=0.0, device="cpu"
 )
 eig_e_met, _, it_e_met, _ = ground_locg_mlx(
-    apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=30, tol=0.0, eig="metal"
+    apply_h_xz, inputs32_v, args=(xs32_i, dg32_i), maxiter=30, tol=0.0, device="gpu"
 )
 assert it_e_ops == it_e_met == 30, f"iteration counts differ: {it_e_ops} vs {it_e_met}"
 assert abs(eig_e_met - eig_e_ops) < 1e-5 * max(1.0, abs(eig_e_ops)), (
-    f"eig='metal' changed the fixed-iteration eigenvalue: {eig_e_met} vs {eig_e_ops}"
+    f"device='gpu' changed the fixed-iteration eigenvalue: {eig_e_met} vs {eig_e_ops}"
 )
 print(
-    f"OK  eig='metal' tracks eig='ops' (eig {eig_e_met:.6f} vs {eig_e_ops:.6f}, {it_e_met} iters)"
+    f"OK  device='gpu' tracks device='cpu' "
+    f"(eig {eig_e_met:.6f} vs {eig_e_ops:.6f}, {it_e_met} iters)"
 )
 
 _orig_eig3 = module.eigenpair_3x3
-_orig_eig3_metal = module.eigenpair_3x3_metal
+_orig_eig3_metal = module._eigenpair_3x3_metal
 _eig_spy = {"ops": 0, "metal": 0}
 
 
@@ -695,78 +465,52 @@ def _spy_eig_metal(*a, **k):
     return _orig_eig3_metal(*a, **k)
 
 
+# The solver reads these off the module at call time, so attribute patching intercepts them.
 module.eigenpair_3x3 = _spy_eig_ops
-module.eigenpair_3x3_metal = _spy_eig_metal
+module._eigenpair_3x3_metal = _spy_eig_metal
 try:
     _eig_spy["ops"] = _eig_spy["metal"] = 0
-    ground_locg_mlx(
-        apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, tol=0.0, eig="metal"
-    )
+    ground_locg_mlx(apply_h_xz, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, tol=0.0, device="gpu")
     assert _eig_spy["metal"] > 0 and _eig_spy["ops"] == 0, (
-        f"eig='metal' did not dispatch exclusively to eigenpair_3x3_metal: {_eig_spy}"
+        f"device='gpu' did not dispatch exclusively to _eigenpair_3x3_metal: {_eig_spy}"
     )
     _eig_metal_calls = _eig_spy["metal"]
 
     _eig_spy["ops"] = _eig_spy["metal"] = 0
-    ground_locg_mlx(
-        apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, tol=0.0, eig="ops"
-    )
+    ground_locg_mlx(apply_h_xz, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, tol=0.0, device="cpu")
     assert _eig_spy["ops"] > 0 and _eig_spy["metal"] == 0, (
-        f"eig='ops' did not dispatch exclusively to eigenpair_3x3: {_eig_spy}"
+        f"device='cpu' did not dispatch exclusively to eigenpair_3x3: {_eig_spy}"
     )
 finally:
     module.eigenpair_3x3 = _orig_eig3
-    module.eigenpair_3x3_metal = _orig_eig3_metal
+    module._eigenpair_3x3_metal = _orig_eig3_metal
 print(
-    f"OK  eig='metal'/eig='ops' dispatch exclusively to their own implementation "
+    f"OK  device='gpu'/device='cpu' dispatch exclusively to their own eigensolve "
     f"({_eig_metal_calls} metal calls, 0 ops calls, for 2 iterations)"
 )
 
-# eig="metal" must refuse an f64 solve, and an unknown value must fail loudly.
+# 3j. device="gpu" must refuse an f64 solve. Metal has no float64, and this guard lives in
+# ground_locg_mlx rather than in the kernel precisely so it fires even when the seed step converges
+# immediately and the loop is never entered -- see the comment at its raise site.
 try:
     ground_locg_mlx(
-        apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals), eig="metal"
+        apply_h_xz, inputs.vinit, args=(inputs.xsources, inputs.diagonals), device="gpu"
     )
 except ValueError as exc:
     assert "float32" in str(exc), f"unexpected guard message: {exc}"
-    print("OK  ground_locg_mlx(eig='metal') rejects float64 input")
+    assert "gpu" in str(exc), f"guard message should name the parameter the caller set: {exc}"
+    print("OK  ground_locg_mlx(device='gpu') rejects float64 input")
 else:
-    raise AssertionError("ground_locg_mlx(eig='metal') accepted float64 -- guard did not fire")
+    raise AssertionError("ground_locg_mlx(device='gpu') accepted float64 -- guard did not fire")
 
+# An unknown device must fail loudly, not fall through to a default.
 try:
-    ground_locg_mlx(apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, eig="bogus")
+    ground_locg_mlx(apply_h_xz, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, device="bogus")
 except ValueError as exc:
     assert "bogus" in str(exc), f"unexpected message: {exc}"
-    print("OK  ground_locg_mlx rejects an unknown eig value")
+    print("OK  ground_locg_mlx rejects an unknown device value")
 else:
-    raise AssertionError("ground_locg_mlx accepted eig='bogus'")
-
-# compile_chunk < 1 must raise rather than HANG. The chunked convergence-checking loop advances by
-# `this_chunk = min(compile_chunk, maxiter - niter)`, so compile_chunk=0 made `niter += this_chunk`
-# a no-op and `while niter < maxiter` spin forever -- found by inspection while aligning this port
-# with rqutils.ground_locg, and confirmed by an actual 120s hang before the guard was added. A hang
-# rather than a wrong number, but the same "fails without saying so" class as the rest of the guards
-# here. Both the compiled and uncompiled paths are checked, since the guard sits above the branch.
-for _bad_chunk in (0, -1):
-    for _compile in (True, False):
-        try:
-            ground_locg_mlx(
-                apply_h_xz_mlx,
-                inputs32_v,
-                args=(xs32_i, dg32_i),
-                maxiter=4,
-                tol=1e-12,
-                compile_body=_compile,
-                compile_chunk=_bad_chunk,
-            )
-        except ValueError as exc:
-            assert "compile_chunk" in str(exc), f"unexpected guard message: {exc}"
-        else:
-            raise AssertionError(
-                f"ground_locg_mlx accepted compile_chunk={_bad_chunk} with "
-                f"compile_body={_compile} -- guard did not fire (this would hang)"
-            )
-print("OK  ground_locg_mlx rejects compile_chunk < 1 (which previously hung forever)")
+    raise AssertionError("ground_locg_mlx accepted device='bogus'")
 
 # 3j. The r_is_zero / seed_converged guard (ground_locg_mlx.py:503-517): a one-hot xinit against a
 # diagonal operator is an exact eigenvector, so the residual after the seed step is exactly zero.
@@ -789,14 +533,14 @@ def _diag_matvec(vec, dvec):
 
 
 for index in (0, 5):
-    for dtype_name, dvec, sas_kw in (
-        ("float64/ops", diag, "ops"),
-        ("float32/metal", diag32, "metal"),
+    for dtype_name, dvec, dev_kw in (
+        ("float64/cpu", diag, "cpu"),
+        ("float32/gpu", diag32, "gpu"),
     ):
         one_hot = np.zeros(60, dtype=dvec.dtype)
         one_hot[index] = 1.0
         eig_seed, vec_seed, iters_seed, converged_seed = ground_locg_mlx(
-            _diag_matvec, one_hot, args=(dvec,), sas=sas_kw
+            _diag_matvec, one_hot, args=(dvec,), device=dev_kw
         )
         assert converged_seed is True, f"{dtype_name} index={index}: not converged at seed step"
         assert iters_seed == 0, f"{dtype_name} index={index}: expected 0 iters, got {iters_seed}"
@@ -823,40 +567,40 @@ for index in (0, 5):
 # at rho~1e9 and dominant at rho~8, so a scaling error there would be invisible in 3j alone.
 # Mirrors tests/test_ground_locg.py::TestZeroResidualAfterSeedStep::test_one_by_one_large_magnitude.
 #
-# 1x1 case, sas="ops" (float64): the JAX fixture uses rel=1e-13. float64 has ~15-16 significant
+# 1x1 case, device="cpu" (float64): the JAX fixture uses rel=1e-13. float64 has ~15-16 significant
 # decimal digits, so 1e-13 leaves comfortable headroom above eps (~2.2e-16) for the Rayleigh
 # quotient's rounding.
 eig_1x1, vec_1x1, iters_1x1, converged_1x1 = ground_locg_mlx(
-    _diag_matvec, np.array([1.0]), args=(np.array([1e9]),), sas="ops"
+    _diag_matvec, np.array([1.0]), args=(np.array([1e9]),), device="cpu"
 )
-assert converged_1x1 is True, "1x1 large-magnitude (ops): not converged at seed step"
-assert iters_1x1 == 0, f"1x1 large-magnitude (ops): expected 0 iters, got {iters_1x1}"
+assert converged_1x1 is True, "1x1 large-magnitude (cpu): not converged at seed step"
+assert iters_1x1 == 0, f"1x1 large-magnitude (cpu): expected 0 iters, got {iters_1x1}"
 rel_err_1x1 = abs(eig_1x1 - 1e9) / 1e9
-assert rel_err_1x1 < 1e-13, f"1x1 large-magnitude (ops): rel err {rel_err_1x1}, eig={eig_1x1}"
+assert rel_err_1x1 < 1e-13, f"1x1 large-magnitude (cpu): rel err {rel_err_1x1}, eig={eig_1x1}"
 err_vec_1x1 = abs(float(np.asarray(vec_1x1)[0]) - 1.0)
-assert err_vec_1x1 < 1e-13, f"1x1 large-magnitude (ops): eigenvector drifted by {err_vec_1x1}"
+assert err_vec_1x1 < 1e-13, f"1x1 large-magnitude (cpu): eigenvector drifted by {err_vec_1x1}"
 print(
-    f"OK  1x1 large-magnitude seed guard (ops, float64): eig={eig_1x1:.1f} "
+    f"OK  1x1 large-magnitude seed guard (cpu, float64): eig={eig_1x1:.1f} "
     f"(rel err {rel_err_1x1:.1e})"
 )
 
-# 1x1 case, sas="metal" (float32): float32 has ~7 significant decimal digits (eps ~1.19e-7), so a
+# 1x1 case, device="gpu" (float32): float32 has ~7 significant decimal digits (eps ~1.19e-7), so a
 # float64-scale rel=1e-13 tolerance is unmeetable by construction -- assert against what f32
 # arithmetic can actually deliver instead (a small multiple of eps), not a borrowed f64 bound.
 eig_1x1_f32, _, iters_1x1_f32, converged_1x1_f32 = ground_locg_mlx(
     _diag_matvec,
     np.array([1.0], dtype=np.float32),
     args=(np.array([1e9], dtype=np.float32),),
-    sas="metal",
+    device="gpu",
 )
-assert converged_1x1_f32 is True, "1x1 large-magnitude (metal): not converged at seed step"
-assert iters_1x1_f32 == 0, f"1x1 large-magnitude (metal): expected 0 iters, got {iters_1x1_f32}"
+assert converged_1x1_f32 is True, "1x1 large-magnitude (gpu): not converged at seed step"
+assert iters_1x1_f32 == 0, f"1x1 large-magnitude (gpu): expected 0 iters, got {iters_1x1_f32}"
 rel_err_1x1_f32 = abs(eig_1x1_f32 - 1e9) / 1e9
 assert rel_err_1x1_f32 < 1e-5, (
-    f"1x1 large-magnitude (metal): rel err {rel_err_1x1_f32}, eig={eig_1x1_f32}"
+    f"1x1 large-magnitude (gpu): rel err {rel_err_1x1_f32}, eig={eig_1x1_f32}"
 )
 print(
-    f"OK  1x1 large-magnitude seed guard (metal, float32): eig={eig_1x1_f32:.1f} "
+    f"OK  1x1 large-magnitude seed guard (gpu, float32): eig={eig_1x1_f32:.1f} "
     f"(rel err {rel_err_1x1_f32:.1e})"
 )
 
@@ -865,14 +609,14 @@ print(
 diag_big = diag * 1e9
 diag_big32 = diag_big.astype(np.float32)
 for index in (0, 5):
-    for dtype_name, dvec, sas_kw, rel_tol in (
-        ("float64/ops", diag_big, "ops", 1e-12),
-        ("float32/metal", diag_big32, "metal", 1e-5),
+    for dtype_name, dvec, dev_kw, rel_tol in (
+        ("float64/cpu", diag_big, "cpu", 1e-12),
+        ("float32/gpu", diag_big32, "gpu", 1e-5),
     ):
         one_hot = np.zeros(60, dtype=dvec.dtype)
         one_hot[index] = 1.0
         eig_big, _, iters_big, converged_big = ground_locg_mlx(
-            _diag_matvec, one_hot, args=(dvec,), sas=sas_kw
+            _diag_matvec, one_hot, args=(dvec,), device=dev_kw
         )
         assert converged_big is True, f"{dtype_name} index={index}: large-mag not converged"
         assert iters_big == 0, f"{dtype_name} index={index}: large-mag expected 0 iters"
@@ -889,11 +633,16 @@ for index in (0, 5):
 # 3l. Metal Shading Language reserved-identifier scan over the kernel SOURCE TEXT.
 #
 # This is the one check here that reads the kernels' `source` strings rather than the shim's
-# reimplementation of them. It exists because a real-device run found `uint half = lanes / 2` in
-# _METAL_SAS_SOURCE: `half` is a reserved built-in scalar type in MSL (16-bit float), so that line
-# failed to compile with "cannot combine with previous 'type-name' declaration specifier" and
-# cascaded into eight further errors. Nothing headless could have caught it -- the numpy shim never
-# compiles the Metal text, and `half` is a perfectly ordinary Python identifier.
+# reimplementation of them. It exists because a real-device run found `uint half = lanes / 2` in the
+# since-deleted fused Rayleigh-Ritz kernel: `half` is a reserved built-in scalar type in MSL
+# (16-bit float), so that line failed to compile with "cannot combine with previous 'type-name'
+# declaration specifier" and cascaded into eight further errors. Nothing headless could have caught
+# it -- the numpy shim never compiles the Metal text, and `half` is a perfectly ordinary Python
+# identifier.
+#
+# The kernel that motivated this scan is gone (it measured slower -- docs/mlx-metal-kernels.md), but
+# the scan stays and still covers `half`: the failure mode belongs to MSL, not to that one kernel,
+# and the next kernel written here would hit it just as easily.
 #
 # A name scan cannot verify that the Metal compiles (only hardware can), but it does pin the
 # specific failure mode that got through, which is the whole point of a regression check.
@@ -938,7 +687,6 @@ _MSL_RESERVED = {
     "simdgroup",
 }
 _kernel_sources = {
-    "_METAL_SAS_SOURCE": module._METAL_SAS_SOURCE,
     "_METAL_MATVEC_SOURCE": module._METAL_MATVEC_SOURCE,
     "_METAL_EIG3_SOURCE": module._METAL_EIG3_SOURCE,
 }

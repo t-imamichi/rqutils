@@ -7,8 +7,8 @@ then attributes the counts to the function that constructed them by walking the 
 This measures **op-construction count**, which is what MLX's lazy graph builder turns into kernel
 launches. It is not a timing measurement and cannot be one: there is no GPU here. Its purpose is
 to say *where* the launches are, so an optimization targets the real hot spot -- the cost model in
-``docs/superpowers/specs/2026-08-03-mlx-sqd-poc-design.md`` ("sync count dominates, launch count
-is secondary") is what turns a launch count into a prediction.
+``docs/mlx-metal-kernels.md`` ("sync count dominates, launch count is secondary") is what turns a
+launch count into a prediction.
 
 Run with:
     uv run python examples/mlx/count_ops.py
@@ -28,16 +28,14 @@ SRC = os.path.join(os.path.dirname(os.path.dirname(HERE)), "rqutils", "ground_lo
 # Functions in the module under test that we attribute ops to. Anything constructed outside these
 # (e.g. directly in ground_locg_mlx's body) is attributed to its own frame name.
 _TRACKED = (
-    "apply_h_xz_mlx",
-    "apply_h_xz_mlx_chunked",
-    "apply_h_xz_mlx_metal",
+    "apply_h_xz",
+    "_apply_h_xz_metal",
     "_compute_sas",
-    "_compute_sas_metal",
     "_project_out",
     "eigenpair_2x2",
     "eigenpair_3x3",
     "_nullvec_3x3",
-    "eigenpair_3x3_metal",
+    "_eigenpair_3x3_metal",
     "iter_body",
     "chunk_body",
     "normalize",
@@ -145,26 +143,9 @@ def build_shim():
                 np.asarray(vecs[:, 0], dtype=np.dtype(output_dtypes[1])),
             ]
 
-        def call_sas(inputs, grid=None, threadgroup=None, output_dtypes=None, **kw):
-            # num_states is unpacked but unused: this shim computes the inner products with a
-            # whole-array dot rather than reproducing the kernel's strided per-lane indexing (that
-            # is check_solver_headless.py's job). Only the op COUNT matters here.
-            vectors, mvs, num_basis, _num_states = inputs
-            v = np.asarray(vectors)
-            m = np.asarray(mvs)
-            out = np.zeros((num_basis, num_basis), dtype=np.dtype(output_dtypes[0]))
-            for i in range(num_basis):
-                for j in range(i, num_basis):
-                    val = float(np.dot(v[i], m[j]))
-                    out[i, j] = val
-                    out[j, i] = val
-            return [out]
-
         # One launch per kernel call, attributed to the calling function.
         if name == "sqd_apply_h_xz":
             return _counting(call_matvec, "metal_kernel:matvec")
-        if name == "sqd_compute_sas":
-            return _counting(call_sas, "metal_kernel:sas")
         if name == "sqd_eigenpair_3x3":
             return _counting(call_eig3, "metal_kernel:eig3")
         raise AssertionError(f"no shim for kernel {name!r}")
@@ -212,11 +193,11 @@ def main():
     num_states = xsources.shape[1]
     vinit = np.random.default_rng(0).normal(size=num_states)
 
-    for label, matvec, dtype, eig in (
-        ("loop", module.apply_h_xz_mlx, np.float64, "ops"),
-        # The fused Metal kernels are f32-only (Metal has no float64), so these arms run at f32.
-        ("metal", module.apply_h_xz_mlx_metal, np.float32, "ops"),
-        ("metal+eig", module.apply_h_xz_mlx_metal, np.float32, "metal"),
+    # The two configurations ground_locg_mlx now offers. device="gpu" is f32-only, since Metal has
+    # no float64; device="cpu" is the only route for an f64 solve and so is measured at f64.
+    for label, matvec, dtype, device in (
+        ("cpu (op-graph eig, f64)", module.apply_h_xz, np.float64, "cpu"),
+        ("gpu (fused matvec + eig, f32)", module._apply_h_xz_metal, np.float32, "gpu"),
     ):
         COUNTS.clear()
         iters = 6
@@ -227,7 +208,7 @@ def main():
             args=(xsources, diagonals.astype(dtype)),
             maxiter=iters,
             tol=0.0,
-            eig=eig,
+            device=device,
         )
         _ENABLED[0] = False
 
@@ -237,6 +218,13 @@ def main():
         # Attribute only the steady-state loop body: seed-iteration ops are paid once, not
         # per iteration, so dividing them by `iters` would understate the per-iteration cost of
         # the body and overstate the seed's.
+        #
+        # NOTE what this total does NOT include: the matvec implementation's own ops. `matvec` below
+        # is ground_locg_mlx's internal closure, not `apply_h_xz`/`_apply_h_xz_metal`, so the gather
+        # ops are attributed to those frames and fall outside this filter. That is why the cpu arm
+        # reports the same 65.0 as every previous op-graph measurement even though the matvec it uses
+        # changed: this number measures the Rayleigh-Ritz-and-below body, and comparing matvecs is
+        # bench.py's job (they differ in launches AND in memory traffic, which no op count sees).
         body = {
             f: n
             for f, n in per_func.items()
@@ -244,10 +232,9 @@ def main():
             in (
                 "iter_body",
                 "_compute_sas",
-                "_compute_sas_metal",
                 "_project_out",
                 "eigenpair_3x3",
-                "eigenpair_3x3_metal",
+                "_eigenpair_3x3_metal",
                 "_nullvec_3x3",
                 "matvec",
                 # converged() runs once per iteration whenever tol != 0, so its ops are part of the
@@ -260,7 +247,7 @@ def main():
             )
         }
         total_body = sum(body.values())
-        print(f"\n=== matvec={label}: op constructions, {iters} iterations ===")
+        print(f"\n=== {label}: op constructions, {iters} iterations ===")
         print(f"{'function':<22}{'total':>8}{'per_iter':>10}{'share':>8}")
         print("-" * 48)
         for func, n in sorted(body.items(), key=lambda kv: -kv[1]):

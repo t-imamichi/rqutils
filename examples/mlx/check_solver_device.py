@@ -8,11 +8,14 @@ THIS SCRIPT REQUIRES A REAL METAL DEVICE (a Mac with MLX installed and GPU acces
 CANNOT RUN HEADLESS. It was written by an agent that could not execute it -- the numpy-shim
 counterpart in check_solver_headless.py is what validated the algorithm instead.
 
-Device status as of 2026-08-05: `apply_h_xz_mlx_metal` and `sas="metal"` have since been
-exercised on a real M1 GPU (via examples/mlx/bench.py) and passed, so their MSL is known to
-compile and be correct. The `eig="metal"` checks below are NEWER and have not been run on
-hardware; that kernel is the first here to call math functions (metal::sqrt/cos/sin/atan2),
-which is exactly what only a device run can validate.
+Device status as of 2026-08-05: both surviving Metal kernels -- `_apply_h_xz_metal` and
+`_eigenpair_3x3_metal` -- have been exercised on a real M1 GPU and passed, so their MSL is known
+to compile and to be correct. The fused Rayleigh-Ritz kernel that used to be checked here is gone;
+it measured slower than the op-graph path (see docs/mlx-metal-kernels.md).
+
+The arms below were rewritten when the solver's option surface collapsed to a single `device`
+parameter, so the *combinations* are new even though both kernels are device-validated. Re-run
+after any change here.
 
 Run with:
     uv run python examples/mlx/check_solver_device.py
@@ -30,10 +33,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _bench_common import build_solver_inputs, dense_reference, generate_problem
 
 from rqutils.ground_locg_mlx import (
-    apply_h_xz_mlx,
-    apply_h_xz_mlx_metal,
+    _apply_h_xz_metal,
+    _eigenpair_3x3_metal,
+    apply_h_xz,
     eigenpair_3x3,
-    eigenpair_3x3_metal,
     ground_locg_mlx,
 )
 
@@ -65,69 +68,72 @@ for device, name in ((mx.cpu, "cpu"), (mx.gpu, "gpu")):
             dg = mx.array(inputs.diagonals, dtype)
             v0 = mx.array(inputs.vinit, dtype)
 
-            mv = np.asarray(apply_h_xz_mlx(v0, xs, dg), dtype=np.float64)
+            mv = np.asarray(apply_h_xz(v0, xs, dg), dtype=np.float64)
             mverr = np.abs(mv - H @ inputs.vinit).max()
 
-            eig, _, iters, _ = ground_locg_mlx(apply_h_xz_mlx, v0, args=(xs, dg))
+            # device="cpu": the portable op-graph path. The only route for f64, and the baseline
+            # every Metal arm is compared against.
+            eig, _, iters, _ = ground_locg_mlx(apply_h_xz, v0, args=(xs, dg), device="cpu")
             ok = abs(eig - ref) < rtol * max(1.0, abs(ref))
             print(
-                f"{arm}: eig={eig:.10f} iters={iters} matvec_err={mverr:.2e} "
+                f"{arm} device=cpu: eig={eig:.10f} iters={iters} matvec_err={mverr:.2e} "
                 f"{'OK' if ok else 'FAIL'}"
             )
             if not ok:
-                failures.append(arm)
+                failures.append(f"{arm}-device-cpu")
 
-            # sas='metal' is f32-only (Metal has no float64), so only exercise it on
-            # the f32 arms. This is the ONLY check that can establish the Metal source
-            # actually compiles and that its barriers are correct -- the numpy shim
-            # cannot.
+            # device="gpu" is f32-only (Metal has no float64), so only the f32 arms below. These
+            # are the ONLY checks that can establish the Metal sources actually compile -- the
+            # numpy shim never reads them.
             if dtname == "f32":
-                eig_sas, _, iters_sas, _ = ground_locg_mlx(
-                    apply_h_xz_mlx, v0, args=(xs, dg), sas="metal"
-                )
-                ok_sas = abs(eig_sas - ref) < rtol * max(1.0, abs(ref))
+                # Fused eigensolve, op-graph matvec. Isolates _eigenpair_3x3_metal: it is the only
+                # kernel here that calls math functions (metal::sqrt/cos/sin/atan2), and the static
+                # checker's metal::-qualification guard catches their spelling, not availability.
+                eig_e, _, iters_e, _ = ground_locg_mlx(apply_h_xz, v0, args=(xs, dg), device="gpu")
+                ok_e = abs(eig_e - ref) < rtol * max(1.0, abs(ref))
                 print(
-                    f"{arm} sas=metal: eig={eig_sas:.10f} iters={iters_sas} "
-                    f"{'OK' if ok_sas else 'FAIL'}"
+                    f"{arm} device=gpu: eig={eig_e:.10f} iters={iters_e} {'OK' if ok_e else 'FAIL'}"
                 )
-                if not ok_sas:
-                    failures.append(f"{arm}-sas-metal")
+                if not ok_e:
+                    failures.append(f"{arm}-device-gpu")
 
-                # Both custom Metal kernels active at once: apply_h_xz_mlx_metal for
-                # matvec + sas="metal" for Rayleigh-Ritz. This is the configuration the
-                # benchmark measures and the only one where both kernels are resident
-                # together.
+                # Both surviving Metal kernels resident at once: _apply_h_xz_metal for the matvec
+                # plus the fused eigensolve. This is exactly what bench.py measures with
+                # `--matvec metal` on a gpu arm, and the configuration that matters most.
+                mv_metal = np.asarray(_apply_h_xz_metal(v0, xs, dg), dtype=np.float64)
+                mverr_metal = np.abs(mv_metal - H @ inputs.vinit).max()
                 eig_both, _, iters_both, _ = ground_locg_mlx(
-                    apply_h_xz_mlx_metal, v0, args=(xs, dg), sas="metal"
+                    _apply_h_xz_metal, v0, args=(xs, dg), device="gpu"
                 )
                 ok_both = abs(eig_both - ref) < rtol * max(1.0, abs(ref))
                 print(
                     f"{arm} metal-both: eig={eig_both:.10f} iters={iters_both} "
-                    f"{'OK' if ok_both else 'FAIL'}"
+                    f"matvec_err={mverr_metal:.2e} {'OK' if ok_both else 'FAIL'}"
                 )
                 if not ok_both:
                     failures.append(f"{arm}-metal-both")
 
-                # eig='metal': the fused 3x3 eigensolve. This is the FIRST kernel here to call
-                # math functions (metal::sqrt/cos/sin/atan2), so this run is the only thing that
-                # can establish they compile -- the static checker's `metal::`-qualification guard
-                # catches the spelling, not the availability.
-                eig_e, _, iters_e, _ = ground_locg_mlx(
-                    apply_h_xz_mlx, v0, args=(xs, dg), eig="metal"
-                )
-                ok_e = abs(eig_e - ref) < rtol * max(1.0, abs(ref))
-                print(
-                    f"{arm} eig=metal: eig={eig_e:.10f} iters={iters_e} {'OK' if ok_e else 'FAIL'}"
-                )
-                if not ok_e:
-                    failures.append(f"{arm}-eig-metal")
+                # device="gpu" must refuse f64 rather than silently narrowing. Checked on device
+                # because the guard lives in ground_locg_mlx, not in the kernel.
+                try:
+                    ground_locg_mlx(
+                        apply_h_xz,
+                        mx.array(inputs.vinit, mx.float64),
+                        args=(xs, mx.array(inputs.diagonals, mx.float64)),
+                        device="gpu",
+                    )
+                except ValueError:
+                    print(f"{arm} f64-guard: device='gpu' rejects float64 OK")
+                else:
+                    print(f"{arm} f64-guard: device='gpu' accepted float64 FAIL")
+                    failures.append(f"{arm}-f64-guard")
 
                 # Direct kernel-vs-op-graph comparison on the matrix classes the solver actually
                 # produces, so a transcription error shows up as a wrong eigenvalue on a specific
                 # case rather than only as a drifted solve. Mirrors case 3k of
                 # check_solver_headless.py, but against the real compiled MSL.
                 eig3_ops = eigenpair_3x3
-                eig3_met = eigenpair_3x3_metal
+                eig3_met = _eigenpair_3x3_metal
                 rng_e = np.random.default_rng(20260805)
                 worst_e = 0.0
                 for _ in range(40):

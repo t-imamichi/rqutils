@@ -32,18 +32,24 @@ samples spread by more than 25% prints a warning to stderr and should not be quo
 ``first_s`` column is a single unrepeatable sample and is indicative only -- see ``timeit`` in
 ``_bench_common.py``.
 
-CAVEAT -- MLX per-call graph reconstruction is not subtracted out. ``ground_locg_mlx`` is
-plain Python: every timed call re-walks the iteration loop and re-constructs MLX's op graph
-from scratch, in Python, before any device work happens. ``ground_locg`` (the JAX original)
-is ``@jax.jit``: tracing happens once and is reported in ``first_s``, and every subsequent
-timed call dispatches an already-compiled executable with no further Python-level graph
-construction. So the MLX arms' ``fixed_s`` / ``per_it_ms`` / ``solve_s`` numbers include a
-per-call Python graph-construction cost that the JAX arms' numbers do not pay in the same
-column. This biases the comparison AGAINST MLX (JAX's steady-state number is cleaner than
-MLX's), which is the safer direction for a benchmark whose main risk is a bogus MLX win --
-but the magnitude has not been measured here (it would require timing graph construction
-without ``mx.eval``, which this PoC does not do; see I4 in the final review). Do not read
-"MLX is slower per iteration" as a verdict on MLX's kernels without accounting for this.
+CAVEAT -- the two frameworks amortize graph construction differently. ``ground_locg`` (the JAX
+original) is ``@jax.jit``: tracing happens once, is reported in ``first_s``, and every subsequent
+call dispatches an already-compiled executable. ``ground_locg_mlx`` now applies ``mx.compile``
+unconditionally, so it traces once per compiled callable too -- but MLX compiles the iteration
+*body* rather than the whole loop, so the Python-level loop driving it is re-walked per call and
+a convergence-checking run additionally syncs once per 10 iterations. The residual asymmetry is
+therefore much smaller than it was before compilation became unconditional, but it is not zero,
+and it biases the comparison AGAINST MLX -- the safer direction for a benchmark whose main risk
+is a bogus MLX win. Its magnitude has not been measured. Do not read "MLX is slower per
+iteration" as a verdict on MLX's kernels without accounting for this.
+
+CAVEAT -- ``per_it_ms`` recorded before the option surface collapsed is not comparable. The
+default matvec changed from the group-at-a-time gather to the chunked one for BOTH frameworks
+(the group-at-a-time variant measured 8.106 ms/iter, the slowest of every configuration tried,
+and is gone), and MLX compilation went from opt-in to always-on. Both changes are algebraically
+exact -- eigenvalues are unaffected beyond f32 last-digit noise -- but every timing number
+recorded against the old defaults describes a different configuration. See
+``docs/mlx-metal-kernels.md``.
 """
 
 import argparse
@@ -133,53 +139,23 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
         "--matvec",
-        choices=("loop", "chunked", "metal"),
-        default="loop",
+        choices=("chunked", "metal"),
+        default="chunked",
         help="Matvec kernel, applied to BOTH jax and mlx arms so the comparison "
         "stays about the solver loop rather than the matvec (Optimization "
-        '1). "loop" (default) is the original group-at-a-time gather -- '
-        "existing measured results are only reproducible with this default. "
-        '"chunked" gathers --chunk X-groups per flat take, cutting op count '
-        "roughly 3*J -> 3*ceil(J/chunk).",
+        '1). "chunked" (default) gathers --chunk X-groups per flat take, '
+        'cutting op count from 3*J to roughly 3*ceil(J/chunk). "metal" is an '
+        "MLX-only fused kernel and is rejected for the jax arms. NOTE: the "
+        'old "loop" (group-at-a-time) choice is gone -- it measured 8.106 '
+        "ms/iter, the slowest of every configuration tried, so per_it_ms "
+        "recorded against it is not comparable to anything measured now.",
     )
     parser.add_argument(
         "--chunk",
         type=int,
         default=16,
         help="Chunk size for --matvec chunked (default 16 -> ~14.3x fewer ops "
-        "at J=100, temporary bounded to chunk*N). Ignored for --matvec loop.",
-    )
-    parser.add_argument(
-        "--compile-body",
-        action="store_true",
-        help="MLX arms only (Optimization 2): wrap the LOBPCG iteration body in "
-        "mx.compile so its ~1260 ops/iteration are traced once instead of "
-        "reconstructed every call. A no-op for jax arms -- reported as a "
-        "note rather than an error, since JAX already amortizes graph "
-        "construction via jax.jit/lax.while_loop (see compile_s).",
-    )
-    parser.add_argument(
-        "--sas",
-        choices=("ops", "metal"),
-        default="ops",
-        help='Rayleigh-Ritz inner-product kernel, MLX f32 arms only. "ops" '
-        "(default) is the portable op-graph _compute_sas -- existing measured "
-        'results are only reproducible with this default. "metal" fuses all '
-        "six distinct inner products into one custom Metal launch, replacing "
-        "16 op launches per iteration and eliminating the symmetrization.",
-    )
-    parser.add_argument(
-        "--eig",
-        choices=("ops", "metal"),
-        default="ops",
-        help="3x3 Rayleigh-Ritz eigensolve kernel, MLX f32 arms only. "
-        '"ops" (default) is the portable op-graph eigenpair_3x3 -- existing '
-        'measured results are only reproducible with this default. "metal" '
-        "fuses the whole eigensolve (balance, Cardano, the rank-aware "
-        "null-vector search, the Rayleigh polish) into one launch, replacing "
-        "~34 op launches per iteration (44%% of the body). Unlike --sas metal "
-        "this is expected to win: there is no N-scaling reduction to "
-        "under-parallelize.",
+        "at J=100, temporary bounded to chunk*N).",
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of a table.")
     parser.add_argument(
@@ -335,33 +311,6 @@ def run_arm(arm, options):
                 f"(setup_precision={setup_precision}) -- the setup chain is wrong"
             )
 
-    compile_body_note = None
-    if framework == "jax" and options.compile_body:
-        # --compile-body is Optimization 2, an MLX-only concept (mx.compile over the LOBPCG
-        # iteration body). JAX already amortizes Python-level graph construction via jax.jit
-        # over the whole solver loop (jax.lax.while_loop/scan) -- that is exactly what compile_s
-        # measures for jax arms -- so there is nothing for this flag to do here. Reported as a
-        # note, not an error: per the WIRING requirements, a jax arm must not fail just because
-        # --compile-body was passed (e.g. under --all, which passes the same flags to every arm).
-        compile_body_note = (
-            f"--compile-body is MLX-only (Optimization 2, mx.compile over the LOBPCG iteration "
-            f"body); ignored for {arm} because JAX already amortizes graph construction via "
-            "jax.jit (see compile_s)."
-        )
-        print(f"NOTE: {compile_body_note}", file=sys.stderr)
-
-    if options.sas == "metal" and framework != "mlx":
-        # Fail loudly rather than silently substituting a different kernel: a "metal" row that
-        # actually timed the op-graph path would misreport what was measured.
-        raise SystemExit(
-            f"{arm}: --sas metal is an MLX-only custom Metal kernel and has no JAX equivalent."
-        )
-
-    if options.eig == "metal" and framework != "mlx":
-        raise SystemExit(
-            f"{arm}: --eig metal is an MLX-only custom Metal kernel and has no JAX equivalent."
-        )
-
     rtol = RTOL[precision]
     if framework == "jax":
         result = _time_jax(arm, inputs, precision, options, matrix, matvec_probe)
@@ -417,10 +366,9 @@ def run_arm(arm, options):
     # matvec/compile settings that produced it travel with it.
     result["matvec"] = options.matvec
     result["chunk"] = options.chunk if options.matvec == "chunked" else None
-    result["sas"] = options.sas
-    result["eig"] = options.eig
-    result["compile_body"] = bool(options.compile_body) and framework == "mlx"
-    result["compile_body_note"] = compile_body_note
+    # `device` is derived from the arm name, not a flag -- see _time_mlx. Recorded because it
+    # selects which eigensolve ran, which per_it_ms depends on heavily (1.75x).
+    result["device"] = device if framework == "mlx" else None
     return result
 
 
@@ -432,7 +380,6 @@ def _time_jax(arm, inputs, precision, options, matrix, matvec_probe):
     import numpy as np
 
     from rqutils.ground_locg import ground_locg
-    from rqutils.sqd import apply_h
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _bench_common import apply_h_xz_chunked, timeit
@@ -442,28 +389,19 @@ def _time_jax(arm, inputs, precision, options, matrix, matvec_probe):
     diagonals = jnp.asarray(inputs.diagonals, dtype=dtype)
     vinit = jnp.asarray(inputs.vinit, dtype=dtype)
 
-    # --matvec selects the kernel used by the solver loop, applied identically to the jax and
-    # mlx arms (Optimization 1) -- see apply_h_xz_chunked's docstring in _bench_common.py for
-    # the op-count/memory tradeoff. "loop" (default) is the fully-cached sqd kernel unchanged, so
-    # the existing measured results stay reproducible.
-    #
-    # apply_h(..., cache_level=(1, 2)) is what used to be a separate apply_h_xz_cached function.
-    # The (scanned, states) argument shape is bound here so the callable still takes
-    # (vec, xsources, diagonals) positionally, which is the signature ground_locg calls and the
-    # one apply_h_xz_chunked mirrors.
+    # --matvec selects the kernel used by the solver loop, applied identically to the jax and mlx
+    # arms (Optimization 1) -- see apply_h_xz_chunked's docstring in _bench_common.py for the
+    # op-count/memory tradeoff. The chunked gather is now the only non-Metal choice: the
+    # group-at-a-time "loop" variant was the slowest configuration measured and is gone from both
+    # frameworks, so this stays symmetric.
     if options.matvec == "metal":
         # Fail loudly rather than silently substituting a different kernel: a "metal" row that
         # actually timed the JAX kernel would be a fabricated comparison.
         raise SystemExit(
             f"{arm}: --matvec metal is an MLX-only custom Metal kernel and has no JAX "
-            "equivalent. Use --matvec loop or --matvec chunked for the jax arms."
+            "equivalent. Use --matvec chunked for the jax arms."
         )
-    if options.matvec == "chunked":
-        matvec_fn = functools.partial(apply_h_xz_chunked, chunk=options.chunk)
-    else:
-
-        def matvec_fn(vec, xsources, diagonals):
-            return apply_h(vec, (xsources, diagonals), None, (1, 2))
+    matvec_fn = functools.partial(apply_h_xz_chunked, chunk=options.chunk)
 
     # Gate: the ported matvec and the original must agree on the same input, probed with a
     # random vector (not vinit) -- see the matvec_probe comment in run_arm.
@@ -507,40 +445,34 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _bench_common import timeit
 
-    from rqutils.ground_locg_mlx import (
-        apply_h_xz_mlx,
-        apply_h_xz_mlx_chunked,
-        apply_h_xz_mlx_metal,
-        ground_locg_mlx,
-    )
+    from rqutils.ground_locg_mlx import _apply_h_xz_metal, apply_h_xz, ground_locg_mlx
 
     # --matvec selects the kernel, mirroring _time_jax exactly (Optimization 1) -- see
-    # apply_h_xz_mlx_chunked's docstring for the op-count/memory tradeoff.
+    # apply_h_xz's docstring for the op-count/memory tradeoff.
     if options.matvec == "metal":
-        # Optimization 3: one fused custom Metal kernel instead of a sequence of MLX ops.
-        # Metal has no float64, so this path is f32-only; refuse rather than silently running
-        # a different kernel than the one the row claims to be timing.
+        # One fused custom Metal kernel instead of a sequence of MLX ops. Metal has no float64, so
+        # this path is f32-only; refuse rather than silently running a different kernel than the one
+        # the row claims to be timing.
         if precision != "f32":
             raise SystemExit(
                 f"{arm}: --matvec metal requires float32 (Metal has no float64). Use an f32 "
                 "arm, or --matvec chunked for the f64 arms."
             )
-        matvec_fn = apply_h_xz_mlx_metal
-    elif options.matvec == "chunked":
-        matvec_fn = functools.partial(apply_h_xz_mlx_chunked, chunk=options.chunk)
+        matvec_fn = _apply_h_xz_metal
     else:
-        matvec_fn = apply_h_xz_mlx
+        matvec_fn = functools.partial(apply_h_xz, chunk=options.chunk)
 
-    if options.sas == "metal" and precision != "f32":
+    # The solver's `device` comes from the ARM NAME, which already encodes it (see ARMS and
+    # run_arm's split) -- deliberately not a separate --device flag, which would be a second and
+    # contradictable source of truth for something --arm already fixes. It selects the eigensolve:
+    # "gpu" the fused Metal kernel, "cpu" the portable op-graph one.
+    #
+    # Note this makes the fused eigensolve unreachable for mlx-cpu-f32, which the old --eig flag
+    # could have combined. Nobody measured that pairing; it is a deliberate loss, not an oversight.
+    solver_device = "gpu" if device == "gpu" else "cpu"
+    if solver_device == "gpu" and precision != "f32":
         raise SystemExit(
-            f"{arm}: --sas metal requires float32 (Metal has no float64). Use an f32 arm, or "
-            "--sas ops for the f64 arms."
-        )
-
-    if options.eig == "metal" and precision != "f32":
-        raise SystemExit(
-            f"{arm}: --eig metal requires float32 (Metal has no float64). Use an f32 arm, or "
-            "--eig ops for the f64 arms."
+            f"{arm}: device='gpu' requires float32 (Metal has no float64); this arm is {precision}."
         )
 
     mx.set_default_device(mx.cpu if device == "cpu" else mx.gpu)
@@ -592,9 +524,9 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
         mx.eval(result[1])
         return result
 
-    # --compile-body is Optimization 2: mx.compile over the LOBPCG iteration body. Off by
-    # default (compile_body=False), which reproduces this function's behaviour exactly as it
-    # was before the parameter existed -- see ground_locg_mlx's docstring.
+    # mx.compile over the LOBPCG iteration body is unconditional inside ground_locg_mlx now (it
+    # was the largest single win and there was no reason to run without it), so there is no flag
+    # here for it -- every mlx row below is a compiled row.
     def fixed():
         return ground_locg_mlx(
             matvec_fn,
@@ -602,9 +534,7 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
             args=(xsources, diagonals),
             maxiter=options.fixed_iters,
             tol=0.0,
-            compile_body=options.compile_body,
-            sas=options.sas,
-            eig=options.eig,
+            device=solver_device,
         )
 
     compile_s, fixed_s = timeit(fixed, options.repeat, sync)
@@ -618,9 +548,7 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
             vinit,
             args=(xsources, diagonals),
             tol=SOLVE_TOL[precision],
-            compile_body=options.compile_body,
-            sas=options.sas,
-            eig=options.eig,
+            device=solver_device,
         )
 
     _, solve_s = timeit(solve, options.repeat, sync)
@@ -664,15 +592,9 @@ def run_all(options):
             options.matvec,
             "--chunk",
             str(options.chunk),
-            "--sas",
-            options.sas,
-            "--eig",
-            options.eig,
         ]
         if options.skip_brute_force:
             argv.append("--skip-brute-force")
-        if options.compile_body:
-            argv.append("--compile-body")
         # check=False: a failing arm is recorded as a "failed" result below rather than aborting
         # the whole sweep, so the remaining arms still get benchmarked.
         proc = subprocess.run(argv, capture_output=True, text=True, check=False)
@@ -721,12 +643,8 @@ def report(results, as_json):
         opt = f"matvec={row.get('matvec', 'loop')}"
         if row.get("matvec") == "chunked":
             opt += f"(chunk={row.get('chunk')})"
-        if row.get("compile_body"):
-            opt += " compile_body"
-        if row.get("sas") == "metal":
-            opt += " sas=metal"
-        if row.get("eig") == "metal":
-            opt += " eig=metal"
+        if row.get("device"):
+            opt += f" device={row['device']}"
         if row.get("reference_path") == "sparse":
             opt += " reference=sparse"
         print(
@@ -758,8 +676,6 @@ def report(results, as_json):
             )
         if row.get("brute_force_note"):
             print(f"NOTE [{row['arm']}]: {row['brute_force_note']}")
-        if row.get("compile_body_note"):
-            print(f"NOTE [{row['arm']}]: {row['compile_body_note']}")
         if row.get("reference_path") == "sparse":
             print(
                 f"NOTE [{row['arm']}]: reference eigenvalue came from sparse_reference (scipy "
