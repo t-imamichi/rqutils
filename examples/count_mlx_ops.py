@@ -249,6 +249,12 @@ def main():
                 "eigenpair_3x3_metal",
                 "_nullvec_3x3",
                 "matvec",
+                # converged() runs once per iteration whenever tol != 0, so its ops are part of the
+                # per-iteration cost. It was previously listed in _TRACKED but omitted here, which
+                # understated the body total for any convergence-checking solve. Note the arms below
+                # run with tol=0.0 (fixed-iteration), so it contributes 0 there -- include it so a
+                # future tol!=0 measurement is not silently short.
+                "converged",
                 "normalize",
             )
         }

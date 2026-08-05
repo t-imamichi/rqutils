@@ -49,7 +49,35 @@ Five structural differences, all forced by MLX:
   a regression there.
 
 The analytic 2x2/3x3 Rayleigh-Ritz step carries over directly, which is what makes this port
-feasible at all -- MLX has no ``eigh``.
+feasible at all.
+
+**On ``mx.linalg.eigh``.** Earlier versions of this docstring said "MLX has no ``eigh``". That is
+no longer true -- ``mx.linalg.eigh`` exists (checked against the installed MLX) and takes exactly
+the input this solver produces: real symmetric, lower triangle, eigenvalues returned in ascending
+order, so ``w[0]``/``v[:, 0]`` would *be* the ground pair. It is nonetheless not used, for a
+measured reason rather than an absent feature:
+
+* An equivalent experiment is already on record. ``docs/superpowers/specs/2026-08-03-mlx-sqd-poc-design.md``
+  moved this eigensolve to the host with ``np.linalg.eigh``, replacing 35 op launches with 2 device
+  syncs, and it measured **1.37x slower** (0.910 vs 0.664 ms/iter) -- reverted in ``4dc8510``. The
+  lesson recorded there is that a sync costs ~389 us, ~53x a kernel launch, because it *drains*
+  MLX's pipeline: every queued op must retire before the CPU can read a value, destroying the async
+  overlap. Any eigensolve that crosses the device boundary per iteration inherits that cost, whether
+  it is spelled ``np.linalg.eigh`` or ``mx.linalg.eigh`` on a CPU stream. (MLX's own docstring
+  example for ``eigh`` passes ``stream=mx.cpu`` explicitly, which is suggestive but not proof of a
+  CPU-only implementation -- this has not been verified on a device.)
+* Even if it does execute on Metal with no sync, the comparison is one general ``eigh`` launch
+  against :func:`eigenpair_3x3_metal`'s single fused launch, which is already at the launch floor
+  and hand-specialized to nine numbers. Break-even is the optimistic case, against a **measured
+  1.75x** that would be given up.
+
+So the analytic route is kept on performance grounds, not for lack of an alternative. What ``eigh``
+*would* buy is accuracy: it is ~2x10^7 times more accurate than the Cardano formulation on the
+near-degenerate matrices a converging LOBPCG produces (1.8e-15 vs 3.6e-08), which is the documented
+cause of ``mlx-cpu-f64`` needing 217 iterations where JAX's f64 needs 89. An ``eigh``-backed option
+confined to the f64 CPU arm -- which can use no Metal kernel and crosses no device boundary -- is
+therefore an unexplored and plausibly *large* win via fewer iterations rather than faster ones. It
+is not implemented here, and would need measuring on real hardware before being believed.
 
 A sixth difference is not structural but a performance consequence of the same asymmetry, and it
 is why several expressions here look less like their JAX counterparts than a straight
@@ -163,9 +191,11 @@ fire by breaking them deliberately.
 differing):** 0.465 -> 0.265 ms/iter (**1.75x**) and 0.0465 -> 0.0275 s to converge (**1.69x**),
 with the eigenvalue **bit-identical** (-5.3960399628) and the iteration count unchanged at 70. The
 end-to-end and per-iteration gains agree because ``iters`` does not move, and the 1.75x exceeds
-what the -43% launch reduction alone predicts -- the fused kernel also removes ~34 intermediate
+what the -50% launch reduction alone predicts -- the fused kernel also removes ~34 intermediate
 allocations per iteration, not just the launches. Note this win is *on top of* ``compile_body``,
-which already amortizes graph construction.
+which already amortizes graph construction. (That measurement was taken when the body stood at
+77.3 -> 44.3 ops; the ratio is the same -50% now that ``_compute_sas`` has brought both ends down
+to 65.0 -> 32.5, so the timing figures still apply.)
 
 MLX LOBPCG API
 ==============
@@ -210,7 +240,9 @@ def _consts(dtype):
     if entry is not None:
         return entry
     entry = _CONST_CACHE[dtype] = {
-        "zero": mx.array(0.0, dtype),
+        # Only values that must be ARRAYS of the solve dtype belong here -- chiefly mx.where
+        # operands, which have to match their branch's dtype. A bare Python float is promoted
+        # in place by mx.maximum/mx.minimum and needs no entry (see eigenpair_3x3's clamps).
         "one": mx.array(1.0, dtype),
         # eigenpair_3x3's root coefficients: the three Cardano roots are the same linear
         # combination a*cos(phi) + b*sin(phi) with these (a, b) pairs.
@@ -223,6 +255,10 @@ def _consts(dtype):
         # search direction out of Rayleigh-Ritz contention (docs/locg.md item I7). A fixed
         # constant, so it does not need rebuilding per iteration.
         "p_mask": mx.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype),
+        # The complement of p_mask, cached rather than recomputed as `1.0 - p_mask` inside the
+        # per-iteration blend: it is loop-invariant, so building it in the hot path was one op
+        # construction per iteration for a constant.
+        "p_keep": mx.array([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 0.0]], dtype),
     }
     return entry
 
@@ -245,6 +281,23 @@ def _indices():
         _INDEX_CACHE["lower_cols"] = mx.array([0, 0, 1])
         _INDEX_CACHE["col_pair"] = mx.array([1, 2, 0])
     return _INDEX_CACHE
+
+
+def normalize(vector, norm=None):
+    """Divide by the norm, leaving a zero vector untouched instead of producing NaN.
+
+    Pass ``norm`` when the caller has already computed it -- several call sites need the norm
+    itself for a separate zero test, and recomputing it here would cost an extra reduction per
+    iteration.
+
+    Module-level, mirroring ``rqutils.ground_locg.normalize``. It was previously a closure inside
+    :func:`ground_locg_mlx` over that solve's cached ``one``, which meant the zero-norm guard --
+    load-bearing against NaN, and one of the invariants ``docs/locg.md`` covers -- had to be
+    re-inlined at every other call site rather than shared.
+    """
+    if norm is None:
+        norm = mx.linalg.norm(vector)
+    return vector / mx.where(norm == 0.0, _consts(norm.dtype)["one"], norm)
 
 
 def apply_h_xz_mlx(vec, xsources, diagonals):
@@ -331,20 +384,34 @@ _METAL_MATVEC_SOURCE = """
     out[i] = acc;
 """
 
-_METAL_MATVEC_KERNEL = None
+# Compiled-kernel cache, keyed by kernel name. `mx.fast.metal_kernel` compiles MSL, so each kernel
+# must be built exactly once and reused; this replaces what used to be three near-identical
+# `global _METAL_*_KERNEL` / `if ... is None` memos, one per kernel, differing only in the four
+# arguments below. Same "build once into a module dict" shape as _CONST_CACHE above.
+_KERNEL_CACHE = {}
+
+
+def _get_kernel(name, input_names, output_names, source):
+    """Build (once) and return the Metal kernel called ``name``."""
+    kernel = _KERNEL_CACHE.get(name)
+    if kernel is None:
+        kernel = _KERNEL_CACHE[name] = mx.fast.metal_kernel(
+            name=name,
+            input_names=input_names,
+            output_names=output_names,
+            source=source,
+        )
+    return kernel
 
 
 def _get_metal_matvec_kernel():
     """Build (once) the fused gather-multiply-accumulate Metal kernel."""
-    global _METAL_MATVEC_KERNEL
-    if _METAL_MATVEC_KERNEL is None:
-        _METAL_MATVEC_KERNEL = mx.fast.metal_kernel(
-            name="sqd_apply_h_xz",
-            input_names=["vec", "xsources", "diagonals", "n_groups", "n_states"],
-            output_names=["out"],
-            source=_METAL_MATVEC_SOURCE,
-        )
-    return _METAL_MATVEC_KERNEL
+    return _get_kernel(
+        "sqd_apply_h_xz",
+        ["vec", "xsources", "diagonals", "n_groups", "n_states"],
+        ["out"],
+        _METAL_MATVEC_SOURCE,
+    )
 
 
 def apply_h_xz_mlx_metal(vec, xsources, diagonals, threadgroup=256):
@@ -471,20 +538,15 @@ _METAL_SAS_SOURCE = """
     }
 """.replace("_METAL_SAS_MAX_THREADGROUP_LITERAL_", str(_METAL_SAS_MAX_THREADGROUP))
 
-_METAL_SAS_KERNEL = None
-
 
 def _get_metal_sas_kernel():
     """Build (once) the fused Rayleigh-Ritz inner-product kernel."""
-    global _METAL_SAS_KERNEL
-    if _METAL_SAS_KERNEL is None:
-        _METAL_SAS_KERNEL = mx.fast.metal_kernel(
-            name="sqd_compute_sas",
-            input_names=["vectors", "mvs", "n_basis", "n_states"],
-            output_names=["out"],
-            source=_METAL_SAS_SOURCE,
-        )
-    return _METAL_SAS_KERNEL
+    return _get_kernel(
+        "sqd_compute_sas",
+        ["vectors", "mvs", "n_basis", "n_states"],
+        ["out"],
+        _METAL_SAS_SOURCE,
+    )
 
 
 def _compute_sas_metal(vectors, mvs, threadgroup=256):
@@ -764,20 +826,15 @@ _METAL_EIG3_SOURCE = """
     }
 """.replace("SQRT3_", repr(_SQRT3))
 
-_METAL_EIG3_KERNEL = None
-
 
 def _get_metal_eig3_kernel():
     """Build (once) the fused 3x3 eigensolve Metal kernel."""
-    global _METAL_EIG3_KERNEL
-    if _METAL_EIG3_KERNEL is None:
-        _METAL_EIG3_KERNEL = mx.fast.metal_kernel(
-            name="sqd_eigenpair_3x3",
-            input_names=["mat"],
-            output_names=["theta", "kappa"],
-            source=_METAL_EIG3_SOURCE,
-        )
-    return _METAL_EIG3_KERNEL
+    return _get_kernel(
+        "sqd_eigenpair_3x3",
+        ["mat"],
+        ["theta", "kappa"],
+        _METAL_EIG3_SOURCE,
+    )
 
 
 def eigenpair_3x3_metal(mat):
@@ -965,17 +1022,15 @@ def ground_locg_mlx(
     def matvec(vec):
         return mat(vec, *args)
 
-    # Constants fetched once per solve rather than rebuilt on every normalize/iter_body call (see
-    # _consts). The dtype is fixed for the whole solve, so this lookup cannot change mid-run.
+    # Constants fetched once per solve rather than rebuilt on every iter_body call (see _consts).
+    # The dtype is fixed for the whole solve, so this lookup cannot change mid-run.
     _solve_consts = _consts(xinit.dtype)
     one = _solve_consts["one"]
     p_mask = _solve_consts["p_mask"]
-
-    def normalize(vector, norm=None):
-        """Divide by the norm, leaving a zero vector untouched instead of producing NaN."""
-        if norm is None:
-            norm = mx.linalg.norm(vector)
-        return vector / mx.where(norm == 0.0, one, norm)
+    p_keep = _solve_consts["p_keep"]
+    # Static Python int, fixed for the whole solve, so converged() does not need a vector argument
+    # just to read a shape off it.
+    num_states = xinit.shape[0]
 
     xinit = normalize(xinit)
 
@@ -1048,7 +1103,7 @@ def ground_locg_mlx(
         # stays a masked blend rather than an item assignment: this runs every iteration inside
         # mx.compile, so the selection must remain part of the traced graph, and MLX has no
         # functional `.at[].set()` that composes with a traced predicate.
-        sas_mat = mx.where(p_is_zero, sas_mat * (1.0 - p_mask) + excluded * p_mask, sas_mat)
+        sas_mat = mx.where(p_is_zero, sas_mat * p_keep + excluded * p_mask, sas_mat)
         theta, kappa = solve_eig3(sas_mat)
         tmp_s = ycurr * kappa[1] + tmp_p * kappa[2]
         norm_s = mx.linalg.norm(tmp_s)
@@ -1066,7 +1121,15 @@ def ground_locg_mlx(
         rnext = axnext - xnext * theta
         return theta, xnext, ynext, rnext, axnext, p_is_zero
 
-    def converged(xcurr, theta, rcurr, axnext, p_is_zero):
+    def converged(theta, rcurr, axnext, p_is_zero):
+        # A zeroed search direction means {x, y} already spans the residual: we are at a stationary
+        # point and no further iteration can lower theta. Test it FIRST, before building reltol --
+        # that early return discards reltol's two op constructions, so computing them above the
+        # branch was pure waste on the terminating iteration.
+        #
+        # This bool() forces a device sync -- the price of MLX having no while_loop.
+        if bool(p_is_zero):
+            return True
         # Compare the residual norm against the floating-point error we'd expect from forming the
         # residual at all. abs(theta) rather than +theta, and a sum rather than the difference the
         # first version of this port inherited: norm(Ax) - theta is a cancellation of two nearly
@@ -1074,11 +1137,14 @@ def ground_locg_mlx(
         # negative and made the test unsatisfiable, so the solver never converged and always burned
         # maxiter (item I4). A ground-state search is typically negative-definite, where +theta
         # would cancel in turn.
-        reltol = (mx.linalg.norm(axnext) + mx.abs(theta)) * xcurr.shape[0] * 10
-        # These float() calls force a device sync -- the price of MLX having no while_loop.
-        if bool(p_is_zero):
-            return True
-        return float(mx.linalg.norm(rcurr)) < tol * float(reltol)
+        reltol = (mx.linalg.norm(axnext) + mx.abs(theta)) * num_states * 10
+        # ONE float() sync, not two: the comparison is folded into a single on-device subtraction
+        # and only its sign is read back. `norm(r) < tol * reltol` as two separate float() calls
+        # drains the MLX pipeline twice per iteration, and syncs are the top item in this repo's
+        # cost model (see docs/superpowers/specs/2026-08-03-mlx-sqd-poc-design.md). Exactly
+        # equivalent -- 0 disagreements over 400k random magnitude pairs spanning 1e-30..1e10 in
+        # both f32 and f64, since tol is a Python float and both operands are non-negative.
+        return float(mx.linalg.norm(rcurr) - tol * reltol) < 0.0
 
     niter = 0
     is_converged = False
@@ -1088,7 +1154,7 @@ def ground_locg_mlx(
     if not compile_body:
         for niter in range(1, maxiter + 1):
             theta, xcurr, ycurr, rcurr, axnext, p_is_zero = iter_body(xcurr, ycurr, rcurr, axnext)
-            if check_convergence and converged(xcurr, theta, rcurr, axnext, p_is_zero):
+            if check_convergence and converged(theta, rcurr, axnext, p_is_zero):
                 is_converged = True
                 break
     elif not check_convergence:
@@ -1113,6 +1179,16 @@ def ground_locg_mlx(
             # No theta/p_is_zero initializers: compile_chunk >= 1 is validated above, so the loop
             # always runs at least once and any initial value would be dead. (They were not merely
             # redundant -- a zero-trip loop would have returned them, reporting theta = 0.)
+            #
+            # NOTE, and a real semantic difference from the uncompiled path: only the LAST
+            # iteration's p_is_zero survives, so a zeroed search direction arising mid-chunk is not
+            # reported. The uncompiled branch above checks it every iteration. Both still converge
+            # -- p_is_zero means no further iteration can lower theta, so the remaining iterations
+            # of the chunk are wasted work, not wrong work, and the flag is re-derived on the next
+            # chunk. Widening the compiled signature to an OR-accumulated flag would fix it, at the
+            # cost of an extra array in the traced carry. Left as is deliberately: this is a
+            # behaviour question, not a cleanup one, and `compile_body` is opt-in and off by
+            # default.
             for _ in range(compile_chunk):
                 theta, xcurr, ycurr, rcurr, axcurr, p_is_zero = iter_body(
                     xcurr, ycurr, rcurr, axcurr
@@ -1120,8 +1196,14 @@ def ground_locg_mlx(
             return theta, xcurr, ycurr, rcurr, axcurr, p_is_zero
 
         compiled_chunk = mx.compile(chunk_body)
-        while niter < maxiter:
-            this_chunk = min(compile_chunk, maxiter - niter)
+        # `range`, not a hand-advanced `while niter < maxiter`. The old shape derived its progress
+        # from `this_chunk = min(compile_chunk, maxiter - niter)` and advanced by it three lines
+        # later, so a non-positive compile_chunk made the advance a no-op and the loop spun forever.
+        # Here Python's own range semantics guarantee termination -- step=0 raises, a negative step
+        # yields an empty range -- which demotes the compile_chunk guard above from load-bearing to
+        # merely defensive (it stays, for the error message).
+        for start in range(0, maxiter, compile_chunk):
+            this_chunk = min(compile_chunk, maxiter - start)
             if this_chunk == compile_chunk:
                 theta, xcurr, ycurr, rcurr, axnext, p_is_zero = compiled_chunk(
                     xcurr, ycurr, rcurr, axnext
@@ -1133,8 +1215,8 @@ def ground_locg_mlx(
                     theta, xcurr, ycurr, rcurr, axnext, p_is_zero = iter_body(
                         xcurr, ycurr, rcurr, axnext
                     )
-            niter += this_chunk
-            if converged(xcurr, theta, rcurr, axnext, p_is_zero):
+            niter = start + this_chunk
+            if converged(theta, rcurr, axnext, p_is_zero):
                 is_converged = True
                 break
 
@@ -1202,13 +1284,11 @@ def _project_out(basis, vector):
     quantity these guards exist to protect. Do not "optimize" this without re-running that
     comparison.
     """
-    one = _consts(vector.dtype)["one"]
     for _ in range(2):
         ips = [mx.sum(vb * vector) for vb in basis]
         for vb, ip in zip(basis, ips):
             vector = vector - vb * ip
-        norm = mx.linalg.norm(vector)
-        vector = vector / mx.where(norm == 0.0, one, norm)
+        vector = normalize(vector)
 
     for _ in range(2):
         ips = [mx.sum(vb * vector) for vb in basis]
@@ -1292,7 +1372,8 @@ def _nullvec_3x3(mat):
     # one at a time -- roughly a dozen launches for nine numbers. One broadcast cross replaces all
     # of it, bit-identically (verified at 0.0 max relative difference over 3000 random matrices
     # spanning scales 1e-8..1e8, including rank-deficient ones with a zeroed column).
-    eye = _consts(mat.dtype)["eye3"]
+    consts = _consts(mat.dtype)
+    eye = consts["eye3"]
     comps = mx.linalg.cross(mx.broadcast_to(col, (3, 3)), eye)
     # Rank 0 (a multiple of the identity): every candidate above is zero, so offer an arbitrary
     # unit vector as the last resort. It has residual 0 and wins by default.
@@ -1313,16 +1394,26 @@ def _nullvec_3x3(mat):
     # per-candidate version produced -- in the same row order (crosses, complements, fallback).
     cands = mx.concatenate(cands)
     norms = mx.linalg.norm(cands, axis=1, keepdims=True)
-    cands = cands / mx.where(norms == 0.0, _consts(norms.dtype)["one"], norms)
+    # `consts` from above, not a second `_consts(norms.dtype)` lookup: norms is the norm of a real
+    # array, so its dtype is mat.dtype by construction, and re-deriving it invited the reader to
+    # wonder whether the two could differ.
+    cands = cands / mx.where(norms == 0.0, consts["one"], norms)
     # `cands @ mat`, not `cands @ mat.T`: this function's contract is a real *symmetric* matrix
     # (see the docstring, and eigenpair_3x3 only ever passes `balanced - xmin*eye`, symmetric by
     # construction), so the transpose is an exact no-op -- verified identical -- and costs an op
     # launch per iteration. The JAX original writes the einsum in the equivalent `mat @ cands_i`
     # order. If this ever needs to accept an asymmetric matrix, the transpose must come back.
     resid = mx.linalg.norm(cands @ mat, axis=1)
-    # A candidate that collapsed to zero is not a valid eigenvector; disqualify it. MLX has no
-    # inf-filling idiom as terse as jnp.where(..., jnp.inf), so add a large finite penalty
-    # proportional to the residual scale instead -- the comparison only needs an ordering.
+    # A candidate that collapsed to zero is not a valid eigenvector; disqualify it with a large
+    # FINITE penalty proportional to the residual scale -- the comparison only needs an ordering.
+    #
+    # `mx.inf` does exist, so `mx.where(alive, resid, mx.inf)` would mirror the JAX original more
+    # closely and in one fewer op. It is avoided deliberately: the rank-0 case (a multiple of the
+    # identity) zeroes the first six candidates, and the surviving e_0 fallback has residual exactly
+    # 0, so an inf-filled vector would be six infs and one zero. That works, but it puts non-finite
+    # values into an array this function then reduces with argmin, and every other guard in this
+    # module is written to keep NaN/inf out of the graph entirely rather than rely on comparison
+    # semantics. A finite penalty is the same ordering with no non-finite intermediates.
     #
     # Test the PRE-normalization norms rather than re-reducing the normalized rows: after the
     # division above every surviving row has norm exactly 1 and every zero row is still exactly 0,
@@ -1350,8 +1441,13 @@ def eigenpair_3x3(mat):
     calls and real/imag norm splits are no-ops here and are dropped. ``ground_locg_mlx`` rejects
     complex input up front, so that assumption is enforced rather than merely documented.
 
-    Reference: J. Kopp, Int. J. Mod. Phys. C. 19, 523 (2008). MLX has no eigh, so the analytic
-    route is the only route.
+    Reference: J. Kopp, Int. J. Mod. Phys. C. 19, 523 (2008).
+
+    ``mx.linalg.eigh`` does exist and would accept this input directly; the analytic route is kept
+    because a per-iteration eigensolve that crosses the device boundary measured 1.37x slower, not
+    because MLX lacks an eigensolver. See the module docstring for the numbers and for the one case
+    (the f64 CPU arm, where Cardano's near-degeneracy error costs 217 iterations against JAX's 89)
+    in which ``eigh`` might still win.
     """
     consts = _consts(mat.dtype)
     eye = consts["eye3"]
@@ -1383,9 +1479,11 @@ def eigenpair_3x3(mat):
         - 2.0 * (balanced[0, 2] * balanced[1, 0] * balanced[2, 1])
     )
     # Both radicands are non-negative for a symmetric matrix; clamp them against rounding.
-    zero = consts["zero"]
-    p = mx.maximum(-3.0 * c1, zero)
-    disc = mx.maximum(-27.0 * c1 * c1 * c1 - 182.25 * c0 * c0, zero)
+    # Bare 0.0, as ground_locg does: mx.maximum promotes a Python scalar without constructing an
+    # array, so this needs no cached constant (unlike the mx.where operands, which must be arrays
+    # to match dtype).
+    p = mx.maximum(-3.0 * c1, 0.0)
+    disc = mx.maximum(-27.0 * c1 * c1 * c1 - 182.25 * c0 * c0, 0.0)
     phi = mx.arctan2(mx.sqrt(disc), -13.5 * c0) / 3.0
     cphi = mx.cos(phi)
     sphi = mx.sin(phi)
