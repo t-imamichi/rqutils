@@ -442,9 +442,70 @@ class TestMatvecKernels:
         vector = rng.normal(size=states.shape[0])
 
         got = np.asarray(
-            apply_h(vector, hamiltonian.x, hamiltonian.z, hamiltonian.c, states_u)
+            apply_h(vector, (hamiltonian.x, hamiltonian.z, hamiltonian.c), states_u, (0, 0))
         ).real
         assert np.abs(got - matrix @ vector).max() < 1e-12
+
+    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
+    def test_every_cache_level_matches_dense(self, cache_level):
+        """All six resolution paths of the unified kernel, each against the dense product.
+
+        ``apply_h`` replaced six near-identical functions with one ``cache_level``-indexed kernel.
+        The risk in that collapse is a mis-wired argument slot -- feeding a Z signature where a
+        coefficient belongs, say -- which would still produce a plausible finite vector. Checking
+        every cell of the 2x3 grid against ``project_dense`` (an independent Kronecker construction)
+        rather than against the other kernels is what catches it: cross-kernel agreement alone would
+        pass if the collapse broke all six identically.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        rng = np.random.default_rng(20260805)
+        num_qubits = 4
+        strings = real_pauli_strings(num_qubits, 6, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = np.unique(rng.integers(0, 2, size=(12, num_qubits)).astype(np.uint8), axis=0)
+
+        hamiltonian = PauliSumXZ.from_paulisum(
+            (strings, coeffs.tolist()), force_real=True, add_padding=True
+        )
+        states_u = uniquify_states(pack_padded(states), states.shape[0])
+        vector = rng.normal(size=states.shape[0])
+        matrix = project_dense(strings, coeffs, states).real
+
+        xgroup = hamiltonian.x
+        if cache_level[0] == 1:
+            xgroup = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
+        match cache_level[1]:
+            case 0:
+                scanned = (xgroup, hamiltonian.z, hamiltonian.c)
+            case 1:
+                signs = np.stack([np.asarray(get_diag_signs(z, states_u)) for z in hamiltonian.z])
+                scanned = (xgroup, signs, hamiltonian.c)
+            case 2:
+                diagonals = np.stack(
+                    [
+                        np.asarray(get_diagonal(z, c, states_u).real)
+                        for z, c in zip(hamiltonian.z, hamiltonian.c)
+                    ]
+                )
+                scanned = (xgroup, diagonals)
+
+        needs_states = cache_level[0] == 0 or cache_level[1] == 0
+        got = np.asarray(
+            apply_h(vector, scanned, states_u if needs_states else None, cache_level)
+        ).real
+        assert np.abs(got - matrix @ vector).max() < 1e-12
+
+    @pytest.mark.parametrize("cache_level", [(0, 0), (0, 1), (0, 2), (1, 0)])
+    def test_omitting_states_raises(self, cache_level):
+        """Only ``(1, 2)`` can run without the state list; the rest must say so, not crash later.
+
+        ``(1, 1)`` and ``(1, 2)`` read neither signature array, which is what lets a caller drop S
+        after caching. For the other four, a missing S would otherwise surface as an opaque failure
+        deep inside ``get_xsource``/``get_diagonal``.
+        """
+        with pytest.raises(ValueError, match="states is required"):
+            apply_h(np.zeros(4), (np.zeros((1, 1), dtype=np.uint8),) * 3, None, cache_level)
 
     def test_apply_h_xz_cached_matches_dense(self):
         """The fully-cached kernel, which is what ``examples/`` and the MLX port both use."""

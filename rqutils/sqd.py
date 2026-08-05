@@ -160,6 +160,7 @@ SQD API
 .. autofunction:: hproj
 """
 
+import functools
 import logging
 import time
 from collections.abc import Callable, Sequence
@@ -430,25 +431,25 @@ def run_sqd(
             (hamiltonian.z, hamiltonian.c),
         )[1]
 
-    match cache_level:
-        case (0, 0):
-            matvec = apply_h
-            args = (hamiltonian.x, hamiltonian.z, hamiltonian.c, states_u)
-        case (0, 1):
-            matvec = apply_h_s_cached
-            args = (hamiltonian.x, states_u, diag_signs, hamiltonian.c)
-        case (0, 2):
-            matvec = apply_h_z_cached
-            args = (hamiltonian.x, states_u, diagonals)
-        case (1, 0):
-            matvec = apply_h_x_cached
-            args = (xsources, hamiltonian.z, hamiltonian.c, states_u)
-        case (1, 1):
-            matvec = apply_h_xs_cached
-            args = (xsources, diag_signs, hamiltonian.c)
-        case (1, 2):
-            matvec = apply_h_xz_cached
-            args = (xsources, diagonals)
+    # Assemble the per-X-group arrays apply_h scans over. This stays a Python-level match on the
+    # static cache_level: the *packing* must be static too, or the tuple structure would become part
+    # of the traced arguments and retrace on every call.
+    xgroup = xsources if cache_level[0] == 1 else hamiltonian.x
+    match cache_level[1]:
+        case 0:
+            scanned = (xgroup, hamiltonian.z, hamiltonian.c)
+        case 1:
+            scanned = (xgroup, diag_signs, hamiltonian.c)
+        case 2:
+            scanned = (xgroup, diagonals)
+    # (1, 2) reads neither signature array, so it needs no states at all -- which is what lets the
+    # caller drop S entirely under the most aggressive caching (see the module docstring).
+    needs_states = cache_level[0] == 0 or cache_level[1] == 0
+    # cache_level is bound here rather than passed through args: ground_locg splats args
+    # positionally (matvec(vec, *args)), so a static_argnames entry would never see it and the
+    # tuple would be traced -- retracing the kernel on every matvec call in the solver loop.
+    matvec = functools.partial(apply_h, cache_level=cache_level)
+    args = (scanned, states_u if needs_states else None)
 
     def vinit_from_min_diag():
         if cache_level[1] == 2:
@@ -675,100 +676,74 @@ def apply_xgrp(
     return xvec * diagonal
 
 
-@jax.jit
+@jax.jit(static_argnames=["cache_level"])
 def apply_h(
     vec: NDArray[np.inexact],
-    xsignatures: NDArray[np.uint8],
-    zsignatures: NDArray[np.uint8],
-    coeffs: NDArray[np.inexact],
-    states: StateList,
+    scanned: tuple[NDArray, ...],
+    states: StateList | None = None,
+    cache_level: tuple[int, int] = (1, 2),
 ) -> jax.Array:
-    """Return Hv using X and Z signatures and Pauli coefficients."""
+    r"""Return :math:`Hv`, resolving the per-X-group inputs according to ``cache_level``.
+
+    All six caching strategies are one ``jax.lax.scan`` over the X groups accumulating
+    ``out + apply_xgrp(xsource, diagonal, vec)``; they differ only in where the two inputs come
+    from. That is exactly the 2x3 grid ``cache_level`` already names, so it is expressed as a grid
+    rather than as six near-identical functions:
+
+    =============  ==========================  =====================================
+    cache_level    ``xsource``                 ``diagonal``
+    =============  ==========================  =====================================
+    ``(0, *)``     ``get_xsource(x, states)``  --
+    ``(1, *)``     scanned (precomputed)       --
+    ``(*, 0)``     --                          ``get_diagonal(z, c, states)``
+    ``(*, 1)``     --                          ``compute_diagonal(signs, c)``
+    ``(*, 2)``     --                          scanned (precomputed)
+    =============  ==========================  =====================================
+
+    ``cache_level`` is static, so each combination traces to the same code the six separate kernels
+    did -- the selection happens once at trace time, not per group. It must stay static: passing it
+    as a traced value would retrace on every matvec call inside the solver loop.
+
+    Args:
+        vec: Vector to multiply.
+        scanned: Per-X-group arrays to scan over, in the order the ``cache_level`` grid implies.
+            ``(0, 0)``: ``(xsignatures, zsignatures, coeffs)``. ``(0, 1)``:
+            ``(xsignatures, diag_signs, coeffs)``. ``(0, 2)``: ``(xsignatures, diagonals)``.
+            ``(1, 0)``: ``(xsources, zsignatures, coeffs)``. ``(1, 1)``:
+            ``(xsources, diag_signs, coeffs)``. ``(1, 2)``: ``(xsources, diagonals)``.
+        states: Uniquified state list. Required unless ``cache_level == (1, 2)``, which reads
+            neither the X signatures nor the Z signatures and so needs no states at all.
+        cache_level: Caching strategy, as documented on :func:`sqd`.
+
+    Returns:
+        :math:`Hv`.
+    """
+    if (cache_level[0] == 0 or cache_level[1] == 0) and states is None:
+        raise ValueError(f"states is required for cache_level={cache_level}")
 
     def fn(out, val):
-        xpat, zpats, cs = val
-        xsource = get_xsource(xpat, states)
-        diagonal = get_diagonal(zpats, cs, states)
+        # val[0] is the X source for this group: either the precomputed index array or the X
+        # signature it is derived from.
+        xsource = val[0] if cache_level[0] == 1 else get_xsource(val[0], states)
+        if cache_level[1] == 0:
+            diagonal = get_diagonal(val[1], val[2], states)
+        elif cache_level[1] == 1:
+            diagonal = compute_diagonal(val[1], val[2])
+        else:
+            diagonal = val[1]
         return out + apply_xgrp(xsource, diagonal, vec), None
 
-    return jax.lax.scan(fn, jnp.zeros_like(vec), (xsignatures, zsignatures, coeffs))[0]
-
-
-@jax.jit
-def apply_h_s_cached(
-    vec: NDArray[np.inexact],
-    xsignatures: NDArray[np.uint8],
-    states: StateList,
-    diag_signs: NDArray[np.uint8],
-    coeffs: NDArray[np.inexact],
-) -> jax.Array:
-    def fn(out, val):
-        xpat, signs, cs = val
-        xsource = get_xsource(xpat, states)
-        diagonal = compute_diagonal(signs, cs)
-        return out + apply_xgrp(xsource, diagonal, vec), None
-
-    return jax.lax.scan(fn, jnp.zeros_like(vec), (xsignatures, diag_signs, coeffs))[0]
-
-
-@jax.jit
-def apply_h_z_cached(
-    vec: NDArray[np.inexact],
-    xsignatures: NDArray[np.uint8],
-    states: StateList,
-    diagonals: NDArray[np.inexact],
-) -> jax.Array:
-    """Return Hv using precomputed xsources and diagonals data."""
-
-    def fn(out, val):
-        xsource = get_xsource(val[0], states)
-        return out + apply_xgrp(xsource, val[1], vec), None
-
-    return jax.lax.scan(fn, jnp.zeros_like(vec), (xsignatures, diagonals))[0]
-
-
-@jax.jit
-def apply_h_x_cached(
-    vec: NDArray[np.inexact],
-    xsources: NDArray[np.int32],
-    zsignatures: NDArray[np.uint8],
-    coeffs: NDArray[np.inexact],
-    states: StateList,
-) -> jax.Array:
-    """Return Hv using precomputed xsources and diagonals data."""
-
-    def fn(out, val):
-        xsource, zpats, cs = val
-        diagonal = get_diagonal(zpats, cs, states)
-        return out + apply_xgrp(xsource, diagonal, vec), None
-
-    return jax.lax.scan(fn, jnp.zeros_like(vec), (xsources, zsignatures, coeffs))[0]
-
-
-@jax.jit
-def apply_h_xs_cached(
-    vec: NDArray[np.inexact],
-    xsources: NDArray[np.int32],
-    diag_signs: NDArray[np.uint8],
-    coeffs: NDArray[np.inexact],
-) -> jax.Array:
-    """Return Hv using precomputed xsources and diagonals data."""
-
-    def fn(out, val):
-        xsource, dsigns, cs = val
-        diagonal = compute_diagonal(dsigns, cs)
-        return out + apply_xgrp(xsource, diagonal, vec), None
-
-    return jax.lax.scan(fn, jnp.zeros_like(vec), (xsources, diag_signs, coeffs))[0]
+    return jax.lax.scan(fn, jnp.zeros_like(vec), scanned)[0]
 
 
 @jax.jit
 def apply_h_xz_cached(
     vec: NDArray[np.inexact], xsources: NDArray[np.int32], diagonals: NDArray[np.inexact]
 ) -> jax.Array:
-    """Return Hv using precomputed xsources and diagonals data."""
-    return jax.lax.scan(
-        lambda out, val: (out + apply_xgrp(val[0], val[1], vec), None),
-        jnp.zeros_like(vec),
-        (xsources, diagonals),
-    )[0]
+    """Return Hv from fully precomputed X sources and diagonals, i.e. ``cache_level=(1, 2)``.
+
+    Kept as a named entry point because it is the one kernel used outside this module: it is the
+    JAX arm of the MLX benchmark (``examples/bench_mlx.py``) and the reference that
+    ``ground_locg_mlx.apply_h_xz_mlx`` was validated against, so both refer to it by name.
+    """
+    return apply_h(vec, (xsources, diagonals), None, (1, 2))
