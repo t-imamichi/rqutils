@@ -5,11 +5,11 @@ the name `mx` to validate the numerics. This catches algorithm transcription err
 kind that matter most -- without needing MLX to initialize.
 
 Run with:
-    uv run python examples/check_ground_locg_mlx_static.py
+    uv run python examples/mlx/check_solver_headless.py
 
 This script does NOT require MLX or a Metal device: it substitutes a numpy shim for
 `mlx.core` and re-executes rqutils/ground_locg_mlx.py's own source text against that shim.
-See examples/check_ground_locg_mlx_mlx.py for the real-MLX counterpart, which requires a
+See examples/mlx/check_solver_device.py for the real-MLX counterpart, which requires a
 Metal device and cannot run headless.
 """
 
@@ -23,8 +23,9 @@ import types
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# The module under test lives in the package; HERE is examples/, so go up one level.
-SRC = os.path.join(os.path.dirname(HERE), "rqutils", "ground_locg_mlx.py")
+# The module under test lives in the package; HERE is examples/mlx/, so go up two levels.
+ROOT = os.path.dirname(os.path.dirname(HERE))
+SRC = os.path.join(ROOT, "rqutils", "ground_locg_mlx.py")
 with open(SRC) as source_file:
     source = source_file.read()
 

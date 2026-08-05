@@ -1,4 +1,4 @@
-"""Verify bench_mlx's JAX arms and its gate/reporting logic end to end.
+"""Verify bench.py's JAX arms and its gate/reporting logic end to end.
 
 This covers the JAX arms only (jax-cpu-f64, jax-cpu-f32) plus arm-name validation, the
 correctness gate's self-test hook, and text-report rendering. It does not exercise any of
@@ -11,7 +11,7 @@ import os
 import subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BENCH = os.path.join(HERE, "bench_mlx.py")
+BENCH = os.path.join(HERE, "bench.py")
 BASE = [
     "uv",
     "run",
@@ -73,7 +73,7 @@ assert "per_it_ms" in out.stdout and "jax-cpu-f64" in out.stdout, out.stdout
 print("OK  text report renders")
 
 # 6. --sas: a JAX arm must refuse it (MLX-only kernel), and the flag must be accepted by the
-# parser. Driven through subprocess like every other check here -- importing bench_mlx would
+# parser. Driven through subprocess like every other check here -- importing bench.py would
 # pull in mlx.core and need a Metal device, which is exactly what this file avoids.
 out = subprocess.run(
     BASE + ["--arm", "jax-cpu-f32", "--sas", "metal"], capture_output=True, text=True, check=False

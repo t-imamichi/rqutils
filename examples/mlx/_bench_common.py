@@ -144,7 +144,7 @@ def apply_h_xz_chunked(
     ========  ========================  =================
 
     This same function is used by the JAX arms of the benchmark (see ``--matvec chunked`` in
-    ``bench_mlx.py``): batching the gather is an algorithmic improvement independent of the
+    ``bench.py``): batching the gather is an algorithmic improvement independent of the
     framework, so restricting it to the MLX arm would confound "MLX got faster" with "the matvec
     got better." Applying it symmetrically keeps the JAX-vs-MLX comparison about the solver loop,
     not about who has the better matvec.

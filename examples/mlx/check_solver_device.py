@@ -6,16 +6,16 @@ fails in a headless session with
 
 THIS SCRIPT REQUIRES A REAL METAL DEVICE (a Mac with MLX installed and GPU access) AND
 CANNOT RUN HEADLESS. It was written by an agent that could not execute it -- the numpy-shim
-counterpart in check_ground_locg_mlx_static.py is what validated the algorithm instead.
+counterpart in check_solver_headless.py is what validated the algorithm instead.
 
 Device status as of 2026-08-05: `apply_h_xz_mlx_metal` and `sas="metal"` have since been
-exercised on a real M1 GPU (via examples/bench_mlx.py) and passed, so their MSL is known to
+exercised on a real M1 GPU (via examples/mlx/bench.py) and passed, so their MSL is known to
 compile and be correct. The `eig="metal"` checks below are NEWER and have not been run on
 hardware; that kernel is the first here to call math functions (metal::sqrt/cos/sin/atan2),
 which is exactly what only a device run can validate.
 
 Run with:
-    uv run python examples/check_ground_locg_mlx_mlx.py
+    uv run python examples/mlx/check_solver_device.py
 """
 
 import os
@@ -125,7 +125,7 @@ for device, name in ((mx.cpu, "cpu"), (mx.gpu, "gpu")):
                 # Direct kernel-vs-op-graph comparison on the matrix classes the solver actually
                 # produces, so a transcription error shows up as a wrong eigenvalue on a specific
                 # case rather than only as a drifted solve. Mirrors case 3k of
-                # check_ground_locg_mlx_static.py, but against the real compiled MSL.
+                # check_solver_headless.py, but against the real compiled MSL.
                 eig3_ops = eigenpair_3x3
                 eig3_met = eigenpair_3x3_metal
                 rng_e = np.random.default_rng(20260805)

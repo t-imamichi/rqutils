@@ -1,6 +1,6 @@
 """Standalone verification script for _bench_common.py.
 
-This repo has no pytest suite by design. Run with: uv run python examples/check_bench_common.py
+This repo has no pytest suite by design. Run with: uv run python examples/mlx/check_bench_common.py
 """
 
 import os

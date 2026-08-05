@@ -1,7 +1,7 @@
 """Count MLX op constructions per LOBPCG iteration, without a Metal device.
 
 Re-executes ``rqutils/ground_locg_mlx.py`` against a numpy shim (the same technique as
-``examples/check_ground_locg_mlx_static.py``) with every shim entry point wrapped in a counter,
+``examples/mlx/check_solver_headless.py``) with every shim entry point wrapped in a counter,
 then attributes the counts to the function that constructed them by walking the Python stack.
 
 This measures **op-construction count**, which is what MLX's lazy graph builder turns into kernel
@@ -11,7 +11,7 @@ to say *where* the launches are, so an optimization targets the real hot spot --
 is secondary") is what turns a launch count into a prediction.
 
 Run with:
-    uv run python examples/count_mlx_ops.py
+    uv run python examples/mlx/count_ops.py
 """
 
 import collections
@@ -22,7 +22,8 @@ import types
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(os.path.dirname(HERE), "rqutils", "ground_locg_mlx.py")
+# HERE is examples/mlx/, so the package root is two levels up.
+SRC = os.path.join(os.path.dirname(os.path.dirname(HERE)), "rqutils", "ground_locg_mlx.py")
 
 # Functions in the module under test that we attribute ops to. Anything constructed outside these
 # (e.g. directly in ground_locg_mlx's body) is attributed to its own frame name.
@@ -134,7 +135,7 @@ def build_shim():
 
         def call_eig3(inputs, output_dtypes=None, **kw):
             # Only the op COUNT matters here: one launch replaces the whole eigensolve. The
-            # arithmetic is validated in check_ground_locg_mlx_static.py, so this returns a
+            # arithmetic is validated in check_solver_headless.py, so this returns a
             # cheap-but-valid eigenpair via numpy rather than re-deriving Cardano.
             (mat,) = inputs
             m = np.asarray(mat, dtype=np.float64)
@@ -147,7 +148,7 @@ def build_shim():
         def call_sas(inputs, grid=None, threadgroup=None, output_dtypes=None, **kw):
             # num_states is unpacked but unused: this shim computes the inner products with a
             # whole-array dot rather than reproducing the kernel's strided per-lane indexing (that
-            # is check_ground_locg_mlx_static.py's job). Only the op COUNT matters here.
+            # is check_solver_headless.py's job). Only the op COUNT matters here.
             vectors, mvs, num_basis, _num_states = inputs
             v = np.asarray(vectors)
             m = np.asarray(mvs)
@@ -181,7 +182,7 @@ def load_module(shim):
     src = src.replace("import mlx.core as mx", "mx = mx  # shimmed")
     # exec is the point: the module's own source text is re-executed against the counting shim, so
     # the counts describe the real ground_locg_mlx.py rather than a copy that could drift from it.
-    # Same technique, and same suppression, as examples/check_ground_locg_mlx_static.py.
+    # Same technique, and same suppression, as examples/mlx/check_solver_headless.py.
     exec(compile(src, SRC, "exec"), module.__dict__)  # noqa: S102
     return module
 

@@ -16,9 +16,9 @@ JAX arm needs its own process. --all re-executes this script once per arm and co
 
 .. code-block:: sh
 
-    uv run --extra mlx --extra qiskit python examples/bench_mlx.py --arm mlx-gpu-f32
-    uv run --extra mlx --extra qiskit python examples/bench_mlx.py --all --num-qubits 10
-    uv run --extra mlx --extra qiskit python examples/bench_mlx.py --all --num-qubits 10 \
+    uv run --extra mlx --extra qiskit python examples/mlx/bench.py --arm mlx-gpu-f32
+    uv run --extra mlx --extra qiskit python examples/mlx/bench.py --all --num-qubits 10
+    uv run --extra mlx --extra qiskit python examples/mlx/bench.py --all --num-qubits 10 \
         --json > results.json
 
 Two metrics are reported per arm: per-iteration cost at a fixed iteration count (identical
@@ -287,10 +287,10 @@ def run_arm(arm, options):
     reference_path = "dense"
     if inputs.subspace_dim > DENSE_REFERENCE_MAX_DIM:
         reference_path = "sparse"
-        # Mirrors sparse_reference's own CSR construction (examples/_bench_common.py) rather
+        # Mirrors sparse_reference's own CSR construction (examples/mlx/_bench_common.py) rather
         # than sharing code with it: sparse_reference's public signature is
         # `sparse_reference(inputs) -> float` (already relied on by
-        # examples/check_bench_common.py), so it has no way to also hand back the matrix it
+        # examples/mlx/check_bench_common.py), so it has no way to also hand back the matrix it
         # built internally without changing that signature. Duplicating the four-line
         # construction here is smaller and less risky than reshaping an already-tested
         # function's interface for a second caller.
