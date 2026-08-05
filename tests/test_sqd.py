@@ -96,7 +96,7 @@ class TestComputeDiagonal:
 
         from rqutils.paulis.symplectic import PauliSumXZ
 
-        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()), force_real=True)
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_p = pack_padded(states)
         states_u = uniquify_states(states_p, states_p.shape[0])
         assert hamiltonian.z.shape[0] == 1, "expected a single X group for pure-Z input"
@@ -461,7 +461,7 @@ class TestMatvecKernels:
         coeffs = rng.normal(size=len(strings))
         states = np.unique(rng.integers(0, 2, size=(12, num_qubits)).astype(np.uint8), axis=0)
 
-        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()), force_real=True)
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_u = uniquify_states(pack_padded(states), states.shape[0])
         matrix = project_dense(strings, coeffs, states).real
         vector = rng.normal(size=states.shape[0])
@@ -490,7 +490,7 @@ class TestMatvecKernels:
         coeffs = rng.normal(size=len(strings))
         states = np.unique(rng.integers(0, 2, size=(12, num_qubits)).astype(np.uint8), axis=0)
 
-        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()), force_real=True)
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_u = uniquify_states(pack_padded(states), states.shape[0])
         vector = rng.normal(size=states.shape[0])
         matrix = project_dense(strings, coeffs, states).real
@@ -545,7 +545,7 @@ class TestMatvecKernels:
         coeffs = rng.normal(size=len(strings))
         states = np.unique(rng.integers(0, 2, size=(12, num_qubits)).astype(np.uint8), axis=0)
 
-        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()), force_real=True)
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_u = uniquify_states(pack_padded(states), states.shape[0])
         xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
         diagonals = np.stack(

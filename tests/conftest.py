@@ -159,10 +159,9 @@ def phaseless_distance(first, second):
 def real_pauli_strings(num_qubits, count, rng, letters="IXYZ"):
     """Return ``count`` distinct Pauli strings with an even number of Ys.
 
-    ``PauliSumXZ.from_paulisum(..., force_real=True)`` requires real coefficients after the
-    ``(-i)^{x.z}`` phase is folded in, which holds exactly when each string has an even Y count.
-    An odd-Y string makes the coefficients complex and ``sqd`` raises rather than silently
-    returning a wrong answer -- but these tests want the supported path.
+    ``PauliSumXZ`` narrows ``.c`` to float64 exactly when the folded ``(-i)^{x.z}`` phase is real,
+    which holds precisely when each string has an even Y count. An odd-Y string leaves the
+    coefficients complex128 -- correct, but not the real-arithmetic path these tests want.
     """
     strings, seen = [], set()
     while len(strings) < count:

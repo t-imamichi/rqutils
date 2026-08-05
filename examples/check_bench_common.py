@@ -27,7 +27,7 @@ assert states.shape == (200, 10) and states.dtype == np.uint8
 # The even-Y property is what makes the coefficients real; assert it explicitly.
 from rqutils.paulis.symplectic import PauliSumXZ
 
-ham = PauliSumXZ.from_paulisum((ps, cs), force_real=True)
+ham = PauliSumXZ.from_paulisum((ps, cs))
 assert ham.c.dtype == np.float64, f"coeffs not real: {ham.c.dtype}"
 
 inputs = build_solver_inputs(ps, cs, states)

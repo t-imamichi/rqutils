@@ -10,9 +10,11 @@ build on. Its two conventions are the ones worth pinning, because getting either
 - **Little-endian qubit ordering**: Qiskit's ``.x``/``.z`` are reversed on ingest, so bit ``q`` of a
   packed signature is qubit ``q``. ``sqd``'s tests cover this transitively; these cover it directly.
 
-One gap was found and fixed while writing these: ``force_real=True`` validated only the *input*
-coefficients, so an odd-Y Pauli string came back complex128 with no warning at all -- see
-:class:`TestForceReal`.
+One gap was found and fixed while writing these: the old ``force_real`` flag validated only the
+*input* coefficients, so an odd-Y Pauli string came back complex128 with no warning at all. The flag
+has since been removed entirely -- it could not deliver what its name promised, and its only real
+effect was silently discarding the imaginary part of a non-Hermitian operator. See
+:class:`TestCoefficientDtype`.
 """
 
 import functools
@@ -188,42 +190,60 @@ class TestGrouping:
         assert hamiltonian.z.shape[1] == len(strings)
 
 
-class TestForceReal:
-    """``force_real=True`` is best-effort: it warns rather than raising, and cannot always succeed."""
+class TestCoefficientDtype:
+    """``.c`` is float64 exactly when the folded phase is real, and there is no flag to force it.
 
-    @pytest.mark.parametrize("string", ["XX", "YY", "ZZ"])
-    def test_even_y_gives_real_coefficients(self, string):
-        """An even number of Ys keeps the phase real, so the result is float64."""
+    This replaces a ``force_real`` parameter that could not do what its name promised. Measured, it
+    had exactly one effect: on a *complex* input coefficient it silently took ``.real``, discarding
+    the imaginary part of a non-Hermitian operator. For real input it was a no-op in the even-Y case
+    (the unconditional narrowing below already handles that) and impossible in the odd-Y case, where
+    it emitted a warning saying so. The flag is gone; a complex coefficient now raises, matching what
+    the Qiskit ingest branch always did.
+    """
+
+    @pytest.mark.parametrize("string", ["XX", "YY", "ZZ", "XZ", "YYYY"])
+    def test_even_y_narrows_to_float64(self, string):
+        """An even number of Ys keeps the folded phase real, so ``.c`` is float64.
+
+        Silence matters as much as the dtype: this is the ordinary case and must not warn.
+        """
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            hamiltonian = PauliSumXZ.from_paulisum(([string], [1.0]), force_real=True)
+            hamiltonian = PauliSumXZ.from_paulisum(([string], [1.0]))
         assert hamiltonian.c.dtype == np.float64
 
-    def test_odd_y_warns_and_stays_complex(self):
-        """``force_real=True`` cannot force an odd-Y string real, and now says so.
+    @pytest.mark.parametrize("string", ["XY", "YYY", "XZY"])
+    def test_odd_y_stays_complex_silently(self, string):
+        """An odd-Y string cannot be real in this convention, and that is not an error.
 
-        The check originally ran on the *input* coefficients only, but the ``(-i)^{x.z}`` phase is
-        folded in afterwards -- so real input became complex output and ``force_real=True`` returned
-        complex128 silently. Callers were left to notice on their own:
-        ``examples/_bench_common.build_solver_inputs`` raises on ``.c.dtype != np.float64`` for
-        exactly this reason. It now warns; it deliberately still does not raise, matching the
-        pre-existing check's best-effort semantics.
+        The ``(-i)^{x.z}`` phase makes real input complex by construction, so complex128 here is the
+        correct answer rather than a failure to force realness -- hence no warning. Callers that
+        genuinely need float64 (the MLX benchmark, which has no complex128 available) check
+        ``.c.dtype``; ``examples/_bench_common.build_solver_inputs`` raises on exactly that.
         """
-        with pytest.warns(UserWarning, match="force_real=True"):
-            hamiltonian = PauliSumXZ.from_paulisum((["XY"], [1.0]), force_real=True)
-        assert hamiltonian.c.dtype == np.complex128
-
-    def test_complex_input_warns(self):
-        """The original pre-phase check: a genuinely complex input coefficient."""
-        with pytest.warns(UserWarning, match="imaginary part"):
-            PauliSumXZ.from_paulisum((["XX"], [1.0 + 1.0j]), force_real=True)
-
-    def test_force_real_false_is_silent(self):
-        """Without the flag, complex coefficients are expected and must not warn."""
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            hamiltonian = PauliSumXZ.from_paulisum((["XY"], [1.0]), force_real=False)
+            hamiltonian = PauliSumXZ.from_paulisum(([string], [1.0]))
         assert hamiltonian.c.dtype == np.complex128
+
+    def test_complex_coefficient_raises(self):
+        """A complex coefficient means a non-Hermitian operator, which every consumer assumes away.
+
+        This used to warn and silently truncate to ``.real`` under ``force_real=True`` -- turning an
+        invalid Hamiltonian into a plausible valid one, the failure mode this package keeps hitting.
+        """
+        with pytest.raises(ValueError, match="must be real for the Hamiltonian to be Hermitian"):
+            PauliSumXZ.from_paulisum((["XX"], [1.0 + 1.0j]))
+
+    def test_complex_coefficient_raises_for_qiskit_input_too(self):
+        """Both ingest paths must agree; the check is hoisted so neither can drift.
+
+        The Qiskit branch always raised while the tuple branch warned and truncated -- two answers to
+        the same question depending on which type you passed in.
+        """
+        qiskit = pytest.importorskip("qiskit")
+        with pytest.raises(ValueError, match="must be real for the Hamiltonian to be Hermitian"):
+            PauliSumXZ.from_paulisum(qiskit.quantum_info.SparsePauliOp(["XX"], [1.0 + 1.0j]))
 
 
 class TestPadding:

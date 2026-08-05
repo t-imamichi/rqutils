@@ -79,7 +79,7 @@ def build_solver_inputs(
     by 0., which is algebraically identical and costs nothing inside the solver loop.
     Both frameworks receive these same arrays, so neither is advantaged.
     """
-    hamiltonian = PauliSumXZ.from_paulisum((pauli_strings, coeffs), force_real=True)
+    hamiltonian = PauliSumXZ.from_paulisum((pauli_strings, coeffs))
     if hamiltonian.c.dtype != np.float64:
         raise ValueError(
             f"Hamiltonian coefficients are {hamiltonian.c.dtype}, expected float64."

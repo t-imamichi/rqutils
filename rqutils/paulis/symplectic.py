@@ -42,7 +42,6 @@ Symplectic Pauli sum representation API
 .. autoclass:: PauliSumXZ
 """
 
-import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -69,7 +68,7 @@ class PauliSumXZ:
     num_qubits: int = field(metadata={"static": True})
 
     @classmethod
-    def from_paulisum(cls, paulisum: Any, force_real: bool = False) -> "PauliSumXZ":
+    def from_paulisum(cls, paulisum: Any) -> "PauliSumXZ":
         if isinstance(paulisum, tuple):  # ([paulis], [coeffs])
             paulis, coeffs = paulisum
             if len(paulis) != len(coeffs):
@@ -91,11 +90,6 @@ class PauliSumXZ:
             num_qubits = paulis.shape[1]
 
         elif HAS_QISKIT and isinstance(paulisum, SparsePauliOp):
-            if not np.allclose(paulisum.coeffs.imag, 0.0):
-                raise ValueError(
-                    "Coefficients of Paulis must be real for the Hamiltonian to be Hermitian."
-                )
-
             # Remove null terms
             paulisum = paulisum.simplify()
             coeffs = paulisum.coeffs
@@ -106,10 +100,16 @@ class PauliSumXZ:
         else:
             raise ValueError("Unsupported input type")
 
-        if force_real:
-            if np.any(coeffs.imag != 0.0):
-                warnings.warn("Found nonzero imaginary part when force_real=True")
-            coeffs = coeffs.real
+        # A complex coefficient on a Pauli string means the operator is not Hermitian, which every
+        # consumer of this class assumes. Checked here rather than per-branch so both ingest paths
+        # agree: the Qiskit branch always raised, while the tuple branch used to warn and silently
+        # take .real under force_real=True -- discarding the imaginary part of a non-Hermitian
+        # operator rather than rejecting it.
+        if np.any(coeffs.imag != 0.0):
+            raise ValueError(
+                "Coefficients of Paulis must be real for the Hamiltonian to be Hermitian."
+            )
+        coeffs = coeffs.real
 
         # Find unique X signatures together with correspondence pointers
         xuniq, indices, counts = np.unique(xbits, axis=0, return_inverse=True, return_counts=True)
@@ -127,23 +127,14 @@ class PauliSumXZ:
             phases = np.array([1.0, -1.0j, -1.0, 1.0j])[iphases]
             phcoeffs[isig, : counts[isig]] = coeffs[ipaulis] * phases
 
+        # Narrow to float64 when the folded phase left everything real, i.e. when every Pauli string
+        # has an even number of Ys. An odd-Y string cannot be real in this convention -- the
+        # (-i)^{x.z} phase turns real input complex -- so `.c` stays complex128 there by
+        # construction, not by mistake. Callers that require float64 (the MLX benchmark, which has
+        # no complex128 available) check `.c.dtype`; there is deliberately no flag to request
+        # realness, since no flag can grant it.
         if np.all(phcoeffs.imag == 0.0):
             phcoeffs = phcoeffs.real
-        elif force_real:
-            # The check above on `coeffs` sees only the *input* coefficients, but the
-            # (-i)^{x.z} phase is folded in afterwards, so a Pauli string with an odd number of Ys
-            # turns real input complex again -- and force_real=True returned complex128 with no
-            # warning at all. Callers were left to notice on their own:
-            # examples/_bench_common.build_solver_inputs raises on `.c.dtype != np.float64` for
-            # exactly this reason. Warn rather than raise, matching the pre-phase check's
-            # best-effort semantics so no existing caller changes behaviour.
-            warnings.warn(
-                "force_real=True but the coefficients are complex after the (-i)^{x.z} phase is "
-                "applied; a Pauli string with an odd number of Ys cannot have a real coefficient "
-                "in this convention. The returned .c is complex128 -- check its dtype if your "
-                "downstream code requires float64.",
-                stacklevel=2,
-            )
 
         # A dummy identity Pauli at bit position 0, aligning with the pad bit that consumers insert
         # into their state bitstrings.

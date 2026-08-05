@@ -235,7 +235,7 @@ def sqd(
     if states_size < states.shape[0]:
         raise ValueError("states_size smaller than the states array length")
     if not isinstance(hamiltonian, PauliSumXZ):
-        hamiltonian = PauliSumXZ.from_paulisum(hamiltonian, force_real=True)
+        hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
 
     if not (mesh := get_abstract_mesh()).empty and (resid := states_size % mesh.size) != 0:
         LOG.debug("Adjusting states_size to make the array divisible by %d", mesh.size)
