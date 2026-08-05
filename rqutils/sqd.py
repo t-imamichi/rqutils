@@ -471,7 +471,18 @@ def run_sqd(
         # sqd returned -1.293, the exact minimum of the block holding the seed, against a true
         # minimum of -2.191 in the other block. The answer was a genuine eigenvalue, just not the
         # lowest one -- so nothing downstream could detect it.
-        return _spread_seed(states_size, states_u, hamiltonian.c.dtype, sharding).at[imin].add(1.0)
+        #
+        # out_sharding is mandatory here, not decorative: a scatter into a sharded operand cannot
+        # resolve its output sharding unambiguously (the update might land on any device), so JAX
+        # raises ShardingTypeError rather than guessing. Without it, sqd() fails outright on ANY
+        # multi-device mesh -- not subtly, but before the solver is ever reached. It went unnoticed
+        # because nothing in the suite runs a mesh; `XLA_FLAGS=--xla_force_host_platform_device_count`
+        # reproduces it on CPU, which is what examples/scaling/poc7_sharding.py does.
+        return (
+            _spread_seed(states_size, states_u, hamiltonian.c.dtype, sharding)
+            .at[imin]
+            .add(1.0, out_sharding=sharding)
+        )
 
     def vinit_nodiag():
         # No diagonal to rank states by, so the spread seed is all there is. A one-hot here is not
