@@ -144,6 +144,23 @@ from scipy.sparse import csr_array
 from rqutils._types import MatrixDimension
 
 
+def _normalize_dim(dim: MatrixDimension) -> tuple[int, ...]:
+    """Return ``dim`` as a tuple of plain ints, treating a scalar as a single subsystem.
+
+    A ``tuple(int)`` is what the memoization dicts in this module key on, so normalizing to exactly
+    that -- rather than to anything merely tuple-shaped -- is what makes ``paulis(2)``,
+    ``paulis((2,))`` and ``paulis(np.int64(2))`` share one cache entry.
+
+    This is Python-level shape inference on a static value, so per ``CLAUDE.md``'s ``npmod`` rule it
+    must run for *every* backend and never sit behind an ``if npmod is np:`` gate. Gating it is what
+    broke the ``npmod=jnp`` path of ``components``, ``compose``, and ``truncate``, each raising
+    "object of type 'int' has no len()" from a line that named nothing.
+    """
+    if isinstance(dim, (int, np.integer)):
+        return (int(dim),)
+    return tuple(map(int, dim))
+
+
 def paulis(dim: MatrixDimension, sparse: bool = False) -> NDArray[np.complex128] | tuple[csr_array]:
     r"""Return an array of generalized Pauli matrices or matrix products of given dimension(s).
 
@@ -155,10 +172,7 @@ def paulis(dim: MatrixDimension, sparse: bool = False) -> NDArray[np.complex128]
         An array of Pauli (product) matrices as an array. For `dim=(d1, d2, ...)`, the shape of
         the array is `(d1**2, d2**2, ..., d1*d2*..., d1*d2*...)`.
     """
-    if isinstance(dim, (int, np.integer)):
-        dim = (int(dim),)
-    elif not isinstance(dim, tuple):
-        dim = tuple(map(int, dim))
+    dim = _normalize_dim(dim)
 
     if len(dim) == 1:
         return pauli_matrices(dim[0], sparse=sparse)
@@ -285,8 +299,7 @@ def paulis_shape(dim: MatrixDimension) -> tuple[int, ...]:
     Returns:
         Shape of the array obtained by ``paulis(dim)``.
     """
-    if isinstance(dim, (int, np.integer)):
-        dim = (int(dim),)
+    dim = _normalize_dim(dim)
 
     return tuple(np.square(dim)) + (tuple(np.prod(dim, keepdims=True)) * 2)
 
@@ -309,14 +322,14 @@ def components(
     Raises:
         ValueError: If `prod(dim)` does not match the matrix dimension.
     """
-    # Normalizing dim is Python-level shape inference on a static value, so it must happen for every
-    # npmod -- `len(dim)` below needs a sequence either way. Gating it left `components(m, dim=3,
-    # npmod=jnp)` raising "object of type 'int' has no len()" from the return statement, naming
-    # nothing. Only the *validation* belongs behind the gate, per CLAUDE.md's npmod rule.
+    # _normalize_dim runs for every npmod -- `len(dim)` below needs a sequence either way, and
+    # gating it left `components(m, dim=3, npmod=jnp)` raising "object of type 'int' has no len()"
+    # from the return statement, naming nothing. Only the *validation* below belongs behind the gate,
+    # per CLAUDE.md's npmod rule.
     if dim is None:
         dim = (matrix.shape[-1],)
-    elif isinstance(dim, (int, np.integer)):
-        dim = (int(dim),)
+    else:
+        dim = _normalize_dim(dim)
 
     if npmod is np and np.prod(dim) != matrix.shape[-1]:
         raise ValueError(
@@ -345,8 +358,8 @@ def compose(
     # npmod, since len(dim) is needed below regardless. Only the validation is gated.
     if dim is None:
         dim = tuple(map(int, np.around(np.sqrt(components.shape))))
-    elif isinstance(dim, (int, np.integer)):
-        dim = (int(dim),)
+    else:
+        dim = _normalize_dim(dim)
 
     if npmod is np and not np.allclose(np.square(dim), components.shape[-len(dim) :]):
         raise ValueError("Components array shape invalid")
@@ -483,10 +496,7 @@ def symmetry(dim: MatrixDimension) -> NDArray[np.int_]:
         An integer array with entries -1, 0, 1 depending on whether the corresponding Pauli matrix
         is antisymmetric, diagonal, or symmetric.
     """
-    if isinstance(dim, (int, np.integer)):
-        dim = (int(dim),)
-    elif not isinstance(dim, tuple):
-        dim = tuple(map(int, dim))
+    dim = _normalize_dim(dim)
 
     if (cache := _symmetries.get(dim)) is not None:
         return cache.copy()
@@ -554,8 +564,7 @@ def labels(
     Returns:
         An ndarray of type string and shape `(d1**2, d2**2, ...)`.
     """
-    if isinstance(dim, (int, np.integer)):
-        dim = (int(dim),)
+    dim = _normalize_dim(dim)
 
     if symbol is None or isinstance(symbol, str):
         symbol = (symbol,) * len(dim)
