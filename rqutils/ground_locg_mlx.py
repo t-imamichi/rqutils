@@ -63,15 +63,20 @@ one ``(7, 3)`` normalization, ``mx.diagonal``/``mx.roll`` instead of element-by-
 ``mx.stack`` -- and hoists its dtype-dependent constants into :data:`_CONST_CACHE` instead of
 rebuilding them every iteration. Each of those was verified *bit-identical* to the form it
 replaced, not merely close: they change only how many ops are launched, never the arithmetic.
-Measured with ``examples/count_mlx_ops.py``, the LOBPCG body went from 116 to 76.3 op
-constructions per iteration (-34%) with the eigenvalue and iteration count unchanged. In
-wall-clock terms that is worth **about 1.05-1.10x** on ``mlx-cpu-f64`` -- the arm that isolates
-this work, since Metal's lack of float64 means none of the fused kernels can run there (2.928 ->
-2.689 ms/iter, controlled, uncompiled; a 3.9% noise floor on this arm is why the range rather than
-the ratio). Small but real, and consistent with the mechanism: this removes Python-level op
-construction, which the cost model ranks third, on a backend with no kernel-launch latency to
-reclaim. Expect less under ``compile_body``, which already amortizes graph construction. This is
-the
+:func:`_compute_sas` likewise takes all n^2 inner products from one stacked matmul instead of n^2
+reductions plus n+1 stacks (14.2 -> 2.3 ops), which is *also* more accurate than what it replaced
+-- see its docstring. Measured with ``examples/count_mlx_ops.py``, the LOBPCG body went from 116 to
+65.0 op constructions per iteration (-44%) with the eigenvalue and iteration count unchanged. In
+wall-clock terms the first 116 -> 76.3 of that was measured at **about 1.05-1.10x** on
+``mlx-cpu-f64`` -- the arm that isolates this work, since Metal's lack of float64 means none of the
+fused kernels can run there (2.928 -> 2.689 ms/iter, controlled, uncompiled; a 3.9% noise floor on
+this arm is why the range rather than the ratio). Small but real, and consistent with the
+mechanism: this removes Python-level op construction, which the cost model ranks third, on a
+backend with no kernel-launch latency to reclaim. Expect less under ``compile_body``, which already
+amortizes graph construction. **The further 76.3 -> 65.0 from the ``_compute_sas`` matmul is not
+yet in that number** -- it postdates the measurement, and unlike the rest it replaces O(N)
+reductions rather than scalar bookkeeping, so it may behave differently with N; re-run
+``examples/bench_mlx.py --arm mlx-cpu-f64`` before quoting a combined figure. This is the
 one respect in which "when you change one, change both" should *not* be applied mechanically:
 porting these batched forms back to JAX would be churn, since XLA already fuses what they
 hand-fuse. The algebra is what must stay in step, not the op granularity.
@@ -105,7 +110,7 @@ quotient -- into one launch. It sits on the *winning* side of that argument for 
 ``_compute_sas`` result makes precise: the eigensolve does not scale with N at all, so it has no
 reduction to under-parallelize. It is ~34 launches whose entire content is scalar arithmetic on
 nine numbers, which one thread does in registers. Measured with ``examples/count_mlx_ops.py``, it
-takes the LOBPCG body from 77.3 to 44.3 op constructions per iteration (-43%), the eigensolve
+takes the LOBPCG body from 65.0 to 32.5 op constructions per iteration (-50%), the eigensolve
 itself going from 34.5 ops to exactly 1 launch. It is fp32-only like the others, and inherits --
 does not introduce -- Cardano's near-degeneracy fragility.
 
@@ -1136,11 +1141,28 @@ def _compute_sas(vectors, mvs):
     Takes the images ``mvs`` rather than computing them, so a caller holding an already-known
     ``A x`` can pass it in instead of paying for a fourth matrix-vector product per iteration
     (``docs/locg.md`` item S1).
+
+    All n^2 inner products come from ONE stacked ``(n, N) @ (N, n)`` matmul rather than n^2
+    separate ``mx.sum(v1 * mv)`` reductions plus n+1 ``mx.stack`` calls -- 9 sums and 4.5 stacks
+    per iteration at n=3 (measured, ``examples/count_mlx_ops.py --by-op``) collapsing to 3 ops.
+
+    This is *more* accurate than the form it replaces, not merely faster: against a longdouble
+    reference over 3000 random unit-norm triples at N=900, the matmul is exact (0.0 max error)
+    while the n^2-sums version carries up to 7.1e-15, because BLAS accumulates in blocks
+    (pairwise, error growing as log N) where ``mx.sum`` over a product array accumulates
+    sequentially. The symmetrization is kept: it is what makes the two triangles agree exactly,
+    and it costs 2 ops against the 3x3 result rather than anything O(N).
+
+    Unlike :func:`_project_out`, this function carries no accumulation-order contract -- its own
+    symmetrization already averages away the rounding difference between the two triangles -- so
+    reassociating the sum here is safe in a way it would *not* be there. Do not apply the same
+    transformation to ``_project_out``: those passes guard against catastrophic cancellation
+    (``docs/locg.md`` items I5/I6) and a matmul reassociates their summation order, measured to
+    shift results by ~1e-14.
     """
-    rows = []
-    for v1 in vectors:
-        rows.append(mx.stack([mx.sum(v1 * mv) for mv in mvs]))
-    sas = mx.stack(rows)
+    stacked_v = mx.stack(vectors)
+    stacked_m = mx.stack(mvs)
+    sas = stacked_v @ stacked_m.T
     # Symmetrize: the two triangles differ only by rounding for real symmetric A.
     return (sas + sas.T) * 0.5
 
@@ -1152,6 +1174,19 @@ def _project_out(basis, vector):
     ``rqutils.ground_locg._project_out``, which this mirrors. Near convergence, ending on a
     normalization can reintroduce basis components through catastrophic cancellation and wreck the
     Rayleigh-Ritz conditioning.
+
+    **Deliberately NOT batched into a matmul, unlike :func:`_compute_sas`.** The eight ``mx.sum``
+    reductions here (four passes x two basis vectors, 13 ops/iteration total) could become one
+    stacked ``B @ v`` per pass, which is what made ``_compute_sas`` 14.2 -> 2.3 ops. It is not
+    done here because a matmul reassociates the summation order, and this function's whole purpose
+    is resisting catastrophic cancellation (``docs/locg.md`` items I5/I6, both measured to fail
+    silently). Tested rather than assumed: over 4000 adversarial cases with ``r`` placed almost
+    entirely inside ``span(x, y)`` plus an orthogonal part of size 1e-14..1e-6, both forms hold
+    residual orthogonality at machine epsilon, but the matmul is consistently *worse* -- worst
+    ``|<b|p>|`` of 8.3e-17 versus 6.2e-17. That margin is small and neither form is broken, so this
+    is a judgement call, not a measured failure: ~4 ops/iteration is not worth a 33% erosion of the
+    quantity these guards exist to protect. Do not "optimize" this without re-running that
+    comparison.
     """
     one = _consts(vector.dtype)["one"]
     for _ in range(2):
