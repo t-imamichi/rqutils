@@ -73,14 +73,16 @@ fused kernels can run there (2.928 -> 2.689 ms/iter, controlled, uncompiled; a 3
 this arm is why the range rather than the ratio). Small but real, and consistent with the
 mechanism: this removes Python-level op construction, which the cost model ranks third, on a
 backend with no kernel-launch latency to reclaim. Expect less under ``compile_body``, which already
-amortizes graph construction. **The further 76.3 -> 65.0 from the ``_compute_sas`` matmul bought
-no measurable time at all** -- 2.742 -> 2.725 ms/iter, 0.6%, well inside this arm's 3.9% noise
-floor and smaller than the 2.1% spread between two runs of identical code. It is kept for its
-*accuracy*, which is a real and separately verified improvement (see :func:`_compute_sas`), not for
-speed. The reason it is flat where the earlier reductions were not: those removed Python-level op
-construction, whereas this one trades 9 tuned reduction kernels for 1 tuned matmul kernel, and at
-N~1000 the reductions were never the bottleneck. A useful negative result -- fewer ops is not the
-same as less time once each op is already an efficient kernel. This is the
+amortizes graph construction. **The further 76.3 -> 65.0 from the ``_compute_sas`` matmul is
+backend-dependent, and instructively so:** flat on the MLX CPU backend (2.742 -> 2.725 ms/iter,
+0.6%, inside that arm's 3.9% noise floor) but worth **~1.17x on the GPU** (0.265 -> 0.224-0.227
+ms/iter, measured across four independent processes agreeing to 1.3%). The mechanism explains both
+halves: on the GPU each ``mx.sum`` is its own kernel launch, so collapsing 9 reductions plus 4.5
+stacks into one matmul removes ~12 launches, whereas the CPU backend has no launches to remove and
+the reductions were never the bottleneck at N~1000. Fewer ops is not automatically less time -- it
+is less time exactly where launch count dominates, which is what the cost model already says. The
+accuracy improvement (see :func:`_compute_sas`) is independent of all of this and holds on every
+backend. This is the
 one respect in which "when you change one, change both" should *not* be applied mechanically:
 porting these batched forms back to JAX would be churn, since XLA already fuses what they
 hand-fuse. The algebra is what must stay in step, not the op granularity.
