@@ -1,200 +1,228 @@
-# Simplifying the `sqd` / `PauliSumXZ` bit-layout conventions
+# Simplifying `rqutils/paulis/`, `sqd.py`, and `ground_locg.py`
 
 Date: 2026-08-05
 Status: approved, not yet implemented
-Breaking: yes (deliberately)
+Breaking: yes, in one narrow respect (`add_padding` is removed from `PauliSumXZ.from_paulisum`)
 
-## Problem
+## Scope
 
-`rqutils/sqd.py` carries several workarounds whose sole purpose is to reconcile its own state
-packing with `PauliSumXZ`'s signature packing. All of them trace to one fact:
+Five changes, ordered by risk. Four are pure duplication removal with no observable behaviour
+change. The fifth removes an unenforceable cross-object invariant that has already caused one bug.
 
-> `np.packbits` fills each byte from the **most significant** end.
+| # | Change | Removes | Observable change |
+|---|---|---|---|
+| 1 | Unify `get_diagonal` / `compute_diagonal` | duplicated `cond_fn` + `while_loop` | none |
+| 2 | Merge the two normalize helpers in `ground_locg` | one function written twice | none |
+| 3 | One `dim` normalization helper in `general.py` | six drifting copies of an idiom | none |
+| 4 | Collapse six `apply_h_*` kernels into one | ~90 lines; 6 functions for a 2x3 grid | none |
+| 5 | Remove `add_padding` | a silent cross-object invariant | none |
 
-Three separate mechanisms exist because of it.
+### Explicitly rejected: LSB-first packing and a trailing sentinel
 
-### 1. The `add_padding` cross-object coupling
+An earlier revision of this document proposed also switching `PauliSumXZ` to LSB-first packing
+(`bitorder='little'`) with the fill-in sentinel moved to a trailing bit at index `num_qubits`. That
+is **not** being done. The reasoning, since the analysis is worth keeping:
 
-`sqd` needs a sentinel to mark fill-in slots produced by uniquification. Because `packbits` is
-MSB-first, the only bit a real state provably cannot reach is a *prepended* one. So states are
-packed as `np.packbits(np.pad(states, {1: (1, 0)}), axis=1)`, and the Hamiltonian must
-independently be built with `PauliSumXZ.from_paulisum(..., add_padding=True)`, which pads
-`xsignatures` on axis 1 and `zsignatures` on axis 2 to shift every signature right by one bit.
+- It *relocates* complexity rather than removing it. Today's filler test, `states_u[:, 0] >> 7`, is a
+  constant expression. Under a trailing sentinel it becomes `is_filler(states_u, num_qubits)`, which
+  requires threading `num_qubits` to five sites **including inside the JIT'd `run_sqd`**, which
+  currently never references it. `sqd.py` would end up more coupled to `num_qubits`, not less, in
+  exchange for deleting one flag.
+- The double bit reversal it would fix is confined to two places — `signature_bits` in the tests and
+  `matmul`'s `offset` shift. Both are correct, tested, and documented. That is a convention doing its
+  job, not a maintenance burden. Contrast item 3, where the copies have already drifted apart.
+- It is the only change in this document with a behavioural blast radius: it reorders the basis
+  states `sqd` returns, and it *introduces* a failure mode that does not currently exist (under LSB
+  packing a genuine state can have `byte0 == 255`, which silently truncated `subspace_dim` to 2
+  against a true 3 at `nq=9` — measured). Spending new tests at `nq in {7,8,9,15,16}` to defend
+  against a hazard we created is a poor trade against a flag rename.
 
-This is a flag on `PauliSumXZ` that exists only to serve a `sqd` sentinel. It is meaningless for
-`svsim`, the representation's other consumer, which never calls `from_paulisum` at all. Nothing
-enforces that the two sides agree, and disagreement is silent: `hproj` shipped with
-`add_padding=True` against unpadded states, so every matrix element landed in the wrong column
-(`tests/test_sqd.py:9`).
+Two invariants were verified while evaluating it, recorded here so the work is not repeated: the
+all-255 filler row does still sort last for every `nq` from 1 to 19 under LSB packing (by
+construction, since the reserved bit caps the top payload byte below 255), and `matmul` would
+collapse to a plain positional decode (`powers = 256 ** arange(B)`, no offset, no reversal). Neither
+is sufficient motivation given the above.
 
-### 2. Bit order is reversed twice
+## Item 1: unify the diagonal accumulators (`sqd.py`)
 
-Qiskit's `.x`/`.z` are reversed on ingest to little-endian
-(`symplectic.py:88-89`), then `packbits` reverses again. The composition means a signature's payload
-bits are the *first* `num_qubits` entries of `np.unpackbits`, in Pauli-string character order —
-the reverse of the qubit numbering. Consequences:
-
-- `tests/test_paulis_symplectic.py:44-53` (`signature_bits`) exists purely to document the double
-  reversal, and has to slice then reverse.
-- `PauliSumXZ.matmul` must compute `offset = 8 * self.x.shape[1] - self.num_qubits` and
-  right-shift by it, with `powers = 256 ** arange(B)[::-1]`, to undo the byte-level reversal.
-
-### 3. Two spellings of one predicate
-
-The filler marker is tested as `states_u[:, 0] >> 7` in two places and `states_u[:, 0] == 255` in
-two others, plus `fill_value=255` at the source. Same question, four expressions, no shared helper.
-
-### 4. Duplicated packing incantation
-
-`np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)` appears verbatim in
-`rqutils/sqd.py:247`, `rqutils/sqd.py:306`, `examples/_bench_common.py:91`, and
-`tests/test_sqd.py:45`. `PauliSumXZ` offers no state-packing helper, so the layout knowledge is
-copy-pasted rather than owned.
-
-## Chosen approach
-
-Change two conventions at their root: **pack LSB-first** and **move the sentinel to a trailing
-bit**. Expose the layout through helpers so exactly one place knows the bit positions.
-
-Rejected alternatives:
-
-- *Keep MSB packing, drop only `add_padding`* (always reserve the pad bit). Fixes the coupling but
-  leaves the double reversal and `matmul`'s offset shift in place.
-- *Separate boolean validity array.* Removes the bit tricks but threads an extra `(N,)` sharded
-  array through all six matvec kernels — cost without a corresponding simplification.
-
-## Design
-
-### `paulis/symplectic.py`
-
-**Packing becomes LSB-first.** Both `packbits` calls in `from_paulisum` take `bitorder='little'`.
-The ingest reversal to little-endian qubit order stays. The two no longer compound, so:
-
-> **bit `q` of the packed signature is qubit `q`**, for every `q`.
-
-**`add_padding` is deleted** (parameter removed, not defaulted). Signatures always pack into
-`B = ceil((num_qubits + 1) / 8)` bytes, reserving bit index `num_qubits` as the sentinel position.
-No shift is applied to the signatures: the reserved bit sits *above* the payload, so X and Z
-signatures have it clear by construction. This is what removes the coupling — there is no longer a
-flag `sqd` must set and `svsim` must not.
-
-Byte counts are unchanged from the current padded layout (`ceil((nq+1)/8)` either way), so memory
-and sharding are unaffected.
-
-**`matmul` loses its correction.** `powers = 256 ** np.arange(B)` (no `[::-1]`), and the
-`offset` computation and `>> offset` both go away — byte 0 is now least significant, so the decode
-is positional. Verified: for `nq` in {3, 8, 9} with qubits 0 and `nq-1` set, the reconstructed
-integer equals `(1 << 0) | (1 << (nq-1))` exactly.
-
-**Two new module-level helpers** own the layout:
+`compute_diagonal` (`sqd.py:601`) and `get_diagonal` (`sqd.py:628`) contain a byte-identical
+`cond_fn`:
 
 ```python
-def pack_states(states: NDArray) -> NDArray[np.uint8]:
-    """Pack binary states LSB-first, reserving the trailing sentinel bit. Returns (N, B) uint8."""
-
-def is_filler(states_p, num_qubits) -> Array:
-    """True where the sentinel bit is set, i.e. the row is a uniquification fill-in."""
+def cond_fn(val):
+    iterm = val[1]
+    return jnp.logical_and(iterm < coeffs.shape[0], jnp.not_equal(coeffs[iterm], 0.0))
 ```
 
-`is_filler` tests byte `num_qubits // 8`, bit `num_qubits % 8`. It must work under `jax.jit` on
-traced arrays (`sqd` calls it inside `run_sqd`) and on plain numpy (`examples/`, tests), so it uses
-only ops common to both — shift, mask, compare.
+and `while_loop` bodies that differ in exactly one line — how the sign bit is derived:
 
-### `sqd.py`
+- `compute_diagonal`: `(diag_signs[:, iterm // 8] >> (7 - (iterm & 7))) & 1`
+- `get_diagonal`: `jnp.sum(jnp.bitwise_count(states & zsignatures[iterm]), axis=1, dtype=uint8) & 1`
 
-| Site | Before | After |
+Extract one private accumulator parameterized by that derivation:
+
+```python
+def _accumulate_diagonal(coeffs, size, sharding, sign_fn):
+    """Sum coeff * (1 - 2 * sign_fn(iterm)) over terms, stopping at the first zero coefficient."""
+```
+
+Both public functions keep their names, signatures, `@jax.jit`, and docstrings; each becomes a
+three-line call. The `iterm & 7` comment at `sqd.py:613-616` (recording the measured 0.71 absolute
+error and 25% eigenvalue error from `& 255`) moves with the `sign_fn` it documents — it must not be
+lost, since it names a real defect.
+
+The early-stop-on-zero-coefficient semantics ("null terms are removed with `simplify()` so we
+iterate until we hit coeff=0") is shared and unchanged.
+
+## Item 2: merge the normalize helpers (`ground_locg.py`)
+
+`normalize` (a closure inside `_ground_locg_callable`, `:307`) and `_normalize_or_zero` (module
+level, `:669`) are the same function: divide by the norm, leave a zero vector untouched rather than
+producing `NaN`. The only difference is that the closure accepts an optional precomputed norm to
+avoid recomputing it.
+
+Merge into one module-level helper carrying the optional argument. The closure exists only because
+it was written inside the function; it captures nothing. All call sites — `:311, 372, 385, 389, 417,
+436, 443, 488, 662, 671` — keep their current behaviour.
+
+This does not touch any guard, balancing step, or re-orthogonalization. Per `CLAUDE.md` and
+`docs/locg.md` those are load-bearing and measured; only the two helpers merge.
+
+## Item 3: one `dim` normalization helper (`general.py`)
+
+The idiom appears six times, in three flavours:
+
+| Site | Function | Form |
 |---|---|---|
-| `sqd:237` | `from_paulisum(..., add_padding=True)` | `from_paulisum(..., force_real=True)` |
-| `sqd:247` | `packbits(pad(...))` | `pack_states(states)` |
-| `sqd:271` | `unpackbits(...)[:, 1 : 1 + nq]` | `unpackbits(..., bitorder='little')[:, :nq]` |
-| `hproj:300` | `from_paulisum(..., add_padding=True)` | `from_paulisum(hamiltonian)` |
-| `hproj:306` | `packbits(pad(...))` | `pack_states(states)` |
-| `_spread_seed:380` | `states_u[:, 0] == 255` | `is_filler(states_u, num_qubits)` |
-| `vinit_from_min_diag:459` | `states_u[:, 0] == 255` | `is_filler(states_u, num_qubits)` |
-| `run_sqd:499` | `searchsorted(states_u[:, 0] >> 7, 1)` | `searchsorted(is_filler(...), True)` |
+| `:158` | `paulis` | `if` scalar, `elif` non-tuple -> `tuple(map(int, dim))` |
+| `:288` | `paulis_shape` | `if` scalar only |
+| `:318` | `components` | `elif` scalar (follows a `None` check) |
+| `:348` | `compose` | `elif` scalar (follows a `None` check) |
+| `:486` | `symmetry` | `if` scalar, `elif` non-tuple -> `tuple(map(int, dim))` |
+| `:557` | `labels` | `if` scalar only |
 
-`num_qubits` reaches these sites via `hamiltonian.num_qubits`, already a `static`-metadata pytree
-field, so no signature changes. `_spread_seed` gains a `num_qubits` parameter.
+Replace with one `_normalize_dim(dim) -> tuple[int, ...]` implementing the fullest form (scalar ->
+1-tuple, any other sequence -> `tuple(map(int, ...))`).
 
-`uniquify_states` is unchanged, including `fill_value=255`.
+**The flavour differences must be checked per site before merging, not assumed accidental.** The
+adopted form is a superset of the narrower ones, so `paulis_shape` and `labels` gain the
+non-tuple-sequence fallback they currently lack. That is a widening — a list `dim` that previously
+flowed through unnormalized now becomes a tuple. For `labels` this is the one site where behaviour
+could change, because `dim` is consumed by `zip(dim, symbol)` and `len(dim)`, both of which accept a
+list today. Verify the widening is inert there before committing to it; if it is not, `labels` keeps
+its own narrower call.
 
-### Invariants verified before adopting this design
+`components` and `compose` keep their `None` handling inline (it is not part of the idiom) and call
+the helper in the `elif` position. The `npmod` gating rule from `CLAUDE.md` is unaffected: this
+normalization is Python-level shape inference on a static value and must continue to run for *every*
+`npmod`, never behind an `if npmod is np:` gate. That is precisely the bug the comments at `:312-315`
+and `:406-411` record, so the helper is called unconditionally at every site.
 
-1. **The all-255 filler row still sorts last, for every `nq` from 1 to 19.** Checked directly. The
-   reserved sentinel bit forces the top payload byte of any real state strictly below `255`, so the
-   all-ones row is the lexicographic maximum *by construction* — a stronger guarantee than the
-   current scheme, which relies on byte 0's high bit alone.
+## Item 4: collapse the six `apply_h_*` kernels (`sqd.py`)
 
-2. **The current boundary predicate breaks and must move.** Under LSB packing a genuine state can
-   have `byte0 == 255` (any `nq >= 8` with the low 8 qubits set). Measured at `nq=9`: rows
-   `[[0,0], [85,1], [255,1]]` plus filler `[255,255]` sort correctly, but `byte0 >> 7` yields
-   `[0,0,1,1]`, so `searchsorted(..., 1)` reports `subspace_dim = 2` against a true 3 — a silent
-   truncation of the returned eigenvector. This is why `is_filler` must key off byte `nq // 8`,
-   bit `nq % 8`, and why the `nq % 8 == 0` cases are explicitly tested.
+`apply_h`, `apply_h_s_cached`, `apply_h_z_cached`, `apply_h_x_cached`, `apply_h_xs_cached`, and
+`apply_h_xz_cached` (`sqd.py:665-761`) are one function. Each is a `jax.lax.scan` accumulating
+`out + apply_xgrp(xsource, diagonal, vec)` over per-X-group arguments. They differ only in how the
+two inputs are resolved:
 
-### Deliberately out of scope
+- `xsource`: from the scanned arguments (cached), or from `get_xsource(xpat, states)` (not cached)
+- `diagonal`: from the scanned arguments (level 2), from `compute_diagonal(signs, cs)` (level 1), or
+  from `get_diagonal(zpats, cs, states)` (level 0)
 
-- **`svsim.py`** — builds `CircuitXZ` itself, never calls `from_paulisum`. Untouched. Its
-  `sin`-carries-`i(-i)^popcount` phase convention is **not** being changed.
-- **`ground_locg.py`, `ground_locg_mlx.py`** — consume `xsources`/`diagonals`, which are index and
-  value arrays with no bit layout. Untouched, so the "change one, change both" duplication rule
-  does not trigger.
-- **The `Q = (-i)^{x·z} Z^z X^x` phase convention** — unchanged everywhere.
+That is exactly the 2x3 grid the `cache_level` tuple already names. Replace the six functions and the
+six-arm `match` at `sqd.py:433-451` with one kernel taking `cache_level` as a static argument.
 
-### Observable behaviour change
+Constraints:
 
-Sort order changes: low qubits are now the most significant lexsort key, so `sqd` returns basis
-states in a different order than before. Eigenvalues are unaffected. Eigenvector entries are
-permuted consistently with the returned basis rows, so callers that zip the two are correct without
-modification; a caller that hardcoded row positions is not.
+- `cache_level` is already static in `run_sqd` (`static_argnames`), so trace-time specialization is
+  preserved and each combination still compiles to the same code it does today. This is a
+  prerequisite, not an aspiration — verify the unified kernel is `jax.jit`'d with `cache_level`
+  static, or every matvec call in the solver loop pays a retrace.
+- The `match` block also binds a different `args` tuple per level. The unified version must keep that
+  packing static too; it stays a Python-level `match` on the static tuple, just building arguments
+  for one kernel instead of selecting among six.
+- `apply_xgrp` is unchanged.
 
-Benchmark results committed in `docs/` remain valid — this changes bit layout, not arithmetic or op
-counts.
+**Gate:** `tests/test_sqd.py` already parametrizes `CACHE_LEVELS` over all six combinations and
+asserts each against `conftest.lowest_projected`, an independent dense reference. Those tests must
+pass unchanged. Additionally assert the six kernels agree with each other elementwise on a fixed
+input before and after the change — `CLAUDE.md` warns that cross-kernel agreement alone is
+insufficient evidence (the two initial-vector bugs fooled all six identically), which is why the
+independent dense reference remains the primary check and the mutual-agreement check is secondary.
 
-## Consumers to update
+## Item 5: remove `add_padding` (`symplectic.py`, `sqd.py`)
 
-- `examples/_bench_common.py:83,91` — `add_padding=True` and the hand-rolled packing.
-- `examples/_bench_common.py:185` — docstring referencing the old `add_padding` bug.
-- `examples/check_bench_common.py:30` — `add_padding=True`.
-- `tests/test_sqd.py` — `pack_padded` helper (:45), the `add_padding=True` calls
-  (:100, :127, :130, :438, :460), the `>> 7` assertions (:150, :153), and the docstrings at
-  :9, :138, :162, :354 that describe the old layout.
-- `tests/test_paulis_symplectic.py` — `signature_bits` (:44-53) collapses to
-  `unpackbits(packed, bitorder='little')[:num_qubits]`; every `add_padding=False` call loses the
-  argument. `TestPadding` (:238-260) is rewritten rather than deleted: its first test
-  (`test_padding_shifts_the_signatures`) loses its subject, but its second
-  (`test_padding_does_not_change_the_coefficients`) keeps a valid one — the reserved sentinel bit is
-  still a dummy identity and must not perturb the `(-i)^{x·z}` phase, so that assertion becomes
-  "reserving the sentinel bit leaves `.c` unchanged" and is checked against an odd-Y string.
+`PauliSumXZ.from_paulisum(..., add_padding=True)` pads `xsignatures` on axis 1 and `zsignatures` on
+axis 2, shifting every signature right by one bit to align with the leading pad bit `sqd` inserts
+into its states. The flag is the problem:
+
+- It exists only to serve a `sqd` sentinel and is meaningless to `svsim`, the representation's other
+  consumer, which never calls `from_paulisum`.
+- Nothing enforces that the two sides agree, and disagreement is silent. `hproj` shipped with
+  `add_padding=True` against unpadded states, so every matrix element landed in the wrong column
+  (`tests/test_sqd.py:9`).
+
+**Change:** delete the parameter. `from_paulisum` always applies the padding. Both consumers then
+share one layout by construction, and there is no flag to set wrongly.
+
+**Deliberately unchanged:** MSB-first `packbits`, the leading pad bit at position 0, `255` as the
+filler value, the `states_u[:, 0] >> 7` and `== 255` sentinel tests, and the returned basis-state
+order. This is what keeps the change inert everywhere except the removed argument.
+
+Byte counts are unchanged, since the padding was already applied on the `sqd` path — the only path
+that reaches `run_sqd`.
+
+**Consequence for `svsim`:** none. It builds `CircuitXZ` itself and never calls `from_paulisum`.
+
+**Consequence for a caller that wanted unpadded signatures:** there is none in the repository. Every
+in-repo call either passes `add_padding=True` (`sqd.py:237,300`, `examples/_bench_common.py:83`,
+`examples/check_bench_common.py:30`, `tests/test_sqd.py:100,127,130,438,460`) or passes
+`add_padding=False` purely because it was the default and the test does not care
+(`tests/test_paulis_symplectic.py`, ~20 sites). The unpadded layout is not used for anything.
+
+### Sites to update
+
+- `rqutils/paulis/symplectic.py:57` — drop the parameter from the signature; `:134` — drop the `if`.
+- `rqutils/sqd.py:237,300` — drop the argument. `:209-212` — the docstring sentence requiring
+  `add_padding=True` becomes a statement that the padding is intrinsic. `:303-305` — the `hproj`
+  comment explaining the alignment stays (the alignment requirement is still real), but stops
+  referring to a flag.
+- `examples/_bench_common.py:83` — drop the argument; `:185` — the docstring recounting the old
+  `add_padding` bug is history and stays, reworded so it does not imply the flag still exists.
+- `examples/check_bench_common.py:30` — drop the argument.
+- `tests/test_sqd.py:100,127,130,438,460` — drop the argument. Docstrings at `:9,:162` reworded.
+- `tests/test_paulis_symplectic.py` — drop `add_padding=False` from 28 calls.
+  `TestPadding` (`:238-260`) is rewritten rather than deleted. Both its tests currently work by
+  comparing a padded build against an unpadded one, which is exactly the comparison that ceases to
+  exist once the flag is gone (all 3 `add_padding=True` calls in this file are here). They must be
+  re-expressed against an *absolute* reference rather than a relative one:
+  - `test_padding_shifts_the_signatures` becomes "the pad bit is always reserved": assert the packed
+    signature for `"IIX"` has its set bit at the position implied by one leading pad bit, computed
+    directly from `num_qubits` rather than by differencing two builds.
+  - `test_padding_does_not_change_the_coefficients` keeps its subject — the pad bit is a dummy
+    identity and must not perturb the `(-i)^{x.z}` phase — but asserts against the phase table
+    value for an odd-Y string (`"XY"` -> `-1j`) instead of against an unpadded build.
 
 ## Testing
 
-Following the repo's defect-oriented convention: each test names the defect it locks down, records
-measured wrong values, and prefers an independent reference over self-consistency.
+Items 1-4 are refactors with no intended behaviour change, so the gate is the existing suite passing
+unchanged, plus the item-4 mutual-agreement check described above. No new tests are needed for them:
+`CLAUDE.md`'s "name the defect it locks down" rule applies to bug fixes, and these fix no bug.
 
-1. **`add_padding` removal.** `hproj` and `sqd` must agree on a subspace containing a trailing basis
-   state that no term couples into — the configuration behind the measured 41×41-for-53-states
-   truncation. With one shared `pack_states`, the two sides cannot disagree on alignment.
-2. **LSB packing.** The existing dense-reconstruction tests
-   (`TestPhaseConvention::test_dense_reconstruction_matches`) are the independent reference and must
-   pass unchanged against the Kronecker-product construction; only `signature_bits` changes.
-3. **`matmul`.** Compare against `dense_from_strings` for a multi-qubit sum including odd-Y strings,
-   covering `nq` on both sides of a byte boundary.
-4. **Sentinel position.** Parametrize `nq` over {7, 8, 9, 15, 16} — the byte-boundary cases where a
-   real state's byte 0 reaches 255 and the old `>> 7` predicate misreports `subspace_dim`. Assert
-   `subspace_dim` equals the true unique count and that no filler row survives into the result.
-5. **All six cache levels.** The existing `CACHE_LEVELS` parametrization must pass unchanged; the
-   two initial-vector bugs affected all six identically, so cross-kernel agreement alone is not
-   sufficient evidence.
+Item 5 gets one new test naming the defect it prevents: `hproj` and `sqd` must agree on a subspace
+containing a trailing basis state that no Pauli term couples into — the configuration behind the
+measured 41x41-for-53-states truncation. With the flag gone the two sides cannot disagree on
+alignment, and the test pins that.
 
-Per `CLAUDE.md`, each new test is verified to fail against the old convention by reverting the
-change in place (not in a copy — the venv holds an editable install pointing at the original).
+Per `CLAUDE.md`, that new test is verified to fail against the old code by reverting the change in
+place (not in a copy — the venv holds an editable install pointing at the original).
 
 ## Definition of done
 
 - `uv run --extra dev pytest` passes.
-- `ruff check`, `ruff format --check`, and `ty check` clean over `rqutils/ tests/ examples/`.
-- `examples/check_ground_locg_mlx_static.py` passes (numpy shim, runs headless).
-- Module docstrings in `sqd.py` and `symplectic.py` updated: the `add_padding=True` requirement at
-  `sqd.py:212` is removed, and the LSB-first layout plus trailing sentinel are documented with the
-  same rigour as the conventions they replace.
+- `uv run --extra dev ruff check rqutils/ tests/ examples/` and `ruff format --check` clean.
+- `uv run --extra dev ty check rqutils/ tests/ examples/` clean.
+- `uv run python examples/check_ground_locg_mlx_static.py` passes (numpy shim, runs headless).
+- No `add_padding` reference remains anywhere: `grep -rn add_padding` returns only historical prose.
+- `docs/locg.md` and `docs/skqd.md` need no changes — items 1-4 preserve every documented invariant,
+  and item 5 touches neither module's subject matter.
