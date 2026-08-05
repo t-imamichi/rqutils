@@ -6,8 +6,9 @@ measured wrong value, so a regression names itself:
 
 - ``compute_diagonal``'s ``ibit = iterm & 255`` (should be ``& 7``), which made the
   ``cache_level[1] == 1`` kernels wrong once an X group held more than 8 Z terms.
-- ``hproj`` building the Hamiltonian with ``add_padding=True`` while packing states *without* the
-  pad bit, so its bit alignment disagreed with the ``sqd`` path.
+- ``hproj`` building the Hamiltonian *with* the signature pad bit while packing states *without* it,
+  so its bit alignment disagreed with the ``sqd`` path. The padding was an opt-in ``add_padding``
+  flag then; it is now intrinsic to ``PauliSumXZ``, so the two sides cannot disagree.
 - ``run_sqd``'s one-hot initial vectors, which cannot leave the connected component of the
   projected Hamiltonian that contains the seed, and which violate ``ground_locg``'s
   non-vanishing-overlap precondition outright when the seed state is decoupled.
@@ -96,9 +97,7 @@ class TestComputeDiagonal:
 
         from rqutils.paulis.symplectic import PauliSumXZ
 
-        hamiltonian = PauliSumXZ.from_paulisum(
-            (strings, coeffs.tolist()), force_real=True, add_padding=True
-        )
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()), force_real=True)
         states_p = pack_padded(states)
         states_u = uniquify_states(states_p, states_p.shape[0])
         assert hamiltonian.z.shape[0] == 1, "expected a single X group for pure-Z input"
@@ -124,10 +123,10 @@ class TestGetXsource:
         states = np.array([[0, 0, 0, 0], [0, 0, 0, 1], [1, 0, 0, 0]], dtype=np.uint8)
         states_u = uniquify_states(pack_padded(states), 3)
         # IIIX flips the last qubit: state 0 <-> state 1, and state 2's partner is absent.
-        hamiltonian = PauliSumXZ.from_paulisum((["IIIX"], [1.0]), add_padding=True)
+        hamiltonian = PauliSumXZ.from_paulisum((["IIIX"], [1.0]))
         assert np.array_equal(np.asarray(get_xsource(hamiltonian.x[0], states_u)), [1, 0, -1])
         # XIII flips the first qubit: state 0 <-> state 2, and state 1's partner is absent.
-        hamiltonian = PauliSumXZ.from_paulisum((["XIII"], [1.0]), add_padding=True)
+        hamiltonian = PauliSumXZ.from_paulisum((["XIII"], [1.0]))
         assert np.array_equal(np.asarray(get_xsource(hamiltonian.x[0], states_u)), [2, -1, 0])
 
 
@@ -159,11 +158,12 @@ class TestHproj:
     def test_matches_dense_reference(self):
         """``hproj`` packed states WITHOUT the pad bit while padding the Hamiltonian.
 
-        The Hamiltonian's X/Z signatures are shifted one bit right by ``add_padding=True``, so
-        unpadded states disagree with them on alignment and every matrix element lands in the wrong
-        column. Measured before the fix on this input: lowest eigenvalue -1.398 against a true
-        -2.191. ``examples/_bench_common`` had worked around it by not using ``hproj`` at all,
-        noting it "raises a shape-mismatch TypeError".
+        ``PauliSumXZ`` shifts every X/Z signature one bit right for the pad bit, so unpadded states
+        disagree with them on alignment and every matrix element lands in the wrong column. Measured
+        before the fix on this input: lowest eigenvalue -1.398 against a true -2.191.
+        ``examples/_bench_common`` had worked around it by not using ``hproj`` at all, noting it
+        "raises a shape-mismatch TypeError". The padding was an opt-in ``add_padding`` flag at the
+        time, which is what let the two sides disagree; it is now unconditional.
         """
         rng = np.random.default_rng(20260804)
         num_qubits = 5
@@ -175,6 +175,34 @@ class TestHproj:
         expected = project_dense(strings, coeffs, states)
         assert matrix.shape == expected.shape
         assert np.abs(matrix - expected.real).max() < 1e-12
+
+    def test_agrees_with_sqd_on_a_subspace_with_a_decoupled_state(self):
+        """``hproj`` and ``sqd`` must agree, since both align states against the same pad bit.
+
+        This is the pairing that the old ``add_padding`` flag left unenforced: each path decided
+        independently whether to pad, and when they disagreed every matrix element moved one column
+        and the answer was still symmetric, so nothing downstream could notice. With the padding
+        intrinsic to ``PauliSumXZ`` there is no flag to set inconsistently, and this pins the two
+        paths together.
+
+        The subspace deliberately includes a state whose X-partner is absent, which is the case that
+        also exercised the missing ``shape=`` on ``hproj``'s ``coo_array``: the two defects lived on
+        the same input, so a passing assertion here covers alignment and extent at once.
+        """
+        rng = np.random.default_rng(20260805)
+        num_qubits = 5
+        strings = real_pauli_strings(num_qubits, 6, rng)
+        coeffs = rng.normal(size=len(strings))
+        # Sparse draw from a 32-state space, so some X-partners necessarily fall outside.
+        states = np.unique(rng.integers(0, 2, size=(7, num_qubits)).astype(np.uint8), axis=0)
+
+        matrix = hproj((strings, coeffs.tolist()), states).toarray()
+        assert matrix.shape == (states.shape[0], states.shape[0])
+        from_hproj = float(np.linalg.eigvalsh(matrix.real)[0])
+        from_sqd = eigval_of(strings, coeffs, states)
+        reference = lowest_projected(strings, coeffs, states)
+        assert from_hproj == pytest.approx(reference, abs=1e-9)
+        assert from_sqd == pytest.approx(reference, abs=1e-6)
 
     def test_shape_is_subspace_dim_when_top_column_unreachable(self):
         """``coo_array((data, (rows, cols)))`` was built with no ``shape=``.
@@ -434,9 +462,7 @@ class TestMatvecKernels:
         coeffs = rng.normal(size=len(strings))
         states = np.unique(rng.integers(0, 2, size=(12, num_qubits)).astype(np.uint8), axis=0)
 
-        hamiltonian = PauliSumXZ.from_paulisum(
-            (strings, coeffs.tolist()), force_real=True, add_padding=True
-        )
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()), force_real=True)
         states_u = uniquify_states(pack_padded(states), states.shape[0])
         matrix = project_dense(strings, coeffs, states).real
         vector = rng.normal(size=states.shape[0])
@@ -465,9 +491,7 @@ class TestMatvecKernels:
         coeffs = rng.normal(size=len(strings))
         states = np.unique(rng.integers(0, 2, size=(12, num_qubits)).astype(np.uint8), axis=0)
 
-        hamiltonian = PauliSumXZ.from_paulisum(
-            (strings, coeffs.tolist()), force_real=True, add_padding=True
-        )
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()), force_real=True)
         states_u = uniquify_states(pack_padded(states), states.shape[0])
         vector = rng.normal(size=states.shape[0])
         matrix = project_dense(strings, coeffs, states).real
@@ -517,9 +541,7 @@ class TestMatvecKernels:
         coeffs = rng.normal(size=len(strings))
         states = np.unique(rng.integers(0, 2, size=(12, num_qubits)).astype(np.uint8), axis=0)
 
-        hamiltonian = PauliSumXZ.from_paulisum(
-            (strings, coeffs.tolist()), force_real=True, add_padding=True
-        )
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()), force_real=True)
         states_u = uniquify_states(pack_padded(states), states.shape[0])
         xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
         diagonals = np.stack(

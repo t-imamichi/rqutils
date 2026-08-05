@@ -18,6 +18,23 @@ Any Pauli string :math:`Q` can be expressed as
 where :math:`x` (X signature) and :math:`z` (Z signature) are binary vectors of length :math:`n`
 (number of qubits) and :math:`xz` represents their inner product.
 
+Bit layout
+==========
+
+Signatures are bit-packed into :math:`\lceil (n+1)/8 \rceil` ``uint8`` s. The extra bit sits at
+position 0 and is always zero: it is a dummy identity factor that aligns the signatures with the pad
+bit consumers insert into their state bitstrings, where it marks spurious (fill-in) entries. This
+padding is intrinsic to the representation rather than optional, so the two sides cannot disagree on
+bit alignment -- a disagreement that is silent, since every matrix element lands in the wrong column
+while the result stays symmetric.
+
+Note that ``np.packbits`` fills each byte from the most significant end, so a signature's payload
+occupies the *leading* entries of ``np.unpackbits`` rather than the trailing ones: bit 0 is the pad
+bit, and the :math:`n` payload bits are entries 1 through :math:`n` in Pauli-string character order,
+which is the reverse of the little-endian qubit numbering used on ingest. Code that decodes a packed
+signature back to an integer must therefore shift by
+:math:`8 \lceil (n+1)/8 \rceil - (n+1)`, counting the pad bit -- see :meth:`PauliSumXZ.matmul`.
+
 Symplectic Pauli sum representation API
 =======================================
 
@@ -53,9 +70,7 @@ class PauliSumXZ:
     num_qubits: int = field(metadata={"static": True})
 
     @classmethod
-    def from_paulisum(
-        cls, paulisum: Any, force_real: bool = False, add_padding: bool = False
-    ) -> "PauliSumXZ":
+    def from_paulisum(cls, paulisum: Any, force_real: bool = False) -> "PauliSumXZ":
         if isinstance(paulisum, tuple):  # ([paulis], [coeffs])
             paulis, coeffs = paulisum
             if len(paulis) != len(coeffs):
@@ -131,10 +146,20 @@ class PauliSumXZ:
                 stacklevel=2,
             )
 
-        if add_padding:
-            # Add a dummy identity Pauli at the padding bit to align with the padding on the states
-            xsignatures = np.pad(xsignatures, {1: (1, 0)})
-            zsignatures = np.pad(zsignatures, {2: (1, 0)})
+        # A dummy identity Pauli at bit position 0, aligning with the pad bit that consumers insert
+        # into their state bitstrings.
+        #
+        # This is unconditional rather than opt-in. As a flag it was an invariant nothing could
+        # enforce: sqd packs its states with a leading pad bit and needs the signatures shifted to
+        # match, but the two decisions lived in separate call sites with no check that they agreed.
+        # When they disagreed, every matrix element landed in the wrong column and the result was
+        # still symmetric, so eigvalsh returned a plausible wrong ground energy -- that is exactly
+        # how hproj shipped broken. Making the padding intrinsic removes the possibility.
+        #
+        # svsim, the only other consumer of this representation, is unaffected: it builds CircuitXZ
+        # itself and never calls this method.
+        xsignatures = np.pad(xsignatures, {1: (1, 0)})
+        zsignatures = np.pad(zsignatures, {2: (1, 0)})
 
         # Pack the bit signatures
         xsignatures = np.packbits(xsignatures, axis=-1)
@@ -153,7 +178,13 @@ class PauliSumXZ:
 
         indices = jnp.arange(rhs.shape[0], dtype=np.int32, out_sharding=jax.typeof(rhs).sharding)
         powers = 256 ** jnp.arange(self.x.shape[1])[::-1]
-        offset = 8 * self.x.shape[1] - self.num_qubits
+        # Right-shift away the trailing bits that packbits added to reach a byte boundary. The stored
+        # payload is num_qubits + 1 bits wide, not num_qubits: bit 0 is the intrinsic pad bit (a dummy
+        # identity factor). Dropping the +1 leaves every signature shifted one place too far left, so
+        # `indices ^ xsig` gathers from the wrong entries and the result is a *permutation* of the
+        # right answer -- measured max abs error 2.073 on XX against the dense product, with the
+        # output entries pairwise swapped. Symmetric and finite, hence silent.
+        offset = 8 * self.x.shape[1] - (self.num_qubits + 1)
         packed_x = jnp.sum(self.x * powers, axis=1, dtype=np.int32) >> offset
         packed_z = jnp.sum(self.z * powers, axis=2, dtype=np.int32) >> offset
 

@@ -209,8 +209,8 @@ def sqd(
 
     Internally, the states are bit-packed and represented by :math:`\lceil (n+1)/8 \rceil`
     ``uint8`` s, where the extra bit is placed at position 0 and serves as the indicator for
-    spurious (fill-in) entries. Accordingly, the PauliSumXZ representation of the Hamiltonian must
-    be made with ``add_padding=True``.
+    spurious (fill-in) entries. ``PauliSumXZ`` reserves the same bit in its signatures
+    unconditionally, so the two are aligned by construction.
 
     Cache level is a 2-tuple where the first element specifies the caching of the source indices
     (0=no caching, 1=cached) and the second specifies the caching of the diagonal elements (0=no
@@ -235,7 +235,7 @@ def sqd(
     if states_size < states.shape[0]:
         raise ValueError("states_size smaller than the states array length")
     if not isinstance(hamiltonian, PauliSumXZ):
-        hamiltonian = PauliSumXZ.from_paulisum(hamiltonian, force_real=True, add_padding=True)
+        hamiltonian = PauliSumXZ.from_paulisum(hamiltonian, force_real=True)
 
     if not (mesh := get_abstract_mesh()).empty and (resid := states_size % mesh.size) != 0:
         LOG.debug("Adjusting states_size to make the array divisible by %d", mesh.size)
@@ -298,12 +298,12 @@ def hproj(
         The projected Hamiltonian as a sparse matrix.
     """
     if not isinstance(hamiltonian, PauliSumXZ):
-        hamiltonian = PauliSumXZ.from_paulisum(hamiltonian, add_padding=True)
+        hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
     if not unique_states:
         states = np.unique(states, axis=0)
-    # The Hamiltonian above is built with add_padding=True, which shifts every X/Z signature right
-    # by one bit, so the states must carry the same leading pad bit or the two disagree on bit
-    # alignment and every matrix element lands in the wrong column. This mirrors what sqd() does.
+    # PauliSumXZ always shifts every X/Z signature right by one bit, so the states must carry the
+    # same leading pad bit or the two disagree on bit alignment and every matrix element lands in
+    # the wrong column. This mirrors what sqd() does.
     states_p = np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
 
     columns, elements = _hproj_cols_elems(hamiltonian, states_p)

@@ -79,9 +79,7 @@ def build_solver_inputs(
     by 0., which is algebraically identical and costs nothing inside the solver loop.
     Both frameworks receive these same arrays, so neither is advantaged.
     """
-    hamiltonian = PauliSumXZ.from_paulisum(
-        (pauli_strings, coeffs), force_real=True, add_padding=True
-    )
+    hamiltonian = PauliSumXZ.from_paulisum((pauli_strings, coeffs), force_real=True)
     if hamiltonian.c.dtype != np.float64:
         raise ValueError(
             f"Hamiltonian coefficients are {hamiltonian.c.dtype}, expected float64."
@@ -182,9 +180,9 @@ def dense_reference(inputs: SolverInputs) -> tuple[np.ndarray, float]:
     internal path agreeing on the same wrong number, so self-consistency proves nothing here.
 
     (This once carried a note that ``hproj`` was unusable because it raised a shape-mismatch
-    TypeError -- it built the Hamiltonian with add_padding=True but packed the states without the
-    pad bit. That bug and a missing ``shape=`` on its ``coo_array`` are both fixed; the reason to
-    keep this separate is independence, not breakage.)
+    TypeError -- it built the Hamiltonian with the signature pad bit but packed the states without
+    it, back when that padding was an opt-in flag. That bug and a missing ``shape=`` on its
+    ``coo_array`` are both fixed; the reason to keep this separate is independence, not breakage.)
     """
     dim = inputs.subspace_dim
     matrix = np.zeros((dim, dim), dtype=np.float64)
