@@ -63,23 +63,24 @@ one ``(7, 3)`` normalization, ``mx.diagonal``/``mx.roll`` instead of element-by-
 ``mx.stack`` -- and hoists its dtype-dependent constants into :data:`_CONST_CACHE` instead of
 rebuilding them every iteration. Each of those was verified *bit-identical* to the form it
 replaced, not merely close: they change only how many ops are launched, never the arithmetic.
-Measured with ``examples/count_mlx_ops.py``, the LOBPCG body went from 116 to 77.8 op
-constructions per iteration (-33%) with the eigenvalue and iteration count unchanged. This is the
+Measured with ``examples/count_mlx_ops.py``, the LOBPCG body went from 116 to 76.3 op
+constructions per iteration (-34%) with the eigenvalue and iteration count unchanged. This is the
 one respect in which "when you change one, change both" should *not* be applied mechanically:
 porting these batched forms back to JAX would be churn, since XLA already fuses what they
 hand-fuse. The algebra is what must stay in step, not the op granularity.
 
-Beyond the port itself, this module also adds two custom Metal kernels via
-``mx.fast.metal_kernel``, selected by :func:`ground_locg_mlx`'s ``sas`` parameter:
-:func:`apply_h_xz_mlx_metal` fuses the matvec's gather-multiply-accumulate into one GPU launch
-(the op-graph path, :func:`apply_h_xz_mlx`/:func:`apply_h_xz_mlx_chunked`, needs several), and
-the private ``_compute_sas_metal`` fuses the Rayleigh-Ritz inner products the same way -- 16 op
-launches (measured) collapsing to 1. Both kernels are float32-only, since Metal has no float64;
-the default ``sas="ops"`` op-graph path is unchanged from before the parameter existed and
-remains the only route for an f64 solve. This is additional surface area, not a structural
-difference forced by the port -- it introduces no new numerics, only a fused execution strategy
-for the same inner products :func:`_compute_sas` already computes, so it does not belong in the
-list above.
+Beyond the port itself, this module also adds three custom Metal kernels via
+``mx.fast.metal_kernel``, selected by :func:`ground_locg_mlx`'s ``sas`` and ``eig`` parameters and
+by the caller's choice of matvec: :func:`apply_h_xz_mlx_metal` fuses the matvec's
+gather-multiply-accumulate into one GPU launch (the op-graph path,
+:func:`apply_h_xz_mlx`/:func:`apply_h_xz_mlx_chunked`, needs several), the private
+``_compute_sas_metal`` fuses the Rayleigh-Ritz inner products the same way -- 16 op launches
+(measured) collapsing to 1 -- and :func:`eigenpair_3x3_metal` fuses the whole 3x3 eigensolve. All
+three are float32-only, since Metal has no float64; the default ``sas="ops"``/``eig="ops"``
+op-graph paths are unchanged from before those parameters existed and remain the only route for an
+f64 solve. This is additional surface area, not a structural difference forced by the port -- it
+introduces no new numerics, only fused execution strategies for quantities the op-graph functions
+already compute, so it does not belong in the list above.
 
 **The kernels landed on opposite sides of the same argument, and the discriminator is output
 parallelism -- not launch count.** Fusing the matvec was a large win; fusing the Rayleigh-Ritz
@@ -115,8 +116,8 @@ MLX cannot initialize without a Metal device, which rules out headless testing. 
 cover the gap: ``examples/check_ground_locg_mlx_static.py`` re-executes this module's source
 against a numpy shim bound to the name ``mx`` (no MLX, no GPU -- this is what validates the
 algorithm and the caller-facing contract), and ``examples/check_ground_locg_mlx_mlx.py`` runs
-the real thing on both devices and both precisions, but requires a real Metal device and has
-not been run.
+the real thing on both devices and both precisions, which requires a real Metal device (see the
+device status below -- it has now been run).
 
 Neither checker exercises the Metal kernels' actual ``source`` strings. The numpy shim
 reimplements the intended per-thread indexing in Python/numpy rather than compiling and running
@@ -188,26 +189,23 @@ _CONST_CACHE = {}
 def _consts(dtype):
     """Return the cached constants for ``dtype``, building them on first use."""
     entry = _CONST_CACHE.get(dtype)
-    if entry is None:
-        entry = {
-            "zero": mx.array(0.0, dtype),
-            "one": mx.array(1.0, dtype),
-            # eigenpair_3x3's root coefficients: the three Cardano roots are the same linear
-            # combination a*cos(phi) + b*sin(phi) with these (a, b) pairs.
-            "cphi_coeff": mx.array([2.0, -1.0, -1.0], dtype),
-            "sphi_coeff": mx.array([0.0, -_SQRT3, _SQRT3], dtype),
-            "eye3": mx.eye(3, dtype=dtype),
-            # eigenpair_2x2's fallback eigenvector for a multiple of the identity.
-            "e0_2": mx.array([1.0, 0.0], dtype),
-            # iter_body's selector for the p direction's diagonal entry, used to lift a zeroed
-            # search direction out of Rayleigh-Ritz contention (docs/locg.md item I7). A fixed
-            # constant, so it does not need rebuilding per iteration.
-            "p_mask": mx.array(
-                [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
-                dtype,
-            ),
-        }
-    _CONST_CACHE[dtype] = entry
+    if entry is not None:
+        return entry
+    entry = _CONST_CACHE[dtype] = {
+        "zero": mx.array(0.0, dtype),
+        "one": mx.array(1.0, dtype),
+        # eigenpair_3x3's root coefficients: the three Cardano roots are the same linear
+        # combination a*cos(phi) + b*sin(phi) with these (a, b) pairs.
+        "cphi_coeff": mx.array([2.0, -1.0, -1.0], dtype),
+        "sphi_coeff": mx.array([0.0, -_SQRT3, _SQRT3], dtype),
+        "eye3": mx.eye(3, dtype=dtype),
+        # eigenpair_2x2's fallback eigenvector for a multiple of the identity.
+        "e0_2": mx.array([1.0, 0.0], dtype),
+        # iter_body's selector for the p direction's diagonal entry, used to lift a zeroed
+        # search direction out of Rayleigh-Ritz contention (docs/locg.md item I7). A fixed
+        # constant, so it does not need rebuilding per iteration.
+        "p_mask": mx.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype),
+    }
     return entry
 
 
@@ -894,6 +892,10 @@ def ground_locg_mlx(
         ValueError: If ``xinit`` is complex. Every kernel here assumes real symmetric input.
         ValueError: If ``sas`` is not ``"ops"`` or ``"metal"``, or if ``sas="metal"`` is
             combined with a non-float32 ``xinit``.
+        ValueError: If ``eig`` is not ``"ops"`` or ``"metal"``, or if ``eig="metal"`` is
+            combined with a non-float32 ``xinit``.
+        ValueError: If ``compile_chunk`` is less than 1, which would make the chunked
+            convergence-checking loop fail to advance and spin forever.
     """
     xinit = mx.array(xinit)
     # Test the dtype's name rather than comparing against mx.complex64: this holds under real MLX
@@ -924,6 +926,13 @@ def ground_locg_mlx(
             f"eig='metal' requires float32 (Metal has no float64), got {xinit.dtype}. Use "
             "eig='ops' for an f64 solve."
         )
+    if compile_chunk < 1:
+        # The chunked convergence-checking loop advances by `this_chunk = min(compile_chunk,
+        # maxiter - niter)`, so a non-positive chunk makes `niter += this_chunk` a no-op and
+        # `while niter < maxiter` spins forever -- a silent hang rather than a wrong answer, but
+        # the same class of failure the rest of this module's guards exist to prevent. Reject it
+        # here instead, where the message can name the parameter.
+        raise ValueError(f"compile_chunk must be >= 1, got {compile_chunk}")
     # Bind the implementation once, before iterating: the dtype is fixed for the whole solve, so
     # a per-iteration dispatch would buy nothing and might force a device sync inside the
     # compiled body (see the design doc -- unverified, and avoided rather than risked).
@@ -965,7 +974,7 @@ def ground_locg_mlx(
     # without the guard eigenpair_2x2 sees a sas_mat whose row/col 1 vanish and selects that null
     # direction, collapsing theta towards 0 instead of reporting rho -- the true answer.
     norm_r = mx.linalg.norm(rcurr)
-    r_is_zero = bool(float(norm_r) == 0.0)
+    r_is_zero = float(norm_r) == 0.0
     tmp_p = normalize(rcurr, norm_r)
     # Reuse ax from iteration 0 rather than recomputing it inside compute_sas.
     sas_mat = compute_sas((xcurr, tmp_p), (ax, matvec(tmp_p)))
@@ -973,13 +982,14 @@ def ground_locg_mlx(
         # Lift the p diagonal out of contention so Rayleigh-Ritz cannot pick the null direction.
         # With p excluded the 2x2 solve collapses onto x alone, giving theta = rho and kappa =
         # [1, 0], so xcurr is unchanged and no new search direction is introduced.
-        excluded = mx.abs(rho) * 2.0 + 1.0
-        sas_mat = sas_mat + mx.stack(
-            [
-                mx.stack([mx.array(0.0, sas_mat.dtype), mx.array(0.0, sas_mat.dtype)]),
-                mx.stack([mx.array(0.0, sas_mat.dtype), excluded - sas_mat[1, 1]]),
-            ]
-        )
+        #
+        # Assign the entry directly, mirroring ground_locg's `sas.at[1, 1].set(excluded)`. MLX
+        # supports item assignment, so the nested mx.stack tower this used to build (four ops to
+        # add `excluded - sas_mat[1, 1]` into one slot) was both longer and *less* exact -- the
+        # subtract-then-re-add does not cancel, measured at 5.7e-14 versus 0 for a direct set.
+        # This branch runs once per solve, not per iteration, so no launch count depends on it.
+        excluded = mx.abs(rho) + mx.abs(rho) + 1.0
+        sas_mat[1, 1] = excluded
     theta, kappa = eigenpair_2x2(sas_mat)
     tmp_t = tmp_p * kappa[0] - xcurr * kappa[1]
     tmp_u = xcurr * kappa[0] + tmp_p * kappa[1]
@@ -1016,13 +1026,15 @@ def ground_locg_mlx(
         # constant, not a function of sas_mat.
         diag_xy = mx.diagonal(sas_mat)[:2]
         excluded = mx.max(diag_xy) + mx.sum(mx.abs(diag_xy)) + 1.0
-        mask = p_mask
-        sas_mat = mx.where(p_is_zero, sas_mat * (1.0 - mask) + excluded * mask, sas_mat)
+        # ground_locg spells this `jnp.where(p_is_zero, sas.at[2, 2].set(excluded), sas)`. Here it
+        # stays a masked blend rather than an item assignment: this runs every iteration inside
+        # mx.compile, so the selection must remain part of the traced graph, and MLX has no
+        # functional `.at[].set()` that composes with a traced predicate.
+        sas_mat = mx.where(p_is_zero, sas_mat * (1.0 - p_mask) + excluded * p_mask, sas_mat)
         theta, kappa = solve_eig3(sas_mat)
         tmp_s = ycurr * kappa[1] + tmp_p * kappa[2]
         norm_s = mx.linalg.norm(tmp_s)
-        tmp_t = tmp_s * (kappa[0] / mx.where(norm_s == 0.0, one, norm_s))
-        tmp_t = tmp_t - xcurr * norm_s
+        tmp_t = tmp_s * (kappa[0] / mx.where(norm_s == 0.0, one, norm_s)) - xcurr * norm_s
         tmp_u = xcurr * kappa[0] + tmp_s
         xnext = normalize(tmp_u)
         # tmp_t is a difference of two quantities both nearly parallel to xcurr as norm_s -> 0, so
@@ -1080,8 +1092,9 @@ def ground_locg_mlx(
         # is not an option, since mx.compile traces a fixed array-in/array-out computation and
         # has no equivalent of jax.lax.while_loop/cond to make that branch part of the graph.
         def chunk_body(xcurr, ycurr, rcurr, axcurr):
-            theta = mx.array(0.0, xcurr.dtype)
-            p_is_zero = mx.array(False)
+            # No theta/p_is_zero initializers: compile_chunk >= 1 is validated above, so the loop
+            # always runs at least once and any initial value would be dead. (They were not merely
+            # redundant -- a zero-trip loop would have returned them, reporting theta = 0.)
             for _ in range(compile_chunk):
                 theta, xcurr, ycurr, rcurr, axcurr, p_is_zero = iter_body(
                     xcurr, ycurr, rcurr, axcurr
@@ -1089,7 +1102,6 @@ def ground_locg_mlx(
             return theta, xcurr, ycurr, rcurr, axcurr, p_is_zero
 
         compiled_chunk = mx.compile(chunk_body)
-        niter = 0
         while niter < maxiter:
             this_chunk = min(compile_chunk, maxiter - niter)
             if this_chunk == compile_chunk:
@@ -1130,8 +1142,8 @@ def _project_out(basis, vector):
     """Orthogonalize ``vector`` against ``basis``, ending on a subtraction.
 
     The repeated passes and the final zeroing are load-bearing; see the comments in
-    ``rqutils/ground_locg.py:390-410``. Near convergence, ending on a normalization can
-    reintroduce basis components through catastrophic cancellation and wreck the
+    ``rqutils.ground_locg._project_out``, which this mirrors. Near convergence, ending on a
+    normalization can reintroduce basis components through catastrophic cancellation and wreck the
     Rayleigh-Ritz conditioning.
     """
     one = _consts(vector.dtype)["one"]
@@ -1212,7 +1224,11 @@ def _nullvec_3x3(mat):
     crosses = mx.linalg.cross(matT, matT[_indices()["col_pair"]])
     # Rank 1 (degenerate lowest eigenvalue): every cross product is numerical noise and the null
     # space is the orthogonal complement of the largest column; any member of it is an eigenvector.
-    col_index = mx.argmax(mx.sum(mx.square(mx.abs(mat)), axis=0))
+    # mx.square alone, not mx.square(mx.abs(...)): |x|^2 == x^2 for real x, and this module rejects
+    # complex input, so the abs the JAX original needs for the complex-Hermitian case is a pure
+    # extra op launch here. Bit-identical, and argmax picks the same column -- verified at 0.0 max
+    # difference over 5000 random matrices spanning scales 1e-8..1e8.
+    col_index = mx.argmax(mx.sum(mx.square(mat), axis=0))
     col = mat[:, col_index]
     # The three complement vectors are exactly `col x e_k` for the standard basis vectors e_k:
     # col x e_0 = [0, col_2, -col_1], col x e_1 = [-col_2, 0, col_0], col x e_2 = [col_1, -col_0, 0],
@@ -1242,7 +1258,12 @@ def _nullvec_3x3(mat):
     cands = mx.concatenate(cands)
     norms = mx.linalg.norm(cands, axis=1, keepdims=True)
     cands = cands / mx.where(norms == 0.0, _consts(norms.dtype)["one"], norms)
-    resid = mx.linalg.norm(cands @ mat.T, axis=1)
+    # `cands @ mat`, not `cands @ mat.T`: this function's contract is a real *symmetric* matrix
+    # (see the docstring, and eigenpair_3x3 only ever passes `balanced - xmin*eye`, symmetric by
+    # construction), so the transpose is an exact no-op -- verified identical -- and costs an op
+    # launch per iteration. The JAX original writes the einsum in the equivalent `mat @ cands_i`
+    # order. If this ever needs to accept an asymmetric matrix, the transpose must come back.
+    resid = mx.linalg.norm(cands @ mat, axis=1)
     # A candidate that collapsed to zero is not a valid eigenvector; disqualify it. MLX has no
     # inf-filling idiom as terse as jnp.where(..., jnp.inf), so add a large finite penalty
     # proportional to the residual scale instead -- the comparison only needs an ordering.

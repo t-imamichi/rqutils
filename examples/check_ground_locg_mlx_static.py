@@ -740,6 +740,33 @@ except ValueError as exc:
 else:
     raise AssertionError("ground_locg_mlx accepted eig='bogus'")
 
+# compile_chunk < 1 must raise rather than HANG. The chunked convergence-checking loop advances by
+# `this_chunk = min(compile_chunk, maxiter - niter)`, so compile_chunk=0 made `niter += this_chunk`
+# a no-op and `while niter < maxiter` spin forever -- found by inspection while aligning this port
+# with rqutils.ground_locg, and confirmed by an actual 120s hang before the guard was added. A hang
+# rather than a wrong number, but the same "fails without saying so" class as the rest of the guards
+# here. Both the compiled and uncompiled paths are checked, since the guard sits above the branch.
+for _bad_chunk in (0, -1):
+    for _compile in (True, False):
+        try:
+            ground_locg_mlx(
+                apply_h_xz_mlx,
+                inputs32_v,
+                args=(xs32_i, dg32_i),
+                maxiter=4,
+                tol=1e-12,
+                compile_body=_compile,
+                compile_chunk=_bad_chunk,
+            )
+        except ValueError as exc:
+            assert "compile_chunk" in str(exc), f"unexpected guard message: {exc}"
+        else:
+            raise AssertionError(
+                f"ground_locg_mlx accepted compile_chunk={_bad_chunk} with "
+                f"compile_body={_compile} -- guard did not fire (this would hang)"
+            )
+print("OK  ground_locg_mlx rejects compile_chunk < 1 (which previously hung forever)")
+
 # 3j. The r_is_zero / seed_converged guard (ground_locg_mlx.py:503-517): a one-hot xinit against a
 # diagonal operator is an exact eigenvector, so the residual after the seed step is exactly zero.
 # Without the guard, eigenpair_2x2 sees a sas_mat whose row/col 1 (the p direction) vanishes and
