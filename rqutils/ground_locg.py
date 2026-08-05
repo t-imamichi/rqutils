@@ -216,6 +216,17 @@ from numpy.typing import DTypeLike, NDArray
 _SQRT3 = math.sqrt(3.0)
 
 
+def normalize(vector: jax.Array, norm: jax.Array | None = None) -> jax.Array:
+    """Divide by the norm, leaving a zero vector untouched instead of producing NaN.
+
+    Pass ``norm`` when the caller has already computed it -- several call sites need the norm itself
+    for a separate zero test, and recomputing it here would cost an extra reduction per iteration.
+    """
+    if norm is None:
+        norm = jnp.linalg.norm(vector)
+    return vector / jnp.where(norm == 0.0, 1.0, norm)
+
+
 def ground_locg(
     mat: Callable[[jax.Array], jax.Array] | jax.Array,
     xinit: jax.Array | int,
@@ -303,12 +314,6 @@ def _ground_locg_callable(
         xinit = (
             jax.lax.broadcasted_iota(xinit.dtype, (vspace[0],), 0, out_sharding=sharding) == xinit
         ).astype(vspace[1])
-
-    def normalize(vector, norm=None):
-        """Divide by the norm, leaving a zero vector untouched instead of producing NaN."""
-        if norm is None:
-            norm = jnp.linalg.norm(vector)
-        return vector / jnp.where(norm == 0.0, 1.0, norm)
 
     def compute_sas(vectors, mvs):
         """Projected matrix over ``vectors``, given their (possibly precomputed) images."""
@@ -659,16 +664,11 @@ def _nullvec_3x3(mat: jax.Array) -> jax.Array:
     # unit vector as the last resort. It has residual 0 and wins by default.
     cands.append(jnp.array([1.0, 0.0, 0.0], dtype=mat.dtype))
 
-    cands = jnp.stack([_normalize_or_zero(c) for c in cands])
+    cands = jnp.stack([normalize(c) for c in cands])
     resid = jnp.linalg.norm(jnp.einsum("ij,cj->ci", mat, cands), axis=1)
     # A candidate that collapsed to zero is not a valid eigenvector; disqualify it.
     resid = jnp.where(jnp.linalg.norm(cands, axis=1) > 0.5, resid, jnp.inf)
     return cands[jnp.argmin(resid)]
-
-
-def _normalize_or_zero(vector: jax.Array) -> jax.Array:
-    norm = jnp.linalg.norm(vector)
-    return vector / jnp.where(norm == 0.0, 1.0, norm)
 
 
 @jax.jit
