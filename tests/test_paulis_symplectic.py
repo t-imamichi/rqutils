@@ -18,7 +18,6 @@ coefficients, so an odd-Y Pauli string came back complex128 with no warning at a
 import functools
 import warnings
 
-import jax.numpy as jnp
 import numpy as np
 import pytest
 from conftest import _PAULI_MATRICES
@@ -269,45 +268,6 @@ class TestPadding:
         """
         hamiltonian = PauliSumXZ.from_paulisum(([string], [1.5]))
         assert hamiltonian.c[0][0] == pytest.approx(1.5 * expected)
-
-
-class TestMatmul:
-    """``matmul`` applies the Pauli sum to a vector, matrix-free."""
-
-    @pytest.mark.parametrize(
-        "strings,coeffs",
-        [
-            (["XX"], [1.0]),
-            (["ZZ"], [2.0]),
-            (["XX", "ZZ"], [1.0, 2.0]),
-            (["XI", "IZ", "YY"], [0.5, -1.0, 2.0]),
-        ],
-    )
-    def test_matches_the_dense_product(self, strings, coeffs):
-        """Against ``dense @ v``, which shares no code with the bit-packed gather."""
-        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs))
-        dimension = 2 ** len(strings[0])
-        rng = np.random.default_rng(20260804)
-        vector = rng.normal(size=dimension) + 1.0j * rng.normal(size=dimension)
-        got = np.asarray(hamiltonian.matmul(jnp.asarray(vector)))
-        expected = dense_from_strings(strings, coeffs) @ vector
-        assert np.abs(got - expected).max() < 1e-12
-
-    def test_wrong_vector_length_raises(self):
-        hamiltonian = PauliSumXZ.from_paulisum((["XX"], [1.0]))
-        with pytest.raises(ValueError, match="incompatible with num_qubits"):
-            hamiltonian.matmul(jnp.zeros(8))
-
-    def test_requires_a_jax_array(self):
-        """A numpy array fails on ``.at[]`` with an opaque AttributeError.
-
-        Recorded rather than fixed: the method is JAX-only by design (it is the matrix-free kernel
-        ``sqd`` traces), but the error names ``.at`` rather than the argument, so this test is the
-        documentation.
-        """
-        hamiltonian = PauliSumXZ.from_paulisum((["XX"], [1.0]))
-        with pytest.raises(AttributeError, match="'at'"):
-            hamiltonian.matmul(np.zeros(4))
 
 
 class TestDataclass:

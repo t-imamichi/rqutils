@@ -81,43 +81,6 @@ and the component :math:`\nu_{k_1 \dots k_s}` is extracted by
     \nu_{k_1 \dots k_s} = 2^{s-2} \mathrm{tr}(\Lambda^{(n_1 \dots n_s)}_{k_1 \dots k_s} H).
 
 
-Dimension truncation
-====================
-
-Thanks to the recursive definition of the Pauli matrices, the decomposition of an
-:math:`m`-dimensional submatrix of an :math:`n`-dimensional Hermitian matrix is mostly trivially
-obtained from the components of the latter:
-
-If
-
-.. math::
-
-    H^{(n)} = \sum_{k=0}^{n^2-1} \nu_k \lambda^{(n)}_k
-
-then the truncated matrix :math:`\bar{H}^{(m)}` is
-
-.. math::
-
-    \bar{H}^{(m)} = \sum_{k=0}^{m^2-1} \bar{\nu}_k \lambda^{(m)}_k,
-
-with :math:`\bar{\nu}_k = \nu_k` for :math:`1 \leq k \leq m^2 - 1`. For :math:`k=0`, however, we
-need to consider the projection of the diagonal matrices:
-
-.. math::
-
-    \mathrm{tr}_{m} (\lambda^{(m)}_0 \bar{\lambda}^{(n|m)}_0) & = 2 \sqrt{\frac{m}{n}}, \\
-    \mathrm{tr}_{m} (\lambda^{(m)}_0 \bar{\lambda}^{(n|m)}_{d^2-1}) & = 2 \sqrt{\frac{m}{d(d-1)}}
-                                                                        \quad \text{if} \; d > m
-
-where :math:`\mathrm{tr}_{m}(\cdot)` represents the :math:`m`-dimensional trace, and
-:math:`\bar{\lambda}^{(n|m)}_k`
-is the :math:`m`-dimensional submatrix of :math:`\lambda^{(n)}_k`. Thus we have
-
-.. math::
-
-    \bar{\nu}_0 = \frac{1}{2} \mathrm{tr}_m (\lambda^{(m)}_0 \bar{H}^{(m)})
-                = \sqrt{\frac{m}{n}} \nu_0 + \sum_{d > m} \sqrt{\frac{m}{d(d-1)}} \nu_{d^2-1}.
-
 Pauli Matrices API
 ==================
 
@@ -126,10 +89,6 @@ Pauli Matrices API
 
    paulis
    components
-   compose
-   l0_projector
-   truncate
-   symmetry
    labels
 """
 
@@ -153,7 +112,7 @@ def _normalize_dim(dim: MatrixDimension) -> tuple[int, ...]:
 
     This is Python-level shape inference on a static value, so per ``CLAUDE.md``'s ``npmod`` rule it
     must run for *every* backend and never sit behind an ``if npmod is np:`` gate. Gating it is what
-    broke the ``npmod=jnp`` path of ``components``, ``compose``, and ``truncate``, each raising
+    broke :func:`components`' ``npmod=jnp`` path (and those of two since-removed functions), raising
     "object of type 'int' has no len()" from a line that named nothing.
     """
     if isinstance(dim, (int, np.integer)):
@@ -290,20 +249,6 @@ def pauli_matrices(dim: int, sparse: bool = False) -> NDArray[np.complex128 | np
 _pauli_matrices = {}
 
 
-def paulis_shape(dim: MatrixDimension) -> tuple[int, ...]:
-    """Return just the shape of the paulis array for the given dimension.
-
-    Args:
-        dim: Dimension(s) of the Pauli matrices.
-
-    Returns:
-        Shape of the array obtained by ``paulis(dim)``.
-    """
-    dim = _normalize_dim(dim)
-
-    return tuple(np.square(dim)) + (tuple(np.prod(dim, keepdims=True)) * 2)
-
-
 def components(
     matrix: ArrayLike, dim: MatrixDimension | None = None, npmod: ModuleType = np
 ) -> NDArray[np.complex128]:
@@ -339,209 +284,6 @@ def components(
 
     basis = paulis(dim)
     return npmod.tensordot(matrix, basis, ((-2, -1), (-1, -2))) * (2 ** (len(dim) - 2))
-
-
-def compose(
-    components: ArrayLike, dim: MatrixDimension | None = None, npmod: ModuleType = np
-) -> NDArray[np.complex128]:
-    r"""Compose a matrix from the Pauli components.
-
-    Args:
-        components: Pauli components of the desired matrix, shape (..., d1**2, d2**2, ...)
-        dim: Subsystem dimensions. If present, last `len(dim)` dimensions of `components`
-            are dotted with the corresponding Pauli matrices.
-
-    Returns:
-        A complex array of shape `(..., d1*d2*..., d1*d2*...)`.
-    """
-    # As in components(): the dim normalization is static shape inference and must run for every
-    # npmod, since len(dim) is needed below regardless. Only the validation is gated.
-    if dim is None:
-        dim = tuple(map(int, np.around(np.sqrt(components.shape))))
-    else:
-        dim = _normalize_dim(dim)
-
-    if npmod is np and not np.allclose(np.square(dim), components.shape[-len(dim) :]):
-        raise ValueError("Components array shape invalid")
-
-    basis = paulis(dim)
-    comp_axes = list(range(-len(dim), 0))
-    pauli_axes = list(range(len(dim)))
-    return npmod.tensordot(components, basis, (comp_axes, pauli_axes))
-
-
-def l0_projector(reduced_dim: int, original_dim: int) -> NDArray[np.float64]:
-    r"""Return the vector that projects the diagonal components onto lambda_0 of reduced_dim.
-
-    Args:
-        reduced_dim: Matrix dimension of the target subspace.
-        original_dim: Matrix dimension of the full space.
-
-    Returns:
-        Projection vector :math:`\vec{v}` that gives :math:`\bar{\nu}_0 = \vec{v} \cdot \vec{\nu}`.
-    """
-    if (cache := _l0_projectors.get((reduced_dim, original_dim))) is not None:
-        return cache.copy()
-
-    if reduced_dim > original_dim:
-        raise ValueError("Reduced dim greater than original dim")
-
-    projector = np.zeros(original_dim**2)
-    projector[0] = np.sqrt(reduced_dim / original_dim)
-
-    for dim in range(reduced_dim + 1, original_dim + 1):
-        projector[dim**2 - 1] = np.sqrt(reduced_dim / dim / (dim - 1))
-
-    projector.setflags(write=False)
-    _l0_projectors[(reduced_dim, original_dim)] = projector.copy()
-    return projector
-
-
-_l0_projectors = {}
-
-
-def truncate(
-    components: ArrayLike, reduced_dim: MatrixDimension, npmod: ModuleType = np
-) -> NDArray[np.complex128]:
-    r"""Truncate a component array of a matrix into the components for a submatrix.
-
-    The component array can have extra dimensions in front (e.g. time axis if this is a time series
-    of components). In such a case, reduced_dim must be a sequence of integers with the length
-    correpsonding to the number of subsystems.
-
-    Args:
-        components: Pauli components of the original matrix, shape (..., d1**2, d2**2, ...)
-        reduced_dim: Dimension(s) of the submatrix(es).
-
-    Returns:
-        Components of the submatrix, shape (..., r1**2, r2**2, ...)
-    """
-    # Normalizing a scalar reduced_dim is pure Python shape inference on a static value, so it
-    # belongs outside the `npmod is np` gate: gating it left the jnp path receiving a bare int and
-    # failing at `len(reduced_dim)` below with "object of type 'int' has no len()", naming nothing.
-    # A scalar means "one subsystem", not "one per array axis" -- keying the repeat count off
-    # len(components.shape) also mis-sized the tuple whenever the component array carried leading
-    # axes (the documented time-series case), since those are not subsystems.
-    if isinstance(reduced_dim, (int, np.integer)):
-        reduced_dim = (int(reduced_dim),)
-
-    num_subsystems = len(reduced_dim)
-    first_component_axis = len(components.shape) - num_subsystems
-
-    original_shape = components.shape[first_component_axis:]
-    # np.square, not npmod.square: reduced_dim is a static Python tuple of ints, and jnp.square
-    # would turn it into a traced array, making `reduced_shape[idim]` unusable as the static
-    # argument that l0_projector and eye need below.
-    reduced_shape = np.square(reduced_dim)
-
-    if npmod is np:
-        if np.any(reduced_shape > np.asarray(original_shape)):
-            raise ValueError("Reduced dimensions greater than original dimensions")
-
-        if np.allclose(reduced_shape, original_shape):
-            return components.copy()
-
-    # np, not npmod: original_shape is components.shape, a static Python tuple. jnp.sqrt rejects a
-    # tuple outright ("sqrt requires ndarray or scalar arguments"), which is why the npmod=jnp path
-    # of this function had never actually run. Shape arithmetic is static in both backends, so
-    # computing it with numpy is correct as well as necessary -- and original_dim must stay a
-    # concrete array to index l0_projector and eye below.
-    original_dim = np.around(np.sqrt(original_shape)).astype(int)
-
-    def project_dim(idim, components):
-        # Construct the projection matrix
-        # Example: original_dim = 3, reduced_dim = 2 (original_shape = 9, reduced_shape = 4):
-        # | p0  0  0 p3  0  0  0  0 p8
-        # |  0  1  0  0  0  0  0  0  0
-        # |  0  0  1  0  0  0  0  0  0
-        # |  0  0  0  1  0  0  0  0  0
-
-        odim = original_dim[idim]  # Dimension of the Paulis
-        osh = original_shape[idim]  # Number of Paulis
-        rdim = reduced_dim[idim]
-        rsh = reduced_shape[idim]
-
-        projector_0 = l0_projector(rdim, odim)[None, :]
-        projector_1 = npmod.concatenate(
-            (npmod.eye(rsh)[1:], npmod.zeros((rsh - 1, osh - rsh))), axis=1
-        )
-        projector = npmod.concatenate((projector_0, projector_1), axis=0)
-        projected = npmod.tensordot(projector, components, (1, first_component_axis + idim))
-        # After tensordot, the projected axis is at position 0
-        return npmod.moveaxis(projected, 0, first_component_axis + idim)
-
-    # A Python loop over subsystems, not jax.lax.fori_loop, even under jnp. The trip count is
-    # len(reduced_dim) -- static in both backends -- and the body indexes reduced_dim and
-    # original_dim, which are Python/numpy sequences of *static* dimensions. fori_loop passes a
-    # traced index, so `reduced_dim[idim]` raised TracerIntegerConversionError: the previous jnp
-    # branch could not run at all. Unrolling is also what lets project_dim build its projector from
-    # concrete shapes, which jnp.eye and l0_projector both require.
-    #
-    # The per-subsystem skip stays a Python `if` for the same reason: the comparison is between two
-    # static ints, so there is no data-dependent control flow here for lax.cond to resolve.
-    for idim in range(num_subsystems):
-        if reduced_dim[idim] != original_dim[idim]:
-            components = project_dim(idim, components)
-
-    return components
-
-
-def symmetry(dim: MatrixDimension) -> NDArray[np.int_]:
-    r"""Return the symmetry (-1, 0, 1) of the Pauli matrices.
-
-    Args:
-        dim: Dimension of the Pauli matrices.
-
-    Returns:
-        An integer array with entries -1, 0, 1 depending on whether the corresponding Pauli matrix
-        is antisymmetric, diagonal, or symmetric.
-    """
-    dim = _normalize_dim(dim)
-
-    if (cache := _symmetries.get(dim)) is not None:
-        return cache.copy()
-
-    subsystems = []
-
-    for pauli_dim in dim:
-        if (sym := _pauli_symmetry.get(pauli_dim)) is None:
-            sym = np.zeros(pauli_dim**2, dtype=int)
-            imat = 1
-            for isub in range(1, pauli_dim):
-                for _ in range(isub):
-                    sym[imat] = 1
-                    imat += 1
-                    sym[imat] = -1
-                    imat += 1
-
-                imat += 1
-
-            sym.setflags(write=False)
-            _pauli_symmetry[pauli_dim] = sym
-
-        subsystems.append(sym)
-
-    # Compose symmetry combinations
-    # Truth table for two subsystems
-    #     -1  0  1
-    #   ----------
-    # -1|  1 -1 -1
-    #  0| -1  0  1
-    #  1| -1  1  1
-
-    fullsym = subsystems[0]
-    for subsystem in subsystems[1:]:
-        symprod = fullsym[..., None] * subsystem
-        symsum = fullsym[..., None] + subsystem
-        fullsym = symprod + np.where(symprod == 0, symsum, 0)
-
-    fullsym.setflags(write=False)
-    _symmetries[dim] = fullsym.copy()
-    return fullsym
-
-
-_symmetries = {}
-_pauli_symmetry = {}
 
 
 def labels(

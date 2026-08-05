@@ -32,8 +32,9 @@ Note that ``np.packbits`` fills each byte from the most significant end, so a si
 occupies the *leading* entries of ``np.unpackbits`` rather than the trailing ones: bit 0 is the pad
 bit, and the :math:`n` payload bits are entries 1 through :math:`n` in Pauli-string character order,
 which is the reverse of the little-endian qubit numbering used on ingest. Code that decodes a packed
-signature back to an integer must therefore shift by
-:math:`8 \lceil (n+1)/8 \rceil - (n+1)`, counting the pad bit -- see :meth:`PauliSumXZ.matmul`.
+signature back to an integer must therefore shift by :math:`8 \lceil (n+1)/8 \rceil - (n+1)`,
+counting the pad bit; dropping that :math:`+1` yields a *permutation* of the right answer, which is
+finite and symmetric and therefore silent.
 
 Symplectic Pauli sum representation API
 =======================================
@@ -46,10 +47,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.tree_util import register_dataclass
-from numpy.typing import NDArray
 
 try:
     from qiskit.quantum_info import SparsePauliOp
@@ -169,31 +168,3 @@ class PauliSumXZ:
     @property
     def arrays(self) -> tuple[jax.Array, jax.Array, jax.Array]:
         return self.x, self.z, self.c
-
-    def matmul(self, rhs: NDArray):
-        if rhs.shape[0] != 2**self.num_qubits:
-            raise ValueError(
-                f"RHS axis 0 size {rhs.shape[0]} is incompatible with num_qubits={self.num_qubits}"
-            )
-
-        indices = jnp.arange(rhs.shape[0], dtype=np.int32, out_sharding=jax.typeof(rhs).sharding)
-        powers = 256 ** jnp.arange(self.x.shape[1])[::-1]
-        # Right-shift away the trailing bits that packbits added to reach a byte boundary. The stored
-        # payload is num_qubits + 1 bits wide, not num_qubits: bit 0 is the intrinsic pad bit (a dummy
-        # identity factor). Dropping the +1 leaves every signature shifted one place too far left, so
-        # `indices ^ xsig` gathers from the wrong entries and the result is a *permutation* of the
-        # right answer -- measured max abs error 2.073 on XX against the dense product, with the
-        # output entries pairwise swapped. Symmetric and finite, hence silent.
-        offset = 8 * self.x.shape[1] - (self.num_qubits + 1)
-        packed_x = jnp.sum(self.x * powers, axis=1, dtype=np.int32) >> offset
-        packed_z = jnp.sum(self.z * powers, axis=2, dtype=np.int32) >> offset
-
-        def apply_xgrp(out, data):
-            xsig, zsigs, coeffs = data
-            signs = 1.0 - 2.0 * (jnp.bitwise_count(indices & zsigs[:, None]) & 1)
-            diags = jnp.sum(coeffs[..., None] * signs, axis=0)
-            diags = jnp.expand_dims(diags, tuple(np.arange(1, rhs.ndim) + 1))
-            out += rhs.at[indices ^ xsig].get(out_sharding=jax.typeof(rhs).sharding) * diags
-            return out, None
-
-        return jax.lax.scan(apply_xgrp, jnp.zeros_like(rhs), (packed_x, packed_z, self.c))[0]
