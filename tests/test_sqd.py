@@ -31,6 +31,7 @@ from rqutils.sqd import (
     get_diagonal,
     get_xsource,
     hproj,
+    run_sqd,
     sqd,
     uniquify_states,
 )
@@ -174,6 +175,47 @@ class TestHproj:
         expected = project_dense(strings, coeffs, states)
         assert matrix.shape == expected.shape
         assert np.abs(matrix - expected.real).max() < 1e-12
+
+    def test_shape_is_subspace_dim_when_top_column_unreachable(self):
+        """``coo_array((data, (rows, cols)))`` was built with no ``shape=``.
+
+        scipy then infers the extent from the largest index actually present, so any trailing
+        basis state that no term couples into is dropped from the matrix entirely. Here qubit-0
+        flip couples states 0<->1 but the partner of the highest state is absent from the
+        subspace, so its column never appears: measured (2, 2) for a 3-state subspace before the
+        fix. The same shortfall was seen as 41x41 for a 53-state subspace with this repo's local
+        two-site ``js`` operators.
+
+        This failed *silently* -- a truncated matrix is still a valid symmetric matrix, so
+        ``eigvalsh`` returns a plausible wrong ground energy rather than raising. The reference
+        is the dense Kronecker projection, which shares no code with the packing path.
+        """
+        strings = ["IIIIIX"]
+        coeffs = np.array([1.0])
+        states = np.array(
+            [[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 1], [1, 0, 0, 0, 0, 0]], dtype=np.uint8
+        )
+        matrix = hproj((strings, coeffs.tolist()), states)
+        assert matrix.shape == (3, 3), "trailing uncoupled basis state was dropped"
+        expected = project_dense(strings, coeffs, states)
+        assert np.abs(matrix.toarray() - expected.real).max() < 1e-12
+
+    def test_empty_projection_returns_zero_matrix(self):
+        """No in-subspace matrix element at all must give a zero matrix, not a raise.
+
+        With zero surviving elements both index arrays are empty, and scipy cannot infer any
+        extent from them: measured ``ValueError: cannot infer dimensions from zero sized index
+        arrays`` before the fix. A fully off-diagonal operator on a subspace closed under none of
+        its terms is a legitimate (if degenerate) input -- the projection is genuinely zero.
+        """
+        strings = ["XXXXXX"]
+        coeffs = np.array([1.0])
+        states = np.array([[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 1]], dtype=np.uint8)
+        matrix = hproj((strings, coeffs.tolist()), states)
+        assert matrix.shape == (2, 2)
+        assert matrix.nnz == 0
+        expected = project_dense(strings, coeffs, states)
+        assert np.abs(matrix.toarray() - expected.real).max() < 1e-12
 
     def test_is_symmetric(self):
         """A real Hermitian projection must come back exactly symmetric.
@@ -350,6 +392,33 @@ class TestSqdEndToEnd:
         states = rng.integers(0, 2, size=(12, 4)).astype(np.uint8)
         with pytest.raises(ValueError, match="states_size smaller"):
             sqd((["ZIII"], [1.0]), states, states_size=4)
+
+    def test_states_size_actually_prevents_recompilation(self):
+        """``states_size`` pinned the internal arrays but not the input, so it never worked.
+
+        ``sqd`` packed ``states`` to its raw length and handed that to ``run_sqd``, where
+        ``states_p`` is a *traced* argument -- so its leading dimension entered the jit cache key and
+        every distinct ``len(states)`` retraced the whole solver despite the pin. That is the exact
+        thing the parameter is documented to prevent, and it failed silently: results stayed correct,
+        only ~7x slower (measured 0.44 s per call versus 0.064 s once the shape repeats, n=16
+        N=4096). The companion test above covers the numbers; this one covers the contract.
+
+        Asserting on cache misses rather than wall-clock keeps it deterministic on a loaded machine.
+        """
+        rng = np.random.default_rng(20260804)
+        strings = real_pauli_strings(4, 5, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = rng.integers(0, 2, size=(12, 4)).astype(np.uint8)
+        states_size = 16
+
+        # Warm the cache at the pinned shape, then count misses across shorter inputs.
+        eigval_of(strings, coeffs, states, states_size=states_size)
+        before = run_sqd._cache_size()
+        for length in (11, 10, 9):
+            eigval_of(strings, coeffs, states[:length], states_size=states_size)
+        assert run_sqd._cache_size() == before, (
+            "run_sqd retraced for a shorter input despite states_size being pinned"
+        )
 
 
 class TestMatvecKernels:
