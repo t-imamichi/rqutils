@@ -34,7 +34,7 @@ measured, which reorders the priorities.
 
 | # | idea | verdict | measured |
 |---|---|---|---|
-| 1 | `searchsorted` replaces the 2N sort | **adopt** | 12–25× per signature; 12–17× on the J-fold precompute |
+| 1 | `searchsorted` replaces the 2N sort | **ADOPTED — now in `get_xsource`** | 12–25× per signature; 12–19× on the J-fold precompute |
 | 3 | `cache_level=(1,1)` vs `(1,2)` | **know about it** | 16× less memory, 2.4–2.6× slower matvec |
 | 4 | real-symmetric f64 path | **already works** | 1.47–1.80× per solve; nothing to implement |
 | 2 | partial-J caching dial | **marginal** | curve is linear, but endpoints dominate |
@@ -42,7 +42,14 @@ measured, which reorders the priorities.
 | 5 | Gray-code X ordering | **dead** | silently drops 91 % of matrix elements |
 | — | multi-device sharding | **bug found and fixed** | `sqd` failed on *any* mesh |
 
-### 1. searchsorted instead of the sort — adopt
+### 1. searchsorted instead of the sort — ADOPTED
+
+**This is now what `get_xsource` does**; `poc1_searchsorted.py` remains as the exploratory record. The
+integrated version re-measured **12.1×, 18.7×, 16.9×** on the J-fold precompute at N = 100k/200k/500k,
+consistent with the POC. Tests are in `tests/test_sqd.py::TestGetXsource`, verified to fail against
+three injected defects: reversed byte significance (7 failures), the `uint64` path used beyond 8 bytes
+(3 failures, exactly the `B > 8` cases), and a non-negative absent-source sentinel (13 failures).
+
 
 `poc1_searchsorted.py`. `S` comes out of `uniquify_states` already lex-sorted, so finding
 `A[i]` with `S[A[i]] == S[i] ^ x` is a binary search into `S`, not a reason to sort a `2N` stack.

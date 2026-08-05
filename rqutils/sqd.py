@@ -540,6 +540,33 @@ def uniquify_states(states_p: StateList, states_size: int) -> StateList:
     return states_srt.at[idx_unique].get(mode="fill", fill_value=255, wrap_negative_indices=False)
 
 
+def _pack_state_keys(states: StateList) -> jax.Array:
+    """Pack `[N, B]` uint8 state rows into `[N]` uint64 scalar keys, preserving lex order.
+
+    Byte 0 becomes the most significant, so integer order on the keys is identical to row lex order.
+    That equivalence is the whole point: it lets a scalar binary search stand in for a lexicographic
+    one. Only valid while `B <= 8`; :func:`get_xsource` checks that before calling.
+    """
+    nbytes = states.shape[1]
+    shifts = jnp.asarray([8 * (nbytes - 1 - i) for i in range(nbytes)], dtype=jnp.uint64)
+    return jnp.sum(states.astype(jnp.uint64) << shifts, axis=1)
+
+
+def _row_less_than(rows: jax.Array, targets: jax.Array) -> jax.Array:
+    """Elementwise lexicographic `rows[i] < targets[i]` over uint8 rows, MSB-first.
+
+    The first differing byte decides, so mask each byte position by "all higher bytes equal" and
+    take any hit. Written without a loop carry so it stays one fused expression per search step.
+    """
+    eq_prefix = jnp.cumprod(
+        jnp.concatenate(
+            [jnp.ones((rows.shape[0], 1), bool), rows[:, :-1] == targets[:, :-1]], axis=1
+        ),
+        axis=1,
+    ).astype(bool)
+    return jnp.any(jnp.logical_and(eq_prefix, rows < targets), axis=1)
+
+
 @jax.jit
 def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
     """Return an index array into the source of an X operation.
@@ -558,34 +585,63 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
     `A[i] = -1` so that `V[A[i]]` can default to a `fill_value` of 0.0 through `at[].get()` applied
     to `V`.
 
-    To find `A`, we first concatenate `S` and `S ^ X` into a `[2N, B]` array and perform a stable
-    sort along axis 0 to obtain an array `T`. Indices from `0` to `2N` are sorted together so that
-    the resulting index array `I` has value `i` at index `k` such that `T[k] = S[i]` (`i < N`) or
-    `T[k] = (S^X)[i-N]` (`i >= N`). Then, if `T[k] == T[k+1]`, `A[I[k]] = I[k+1] - N`. On the other
-    hand, `T[k] != T[k+1]` where `I[k] < N` implies that the source bitstring does not exist for
-    `S[I[k]]` and therefore `A[I[k]]` must be set to `-1`.
+    **`states` must be lex-sorted.** This has always been required -- the previous sort-based
+    implementation also silently returned a wrong answer otherwise -- but was never stated. Both
+    in-tree callers satisfy it: `run_sqd` passes `uniquify_states`' output, and `hproj` passes
+    `np.unique(..., axis=0)`'s. Note `hproj`'s `unique_states=True` shortcut skips that `np.unique`,
+    so a caller passing unsorted-but-unique states gets a wrong (and non-symmetric) matrix; that
+    predates this implementation and is pinned by
+    `tests/test_sqd.py::TestHproj::test_unsorted_input_is_rejected`.
+
+    Since `S` is sorted, finding `A` is a **binary search** of `S ^ X` into `S` -- not a reason to
+    sort anything. The former implementation concatenated `S` and `S ^ X` into a `[2N, B]` array and
+    sorted that, which cost three things: the `2N` allocation is what caps `N` at `2^31` (the sort
+    must run on one device), `lax.sort` was observed to leak GPU memory (up to 5 GB at shape
+    `(5M, 9)`), and it dominated runtime -- measured 66-97% of an entire solve. A `searchsorted` is a
+    pure gather, so it also shards, where a sort does not. Measured 12-25x faster per signature and
+    12-17x on the J-fold precompute; see `docs/scaling-pocs.md`.
+
+    Two paths, selected statically on width. `B <= 8` packs each row into a `uint64` and uses
+    `jnp.searchsorted` directly; wider inputs fall back to an explicit lexicographic binary search
+    (measured 3.0-3.7x rather than 12-25x, so the fast path is worth keeping separate). The
+    boundary is a correctness limit, not a tuning parameter: at `B > 8` a `uint64` key would silently
+    truncate the row and alias distinct states onto one key.
+
+    Returns `-1` at every position whose source is absent. Note the previous implementation returned
+    *assorted* negative values there (it computed `I[k+1] - N` unconditionally) rather than exactly
+    `-1`; consumers cannot tell, because `apply_xgrp` gathers with
+    `mode="fill", wrap_negative_indices=False` and any negative index yields 0.0. Tests comparing
+    against a stored index array must therefore compare only valid rows, or compare the gathered
+    result.
     """
-    size = states.shape[0]
-    mapped_states = jnp.bitwise_xor(states, xsignature)  # S^X
-    joined = jnp.concatenate([states, mapped_states], axis=0)
-    idx = jax.lax.iota(np.int32, 2 * size)
-    # lax.sort seems to leak GPU memory; can lose as much as 5 GB when sorting x of shape (5M,9)
-    sorted = jax.lax.sort(tuple(joined.T) + (idx,), num_keys=joined.shape[1])
-    joined_sorted = jnp.stack(sorted[:-1], axis=1)  # T
-    idx_sorted = sorted[-1]  # I
+    size, nbytes = states.shape
+    targets = jnp.bitwise_xor(states, xsignature)  # S^X
     invalid = np.array(-1, dtype=np.int32)
 
-    source_idx = jnp.where(
-        jnp.all(jnp.equal(joined_sorted[:-1], joined_sorted[1:]), axis=1),  # T[k] == T[k+1]
-        idx_sorted[1:] - size,  # I[k+1] - N
-        invalid,
-    )
-    # Stripped-down jnp.nonzero implementation (with dtype control; othersize int64 is used
-    # unnecessarily)
-    tposition = jnp.cumsum(
-        jnp.bincount(jnp.cumsum(idx_sorted < size, dtype=np.int32), length=size), dtype=np.int32
-    )
-    xsource = source_idx.at[tposition].get(mode="fill", fill_value=invalid)
+    if nbytes <= 8:
+        keys = _pack_state_keys(states)
+        pos = jnp.searchsorted(keys, _pack_state_keys(targets), side="left")
+        # searchsorted returns N for a target above every key; clamp before gathering so the
+        # equality test below stays in bounds.
+        pos = jnp.minimum(pos, size - 1)
+        found = keys[pos] == _pack_state_keys(targets)
+    else:
+        # Explicit binary search on the rows themselves. Invariant: lo is the count of rows strictly
+        # less than the target, so after ceil(log2(N)) + 1 halvings lo is the insertion point.
+        def step(carry, _):
+            lo, hi = carry
+            mid = (lo + hi) // 2
+            go_right = _row_less_than(states[jnp.minimum(mid, size - 1)], targets)
+            return (jnp.where(go_right, mid + 1, lo), jnp.where(go_right, hi, mid)), None
+
+        nsteps = int(np.ceil(np.log2(max(size, 2)))) + 1
+        lo = jnp.zeros(size, dtype=jnp.int32)
+        hi = jnp.full(size, size, dtype=jnp.int32)
+        (lo, _), _ = jax.lax.scan(step, (lo, hi), None, length=nsteps)
+        pos = jnp.minimum(lo, size - 1)
+        found = jnp.all(states[pos] == targets, axis=1)
+
+    xsource = jnp.where(found, pos, invalid).astype(np.int32)
     if not (mesh := get_abstract_mesh()).empty:
         xsource = jax.reshard(xsource, PartitionSpec(mesh.axis_names))
     return xsource

@@ -131,13 +131,19 @@ Two measured facts about the cost, from the six scaling POCs under `examples/sca
 `docs/scaling-pocs.md`). **`get_xsource` setup dominates** — weighted by call count it is 66–97% of a
 solve (3.1 s against 79 ms of matvec loop at 10 iterations, N=200k, J=50), so the `2N` sort is not
 merely the `N ≤ 2^31` ceiling but the main cost at every size measured, while `matvec/J` is flat at
-~0.16 ms and confirms the `O(J·N)` model. A `searchsorted` into the already-sorted `S` measured
-12–17× faster on the J-fold precompute and is the one adopted recommendation; the caching docstring
-above, which frames the tradeoff as memory-versus-speed, will mislead you about where the time goes.
-**And `get_xsource` returns assorted negatives, not `-1`, on fill-in rows** (`idx_sorted[1:] - size`);
-`apply_xgrp` gathers with `mode="fill", wrap_negative_indices=False`, so any negative yields 0.0. A
-bit-identical gate against it therefore fails spuriously — compare valid-row indices *and* the
-gathered result, which is the only property a consumer can observe.
+~0.16 ms and confirms the `O(J·N)` model. The caching docstring above, which frames the tradeoff as
+memory-versus-speed, will mislead you about where the time goes.
+
+**`get_xsource` is now a binary search, not a sort** (12–19× faster on the J-fold precompute), which is
+why **`states` must be lex-sorted** — always required, since the sort was equally wrong on unsorted
+input, but previously undocumented. `hproj(unique_states=True)` skips its `np.unique` and so can
+violate it; that returns a non-symmetric matrix and is pinned by
+`TestHproj::test_unsorted_input_with_unique_states_is_wrong`. Two paths selected statically on width:
+`uint64` keys for `B ≤ 8` bytes, an explicit lexicographic search beyond. That boundary is a
+**correctness** limit — a `uint64` key silently truncates a wider row and aliases distinct states —
+so if you touch it, note that a test only catches the overrun when the subspace's *leading* bytes
+collide and partners genuinely exist; `packbits` puts low qubit indices in the *leading* bytes, the
+reverse of the qubit numbering, and getting that backwards makes the test pass vacuously.
 
 **`ground_locg.py`** — single-vector (block-size-1) LOBPCG specialization used as `sqd`'s eigensolver, with the Rayleigh–Ritz step solved analytically (`eigenpair_2x2`, `eigenpair_3x3` via Cardano) instead of via `eigh`, to keep memory down for huge vectors. It is sharding-transparent **only if the `mat` callable preserves output sharding** — that contract is why every `apply_*` in `sqd.py` passes `out_sharding=jax.typeof(vec).sharding`. Every guard in it is load-bearing and was measured: `docs/locg.md` catalogues seven defects (I1–I7) that each failed *silently*, returning a plausible wrong number rather than raising. Don't "simplify" the balancing, the re-orthogonalizations, or the zero-direction masks.
 

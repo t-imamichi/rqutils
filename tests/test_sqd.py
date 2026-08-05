@@ -128,6 +128,106 @@ class TestGetXsource:
         hamiltonian = PauliSumXZ.from_paulisum((["XIII"], [1.0]))
         assert np.array_equal(np.asarray(get_xsource(hamiltonian.x[0], states_u)), [2, -1, 0])
 
+    @pytest.mark.parametrize("num_qubits", [6, 7, 8, 15, 16, 23, 24, 55, 63, 64, 71, 80])
+    def test_matches_dense_partner_map_across_byte_widths(self, num_qubits):
+        """Defect: a source-index array that is a *permutation* of the right answer.
+
+        ``get_xsource`` is a binary search into a lex-sorted ``S``, with a ``uint64``-key fast path
+        for ``B <= 8`` bytes and a lexicographic fallback beyond. Two ways that goes wrong silently:
+
+        - Packing bytes in the wrong significance order makes integer order disagree with row lex
+          order, so the search lands on a *different but valid* index. Every consumer still gets a
+          finite number and the projected matrix stays symmetric.
+        - At ``B > 8`` a ``uint64`` key cannot hold the row, so distinct states alias onto one key
+          and unrelated states are reported as partners. This is why the width boundary is a
+          correctness check and not a tuning knob.
+
+        The reference is a dict from state bytes to row index, built with plain Python -- it shares
+        no code with the packing, the search, or the sort the search replaced. The parametrization
+        straddles every byte boundary the packing crosses: ``n+1`` at 7/8/9 bits, 15/16/17, and the
+        ``B = 8`` -> ``B = 9`` transition at ``n = 63``/``64`` where the fast path must hand over to
+        the fallback.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        rng = np.random.default_rng(num_qubits)
+        # The subspace is CONSTRUCTED to be partly closed under flipping the last qubit, not sampled
+        # and hoped over. Two reasons, both learned by getting it wrong:
+        #
+        # - If no signature has a partner inside the subspace, the expected answer is "-1
+        #   everywhere" and an implementation that finds nothing agrees with it. A random wide
+        #   signature essentially never has a partner, so the test would pass vacuously.
+        # - The variation is concentrated in the TRAILING bytes of the packed row so the leading 8
+        #   bytes collide across states. That is what makes a truncating uint64 key alias distinct
+        #   states, which is the ``B > 8`` failure this parametrization exists to catch. Note the
+        #   orientation: ``packbits`` fills from the most significant end and the pad bit is at
+        #   position 0, so *low* qubit indices land in the *leading* bytes -- the reverse of the
+        #   little-endian qubit numbering.
+        nvary = min(num_qubits, 12)
+        base = np.zeros((200, num_qubits), dtype=np.uint8)
+        base[:, num_qubits - nvary :] = rng.integers(0, 2, size=(200, nvary), dtype=np.uint8)
+        # Include each state's last-qubit partner for half the rows, so partners both exist (those)
+        # and are absent (the rest).
+        partners = base[: base.shape[0] // 2].copy()
+        partners[:, -1] ^= 1
+        states = np.unique(np.concatenate([base, partners], axis=0), axis=0)
+        states_p = pack_padded(states)
+        states_u = np.asarray(uniquify_states(states_p, states_p.shape[0]))
+
+        # Independent reference: explicit lookup table over the packed rows.
+        row_of = {row.tobytes(): i for i, row in enumerate(states_u)}
+
+        # At least one signature must have partners that genuinely EXIST in the subspace, or the
+        # expected answer is "-1 everywhere" and any implementation returning nothing agrees with
+        # it. A random wide signature almost never has a partner in a sampled subspace, so include a
+        # low-weight one -- flipping one of the last qubits keeps ~half the pairs inside a subspace
+        # whose variation lives in those bits.
+        low_weight = "I" * (num_qubits - 1) + "X"
+        labels = [low_weight]
+        labels += ["".join(rng.choice(list("IXYZ"), size=num_qubits)) for _ in range(2)]
+        hamiltonian = PauliSumXZ.from_paulisum((labels, [1.0] * len(labels)))
+        # Guard the guard: if no signature couples anything, this test proves nothing.
+        n_present = max(
+            int(np.sum(np.asarray(get_xsource(np.asarray(xs), states_u)) >= 0))
+            for xs in hamiltonian.x
+        )
+        assert n_present > 0, (
+            f"n={num_qubits}: no signature has any partner in the subspace, so the expected "
+            "answer is -1 everywhere and this test cannot distinguish implementations"
+        )
+
+        for xsig in hamiltonian.x:
+            got = np.asarray(get_xsource(np.asarray(xsig), states_u))
+            expected = np.array(
+                [row_of.get(np.bitwise_xor(row, xsig).tobytes(), -1) for row in states_u],
+                dtype=np.int32,
+            )
+            # Fill-in rows (all-255) have no source; both sides agree they are absent, but only the
+            # sign is contractual there -- see the note in get_xsource's docstring.
+            is_fill = states_u[:, 0] == 255
+            assert np.array_equal(got[~is_fill], expected[~is_fill]), (
+                f"n={num_qubits} B={states_u.shape[1]}: index array disagrees with the dense "
+                f"partner map on {int(np.sum(got[~is_fill] != expected[~is_fill]))} valid rows"
+            )
+            assert np.all(got[is_fill] < 0), "fill rows must report no source"
+
+    def test_absent_source_is_negative_not_wrapped(self):
+        """Defect: an absent source that indexes a real vector entry instead of gathering zero.
+
+        The contract consumers rely on is only that an absent source is *negative*, since
+        ``apply_xgrp`` gathers with ``wrap_negative_indices=False``. A non-negative sentinel (0, or
+        ``N``) would silently add a spurious matrix element. Pinned here because the sort-based
+        implementation returned assorted negatives while the search returns exactly -1, so the
+        *sign* is the invariant, not the value.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        # Single state whose IIIX partner (0001) is not in the subspace.
+        states_u = uniquify_states(pack_padded(np.array([[0, 0, 0, 0]], dtype=np.uint8)), 1)
+        hamiltonian = PauliSumXZ.from_paulisum((["IIIX"], [1.0]))
+        got = np.asarray(get_xsource(hamiltonian.x[0], states_u))
+        assert got[0] < 0, f"absent source must be negative, got {got[0]}"
+
 
 class TestUniquifyStates:
     """``uniquify_states`` sorts, deduplicates, and pads to a fixed size with 255 fillers."""
@@ -153,6 +253,36 @@ class TestUniquifyStates:
 
 class TestHproj:
     """``hproj`` builds the projected Hamiltonian densely (sparse), as a debug/reference path."""
+
+    def test_unsorted_input_with_unique_states_is_wrong(self):
+        """Defect: ``unique_states=True`` accepts unsorted states and returns a wrong matrix.
+
+        ``get_xsource`` requires a lex-sorted ``S``. Both production callers satisfy it -- ``run_sqd``
+        via ``uniquify_states``, ``hproj`` via ``np.unique(..., axis=0)`` -- but ``hproj``'s
+        ``unique_states=True`` shortcut skips that ``np.unique``, so a caller who has already
+        deduplicated *without* sorting silently violates the precondition.
+
+        This predates the search-based ``get_xsource``: the sort-based implementation was equally
+        wrong on unsorted input, just wrong differently. The test pins the *detectable signature*
+        rather than the specific wrong numbers, since those are implementation-dependent: the
+        returned matrix is **not symmetric**, which a Hermitian projection must always be. It exists
+        so that anyone tightening this into a raise has a named test to flip, and so the asymmetry is
+        not mistaken for a regression in the search.
+        """
+        # Unique but NOT sorted: row order is 1000, 0000, 0001.
+        unsorted = np.array([[1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 1]], dtype=np.uint8)
+        bad = hproj((["IIIX"], [1.0]), unsorted, unique_states=True).toarray().real
+        assert not np.allclose(bad, bad.T), (
+            "unsorted input happened to give a symmetric matrix; this test's premise is stale"
+        )
+
+        # The same states, sorted, give the correct symmetric coupling 0000 <-> 0001.
+        good = hproj((["IIIX"], [1.0]), np.unique(unsorted, axis=0), unique_states=True)
+        good = good.toarray().real
+        assert np.allclose(good, good.T)
+        expected = np.zeros((3, 3))
+        expected[0, 1] = expected[1, 0] = 1.0
+        assert np.allclose(good, expected)
 
     def test_matches_dense_reference(self):
         """``hproj`` packed states WITHOUT the pad bit while padding the Hamiltonian.
