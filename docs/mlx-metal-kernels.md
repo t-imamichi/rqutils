@@ -235,6 +235,29 @@ establish that the MSL compiles and is correct on hardware. As of 2026-08-05 all
 M1 with `FAILURES: none`, and the fused eigensolve agrees with `numpy.linalg.eigh` to 2.98e-07
 (GPU) and 4.00e-07 (CPU) over 40 random symmetric matrices.
 
+**Re-run after the option collapse (2026-08-05, same M1), all 12 arms `FAILURES: none`.** This is
+the run that validates the `device=`-selected *combinations*, not just each kernel in isolation.
+Three things it pinned:
+
+- `mlx-gpu-f32 --matvec metal` measured **0.224 ms/iter at 70 iterations** with
+  `matvec_err` 1.69e-06 — the bottom of the 0.224–0.227 range recorded for this configuration
+  above, which is what confirms `device="gpu"` actually reaches both fused kernels rather than
+  silently falling back to the op-graph path. A fallback would have read ~0.46.
+- The eigenvalue was **−5.3960409164**, i.e. the *post*-`_compute_sas` value, not the
+  −5.3960399628 in the eigensolve table. Both are correct; see the f32 last-digit paragraph above
+  before treating the difference as a regression.
+- `mlx-cpu-f64` reported `matvec_err` **exactly 0.0**, better than the 3.55e-15 recorded for the
+  f64 arms previously. Structural rather than lucky: at this problem's J≤20 with `chunk=16` the
+  chunked gather is one flat `take` plus a single `mx.sum`, so there is no cross-group `out = out +
+  ...` accumulation left to round. The deleted group-at-a-time matvec accumulated J times, which is
+  where the 3.55e-15 came from.
+
+One combination is now exercised **only** by this checker: `mlx-cpu-f32` with `device="gpu"` (fused
+eigensolve, op-graph matvec on the CPU backend). `bench.py` derives `device` from the arm name, so
+it cannot produce that pairing. It passes at `rtol=1e-4`, and its eigenvalue legitimately differs
+from the same arm's `metal-both` in the last two f32 digits — different arithmetic runs in different
+places — so do not expect bit-equality between those two rows.
+
 ## Scope and limitations
 
 - **One machine.** Every timing here is an Apple M1 with a 7-core GPU. Ratios on other Apple

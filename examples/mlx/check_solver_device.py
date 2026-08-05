@@ -14,8 +14,13 @@ to compile and to be correct. The fused Rayleigh-Ritz kernel that used to be che
 it measured slower than the op-graph path (see docs/mlx-metal-kernels.md).
 
 The arms below were rewritten when the solver's option surface collapsed to a single `device`
-parameter, so the *combinations* are new even though both kernels are device-validated. Re-run
-after any change here.
+parameter. That rewrite HAS since been run on an M1: all 12 arms pass, `FAILURES: none`
+(2026-08-05). Re-run after any change here.
+
+Note the `mlx-cpu-f32 device=gpu` arm is the one configuration `bench.py` cannot produce -- it
+derives `device` from the arm name, so it never pairs the CPU backend with the fused eigensolve.
+Its eigenvalue legitimately differs from the same arm's `metal-both` row in the last two f32
+digits, since different arithmetic runs in different places; the gate is `rtol`, not bit-equality.
 
 Run with:
     uv run python examples/mlx/check_solver_device.py
