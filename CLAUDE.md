@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Environment & commands
 
-Always use `uv run python` (not bare `python`) — the venv at `.venv` is managed by uv.
+Always use `uv run python` (not bare `python`) — the venv at `.venv` is managed by uv. No `timeout` on
+macOS (it is GNU coreutils) — use the Bash tool's own timeout rather than wrapping a command in it.
 
 ```bash
 uv run python -c "import rqutils; print(rqutils.__version__)"
@@ -69,6 +70,12 @@ allows. Those were triaged individually rather than blanket-disabled — prefer 
 in the code over widening the ignore list. Pre-commit runs only whitespace/EOF/YAML/large-file
 hooks; it does not run ruff or ty.
 
+New scripts under `examples/` trip rules the existing tree does not: **B023** (a `lambda` in a `for`
+loop capturing the loop variable — endemic to benchmark harnesses passing thunks to a timer; fix by
+binding as a default arg, `lambda vec=vec: ...`, not by restructuring the loop) and **E402** (imports
+after the mandatory `jax.config.update('jax_enable_x64', True)`, which needs `# noqa: E402`).
+`ruff --fix` resolves neither.
+
 ## Testing
 
 ```bash
@@ -77,11 +84,12 @@ uv run --extra dev pytest -v -x        # verbose, stop at first failure
 ```
 
 One `tests/test_<module>.py` per module. All seven are covered — `ground_locg`, `sqd`, `svsim`,
-`paulis/general`, `paulis/symplectic`, `qprint`, `math` — but **only single-device**: nothing
-exercises a multi-device mesh, so `ground_locg`'s `out_sharding` contract, `sqd`'s mesh-size
-padding, and `svsim`'s `out_sharding` are all unverified. `rqutils/ground_locg_mlx.py` needs a Metal
-device and is checked by `examples/mlx/check_solver_headless.py` (numpy shim, runs anywhere) and
-`examples/mlx/check_solver_device.py` (real device) instead. `tests/` also contains three Jupyter
+`paulis/general`, `paulis/symplectic`, `qprint`, `math` — but **only single-device**: no *test*
+exercises a multi-device mesh. `sqd`'s mesh-size padding and, through it, `ground_locg`'s
+`out_sharding` contract are now covered by `examples/scaling/poc7_sharding.py` (see below) rather than
+by pytest; **`svsim`'s `out_sharding` is still exercised by nothing.** `rqutils/ground_locg_mlx.py`
+needs a Metal device and is checked by `examples/mlx/check_solver_headless.py` (numpy shim, runs
+anywhere) and `examples/mlx/check_solver_device.py` (real device) instead. `tests/` also contains three Jupyter
 notebooks used as interactive scratchpads; pytest does not collect them.
 
 `tests/conftest.py` enables `jax_enable_x64` before any `rqutils` import — every tolerance in the
@@ -96,6 +104,15 @@ internal code path agree on the same wrong number. Verify a new test actually fa
 it targets by reverting the fix in place; a copy of the repo does not work, since the venv holds an
 editable install pointing at the original.
 
+**Multi-device paths are testable on CPU — use it.**
+`XLA_FLAGS=--xla_force_host_platform_device_count=4` gives virtual devices that exercise every
+sharding code path (mesh detection, `PartitionSpec` propagation, `jax.reshard`, `sqd`'s mesh-size
+padding) with no GPU. This is not hypothetical: the first run found `sqd` raising `ShardingTypeError`
+on *any* mesh, because one scatter omitted `out_sharding` while every neighbouring op passed it.
+`examples/scaling/poc7_sharding.py` is the harness — sharded against single-device against a dense
+`eigvalsh` reference, plus every residue of `N mod mesh.size`. Timings under virtual devices are
+meaningless (they share one CPU), so use this for correctness only.
+
 ## Architecture
 
 Eight largely independent modules under `rqutils/`; nothing but `sqd.py → {paulis/symplectic.py, ground_locg.py}` and `qprint.py → paulis/general.py` couples them. `ground_locg_mlx.py` imports nothing from the package and nothing imports it.
@@ -109,6 +126,18 @@ Eight largely independent modules under `rqutils/`; nothing but `sqd.py → {pau
 
 - States carry **one extra zero pad bit at position 0** before `packbits`. `PauliSumXZ` reserves the same bit in its signatures unconditionally, so the two are aligned by construction — this used to be an opt-in `add_padding` flag, and the two sides disagreeing is how `hproj` shipped broken. Filler slots produced by uniquification are `255`, detected via `states_u[:, 0] >> 7`.
 - `cache_level=(source_indices, diagonals)` selects among six matvec strategies trading memory for speed. They are one kernel, `apply_h`, indexed by that 2×3 grid; `cache_level` **must** stay static (it is bound via `functools.partial`, since `ground_locg` splats `args` positionally and `static_argnames` would never see it). `apply_h_xz_cached` is a named wrapper for `(1, 2)` because `examples/mlx/bench.py` and `ground_locg_mlx` both refer to it. `states_size` exists solely to pin array shapes and prevent JIT recompilation.
+
+Two measured facts about the cost, from the six scaling POCs under `examples/scaling/` (findings in
+`docs/scaling-pocs.md`). **`get_xsource` setup dominates** — weighted by call count it is 66–97% of a
+solve (3.1 s against 79 ms of matvec loop at 10 iterations, N=200k, J=50), so the `2N` sort is not
+merely the `N ≤ 2^31` ceiling but the main cost at every size measured, while `matvec/J` is flat at
+~0.16 ms and confirms the `O(J·N)` model. A `searchsorted` into the already-sorted `S` measured
+12–17× faster on the J-fold precompute and is the one adopted recommendation; the caching docstring
+above, which frames the tradeoff as memory-versus-speed, will mislead you about where the time goes.
+**And `get_xsource` returns assorted negatives, not `-1`, on fill-in rows** (`idx_sorted[1:] - size`);
+`apply_xgrp` gathers with `mode="fill", wrap_negative_indices=False`, so any negative yields 0.0. A
+bit-identical gate against it therefore fails spuriously — compare valid-row indices *and* the
+gathered result, which is the only property a consumer can observe.
 
 **`ground_locg.py`** — single-vector (block-size-1) LOBPCG specialization used as `sqd`'s eigensolver, with the Rayleigh–Ritz step solved analytically (`eigenpair_2x2`, `eigenpair_3x3` via Cardano) instead of via `eigh`, to keep memory down for huge vectors. It is sharding-transparent **only if the `mat` callable preserves output sharding** — that contract is why every `apply_*` in `sqd.py` passes `out_sharding=jax.typeof(vec).sharding`. Every guard in it is load-bearing and was measured: `docs/locg.md` catalogues seven defects (I1–I7) that each failed *silently*, returning a plausible wrong number rather than raising. Don't "simplify" the balancing, the re-orthogonalizations, or the zero-direction masks.
 
