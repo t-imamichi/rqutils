@@ -90,6 +90,44 @@ alone predicts, because the fused kernel also removes ~34 intermediate allocatio
 Unlike the op-graph reductions below, **this win survives compilation** — it is on top of the 2.71×,
 not masked by it.
 
+## How MLX actually compares to JAX
+
+Every other measurement here is MLX-vs-MLX. This is the cross-framework picture, all five available
+arms in one `--all` sweep on identical arrays with the same matvec — the only configuration in which
+the comparison is meaningful (M1, n=12/p=100/s=1000, `--matvec chunked`, `--repeat 5`, 2026-08-05):
+
+| arm | per_it_ms | iters | solve_s | eigval | matvec_err |
+|---|---|---|---|---|---|
+| `jax-cpu-f64` | **0.302** | 217 | 0.0653 | −5.3960400377 | 3.55e-15 |
+| `jax-cpu-f32` | **0.223** | 63 | 0.0147 | −5.3960390091 | 8.27e-07 |
+| `mlx-cpu-f64` | 2.318 | 220 | 0.5175 | −5.3960400377 | 3.55e-15 |
+| `mlx-cpu-f32` | 2.241 | 70 | 0.1695 | −5.3960409164 | 8.43e-07 |
+| `mlx-gpu-f32` | 0.412 | 70 | 0.0398 | −5.3960390091 | 1.04e-06 |
+
+The like-for-like ratios:
+
+- **f64, CPU: JAX is 7.7× faster** (0.302 vs 2.318).
+- **f32, CPU: JAX is 10.0× faster** (0.223 vs 2.241).
+- **MLX's own backends: the GPU is 5.4× its CPU backend** (2.241 → 0.412), and with the fused
+  matvec+eigensolve it reaches 0.224–0.229 — another ~1.8×.
+- **Best of each, f32: JAX on CPU still beats MLX on the GPU, 1.85×** (0.223 vs 0.412). Even MLX's
+  fully fused 0.228 does not overtake it.
+
+Two things this table establishes beyond the timings:
+
+- **The port is arithmetically faithful.** The two f64 arms agree on the eigenvalue to 11 digits
+  (−5.3960400377) with identical `matvec_err` (3.55e-15), from independent implementations. That is
+  much stronger evidence than any self-consistency check.
+- **The f64 iteration counts essentially match** (217 vs 220), which is what retires the old
+  "Cardano costs MLX 2.4× the iterations" claim — see the `eigh` discussion below.
+
+Read `per_it_ms`, not `solve_s`, when comparing across precisions: f32 converges in far fewer
+iterations (63–70 vs 217–220), so `solve_s` conflates speed with iteration count. And note the
+residual asymmetry the `bench.py` caveat describes — MLX compiles the iteration *body* while JAX jits
+the whole loop, so MLX still re-walks the driving Python loop per call. It biases against MLX, which
+is the safe direction, but it means these ratios are an upper bound on MLX's disadvantage rather than
+a measurement of its kernels.
+
 ## Negative results — do not rediscover these
 
 ### `sas="metal"`: fusing the Rayleigh–Ritz reduction was *slower*
@@ -160,13 +198,30 @@ the comparison is one general `eigh` launch against a single fused launch alread
 floor and hand-specialized to nine numbers: break-even is the *optimistic* case, against a measured
 1.75× that would be given up.
 
-**The one place `eigh` might still win, unexplored.** What it would buy is accuracy: it is ~2×10⁷
-times more accurate than Cardano on the near-degenerate matrices a converging LOBPCG produces
-(1.8e-15 versus 3.6e-08). That is the documented cause of `mlx-cpu-f64` needing **217 iterations
-where JAX's f64 needs 89**. An `eigh`-backed path confined to the f64 CPU arm — which can use no
-Metal kernel and crosses no device boundary — is therefore a plausibly *large* win via fewer
-iterations rather than faster ones. It is not implemented, and would need measuring on real
-hardware before being believed.
+**The one place `eigh` might still win — and the evidence for it is now weak.** What it would buy is
+accuracy: it is ~2×10⁷ times more accurate than Cardano on the near-degenerate matrices a converging
+LOBPCG produces (1.8e-15 versus 3.6e-08). Earlier notes here cited `mlx-cpu-f64` needing "217
+iterations where JAX's f64 needs 89" as the payoff, implying MLX's Cardano path costs ~2.4× the
+iterations.
+
+**That comparison was across different problem sizes and does not survive a controlled run.** At
+n=12/p=100/s=1000, `--matvec chunked` on an M1 (2026-08-05):
+
+| arm | iters | per_it_ms | eigval | matvec_err |
+|---|---|---|---|---|
+| `jax-cpu-f64` | 217 | 0.302 | −5.3960400377 | 3.55e-15 |
+| `mlx-cpu-f64` | 220 | 2.318 | −5.3960400377 | 3.55e-15 |
+
+Same eigenvalue to 11 digits, same matvec error, and **220 vs 217 iterations — a 1.4% difference,
+not 2.4×**. Both implementations use the same Cardano formulation, so this is the expected result;
+the "89" figure belongs to some other configuration and should not be read as a JAX-vs-MLX
+iteration-count gap.
+
+So an `eigh`-backed f64 path would have to justify itself on *accuracy* alone, with no iteration-count
+win to bank on at this size. Cardano's near-degeneracy error is real and could still bite on a
+harder spectrum — but nothing measured here shows it costing iterations, and the honest summary is
+that MLX's f64 gap is **~7.7× in per-iteration time**, not in iteration count. Anyone reviving this
+idea should first find a problem where the iteration counts actually diverge.
 
 ## Op-count reduction: fewer ops is not automatically less time
 

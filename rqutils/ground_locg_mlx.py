@@ -590,8 +590,9 @@ def _eigenpair_3x3_metal(mat):
     degenerate (measured 3.6e-08 versus ``eigh``'s 1.8e-15), and ``rqutils.ground_locg``'s JAX
     original exhibits *bit-identical* error on the same matrices. This kernel is that same
     formulation, so an f32 solve using it is subject to the same fragility as an f32 solve without
-    it -- see ``docs/mlx-metal-kernels.md``, which traces
-    ``mlx-cpu-f64``'s 652-iteration count to exactly this.
+    it. Note this fragility has NOT been observed to cost iterations: in a controlled run the f64
+    arms of both frameworks converged in 220 (MLX) versus 217 (JAX) iterations to the same
+    eigenvalue. See ``docs/mlx-metal-kernels.md``.
 
     Args:
         mat: A 3x3 real symmetric matrix, float32. Only the diagonal and lower triangle are read
@@ -1124,9 +1125,10 @@ def eigenpair_3x3(mat):
 
     ``mx.linalg.eigh`` does exist and would accept this input directly; the analytic route is kept
     because a per-iteration eigensolve that crosses the device boundary measured 1.37x slower, not
-    because MLX lacks an eigensolver. See the module docstring for the numbers and for the one case
-    (the f64 CPU arm, where Cardano's near-degeneracy error costs 217 iterations against JAX's 89)
-    in which ``eigh`` might still win.
+    because MLX lacks an eigensolver. An earlier note here claimed Cardano's near-degeneracy error
+    costs the f64 CPU arm 217 iterations against JAX's 89, which would have made an ``eigh``-backed
+    f64 path a large win; a controlled run retired that claim (220 vs 217 -- both frameworks use the
+    same formulation, so they converge alike). ``docs/mlx-metal-kernels.md`` has the numbers.
     """
     consts = _consts(mat.dtype)
     eye = consts["eye3"]
