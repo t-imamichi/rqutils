@@ -64,7 +64,14 @@ one ``(7, 3)`` normalization, ``mx.diagonal``/``mx.roll`` instead of element-by-
 rebuilding them every iteration. Each of those was verified *bit-identical* to the form it
 replaced, not merely close: they change only how many ops are launched, never the arithmetic.
 Measured with ``examples/count_mlx_ops.py``, the LOBPCG body went from 116 to 76.3 op
-constructions per iteration (-34%) with the eigenvalue and iteration count unchanged. This is the
+constructions per iteration (-34%) with the eigenvalue and iteration count unchanged. In
+wall-clock terms that is worth **about 1.05-1.10x** on ``mlx-cpu-f64`` -- the arm that isolates
+this work, since Metal's lack of float64 means none of the fused kernels can run there (2.928 ->
+2.689 ms/iter, controlled, uncompiled; a 3.9% noise floor on this arm is why the range rather than
+the ratio). Small but real, and consistent with the mechanism: this removes Python-level op
+construction, which the cost model ranks third, on a backend with no kernel-launch latency to
+reclaim. Expect less under ``compile_body``, which already amortizes graph construction. This is
+the
 one respect in which "when you change one, change both" should *not* be applied mechanically:
 porting these batched forms back to JAX would be churn, since XLA already fuses what they
 hand-fuse. The algebra is what must stay in step, not the op granularity.

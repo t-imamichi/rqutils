@@ -188,16 +188,44 @@ original, which already used `diagonal`/`roll`/`prod`.
 
 ## What this does not tell you
 
-**No timing measurement was taken, on either backend.** MLX requires a Metal
-device to initialize and none was reachable, so every number here is an
-op-construction count, not a wall-clock figure. The POC's cost model ranks
-op-construction count *third*, behind sync count and launch count — and this
-change touches neither of the first two: it removes no syncs and the iteration
-count is unchanged. So the honest prediction is a modest improvement on the
-uncompiled MLX path, largest where per-op overhead dominates (small N), and
-smaller under `--compile-body`, which already amortizes graph construction.
-**Someone with a Metal device should run `examples/bench_mlx.py` before any
-speedup factor is quoted.**
+**These counts are op constructions, not wall-clock time.** The POC's cost model
+ranks op-construction count *third*, behind sync count and launch count — and this
+change touches neither of the first two: it removes no syncs and the iteration count
+is unchanged.
+
+### Measured on `mlx-cpu-f64` (M1, 2026-08-05)
+
+`mlx-cpu-f64` is the arm that isolates this work: Metal has no float64, so none of
+the three fused kernels can run and what remains is purely the op-graph reductions.
+Controlled, `956afa3` (before) vs `8318cd9` (after), n=12/p=100/s=1000,
+`--matvec chunked`, no `--compile-body`, `--repeat 10`:
+
+| | `per_it_ms` | `solve_s` |
+|---|---|---|
+| baseline | 2.928 | 0.6403 |
+| optimized | 2.689 | 0.5870 |
+| | 1.089× | 1.091× |
+
+`iters` 217 and `eigval` -5.3960400377 identical in both, confirming bit-identical
+numerics.
+
+**Quote this as "about 1.05–1.10×", not 1.089×.** Two same-code runs on this arm
+spread 3.9% (2.656 vs 2.760), so while 8.9% clears the noise floor, three
+significant figures overstate the precision. `per_it_ms` and `solve_s` agreeing to
+0.2% is the internal consistency check: `iters` does not move, so they must track.
+
+Small but real, and consistent with the mechanism — removing Python-level op
+construction on a backend with no kernel-launch latency to reclaim. Expect *less*
+under `--compile-body`, which already amortizes graph construction, and the f32
+Metal arms get their speed from the fused kernels instead (see the update above).
+
+Method note: three earlier attempts at this measurement were uninterpretable. A
+`git stash push` silently no-op'd (the work was already committed), so two runs
+measured the same code — which is how the 3.9% noise floor above got measured. Then
+reverting only `ground_locg_mlx.py` left `bench_mlx.py` at HEAD passing the `eig=`
+kwarg the old module lacks, raising `TypeError`. **Revert both files together, and
+verify with `grep -c _CONST_CACHE rqutils/ground_locg_mlx.py` (0 = baseline) before
+trusting a baseline row.**
 
 `examples/count_mlx_ops.py` is new and exists to make this class of regression
 visible: it re-executes the module's own source against a counting numpy shim, so
