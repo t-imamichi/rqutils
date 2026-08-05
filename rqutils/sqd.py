@@ -162,7 +162,7 @@ SQD API
 
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from numbers import Number
 
 import jax
@@ -598,9 +598,27 @@ def get_diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Arr
     return jax.lax.scan(get_signs, (init, 0, 0), zsignatures)[0][0]
 
 
-@jax.jit
-def compute_diagonal(diag_signs: NDArray[np.uint8], coeffs: NDArray[np.inexact]) -> jax.Array:
-    """Compute the diagonals from the sign bits and coefficients."""
+def _accumulate_diagonal(
+    coeffs: NDArray[np.inexact], template: jax.Array, sign_bit: Callable[[jax.Array], jax.Array]
+) -> jax.Array:
+    """Sum ``coeff * (1 - 2 * sign_bit(iterm))`` over the Z terms of one X group.
+
+    The two public diagonal builders differ only in how they derive the sign bit -- from cached
+    packed bits, or from ``popcount(state & z)`` -- so everything else lives here: the termination
+    rule, the accumulator dtype, and the output sharding.
+
+    Null terms are removed by ``hamiltonian.simplify()`` on ingest, so a zero coefficient marks the
+    end of the real terms in a zero-padded Z group and the loop stops there rather than scanning the
+    full rectangle.
+
+    Args:
+        coeffs: Phased coefficients for this X group, shape ``(K,)``.
+        template: Array whose leading axis length and sharding the output follows.
+        sign_bit: Maps a term index to that term's per-state sign bit (0 or 1).
+
+    Returns:
+        The composed diagonal, shape ``(template.shape[0],)``.
+    """
 
     def cond_fn(val):
         iterm = val[1]
@@ -608,21 +626,27 @@ def compute_diagonal(diag_signs: NDArray[np.uint8], coeffs: NDArray[np.inexact])
 
     def add_diag(val):
         diagonal, iterm = val
-        coeff = coeffs[iterm]
-        ibyte = iterm // 8
-        # iterm & 7, not iterm & 255: this is the bit offset WITHIN the byte selected above, so it
-        # must wrap at 8. With & 255 the shift 7 - ibit goes negative from iterm=8 onward, i.e. as
-        # soon as an X group holds more than 8 Z terms, and the composed diagonal is silently wrong
-        # (measured: 0.71 absolute error on 9 terms, and a 25% error in the end-to-end eigenvalue).
-        ibit = iterm & 7
-        signed = (diag_signs[:, ibyte] >> (7 - ibit)) & 1
-        signs = 1.0 - 2.0 * signed
-        return diagonal + coeff * signs, iterm + 1
+        signs = 1.0 - 2.0 * sign_bit(iterm)
+        return diagonal + coeffs[iterm] * signs, iterm + 1
 
     init = jnp.zeros(
-        diag_signs.shape[0], dtype=coeffs.dtype, out_sharding=jax.typeof(diag_signs).sharding
+        template.shape[0], dtype=coeffs.dtype, out_sharding=jax.typeof(template).sharding
     )
     return jax.lax.while_loop(cond_fn, add_diag, (init, 0))[0]
+
+
+@jax.jit
+def compute_diagonal(diag_signs: NDArray[np.uint8], coeffs: NDArray[np.inexact]) -> jax.Array:
+    """Compute the diagonals from the sign bits and coefficients."""
+
+    def sign_bit(iterm):
+        # iterm & 7, not iterm & 255: this is the bit offset WITHIN the selected byte, so it must
+        # wrap at 8. With & 255 the shift 7 - ibit goes negative from iterm=8 onward, i.e. as soon as
+        # an X group holds more than 8 Z terms, and the composed diagonal is silently wrong
+        # (measured: 0.71 absolute error on 9 terms, and a 25% error in the end-to-end eigenvalue).
+        return (diag_signs[:, iterm // 8] >> (7 - (iterm & 7))) & 1
+
+    return _accumulate_diagonal(coeffs, diag_signs, sign_bit)
 
 
 @jax.jit
@@ -631,21 +655,10 @@ def get_diagonal(
 ) -> jax.Array:
     """Return the fully composed diagonals for one X signature."""
 
-    # Null terms are removed with hamiltonian.simplify() so we iterate until we hit coeff=0
-    def cond_fn(val):
-        iterm = val[1]
-        return jnp.logical_and(iterm < coeffs.shape[0], jnp.not_equal(coeffs[iterm], 0.0))
+    def sign_bit(iterm):
+        return jnp.sum(jnp.bitwise_count(states & zsignatures[iterm]), axis=1, dtype=np.uint8) & 1
 
-    def add_diag(val):
-        diagonal, iterm = val
-        zsignature = zsignatures[iterm]
-        coeff = coeffs[iterm]
-        signed = jnp.sum(jnp.bitwise_count(states & zsignature), axis=1, dtype=np.uint8) & 1
-        signs = 1.0 - 2.0 * signed
-        return diagonal + coeff * signs, iterm + 1
-
-    init = jnp.zeros(states.shape[0], dtype=coeffs.dtype, out_sharding=jax.typeof(states).sharding)
-    return jax.lax.while_loop(cond_fn, add_diag, (init, 0))[0]
+    return _accumulate_diagonal(coeffs, states, sign_bit)
 
 
 @jax.jit
