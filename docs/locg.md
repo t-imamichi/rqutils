@@ -88,11 +88,65 @@ With I1–I3 fixed plus a Rayleigh-quotient polish (see below), over 20000 rando
 The fixed closed form matches LAPACK to within a bit. The Rayleigh-quotient polish
 ($\theta \leftarrow v^\dagger B v$ on the balanced matrix) is second-order in the eigenvector error
 and lifts near-degenerate cases from $\sqrt{\epsilon} \approx 3\times10^{-9}$ to full
-$10^{-16}$ — worth its cost, since it is three flops on a 3-vector.
+$10^{-16}$ — worth its cost, since it is three flops on a 3-vector. Note this fixes the
+*eigenvalue* only; see "The polish rescues $\theta$, not $v$" below.
 
-Cost: compile 46 ms → 85 ms, per-call 5.0 µs → 8.2 µs. `jnp.linalg.eigh` is 6.8 µs per call but
-126 ms to compile, so keeping the closed form remains justified — this preserves the design
-intent recorded in the "`jnp.sum` hates small arrays" comments.
+Cost: compile 46 ms → 85 ms, per-call 5.0 µs → 8.2 µs.
+
+**Why not `jnp.linalg.eigh`, restated.** This was originally justified on compile time: `eigh` cost
+126 ms against the closed form's 85 ms. **That is no longer true** — re-measured on jax 0.11.0,
+`eigh` compiles in **20.3 ms (f64) / 21.8 ms (complex128)** against the closed form's unchanged
+83.9 / 106.6 ms, and is *faster* per call (5.91 vs 6.93 µs). End-to-end first-call compile for
+`ground_locg` drops 279 ms → 3.1 ms at $n = 200$. Anyone re-deriving the decision from compile time
+alone will now reach the opposite conclusion, so the argument that actually survives is:
+
+- **`eigh` is a fusion barrier inside the `while_loop` body.** On GPU it lowers to an FFI custom
+  call, `{cuda,rocm}solver_syevd_ffi` (`jax/_src/lax/linalg.py:1298-1306`), which XLA cannot fuse
+  into the surrounding elementwise graph. The closed form is nine-number scalar arithmetic that
+  folds into neighbouring kernels. This is the real content of the "`jnp.sum` hates small arrays"
+  design intent.
+- **cuSOLVER `syevd` on a 3×3 is pathological**: a blocked algorithm with workspace queries, sized
+  for $n$ in the hundreds-to-thousands. Compare the sibling MAGMA path's own docstring warning
+  (`linalg.py:150-152`), "typically slower than the equivalent LAPACK implementation for small
+  matrices (less than about 2048)" — three orders of magnitude above $n = 3$. There is also an
+  `info` round trip per call (`linalg.py:1313-1318`).
+- `implementation=JACOBI` does not help: still a cuSOLVER custom call, still unfusable.
+
+Measured end-to-end with `eigh` swapped in for both kernels (CPU, f64): six cases spanning
+$n = 200$–800, shifts $0$ and $\pm 10^{6}$, real and complex operators — **bit-identical
+eigenvalues and identical iteration counts** in every case. At these sizes the matvec dominates and
+the projected solve is not where accuracy or time is decided; the GPU fusability argument above is
+the whole reason to prefer one over the other.
+
+### The polish rescues $\theta$, not $v$
+
+The Rayleigh-quotient polish is second order in the eigenvector *angle* error, so it repairs the
+eigenvalue while leaving the eigenvector as computed. `_nullvec_3x3`'s cross products are the
+cancellation-prone step (Kopp §3.2: "the subtractions … are very prone to cancellation errors"), and
+under near-degeneracy they lose the eigenvector itself — there is then nothing left for the polish
+to recover from.
+
+Measured, complex128, on a matrix whose two lowest eigenvalues are separated by
+$g = \mathrm{gap}/(\epsilon\|A\|) \approx 6.5\times10^{5}$:
+
+| | $\theta$ error | residual | $\lvert\langle v_{\mathrm{true}} \vert v\rangle\rvert$ |
+|---|---|---|---|
+| closed form | 1.16e-10 | 7.18e-11 | **0.447** |
+| `jnp.linalg.eigh` | 2.4e-17 | 3.4e-17 | 0.999999999999 |
+
+The returned eigenvector is nearly orthogonal to the truth while $\theta$ still looks fine to ten
+digits. This matters here specifically because LOBPCG propagates the *vector*: $\kappa$ becomes the
+next iterate's search direction, which is the same class of hazard as I5. Sweeping $g$ in
+half-decade bins, the closed form's p99 residual grows monotonically with $g$ (4.9e-16 at
+$g \sim 1$ to 3.6e-09 at $g \sim 10^{6}$) with p99 eigenspace angle $\approx 1$ across
+$3 \le g \le 3\times10^{3}$; a fixed-4-sweep Hermitian Jacobi holds ~1e-15 residual and
+$\le 0.15$ angle throughout.
+
+It has not been shown that `ground_locg` ever *builds* such a `sas`: `_project_out` keeps
+$\{x, y, p\}$ orthonormal by construction, and across ten controlled end-to-end runs (real and
+complex, $n = 200$–800) every kernel variant tried returned bit-identical eigenvalues with
+identical iteration counts. Recorded because the failure is silent and the diagnostic — check the
+eigenvector, not just $\theta$ — is not obvious from the code.
 
 ### `eigenpair_2x2` shares I1 and I2
 

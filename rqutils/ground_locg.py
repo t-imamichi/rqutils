@@ -146,6 +146,17 @@ v` on the balanced matrix. This is second order in the eigenvector error and rec
 precision where the closed form alone reaches only :math:`\sqrt{\epsilon}` (a near-degenerate lowest
 pair).
 
+Being second order in the eigenvector *angle* error, the polish repairs the eigenvalue and leaves
+the eigenvector as computed. Those are not equally good: for a near-degenerate lowest pair the
+returned :math:`v` can be nearly orthogonal to the true eigenvector while :math:`\theta` is still
+accurate to ten digits (measured :math:`|\langle v_{\mathrm{true}} | v \rangle| = 0.447` against a
+:math:`\theta` error of 1.2e-10). :func:`_nullvec_3x3`'s cross products are the fragile step, and
+once they lose the eigenvector the polish has nothing to recover from. So when auditing this module,
+check the eigenvector and not only :math:`\theta` -- the caller propagates the vector, since
+:math:`\kappa` becomes the next iteration's search direction. ``docs/locg.md`` records the measured
+sweep; it has *not* been shown that the iteration ever builds such a projected matrix, since
+:func:`_project_out` keeps the basis orthonormal by construction.
+
 Iteration
 ---------
 
