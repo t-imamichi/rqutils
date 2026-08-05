@@ -26,7 +26,6 @@ from conftest import lowest_projected, project_dense, real_pauli_strings
 
 from rqutils.sqd import (
     apply_h,
-    apply_h_xz_cached,
     compute_diagonal,
     get_diag_signs,
     get_diagonal,
@@ -531,8 +530,13 @@ class TestMatvecKernels:
         with pytest.raises(ValueError, match="states is required"):
             apply_h(np.zeros(4), (np.zeros((1, 1), dtype=np.uint8),) * 3, None, cache_level)
 
-    def test_apply_h_xz_cached_matches_dense(self):
-        """The fully-cached kernel, which is what ``examples/`` and the MLX port both use."""
+    def test_fully_cached_level_matches_dense(self):
+        """``cache_level=(1, 2)``, the level ``examples/bench_mlx.py`` and the MLX port mirror.
+
+        Overlaps :meth:`test_every_cache_level_matches_dense` by design: this one fixes the input
+        that ``ground_locg_mlx.apply_h_xz_mlx`` was validated against, so it stays a named pin for
+        the ported kernel even as the grid test's parametrization changes.
+        """
         from rqutils.paulis.symplectic import PauliSumXZ
 
         rng = np.random.default_rng(20260804)
@@ -553,5 +557,5 @@ class TestMatvecKernels:
         matrix = project_dense(strings, coeffs, states).real
         vector = rng.normal(size=states.shape[0])
 
-        got = np.asarray(apply_h_xz_cached(vector, xsources, diagonals)).real
+        got = np.asarray(apply_h(vector, (xsources, diagonals), None, (1, 2))).real
         assert np.abs(got - matrix @ vector).max() < 1e-12

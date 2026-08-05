@@ -115,7 +115,8 @@ def apply_h_xz_chunked(
 ) -> jnp.ndarray:
     """Return Hv via chunked batched gather, the JAX counterpart of ``apply_h_xz_mlx_chunked``.
 
-    ``rqutils.sqd.apply_h_xz_cached`` (and ``ground_locg_mlx.apply_h_xz_mlx``) loop over the J
+    ``rqutils.sqd.apply_h`` at ``cache_level=(1, 2)`` (and ``ground_locg_mlx.apply_h_xz_mlx``)
+    loop over the J
     X-groups doing one take+multiply+add per group -- 3J elementary ops per matvec. Since
     ``xsources``/``diagonals`` are dense ``(J, N)`` arrays, groups can instead be processed in
     chunks: gather a whole chunk with one flat ``take``, reshape, and reduce with a single
@@ -157,10 +158,10 @@ def apply_h_xz_chunked(
         diagonals: Sanitized diagonals, shape ``(J, N)``, matching ``vec``'s dtype.
         chunk: Number of X-groups to gather per flat ``take``. Static (Python int) -- it
             controls how many trace-time loop iterations ``jax.jit`` unrolls, exactly like the
-            existing ``xsources.shape[0]`` group loop in ``apply_h_xz_cached``.
+            existing ``xsources.shape[0]`` group loop in ``apply_h`` at ``cache_level=(1, 2)``.
 
     Returns:
-        ``H @ vec``, algebraically identical to ``apply_h_xz_cached``.
+        ``H @ vec``, algebraically identical to ``apply_h`` at ``cache_level=(1, 2)``.
     """
     num_groups = xsources.shape[0]
     out = jnp.zeros_like(vec)

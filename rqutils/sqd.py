@@ -734,16 +734,3 @@ def apply_h(
         return out + apply_xgrp(xsource, diagonal, vec), None
 
     return jax.lax.scan(fn, jnp.zeros_like(vec), scanned)[0]
-
-
-@jax.jit
-def apply_h_xz_cached(
-    vec: NDArray[np.inexact], xsources: NDArray[np.int32], diagonals: NDArray[np.inexact]
-) -> jax.Array:
-    """Return Hv from fully precomputed X sources and diagonals, i.e. ``cache_level=(1, 2)``.
-
-    Kept as a named entry point because it is the one kernel used outside this module: it is the
-    JAX arm of the MLX benchmark (``examples/bench_mlx.py``) and the reference that
-    ``ground_locg_mlx.apply_h_xz_mlx`` was validated against, so both refer to it by name.
-    """
-    return apply_h(vec, (xsources, diagonals), None, (1, 2))

@@ -8,7 +8,8 @@ Single-vector LOBPCG on MLX (Apple Metal)
 Overview
 ========
 
-An MLX port of :mod:`rqutils.ground_locg` and of ``rqutils.sqd.apply_h_xz_cached``, for running
+An MLX port of :mod:`rqutils.ground_locg` and of ``rqutils.sqd.apply_h`` at
+``cache_level=(1, 2)``, for running
 the SQD eigensolver loop on Apple GPUs. The algorithm is the same single-vector LOBPCG -- see
 :mod:`rqutils.ground_locg` for the derivation, the Rayleigh-Ritz specialization, and the
 numerical analysis behind every guard reproduced here.
@@ -117,7 +118,8 @@ _SQRT3 = math.sqrt(3.0)
 def apply_h_xz_mlx(vec, xsources, diagonals):
     """Return Hv from precomputed X sources and diagonals.
 
-    Mirrors ``rqutils.sqd.apply_h_xz_cached``. ``xsources`` must already be sanitized (no
+    Mirrors ``rqutils.sqd.apply_h`` at ``cache_level=(1, 2)``. ``xsources`` must already be
+    sanitized (no
     negative entries, with the corresponding diagonals zeroed) -- see
     ``_bench_common.build_solver_inputs``.
     """
@@ -231,7 +233,8 @@ def apply_h_xz_mlx_metal(vec, xsources, diagonals, threadgroup=256):
     Metal is float32-only for this purpose (it has no float64 at all), so this path is usable
     only by the f32 arms. Callers must check ``vec.dtype``; passing float64 raises.
 
-    The kernel's arithmetic was validated against ``apply_h_xz_cached`` by simulating the exact
+    The kernel's arithmetic was validated against ``apply_h`` at ``cache_level=(1, 2)``
+    by simulating the exact
     per-thread indexing in numpy: max abs diff 2.7e-15, and 3.6e-15 against a dense ``H @ v``.
 
     Args:

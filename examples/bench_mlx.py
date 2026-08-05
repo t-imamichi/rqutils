@@ -350,7 +350,7 @@ def run_arm(arm, options):
     else:
         result = _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe)
 
-    # Gate: the ported matvec (apply_h_xz_mlx, or apply_h_xz_cached re-checked for symmetry)
+    # Gate: the ported matvec (apply_h_xz_mlx, or the JAX kernel re-checked for symmetry)
     # must agree with the dense H @ v built straight from the same solver inputs. This isolates
     # a matvec bug (e.g. mx.take behaving unlike jax's fill-mode gather on out-of-bounds
     # indices) from a solver-loop bug -- without it, a broken matvec would only ever be visible
@@ -413,7 +413,7 @@ def _time_jax(arm, inputs, precision, options, matrix, matvec_probe):
     import numpy as np
 
     from rqutils.ground_locg import ground_locg
-    from rqutils.sqd import apply_h_xz_cached
+    from rqutils.sqd import apply_h
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _bench_common import apply_h_xz_chunked, timeit
@@ -425,11 +425,16 @@ def _time_jax(arm, inputs, precision, options, matrix, matvec_probe):
 
     # --matvec selects the kernel used by the solver loop, applied identically to the jax and
     # mlx arms (Optimization 1) -- see apply_h_xz_chunked's docstring in _bench_common.py for
-    # the op-count/memory tradeoff. "loop" (default) is apply_h_xz_cached unchanged, so the
-    # existing measured results stay reproducible.
+    # the op-count/memory tradeoff. "loop" (default) is the fully-cached sqd kernel unchanged, so
+    # the existing measured results stay reproducible.
+    #
+    # apply_h(..., cache_level=(1, 2)) is what used to be a separate apply_h_xz_cached function.
+    # The (scanned, states) argument shape is bound here so the callable still takes
+    # (vec, xsources, diagonals) positionally, which is the signature ground_locg calls and the
+    # one apply_h_xz_chunked mirrors.
     if options.matvec == "metal":
         # Fail loudly rather than silently substituting a different kernel: a "metal" row that
-        # actually timed apply_h_xz_cached would be a fabricated comparison.
+        # actually timed the JAX kernel would be a fabricated comparison.
         raise SystemExit(
             f"{arm}: --matvec metal is an MLX-only custom Metal kernel and has no JAX "
             "equivalent. Use --matvec loop or --matvec chunked for the jax arms."
@@ -437,7 +442,9 @@ def _time_jax(arm, inputs, precision, options, matrix, matvec_probe):
     if options.matvec == "chunked":
         matvec_fn = functools.partial(apply_h_xz_chunked, chunk=options.chunk)
     else:
-        matvec_fn = apply_h_xz_cached
+
+        def matvec_fn(vec, xsources, diagonals):
+            return apply_h(vec, (xsources, diagonals), None, (1, 2))
 
     # Gate: the ported matvec and the original must agree on the same input, probed with a
     # random vector (not vinit) -- see the matvec_probe comment in run_arm.
