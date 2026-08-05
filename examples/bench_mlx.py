@@ -168,6 +168,19 @@ def parse_args(argv=None):
         "six distinct inner products into one custom Metal launch, replacing "
         "16 op launches per iteration and eliminating the symmetrization.",
     )
+    parser.add_argument(
+        "--eig",
+        choices=("ops", "metal"),
+        default="ops",
+        help="3x3 Rayleigh-Ritz eigensolve kernel, MLX f32 arms only. "
+        '"ops" (default) is the portable op-graph eigenpair_3x3 -- existing '
+        'measured results are only reproducible with this default. "metal" '
+        "fuses the whole eigensolve (balance, Cardano, the rank-aware "
+        "null-vector search, the Rayleigh polish) into one launch, replacing "
+        "~34 op launches per iteration (44%% of the body). Unlike --sas metal "
+        "this is expected to win: there is no N-scaling reduction to "
+        "under-parallelize.",
+    )
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of a table.")
     parser.add_argument(
         "--skip-brute-force",
@@ -344,6 +357,11 @@ def run_arm(arm, options):
             f"{arm}: --sas metal is an MLX-only custom Metal kernel and has no JAX equivalent."
         )
 
+    if options.eig == "metal" and framework != "mlx":
+        raise SystemExit(
+            f"{arm}: --eig metal is an MLX-only custom Metal kernel and has no JAX equivalent."
+        )
+
     rtol = RTOL[precision]
     if framework == "jax":
         result = _time_jax(arm, inputs, precision, options, matrix, matvec_probe)
@@ -400,6 +418,7 @@ def run_arm(arm, options):
     result["matvec"] = options.matvec
     result["chunk"] = options.chunk if options.matvec == "chunked" else None
     result["sas"] = options.sas
+    result["eig"] = options.eig
     result["compile_body"] = bool(options.compile_body) and framework == "mlx"
     result["compile_body_note"] = compile_body_note
     return result
@@ -518,6 +537,12 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
             "--sas ops for the f64 arms."
         )
 
+    if options.eig == "metal" and precision != "f32":
+        raise SystemExit(
+            f"{arm}: --eig metal requires float32 (Metal has no float64). Use an f32 arm, or "
+            "--eig ops for the f64 arms."
+        )
+
     mx.set_default_device(mx.cpu if device == "cpu" else mx.gpu)
     dtype = mx.float64 if precision == "f64" else mx.float32
     # Pass dtype at CONSTRUCTION, never construct-then-cast: MLX's docs state that "NumPy
@@ -579,6 +604,7 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
             tol=0.0,
             compile_body=options.compile_body,
             sas=options.sas,
+            eig=options.eig,
         )
 
     compile_s, fixed_s = timeit(fixed, options.repeat, sync)
@@ -594,6 +620,7 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
             tol=SOLVE_TOL[precision],
             compile_body=options.compile_body,
             sas=options.sas,
+            eig=options.eig,
         )
 
     _, solve_s = timeit(solve, options.repeat, sync)
@@ -639,6 +666,8 @@ def run_all(options):
             str(options.chunk),
             "--sas",
             options.sas,
+            "--eig",
+            options.eig,
         ]
         if options.skip_brute_force:
             argv.append("--skip-brute-force")
@@ -696,6 +725,8 @@ def report(results, as_json):
             opt += " compile_body"
         if row.get("sas") == "metal":
             opt += " sas=metal"
+        if row.get("eig") == "metal":
+            opt += " eig=metal"
         if row.get("reference_path") == "sparse":
             opt += " reference=sparse"
         print(

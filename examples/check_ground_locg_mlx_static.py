@@ -73,6 +73,10 @@ for fn in (
     "argmax",
     "logical_or",
     "matmul",
+    # Added when _nullvec_3x3's candidate construction was batched: the orthogonal-complement
+    # candidates are now built as `col x e_k` via one broadcast cross product instead of by
+    # indexing out individual scalars and negating them one at a time.
+    "broadcast_to",
 ):
     if hasattr(np, fn):
         setattr(shim, fn, getattr(np, fn))
@@ -140,10 +144,70 @@ def _shim_metal_kernel(name, input_names, output_names, source, **kwargs):
             out[j, i] = partials[0]
         return [out]
 
+    def call_eig3(inputs, grid=None, threadgroup=None, output_dtypes=None, **kw):
+        (mat,) = inputs
+        m = np.asarray(mat)
+        assert m.shape == (3, 3), f"eigenpair_3x3 kernel expects a (3, 3) matrix, got {m.shape}"
+        assert grid == (1, 1, 1), (
+            f"grid {grid} != (1, 1, 1): the 3x3 eigensolve has no output parallelism, so the "
+            "caller must launch exactly one thread"
+        )
+        assert threadgroup == (1, 1, 1), f"threadgroup {threadgroup} != (1, 1, 1)"
+        dtype = np.dtype(output_dtypes[0])
+        # Reproduce the kernel's *intended* single-thread arithmetic, in the same order: balance,
+        # Cardano, the rank-aware seven-candidate search with first-extremum tie-breaking, then the
+        # closing Rayleigh quotient. Independent of `source`, so a bug in the Metal text itself is
+        # invisible here -- only the real-device run can catch that.
+        shift = (m[0, 0] + m[1, 1] + m[2, 2]) / 3.0
+        scale = np.abs(m).max()
+        if not scale > 0.0:
+            scale = 1.0
+        b = (m - shift * np.eye(3)) / scale
+        bd = np.diagonal(b)
+        od = np.array([b[1, 0], b[2, 0], b[2, 1]]) ** 2
+        c1 = (bd[0] * bd[2] + bd[1] * bd[0] + bd[2] * bd[1]) - od.sum()
+        c0 = (
+            (bd[0] * od[2] + bd[1] * od[1] + bd[2] * od[0])
+            - bd[0] * bd[1] * bd[2]
+            - 2.0 * (b[0, 2] * b[1, 0] * b[2, 1])
+        )
+        p = max(-3.0 * c1, 0.0)
+        disc = max(-27.0 * c1**3 - 182.25 * c0 * c0, 0.0)
+        phi = np.arctan2(np.sqrt(disc), -13.5 * c0) / 3.0
+        cphi, sphi = np.cos(phi), np.sin(phi)
+        sqrt3 = np.sqrt(3.0)
+        xmin = min(2.0 * cphi, -cphi - sqrt3 * sphi, -cphi + sqrt3 * sphi) * np.sqrt(p) / 3.0
+
+        s = b - xmin * np.eye(3)
+        cands = np.zeros((7, 3))
+        for k, (a, bcol) in enumerate(((0, 1), (1, 2), (2, 0))):
+            cands[k] = np.cross(s[:, a], s[:, bcol])
+        colnorms = np.sum(np.square(s), axis=0)
+        # First maximum, matching the kernel's strict-> ascending scan and argmax.
+        col_index = int(np.argmax(colnorms))
+        col = s[:, col_index]
+        cands[3] = [0.0, col[2], -col[1]]
+        cands[4] = [-col[2], 0.0, col[0]]
+        cands[5] = [col[1], -col[0], 0.0]
+        cands[6] = [1.0, 0.0, 0.0]
+        norms = np.linalg.norm(cands, axis=1)
+        cands = cands / np.where(norms == 0.0, 1.0, norms)[:, None]
+        resid = np.linalg.norm(cands @ s.T, axis=1)
+        resid = resid + (norms == 0.0) * (resid.max() + 1.0)
+        # First minimum, matching the kernel's strict-< ascending scan and argmin.
+        vec = cands[int(np.argmin(resid))]
+        rq = float(vec @ (b @ vec))
+        return [
+            np.array([rq * scale + shift], dtype=dtype),
+            np.asarray(vec, dtype=np.dtype(output_dtypes[1])),
+        ]
+
     if name == "sqd_apply_h_xz":
         return call_matvec
     if name == "sqd_compute_sas":
         return call_sas
+    if name == "sqd_eigenpair_3x3":
+        return call_eig3
     raise AssertionError(f"no shim implementation for Metal kernel {name!r}")
 
 
@@ -498,6 +562,184 @@ else:
 _ = _compute_sas_metal(tuple(vecs32_tg[:2]), tuple(mvs32_tg[:2]), threadgroup=256)
 print("OK  _compute_sas_metal still works at threadgroup=256")
 
+# 3k. eigenpair_3x3_metal must agree with the op-graph eigenpair_3x3 on the matrix classes the
+# solver actually produces, INCLUDING the rank-deficient and near-degenerate ones the seven-
+# candidate search and the balancing exist for. This is the check that discriminates a transcription
+# error in the fused kernel's algorithm: a wrong permutation in the characteristic polynomial, a
+# dropped balancing step, or a tie-breaking difference in the argmax/argmin scans.
+eigenpair_3x3_metal = module.eigenpair_3x3_metal
+eigenpair_3x3_ops = module.eigenpair_3x3
+_rng_eig = np.random.default_rng(20260805)
+
+
+def _sym32(matrix):
+    matrix = (matrix + matrix.T) * 0.5
+    return matrix.astype(np.float32)
+
+
+_eig_cases = []
+# Generic well-separated spectra.
+for _ in range(40):
+    _eig_cases.append(("generic", _sym32(_rng_eig.normal(size=(3, 3)))))
+# Large trace: the case balancing exists for (docs/locg.md I1/I2). Without balancing the
+# characteristic polynomial's coefficients lose all significance and disc goes negative -> NaN.
+for shift_mag in (1e3, 1e5, 1e7):
+    _eig_cases.append(("large-trace", _sym32(_rng_eig.normal(size=(3, 3)) + shift_mag * np.eye(3))))
+# Exactly degenerate and near-degenerate lowest pairs: rank-1 and rank-2 null spaces, which is
+# what the seven-candidate search is for (item I3).
+for eps in (0.0, 1e-7, 1e-4):
+    basis = np.linalg.qr(_rng_eig.normal(size=(3, 3)))[0]
+    for lows in ((1.0, 1.0 + eps, 5.0), (-2.0, -2.0 - eps, 3.0)):
+        _eig_cases.append(("degenerate", _sym32(basis @ np.diag(lows) @ basis.T)))
+# Multiples of the identity (rank 0 after the shift) and the exact zero matrix: every candidate
+# collapses, so the e_0 fallback must win.
+_eig_cases.append(("identity", np.eye(3, dtype=np.float32) * np.float32(3.5)))
+_eig_cases.append(("zero", np.zeros((3, 3), dtype=np.float32)))
+# A diagonal matrix carrying the p_is_zero exclusion shift that iter_body applies, which is
+# max(diag_xy) + sum(|diag_xy|) + 1 -- bounded by the matrix's own scale, NOT an arbitrary huge
+# value. Using 1e9 here instead would test something the solver never produces AND would fail for
+# both implementations equally: after balancing by scale=1e9, -1.5 and -1.0 collapse to bit-
+# identical float32 (measured difference exactly 0.0, against eps=1.19e-07), so the true minimum is
+# unrecoverable in fp32 by any algorithm. The op-graph eigenpair_3x3 returns 0.0 for that input
+# too. That is the documented fp32 dynamic-range limit of this balancing, not a kernel defect, so
+# the case is written the way the solver actually generates it.
+_excl_diag = np.array([-1.5, -1.0])
+_excl = _excl_diag.max() + np.abs(_excl_diag).sum() + 1.0
+_eig_cases.append(("excluded-p", np.diag([-1.5, -1.0, _excl]).astype(np.float32)))
+
+_worst_eig = 0.0
+_worst_case = None
+for _label, _mat in _eig_cases:
+    _th_ops, _kp_ops = eigenpair_3x3_ops(_mat)
+    _th_met, _kp_met = eigenpair_3x3_metal(_mat)
+    assert np.isfinite(_th_met), f"{_label}: metal eigenvalue is not finite ({_th_met})"
+    assert np.all(np.isfinite(_kp_met)), f"{_label}: metal eigenvector is not finite ({_kp_met})"
+    # Compare eigenvalues, which are basis-independent. The eigenvectors can legitimately differ
+    # by sign, and for a degenerate lowest pair by an arbitrary rotation within the eigenspace, so
+    # asserting on them directly would be wrong -- check the Rayleigh quotient instead.
+    _den = max(1.0, abs(float(_th_ops)))
+    _err = abs(float(_th_met) - float(_th_ops)) / _den
+    if _err > _worst_eig:
+        _worst_eig, _worst_case = _err, _label
+    assert _err < 1e-5, f"{_label}: metal eigenvalue {_th_met} vs ops {_th_ops} (rel {_err:.2e})"
+    # The returned vector must actually be a unit eigenvector for the returned eigenvalue: this is
+    # what catches a null-vector selection bug that happens to leave the eigenvalue intact.
+    _nrm = float(np.linalg.norm(_kp_met))
+    assert abs(_nrm - 1.0) < 1e-5, f"{_label}: metal eigenvector norm {_nrm} != 1"
+    # Normalize the residual by the MATRIX norm, not by |theta|: |Av - theta v| is an absolute
+    # quantity whose float32 rounding floor scales with |A|, so dividing by a small |theta| on a
+    # large-norm matrix would demand accuracy the arithmetic cannot deliver.
+    _mnorm = max(1.0, float(np.abs(_mat).max()))
+    _resid = np.linalg.norm(_mat @ _kp_met - float(_th_met) * _kp_met) / _mnorm
+    assert _resid < 1e-4, f"{_label}: |Av - theta v|/|A| = {_resid:.2e} -- not an eigenpair"
+print(
+    f"OK  eigenpair_3x3_metal matches eigenpair_3x3 on {len(_eig_cases)} matrices spanning "
+    f"generic/large-trace/degenerate/identity/zero (worst rel {_worst_eig:.2e} on {_worst_case}), "
+    "and every returned pair satisfies |Av - theta v| ~ 0"
+)
+
+# The fused kernel must return the SMALLEST eigenvalue, not just some eigenvalue -- an independent
+# check against numpy's eigh, since both rqutils paths share the same Cardano formulation and would
+# agree with each other on a sign or root-selection error.
+_worst_vs_eigh = 0.0
+for _label, _mat in _eig_cases:
+    _th_met, _ = eigenpair_3x3_metal(_mat)
+    _ref = float(np.linalg.eigvalsh(_mat.astype(np.float64)).min())
+    _err = abs(float(_th_met) - _ref) / max(1.0, abs(_ref))
+    _worst_vs_eigh = max(_worst_vs_eigh, _err)
+    assert _err < 1e-4, f"{_label}: metal {_th_met} is not the minimum eigenvalue {_ref}"
+print(
+    f"OK  eigenpair_3x3_metal returns the MINIMUM eigenvalue (vs numpy eigh, worst rel "
+    f"{_worst_vs_eigh:.2e}) -- independent of the shared Cardano formulation"
+)
+
+# eigenpair_3x3_metal must refuse float64 rather than silently narrowing.
+try:
+    eigenpair_3x3_metal(np.eye(3, dtype=np.float64))
+except ValueError as exc:
+    assert "float32" in str(exc), f"unexpected guard message: {exc}"
+    print("OK  eigenpair_3x3_metal rejects float64 input (Metal has no float64)")
+else:
+    raise AssertionError("eigenpair_3x3_metal accepted float64 input -- guard did not fire")
+
+# 3l. eig="metal" end-to-end: same trajectory as eig="ops" in fixed-iteration mode, and dispatch
+# proven by a call spy (the numerical check alone would pass a mis-wired call site, exactly as for
+# sas above).
+eig_e_ops, _, it_e_ops, _ = ground_locg_mlx(
+    apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=30, tol=0.0, eig="ops"
+)
+eig_e_met, _, it_e_met, _ = ground_locg_mlx(
+    apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=30, tol=0.0, eig="metal"
+)
+assert it_e_ops == it_e_met == 30, f"iteration counts differ: {it_e_ops} vs {it_e_met}"
+assert abs(eig_e_met - eig_e_ops) < 1e-5 * max(1.0, abs(eig_e_ops)), (
+    f"eig='metal' changed the fixed-iteration eigenvalue: {eig_e_met} vs {eig_e_ops}"
+)
+print(
+    f"OK  eig='metal' tracks eig='ops' (eig {eig_e_met:.6f} vs {eig_e_ops:.6f}, {it_e_met} iters)"
+)
+
+_orig_eig3 = module.eigenpair_3x3
+_orig_eig3_metal = module.eigenpair_3x3_metal
+_eig_spy = {"ops": 0, "metal": 0}
+
+
+def _spy_eig_ops(*a, **k):
+    _eig_spy["ops"] += 1
+    return _orig_eig3(*a, **k)
+
+
+def _spy_eig_metal(*a, **k):
+    _eig_spy["metal"] += 1
+    return _orig_eig3_metal(*a, **k)
+
+
+module.eigenpair_3x3 = _spy_eig_ops
+module.eigenpair_3x3_metal = _spy_eig_metal
+try:
+    _eig_spy["ops"] = _eig_spy["metal"] = 0
+    ground_locg_mlx(
+        apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, tol=0.0, eig="metal"
+    )
+    assert _eig_spy["metal"] > 0 and _eig_spy["ops"] == 0, (
+        f"eig='metal' did not dispatch exclusively to eigenpair_3x3_metal: {_eig_spy}"
+    )
+    _eig_metal_calls = _eig_spy["metal"]
+
+    _eig_spy["ops"] = _eig_spy["metal"] = 0
+    ground_locg_mlx(
+        apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, tol=0.0, eig="ops"
+    )
+    assert _eig_spy["ops"] > 0 and _eig_spy["metal"] == 0, (
+        f"eig='ops' did not dispatch exclusively to eigenpair_3x3: {_eig_spy}"
+    )
+finally:
+    module.eigenpair_3x3 = _orig_eig3
+    module.eigenpair_3x3_metal = _orig_eig3_metal
+print(
+    f"OK  eig='metal'/eig='ops' dispatch exclusively to their own implementation "
+    f"({_eig_metal_calls} metal calls, 0 ops calls, for 2 iterations)"
+)
+
+# eig="metal" must refuse an f64 solve, and an unknown value must fail loudly.
+try:
+    ground_locg_mlx(
+        apply_h_xz_mlx, inputs.vinit, args=(inputs.xsources, inputs.diagonals), eig="metal"
+    )
+except ValueError as exc:
+    assert "float32" in str(exc), f"unexpected guard message: {exc}"
+    print("OK  ground_locg_mlx(eig='metal') rejects float64 input")
+else:
+    raise AssertionError("ground_locg_mlx(eig='metal') accepted float64 -- guard did not fire")
+
+try:
+    ground_locg_mlx(apply_h_xz_mlx, inputs32_v, args=(xs32_i, dg32_i), maxiter=2, eig="bogus")
+except ValueError as exc:
+    assert "bogus" in str(exc), f"unexpected message: {exc}"
+    print("OK  ground_locg_mlx rejects an unknown eig value")
+else:
+    raise AssertionError("ground_locg_mlx accepted eig='bogus'")
+
 # 3j. The r_is_zero / seed_converged guard (ground_locg_mlx.py:503-517): a one-hot xinit against a
 # diagonal operator is an exact eigenvector, so the residual after the seed step is exactly zero.
 # Without the guard, eigenpair_2x2 sees a sas_mat whose row/col 1 (the p direction) vanishes and
@@ -670,6 +912,7 @@ _MSL_RESERVED = {
 _kernel_sources = {
     "_METAL_SAS_SOURCE": module._METAL_SAS_SOURCE,
     "_METAL_MATVEC_SOURCE": module._METAL_MATVEC_SOURCE,
+    "_METAL_EIG3_SOURCE": module._METAL_EIG3_SOURCE,
 }
 for _src_name, _src_text in _kernel_sources.items():
     # Strip // comments first: prose legitimately discusses `half` to explain this very bug.
@@ -682,5 +925,48 @@ for _src_name, _src_text in _kernel_sources.items():
         "Rename them (e.g. `half` -> `stride`)."
     )
     print(f"OK  {_src_name} declares no MSL-reserved identifiers ({len(_declared)} names checked)")
+
+# Every math function called from a kernel must be namespace-qualified (`metal::sqrt`, not bare
+# `sqrt`). Metal Shading Language puts these in the `metal` namespace, and MLX wraps the `source`
+# text in a function body without a `using namespace metal;`, so an unqualified call fails to
+# compile -- another defect class the numpy shim is structurally blind to, since Python resolves
+# `np.sqrt` regardless of what the Metal text says. _METAL_EIG3_SOURCE is the first kernel here to
+# call any math function at all, so this had no in-repo precedent to copy.
+_MSL_MATH = (
+    "sqrt",
+    "abs",
+    "max",
+    "min",
+    "cos",
+    "sin",
+    "atan2",
+    "atan",
+    "exp",
+    "log",
+    "pow",
+    "fabs",
+    "fmax",
+    "fmin",
+    "hypot",
+    "rsqrt",
+    "floor",
+    "ceil",
+)
+for _src_name, _src_text in _kernel_sources.items():
+    _code_only = re.sub(r"//[^\n]*", "", _src_text)
+    _unqualified = set()
+    for _fn in _MSL_MATH:
+        # A call not preceded by `metal::` (or by another identifier character, which would make it
+        # part of a longer name such as `best_colnorm` or a member call).
+        for _match in re.finditer(rf"(?<![\w:]){_fn}\s*\(", _code_only):
+            _start = _match.start()
+            if not _code_only[:_start].endswith("metal::"):
+                _unqualified.add(_fn)
+    assert not _unqualified, (
+        f"{_src_name} calls math function(s) {sorted(_unqualified)} without the `metal::` "
+        "namespace qualifier. MLX does not emit `using namespace metal;`, so Metal will fail to "
+        "compile these. Prefix them with `metal::`."
+    )
+print(f"OK  all {len(_kernel_sources)} kernel sources qualify their math calls with `metal::`")
 
 print("\nALL STATIC CHECKS PASSED (numpy shim; MLX itself still unverified)")

@@ -8,6 +8,12 @@ THIS SCRIPT REQUIRES A REAL METAL DEVICE (a Mac with MLX installed and GPU acces
 CANNOT RUN HEADLESS. It was written by an agent that could not execute it -- the numpy-shim
 counterpart in check_ground_locg_mlx_static.py is what validated the algorithm instead.
 
+Device status as of 2026-08-05: `apply_h_xz_mlx_metal` and `sas="metal"` have since been
+exercised on a real M1 GPU (via examples/bench_mlx.py) and passed, so their MSL is known to
+compile and be correct. The `eig="metal"` checks below are NEWER and have not been run on
+hardware; that kernel is the first here to call math functions (metal::sqrt/cos/sin/atan2),
+which is exactly what only a device run can validate.
+
 Run with:
     uv run python examples/check_ground_locg_mlx_mlx.py
 """
@@ -26,6 +32,8 @@ from _bench_common import build_solver_inputs, dense_reference, generate_problem
 from rqutils.ground_locg_mlx import (
     apply_h_xz_mlx,
     apply_h_xz_mlx_metal,
+    eigenpair_3x3,
+    eigenpair_3x3_metal,
     ground_locg_mlx,
 )
 
@@ -99,6 +107,57 @@ for device, name in ((mx.cpu, "cpu"), (mx.gpu, "gpu")):
                 )
                 if not ok_both:
                     failures.append(f"{arm}-metal-both")
+
+                # eig='metal': the fused 3x3 eigensolve. This is the FIRST kernel here to call
+                # math functions (metal::sqrt/cos/sin/atan2), so this run is the only thing that
+                # can establish they compile -- the static checker's `metal::`-qualification guard
+                # catches the spelling, not the availability.
+                eig_e, _, iters_e, _ = ground_locg_mlx(
+                    apply_h_xz_mlx, v0, args=(xs, dg), eig="metal"
+                )
+                ok_e = abs(eig_e - ref) < rtol * max(1.0, abs(ref))
+                print(
+                    f"{arm} eig=metal: eig={eig_e:.10f} iters={iters_e} {'OK' if ok_e else 'FAIL'}"
+                )
+                if not ok_e:
+                    failures.append(f"{arm}-eig-metal")
+
+                # Direct kernel-vs-op-graph comparison on the matrix classes the solver actually
+                # produces, so a transcription error shows up as a wrong eigenvalue on a specific
+                # case rather than only as a drifted solve. Mirrors case 3k of
+                # check_ground_locg_mlx_static.py, but against the real compiled MSL.
+                eig3_ops = eigenpair_3x3
+                eig3_met = eigenpair_3x3_metal
+                rng_e = np.random.default_rng(20260805)
+                worst_e = 0.0
+                for _ in range(40):
+                    a = rng_e.normal(size=(3, 3))
+                    a = ((a + a.T) * 0.5).astype(np.float32)
+                    am = mx.array(a, mx.float32)
+                    t_ops, _ = eig3_ops(am)
+                    t_met, kp_met = eig3_met(am)
+                    ref_min = float(np.linalg.eigvalsh(a.astype(np.float64)).min())
+                    den = max(1.0, abs(ref_min))
+                    worst_e = max(worst_e, abs(float(t_met) - float(t_ops)) / den)
+                    # Independent of the shared Cardano formulation: both rqutils paths would
+                    # agree with each other on a root-selection error, but eigh would not.
+                    if abs(float(t_met) - ref_min) / den > 1e-4:
+                        print(
+                            f"{arm} eig3-metal: {float(t_met)} is not the minimum "
+                            f"eigenvalue {ref_min} -- FAIL"
+                        )
+                        failures.append(f"{arm}-eig3-vs-eigh")
+                        break
+                    kp = np.asarray(kp_met, dtype=np.float64)
+                    if abs(np.linalg.norm(kp) - 1.0) > 1e-4:
+                        print(f"{arm} eig3-metal: eigenvector not unit norm -- FAIL")
+                        failures.append(f"{arm}-eig3-norm")
+                        break
+                else:
+                    print(
+                        f"{arm} eig3-metal: matches op-graph and numpy eigh on 40 random "
+                        f"symmetric matrices (worst rel {worst_e:.2e}) OK"
+                    )
         except Exception as exc:  # noqa: BLE001 (a checker must survive any arm's failure)
             print(f"{arm}: ERROR {type(exc).__name__}: {exc}")
             failures.append(arm)
