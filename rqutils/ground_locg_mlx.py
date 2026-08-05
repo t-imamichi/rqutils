@@ -73,10 +73,14 @@ fused kernels can run there (2.928 -> 2.689 ms/iter, controlled, uncompiled; a 3
 this arm is why the range rather than the ratio). Small but real, and consistent with the
 mechanism: this removes Python-level op construction, which the cost model ranks third, on a
 backend with no kernel-launch latency to reclaim. Expect less under ``compile_body``, which already
-amortizes graph construction. **The further 76.3 -> 65.0 from the ``_compute_sas`` matmul is not
-yet in that number** -- it postdates the measurement, and unlike the rest it replaces O(N)
-reductions rather than scalar bookkeeping, so it may behave differently with N; re-run
-``examples/bench_mlx.py --arm mlx-cpu-f64`` before quoting a combined figure. This is the
+amortizes graph construction. **The further 76.3 -> 65.0 from the ``_compute_sas`` matmul bought
+no measurable time at all** -- 2.742 -> 2.725 ms/iter, 0.6%, well inside this arm's 3.9% noise
+floor and smaller than the 2.1% spread between two runs of identical code. It is kept for its
+*accuracy*, which is a real and separately verified improvement (see :func:`_compute_sas`), not for
+speed. The reason it is flat where the earlier reductions were not: those removed Python-level op
+construction, whereas this one trades 9 tuned reduction kernels for 1 tuned matmul kernel, and at
+N~1000 the reductions were never the bottleneck. A useful negative result -- fewer ops is not the
+same as less time once each op is already an efficient kernel. This is the
 one respect in which "when you change one, change both" should *not* be applied mechanically:
 porting these batched forms back to JAX would be churn, since XLA already fuses what they
 hand-fuse. The algebra is what must stay in step, not the op granularity.
@@ -1159,6 +1163,14 @@ def _compute_sas(vectors, mvs):
     transformation to ``_project_out``: those passes guard against catastrophic cancellation
     (``docs/locg.md`` items I5/I6) and a matmul reassociates their summation order, measured to
     shift results by ~1e-14.
+
+    One visible consequence, expected and benign: because the accumulation order changes, **f32
+    eigenvalues shift in their last one or two digits** relative to runs recorded before this
+    change (e.g. -5.3960409164 versus -5.3960399628, ~1.8e-7 relative, against an f32 eps of
+    1.19e-7), and the f32 arms no longer agree digit-for-digit across ``sas``/``eig`` combinations.
+    Iteration counts are unchanged and the correctness gate passes with a >500x margin at
+    ``rtol=1e-4``. f64 is unaffected at the printed precision. Do not treat an f32 last-digit
+    difference against a pre-matmul recorded value as a regression.
     """
     stacked_v = mx.stack(vectors)
     stacked_m = mx.stack(mvs)
