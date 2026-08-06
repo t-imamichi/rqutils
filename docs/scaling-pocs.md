@@ -5,10 +5,37 @@ Two are worth adopting, one is worth knowing about, two are dead, and one attemp
 the library.
 
 **Machine and its limits.** Apple M1, 16 GB, `jax.default_backend() == "cpu"`, one device, x64
-enabled. Every number below is CPU. Two claims in `rqutils/sqd.py` are GPU-specific and were **not**
-verified: the `lax.sort` memory leak (`sqd.py:561`) and multi-GPU speedup. `examples/scaling/poc8_gpu_unverified.py`
-exists to settle both in one run on a CUDA box. Quoting a CPU ratio as a GPU ratio is the error
-`CLAUDE.md` warns about for the MLX arms, so it is not done here.
+enabled. Every number below is CPU unless a section says otherwise. Quoting a CPU ratio as a GPU ratio
+is the error `CLAUDE.md` warns about for the MLX arms, so it is not done here.
+
+**GPU status (NVIDIA GH200 120GB, single device, 2026-08-06).** Two of the three GPU-specific claims
+in `poc8_gpu_unverified.py` are now settled and one remains unrun:
+
+- **searchsorted speedup: 5.15× at N = 64M**, rising with `N` (§1 below). Not the CPU 12–25×.
+- **`lax.sort` memory leak: does not reproduce.** The in-tree note was stale (§1 below).
+- **Multi-GPU speedup: UNRUN.** The box has one GH200. `--devices` sets `CUDA_VISIBLE_DEVICES`, a
+  *filter* over devices the driver already exposes, so it cannot conjure a second GPU — this is unrun,
+  not unresolved, and needs a physically multi-GPU machine. `poc7_sharding.py` already covers sharding
+  *correctness* on virtual CPU devices, so only speed is missing.
+
+**A POC's baseline must be pinned, not read from the library.** POC 1's proposal was adopted in
+commit 23fb226, which made `get_xsource` *be* the searchsorted — and silently turned both POC 1's and
+POC 8's timing arms into searchsorted-versus-searchsorted comparisons. The first GPU run of POC 8
+duly reported 1.002×/1.000×/1.000× and a flat memory profile, and produced no information about
+either claim; POC 1e read 0.26× "SLOWER" for the same reason. `fmt_ratio` was right every time, which
+is precisely what made it unalarming. Both files now time against `poc1.xsource_sort_legacy`, a
+verbatim copy of the pre-23fb226 sort, and their *correctness* arms still compare against the library
+(that agreement is now a regression test rather than a proposal). Restoring the baseline recovered
+12.1×/18.3× and, for the lex variant, 3.57×/3.18× — matching what 23fb226 recorded.
+
+Three measurement defects in POC 8 were fixed at the same time, all of the same character as the
+library bugs this suite is organized around: a plausible reading rather than an error. Its leak test
+sampled `bytes_in_use` *after* `del`, and printed `peak_bytes_in_use`, a high-water mark that never
+decreases — neither column could move regardless of the truth. Its `--devices` flag sets
+`CUDA_VISIBLE_DEVICES`, a filter over devices the driver already exposes, so it cannot conjure a
+second GPU: Claim 3 on a one-GPU box is **unrun**, not unresolved. And the sort arm now asserts it
+grows with `N`; the stale run's 84/93/159 ms across a 25× `N` increase was the visible tell, and the
+guard was verified to fire on exactly those numbers and stay quiet on healthy ones.
 
 Timings are min-of-N-trials with the measured spread reported alongside; `_scaling_common.fmt_ratio`
 refuses to call a difference a win when it falls inside that spread. Several rows below are therefore
@@ -34,7 +61,7 @@ measured, which reorders the priorities.
 
 | # | idea | verdict | measured |
 |---|---|---|---|
-| 1 | `searchsorted` replaces the 2N sort | **ADOPTED — now in `get_xsource`** | 12–25× per signature; 12–19× on the J-fold precompute |
+| 1 | `searchsorted` replaces the 2N sort | **ADOPTED — now in `get_xsource`** | CPU 12–25× per signature; **GPU 5.15× at N=64M**, rising |
 | 3 | `cache_level=(1,1)` vs `(1,2)` | **know about it** | 16× less memory, 2.4–2.6× slower matvec |
 | 4 | real-symmetric f64 path | **already works** | 1.47–1.80× per solve; nothing to implement |
 | 2 | partial-J caching dial | **marginal** | curve is linear, but endpoints dominate |
@@ -46,7 +73,48 @@ measured, which reorders the priorities.
 
 **This is now what `get_xsource` does**; `poc1_searchsorted.py` remains as the exploratory record. The
 integrated version re-measured **12.1×, 18.7×, 16.9×** on the J-fold precompute at N = 100k/200k/500k,
-consistent with the POC. Tests are in `tests/test_sqd.py::TestGetXsource`, verified to fail against
+consistent with the POC.
+
+#### Measured on GPU (NVIDIA GH200 120GB, 2026-08-06)
+
+**5.15× at N = 64M, single signature, and still rising.** The CPU figure does not transfer, exactly as
+predicted: a GPU sort is well optimized relative to its gather, so the ratio compresses while the
+direction holds.
+
+| N | legacy sort | searchsorted | speedup | noise |
+|---|---|---|---|---|
+| 1 000 000 | 1.13 ms | 0.44 ms | 2.56× | 9.4 % |
+| 4 000 000 | 4.70 ms | 1.39 ms | 3.38× | 2.9 % |
+| 16 000 000 | 21.5 ms | 4.93 ms | 4.36× | 1.2 % |
+| 64 000 000 | 104 ms | 20.2 ms | **5.15×** | 0.3 % |
+
+`alpha = 1.09` (sort) against `0.92` (searchsorted) from a log-log fit. That gap is why the ratio
+climbs monotonically and why 5.15× is a **lower bound** rather than a plateau — the sort is mildly
+superlinear, the gather mildly sublinear.
+
+**Two GPU numbers from the same run are artifacts; do not quote them.** POC 1c (J = 50) reported
+12.5–14×, suspiciously close to the CPU figure, with a sort arm *flat* at 1141/1239/1201 ms across a
+5× `N` range — launch-latency bound, so it is a ratio of two overheads. POC 1b below N = 1M gives
+2.56× for the same reason. On a GH200 the launch-bound regime extends past N = 1M at J = 1 **and**
+covers N = 500k at J = 50, so it is per-call latency × call count, not `N` alone: reaching
+compute-bound needs large `N` *per call*, which is what `--sweep-to` does. `check_scaling` now fits
+`alpha` and refuses to call the ratios quotable below 0.6, because the launch-bound numbers are
+reproducible and meaningless at the same time — the same failure mode as the stale-baseline 1.00×,
+one layer down.
+
+#### The `lax.sort` GPU memory leak does not reproduce — the note was stale
+
+Measured on the same GH200 at n = 28, N = 5M, B = 4, J = 50, five repetitions per arm: the legacy
+sort allocated ~0.95 GB of live transients and returned to the 0.019 GB baseline **every** repetition,
+`retained_vs_baseline` and `drift_vs_rep0` both +0.000 GB. The searchsorted arm was identical. So on
+this backend and JAX version, `lax.sort` does not leak, and the original note (up to 5 GB at shape
+`(5M, 9)`) was either version-specific or has been fixed upstream. Reported rather than dropped, per
+the script's own instruction.
+
+Note this is now a claim about `lax.sort` itself: the sort left the library in 23fb226, so it is
+answerable only against the pinned legacy arm, and a flat result there is a finding about JAX rather
+than about `sqd`. The removal still stands on the other three grounds (speed, the `2N` allocation
+behind the `N ≤ 2**31` ceiling, and shardability). Tests are in `tests/test_sqd.py::TestGetXsource`, verified to fail against
 three injected defects: reversed byte significance (7 failures), the `uint64` path used beyond 8 bytes
 (3 failures, exactly the `B > 8` cases), and a non-negative absent-source sentinel (13 failures).
 
@@ -64,12 +132,16 @@ J-fold precompute (the cost `baseline.py` found dominant): **12.0×, 16.9×, 14.
 N = 100k/200k/500k with J = 50. Transient allocation drops 2.2–3.4×.
 
 Three properties beyond speed: it removes the `2N` allocation that sets the `N ≤ 2**31` ceiling; a
-gather **shards** where a sort does not; and it should remove the `sqd.py:561` GPU leak, though that
-last one is unverified here.
+gather **shards** where a sort does not; and it removes the `lax.sort` GPU leak — which, measured on a
+GH200, turned out not to exist on that backend anyway (see the GPU subsection above). The removal
+stands on the other two grounds plus speed.
 
 Two costs to be honest about. The fast path packs a state row into a `uint64`, so it is exact only
 while `n + 1 ≤ 64` bits — a hard correctness boundary, asserted rather than documented. An
-arbitrary-width lexicographic variant removes the limit at 3.0–3.7× instead of 12–25×.
+arbitrary-width lexicographic variant removes the limit at 3.0–3.7× instead of 12–25× on CPU. **The
+lex variant has no quotable GPU number:** POC 1e times a single signature at N = 200k, which is inside
+the GH200's launch-bound regime (it read 1.60×/1.62×, and the u64 path reads 2.56× at N = 1M for the
+same reason). Sizing it up the way `--sweep-to` does for POC 1b would fix that; nobody has.
 
 **The correctness gate had to be rewritten, and the reason is the interesting part.** "Bit-identical"
 rejected a correct implementation: on a fill-in row the library's `idx_sorted[1:] - size` lands on

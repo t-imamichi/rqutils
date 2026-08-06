@@ -1,16 +1,25 @@
 """POC 1: replace ``get_xsource``'s 2N sort with a searchsorted into the already-sorted S.
 
+**This POC's proposal was adopted in commit 23fb226, so ``rqutils.sqd.get_xsource`` IS the
+searchsorted now.** The sort baseline therefore lives here, as ``xsource_sort_legacy`` -- a verbatim
+copy of the pre-23fb226 implementation -- and every *timing* arm compares against that, not against
+the library. Timing against the library would compare two binary searches and report 1.00x, which is
+exactly what happened on the first GPU run of ``poc8_gpu_unverified.py``. The *correctness* arms still
+reference the library on purpose: agreeing with what ``sqd`` actually ships is the property that
+matters, and it is now a regression test rather than a proposal.
+
 ``get_xsource`` finds, for each ``i``, the index ``A[i]`` with ``S[A[i]] == S[i] ^ x``, or -1 when no
-such state is in the subspace. It does this by concatenating ``S`` and ``S ^ x`` into a ``2N`` array,
-sorting it, and reading off adjacent equal pairs. That sort is why ``N <= 2**31``, is noted in-tree as
-leaking up to 5 GB of GPU memory, and -- per ``baseline.py`` -- is 66-97% of an entire solve.
+such state is in the subspace. The former implementation did this by concatenating ``S`` and
+``S ^ x`` into a ``2N`` array, sorting it, and reading off adjacent equal pairs. That sort is why
+``N <= 2**31``, is noted in-tree as leaking up to 5 GB of GPU memory, and -- per ``baseline.py`` --
+was 66-97% of an entire solve.
 
 But ``S`` is **already lex-sorted**: ``uniquify_states`` returns it that way. So the lookup is a
 binary search of ``S ^ x`` into ``S``, which needs no ``2N`` allocation and no sort at all. A
 ``searchsorted`` is also a pure gather, so unlike a sort it shards -- each device can search its
 local slice against a replicated ``S``.
 
-Two implementations are compared against the library:
+Two implementations are compared against the legacy sort (timing) and the library (correctness):
 
 ``searchsorted_u64`` packs each state row into a single uint64 key and searches. This is the fast
 path and it is **exact only while n+1 <= 64 bits**, i.e. up to 63 qubits. That covers every problem
@@ -25,7 +34,7 @@ Correctness gate, in two parts, because "bit-identical" turns out to be the wron
 reason is worth recording.
 
 On a **fill-in row** (all-255, produced by uniquification) the target ``255 ^ x`` is never in ``S``,
-so the answer is "no source". The library's sort reaches that verdict through
+so the answer is "no source". The legacy sort reaches that verdict through
 ``idx_sorted[1:] - size`` and lands on assorted negative values (-12, -11, -10, ...) rather than
 exactly -1; a searchsorted returns -1. Both are consumed identically, because ``apply_xgrp`` gathers
 with ``mode="fill", wrap_negative_indices=False``, so *any* negative index yields 0.0. Demanding
@@ -42,6 +51,7 @@ So the gate is:
 Run: uv run --extra qiskit python examples/scaling/poc1_searchsorted.py
 """
 
+import argparse
 import os
 import sys
 
@@ -60,6 +70,48 @@ from rqutils.sqd import get_xsource, uniquify_states
 # Fill-in rows from uniquification are all-255. They must never match a real source: a genuine
 # packed state always has byte 0 < 128 because of the pad bit, so 255 is unreachable by construction.
 FILL_BYTE = 255
+
+
+@jax.jit
+def xsource_sort_legacy(xsignature, states):
+    """The pre-23fb226 ``get_xsource``: concatenate ``S`` and ``S ^ X`` into ``2N`` rows and sort.
+
+    **This is the baseline arm, and it lives here because the library no longer provides one.**
+    Commit 23fb226 replaced ``rqutils.sqd.get_xsource`` with the searchsorted below, so timing
+    ``get_xsource`` against ``xsource_searchsorted_u64`` now compares two binary searches and
+    measures 1.00x. That is exactly what happened on the first GPU run of ``poc8``: both arms were
+    the same algorithm, ``fmt_ratio`` correctly refused to call a winner, and the run produced no
+    information about the 12-25x claim it existed to check. A POC whose baseline is whatever the
+    library currently does silently stops being a comparison the moment the library changes.
+
+    Copied verbatim from ``git show 23fb226^:rqutils/sqd.py`` rather than reconstructed, including
+    the ``lax.sort`` leak comment -- a hand-rewritten sort would measure the rewrite. The
+    ``jax.reshard`` tail is dropped because these POCs time a single device; the sort is the subject.
+
+    Returns assorted negative values (not exactly -1) on fill-in rows, since it computes
+    ``I[k+1] - N`` unconditionally. Consumers cannot tell, because ``apply_xgrp`` gathers with
+    ``wrap_negative_indices=False`` and any negative index yields 0.0 -- which is why the
+    correctness gate here compares valid-row indices and gathered results, not raw index arrays.
+    """
+    size = states.shape[0]
+    mapped_states = jnp.bitwise_xor(states, xsignature)  # S^X
+    joined = jnp.concatenate([states, mapped_states], axis=0)
+    idx = jax.lax.iota(np.int32, 2 * size)
+    # lax.sort seems to leak GPU memory; can lose as much as 5 GB when sorting x of shape (5M,9)
+    srt = jax.lax.sort(tuple(joined.T) + (idx,), num_keys=joined.shape[1])
+    joined_sorted = jnp.stack(srt[:-1], axis=1)  # T
+    idx_sorted = srt[-1]  # I
+    invalid = np.array(-1, dtype=np.int32)
+
+    source_idx = jnp.where(
+        jnp.all(jnp.equal(joined_sorted[:-1], joined_sorted[1:]), axis=1),  # T[k] == T[k+1]
+        idx_sorted[1:] - size,  # I[k+1] - N
+        invalid,
+    )
+    tposition = jnp.cumsum(
+        jnp.bincount(jnp.cumsum(idx_sorted < size, dtype=np.int32), length=size), dtype=np.int32
+    )
+    return source_idx.at[tposition].get(mode="fill", fill_value=invalid)
 
 
 def _pack_u64(states: jax.Array) -> jax.Array:
@@ -201,18 +253,29 @@ def check_correctness():
     return ok
 
 
-def check_scaling():
-    header("POC 1b: SCALING -- per-signature cost vs N (n=24, single X signature)")
-    print(f"{'N':>9s}  {'sort (lib)':>13s}  {'searchsorted':>13s}  {'verdict':>34s}")
+def check_scaling(sizes=None, num_qubits=24):
+    """Per-signature cost vs N, plus the fitted exponent.
+
+    ``alpha`` (from a log-log fit) is the load-bearing output, not the ratios: it says whether the
+    measurement is in the regime where the ratio means anything. On a GH200 the default sizes give
+    alpha = 0.29 (sort) and 0.10 (searchsorted) -- both far below the ~1 of a saturated device --
+    because J=1 kernels at N <= 1M are **launch-latency bound**, so per-call overhead swamps the
+    work and every ratio is a ratio of two overheads. Pass ``--sweep-to`` to push N until alpha
+    approaches 1; the ratio at the largest size where alpha is near 1 is the quotable GPU number.
+    """
+    header(f"POC 1b: SCALING -- per-signature cost vs N (n={num_qubits}, single X signature)")
+    print(f"{'N':>9s}  {'legacy sort':>13s}  {'searchsorted':>13s}  {'verdict':>34s}")
     rows = []
-    for num_states in [10_000, 50_000, 200_000, 500_000, 1_000_000]:
-        p = make_problem(24, num_states, num_terms=8, seed=12)
+    for num_states in sizes or [10_000, 50_000, 200_000, 500_000, 1_000_000]:
+        p = make_problem(num_qubits, num_states, num_terms=8, seed=12)
         size = p.states_p.shape[0]
         states_u = jax.block_until_ready(uniquify_states(p.states_p, size))
         xsig = p.hamiltonian.x[0]
 
         t_ref = timeit(
-            lambda xsig=xsig, states_u=states_u: get_xsource(xsig, states_u), "lib", trials=5
+            lambda xsig=xsig, states_u=states_u: xsource_sort_legacy(xsig, states_u),
+            "legacy sort",
+            trials=5,
         )
         t_new = timeit(
             lambda xsig=xsig, states_u=states_u: xsource_searchsorted_u64(xsig, states_u),
@@ -227,13 +290,41 @@ def check_scaling():
 
     print()
     ns = np.array([r[0] for r in rows], dtype=float)
-    for name, idx in [("sort (lib)", 1), ("searchsorted", 2)]:
+    alphas = {}
+    for name, idx in [("legacy sort", 1), ("searchsorted", 2)]:
         ts = np.array([r[idx].min_s for r in rows])
-        alpha = np.polyfit(np.log(ns), np.log(ts), 1)[0]
-        print(f"  {name:<14s} alpha = {alpha:.2f}  (cost ~ N^alpha)")
+        alphas[name] = np.polyfit(np.log(ns), np.log(ts), 1)[0]
+        print(f"  {name:<14s} alpha = {alphas[name]:.2f}  (cost ~ N^alpha)")
+
+    # alpha is the gate on whether the ratios above are quotable. A sort is >= N log N, so an alpha
+    # well under 1 means fixed per-call cost dominates and the ratio is overhead/overhead. This is
+    # the check that explains poc8's flat sort arm on a GH200 (1256/1313/1599 ms for 25x N) -- the
+    # numbers were reproducible and meaningless at the same time.
+    a_sort = alphas["legacy sort"]
+    print()
+    if a_sort < 0.6:
+        print(
+            f"  LAUNCH-BOUND: alpha = {a_sort:.2f} for a sort, which is at least linear in theory."
+        )
+        print(
+            "  Fixed per-call cost dominates at these sizes, so the ratios above are ratios of two"
+        )
+        print(
+            "  overheads and must NOT be quoted as the GPU speedup. Re-run with --sweep-to to push"
+        )
+        print("  N until alpha approaches 1, and read the ratio there.")
+        largest = rows[-1]
+        print(
+            f"  Best available lower bound: {largest[1].min_s / largest[2].min_s:.2f}x at N={largest[0]}, "
+            "rising with N."
+        )
+    else:
+        print(
+            f"  COMPUTE-BOUND ENOUGH: alpha = {a_sort:.2f}. The largest-N ratio above is quotable."
+        )
 
     header("POC 1c: full J-fold precompute -- the cost baseline.py found dominant")
-    print(f"{'N':>9s}  {'J':>4s}  {'sort (lib)':>13s}  {'searchsorted':>13s}  {'verdict':>34s}")
+    print(f"{'N':>9s}  {'J':>4s}  {'legacy sort':>13s}  {'searchsorted':>13s}  {'verdict':>34s}")
     for num_states, j in [(100_000, 50), (200_000, 50), (500_000, 50)]:
         p = make_problem(24, num_states, num_terms=100, num_xgroups=j, seed=13)
         size = p.states_p.shape[0]
@@ -241,7 +332,7 @@ def check_scaling():
         xs = p.hamiltonian.x
 
         def all_ref(states_u=states_u, xs=xs):
-            return jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, xs)[1]
+            return jax.lax.scan(lambda _, x: (None, xsource_sort_legacy(x, states_u)), None, xs)[1]
 
         def all_new(states_u=states_u, xs=xs):
             return jax.lax.scan(
@@ -256,7 +347,7 @@ def check_scaling():
             i_same, g_same, nbad = _equivalent(ref_all[isig], new_all[isig], states_u, rng)
             assert i_same and g_same, f"J-fold mismatch at sig {isig}: nbad={nbad}"
 
-        t_ref = timeit(all_ref, "lib", trials=3)
+        t_ref = timeit(all_ref, "legacy sort", trials=3)
         t_new = timeit(all_new, "new", trials=3)
         print(
             f"{size:>9d}  {p.num_xgroups:>4d}  {t_ref.min_s * 1e3:>11.2f}ms  "
@@ -267,7 +358,7 @@ def check_scaling():
     print("Analytic, since the CPU backend does not report a GPU-style peak. Counting only the")
     print("transients one call allocates on top of S, which both paths share.")
     print()
-    print("  sort path, per get_xsource call:")
+    print("  legacy sort path, per call:")
     print("    S^X            N x B  uint8")
     print("    joined         2N x B uint8   (concatenate)")
     print("    iota           2N     int32")
@@ -295,15 +386,24 @@ def check_scaling():
                 f"{ss_peak / 2**30:>10.2f}GB  {sort_peak / ss_peak:>6.2f}x"
             )
     print()
-    print("  NOTE: this is transient allocation arithmetic, NOT the 5 GB GPU leak recorded in")
-    print("  rqutils/sqd.py:561. That leak is an allocator behaviour of lax.sort on a GPU backend")
-    print("  and is UNVERIFIABLE on this CPU-only machine. Removing the sort should remove it, but")
-    print("  that specific claim is untested here -- see poc_gpu_unverified.py.")
+    print("  NOTE: this is transient allocation arithmetic, NOT the 5 GB GPU leak once recorded in")
+    print("  rqutils/sqd.py. That leak is an allocator behaviour of lax.sort on a GPU backend, so")
+    print("  this analytic table cannot speak to it either way -- poc8_gpu_unverified.py measures")
+    if jax.default_backend() == "cpu":
+        print("  it, and on a CPU-only machine it is unverifiable.")
+    else:
+        print(
+            "  it. Measured flat on a GH200 (2026-08-06): the sort allocated ~0.95GB of transients"
+        )
+        print(
+            "  at N=5M/B=4 and returned to baseline after every repetition, so on that backend and"
+        )
+        print("  JAX version the leak does NOT reproduce and the original note is stale.")
 
 
 def check_lex_variant():
     header("POC 1e: arbitrary-width lex variant (removes the 63-qubit limit)")
-    print(f"{'n':>4s}  {'N':>9s}  {'sort (lib)':>13s}  {'lex ssorted':>13s}  {'verdict':>34s}")
+    print(f"{'n':>4s}  {'N':>9s}  {'legacy sort':>13s}  {'lex ssorted':>13s}  {'verdict':>34s}")
     for num_qubits, num_states in [(24, 200_000), (80, 200_000)]:
         p = make_problem(num_qubits, num_states, num_terms=8, seed=14)
         size = p.states_p.shape[0]
@@ -315,7 +415,9 @@ def check_lex_variant():
         assert i_same and g_same, f"lex mismatch at n={num_qubits}: nbad={nbad}"
 
         t_ref = timeit(
-            lambda xsig=xsig, states_u=states_u: get_xsource(xsig, states_u), "lib", trials=3
+            lambda xsig=xsig, states_u=states_u: xsource_sort_legacy(xsig, states_u),
+            "legacy sort",
+            trials=3,
         )
         t_new = timeit(
             lambda xsig=xsig, states_u=states_u: xsource_searchsorted_lex(xsig, states_u),
@@ -329,9 +431,41 @@ def check_lex_variant():
         )
 
 
+def _sweep_sizes(limit, num_qubits):
+    """Geometric ladder up to ``limit``, for pushing N out of the launch-bound regime.
+
+    Starts at 1M (where the default ladder ends) and quadruples. ``n`` is raised alongside so the
+    subspace can actually hold the requested count: N distinct states need n > log2(N), and a
+    too-small n silently caps the post-uniquification size, which would flatten the fit and read as
+    "still launch-bound" no matter how large ``limit`` is.
+    """
+    sizes, n = [], 1_000_000
+    while n <= limit:
+        sizes.append(n)
+        n *= 4
+    need = int(np.ceil(np.log2(max(sizes) * 4))) if sizes else num_qubits
+    return sizes, max(num_qubits, need)
+
+
 if __name__ == "__main__":
-    if not check_correctness():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--sweep-to",
+        type=int,
+        metavar="N",
+        help="Extend POC 1b's N ladder up to N (e.g. 64000000) to leave the launch-bound regime. "
+        "Raises n as needed so the subspace can hold that many distinct states.",
+    )
+    ap.add_argument("--skip-correctness", action="store_true", help="Skip POC 1a (timings only).")
+    opts = ap.parse_args()
+
+    if not opts.skip_correctness and not check_correctness():
         print("\nABORTING: correctness gate failed, timings would be meaningless.")
         sys.exit(1)
-    check_scaling()
+    if opts.sweep_to:
+        sizes, nq = _sweep_sizes(opts.sweep_to, 24)
+        print(f"\n(--sweep-to {opts.sweep_to}: N ladder {sizes}, n={nq})")
+        check_scaling(sizes=sizes, num_qubits=nq)
+    else:
+        check_scaling()
     check_lex_variant()

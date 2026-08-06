@@ -598,8 +598,15 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
     sorted that, which cost three things: the `2N` allocation is what caps `N` at `2^31` (the sort
     must run on one device), `lax.sort` was observed to leak GPU memory (up to 5 GB at shape
     `(5M, 9)`), and it dominated runtime -- measured 66-97% of an entire solve. A `searchsorted` is a
-    pure gather, so it also shards, where a sort does not. Measured 12-25x faster per signature and
-    12-17x on the J-fold precompute; see `docs/scaling-pocs.md`.
+    pure gather, so it also shards, where a sort does not. Measured on CPU at 12-25x per signature and
+    12-17x on the J-fold precompute, and **5.15x at N=64M on an NVIDIA GH200** (a GPU sort is
+    well optimized relative to its gather, so the ratio compresses while the direction holds); see
+    `docs/scaling-pocs.md`.
+
+    The memory leak, re-measured on that GH200 against a pinned copy of the old sort, **did not
+    reproduce**: ~0.95 GB of transients at `(5M, 4)` were fully reclaimed after every repetition. That
+    note was therefore stale or version-specific. It is recorded here as history because the removal
+    never depended on it -- the `2N` ceiling, shardability and runtime each justify it alone.
 
     Two paths, selected statically on width. `B <= 8` packs each row into a `uint64` and uses
     `jnp.searchsorted` directly; wider inputs fall back to an explicit lexicographic binary search

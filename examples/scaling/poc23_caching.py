@@ -14,8 +14,10 @@ rest -- turns a 6-point discrete choice into a continuous memory/time curve. Whe
 depends entirely on the shape of the curve, which is the thing to measure: if time is flat in ``J'``
 until it collapses at the end, the dial is worthless because only the endpoints matter.
 
-POC 2 builds on POC 1's searchsorted, since after that result recomputation is 12-25x cheaper than
-the library's sort and the tradeoff shifts substantially. Both are reported.
+POC 2 builds on POC 1's searchsorted, since after that result recomputation is 12-25x cheaper on CPU
+(5.15x on a GH200) than the old sort, and the tradeoff shifts substantially. Both are reported. The
+smaller GPU ratio does not change POC 2's "marginal" verdict, which rests on the *shape* of the curve
+-- flat in ``J'`` until it collapses at the end, so only the endpoints matter -- not on the magnitude.
 
 Run: uv run --extra qiskit python examples/scaling/poc23_caching.py
 """

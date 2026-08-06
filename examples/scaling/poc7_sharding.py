@@ -144,7 +144,7 @@ def main():
         print("  DIVERGENCE: the sharded path does not reproduce the single-device answer.")
     print()
     print("  STILL UNVERIFIED: real multi-GPU behaviour (interconnect, per-device memory limits,")
-    print("  the lax.sort GPU memory leak at sqd.py:561). Virtual CPU devices cannot speak to any")
+    print("  the lax.sort GPU memory leak, since removed). Virtual CPU devices cannot speak to any")
     print("  of those.")
     return 0
 

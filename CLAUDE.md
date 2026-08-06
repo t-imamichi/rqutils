@@ -134,9 +134,33 @@ merely the `N ≤ 2^31` ceiling but the main cost at every size measured, while 
 ~0.16 ms and confirms the `O(J·N)` model. The caching docstring above, which frames the tradeoff as
 memory-versus-speed, will mislead you about where the time goes.
 
-**`get_xsource` is now a binary search, not a sort** (12–19× faster on the J-fold precompute), which is
-why **`states` must be lex-sorted** — always required, since the sort was equally wrong on unsorted
-input, but previously undocumented. `hproj(unique_states=True)` skips its `np.unique` and so can
+Because that change landed, **the POCs under `examples/scaling/` no longer have a baseline in the
+library, and must not be pointed at one.** `poc1.xsource_sort_legacy` is a verbatim copy of the
+pre-23fb226 sort and is the timing baseline for both POC 1 and POC 8; their *correctness* arms still
+compare against `get_xsource`, which is the point (agreement with what ships is now a regression test).
+Point a timing arm at the library and you get searchsorted-versus-searchsorted: the first GPU run of
+`poc8_gpu_unverified.py` reported 1.002×/1.000×/1.000×, POC 1e read 0.26× "SLOWER", and `fmt_ratio`
+was correct every time — which is what made it easy to misread as a GPU finding. Restoring the
+baseline recovers 12.1×/18.3× and 3.57×/3.18× for the lex variant. Two related traps in that script,
+both fixed: `peak_bytes_in_use` is a high-water mark that never decreases (and sampling `bytes_in_use`
+after `del` reads the post-free baseline), so a leak test built on either cannot observe anything; and
+`--devices` sets `CUDA_VISIBLE_DEVICES`, a *filter* over what the driver exposes, so it cannot create a
+second GPU — Claim 3 on a one-GPU box is unrun, not unresolved.
+
+**On GPU the speedup is 5.15×, not 12–25×** (NVIDIA GH200, N=64M single signature, `alpha` 1.09 vs
+0.92, so still rising with N). Two other GPU numbers from the same run are launch-bound artifacts and
+must not be quoted: POC 1c at J=50 reads 12.5–14× — deceptively close to the CPU figure — with a sort
+arm *flat* at 1141/1239/1201 ms across a 5× N range, and POC 1b below N=1M reads 2.56×. The
+launch-bound regime covers J=1 past N=1M *and* J=50 at N=500k, so it is per-call latency × call count,
+not N alone; `--sweep-to` exists to escape it and `check_scaling` fits `alpha`, refusing to call a
+ratio quotable below 0.6. **Also measured: the `lax.sort` GPU memory leak does not reproduce** (~0.95 GB
+of transients fully reclaimed every rep at N=5M/B=4), so that note was stale — and since the sort left
+the library, it is now a claim about `lax.sort` rather than about `sqd`. Multi-GPU speed remains
+**unrun**, needing a physically multi-GPU box.
+
+**`get_xsource` is now a binary search, not a sort** (12–19× faster on the J-fold precompute on CPU),
+which is why **`states` must be lex-sorted** — always required, since the sort was equally wrong on
+unsorted input, but previously undocumented. `hproj(unique_states=True)` skips its `np.unique` and so can
 violate it; that returns a non-symmetric matrix and is pinned by
 `TestHproj::test_unsorted_input_with_unique_states_is_wrong`. Two paths selected statically on width:
 `uint64` keys for `B ≤ 8` bytes, an explicit lexicographic search beyond. That boundary is a
