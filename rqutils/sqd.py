@@ -144,11 +144,13 @@ and accordingly all arrays with an axis with size :math:`N` follow the same shar
 aggressive caching strategy described above will be possible this way.
 
 However, there is a limit to scaling in :math:`N` (SQD subspace dimension) imposed by the need to
-sort the states list during the initial uniquification, and also whenever the source indices for an
-X signature is computed. At the moment, sorting must take place within a single device, with at most
-:math:`2^32` elements involved. Furthermore, source indices identification sorts through a stack of
-two state lists. Therefore, the maximum achievable :math:`N` is :math:`2^31`. A comparable limit
-is set by the GPU memory, which is at most O(100)GB per device as of mid-2026.
+sort the states list during the initial uniquification. That sort must take place within a single
+device, with at most :math:`2^32` elements involved, so it caps the achievable :math:`N` at
+:math:`2^31`. Source index identification no longer contributes: it is a binary search into the
+already-sorted state list rather than a sort of a stacked :math:`2N` array, which is why the cap
+comes from :func:`uniquify_states` alone -- see :func:`get_xsource` for that change and what it was
+measured to be worth. A comparable limit is set by the GPU memory, which is at most O(100)GB per
+device as of mid-2026.
 
 When the source indices are cached but neither the sign bits nor the diagonals are, the state list
 :math:`S` will also be sharded after the computation of the source indices are done.
@@ -158,6 +160,8 @@ SQD API
 
 .. autofunction:: sqd
 .. autofunction:: hproj
+.. autofunction:: pack_states
+.. autofunction:: unpack_states
 """
 
 import functools
@@ -187,6 +191,47 @@ except ImportError:
     pass
 type Vector = np.ndarray[tuple[int], np.dtype[np.inexact]]
 type StateList = np.ndarray[tuple[int, int], np.dtype[np.uint8]]
+
+
+def pack_states(states: StateList) -> StateList:
+    """Pack binary states into bytes, inserting the leading pad bit that :class:`PauliSumXZ` expects.
+
+    :class:`PauliSumXZ` shifts every X/Z signature right by one bit unconditionally, so the states
+    must carry the same leading pad bit or the two disagree on bit alignment and every matrix element
+    lands in the wrong column. That failure is silent -- it returns a plausible wrong eigenvalue --
+    which is why this is one function rather than an idiom each call site restates. The same reason
+    ``PauliSumXZ`` dropped its ``add_padding`` flag: a bit layout no caller can get wrong beats an
+    invariant every caller has to remember.
+
+    The pad bit must be inserted with :func:`numpy.pad` before packing, not shifted afterwards,
+    because :func:`numpy.packbits` fills each byte from the most significant end.
+
+    The pad bit also makes byte 0 of any genuine state `< 128`, which is what lets ``255`` serve as
+    an unambiguous fill-in marker for the padded slots (see :func:`uniquify_states`).
+
+    Args:
+        states: Binary array of computational basis states, shape ``(num_states, num_qubits)``.
+
+    Returns:
+        Packed states, shape ``(num_states, ceil((num_qubits + 1) / 8))``.
+    """
+    return np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
+
+
+def unpack_states(states_p: StateList, num_qubits: int) -> StateList:
+    """Unpack states packed by :func:`pack_states`, dropping the leading pad bit.
+
+    The inverse of :func:`pack_states`; the two are defined together so the ``+1`` offset that the
+    pad bit imposes cannot drift between them.
+
+    Args:
+        states_p: Packed states, shape ``(num_states, num_bytes)``.
+        num_qubits: Number of qubits to recover, i.e. the original trailing dimension.
+
+    Returns:
+        Binary array of states, shape ``(num_states, num_qubits)``.
+    """
+    return np.unpackbits(states_p, axis=-1)[:, 1 : 1 + num_qubits]
 
 
 def sqd(
@@ -241,11 +286,7 @@ def sqd(
         LOG.debug("Adjusting states_size to make the array divisible by %d", mesh.size)
         states_size += mesh.size - resid
 
-    # Need an extra left zero bit to distinguish fill-in states from the inputs after
-    # unique(..., size=X, fill_value=255)
-    # We need to insert the bit with pad() at this point because packbits() fills from the left
-    # Perhaps write a new ufunc if this becomes too slow for very large input?
-    states_p = np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
+    states_p = pack_states(states)
     # Pad the *input* up to states_size too, not just the internal arrays. states_p is a traced
     # argument of run_sqd, so its leading dimension is part of the jit cache key: leaving it at the
     # raw input length retraces the whole solver on every distinct len(states), which is precisely
@@ -254,9 +295,8 @@ def sqd(
     # still leaked the input length through.
     #
     # 255 is the correct filler, and for the same reason uniquify_states uses it: an all-ones row
-    # sorts to the end of the lexsort, and its high bit in byte 0 is the fill-in marker that
-    # _spread_seed and the diagonal masking below already test via states_u[:, 0] >> 7. A genuine
-    # state can never collide with it, because the pad bit inserted above forces byte 0 < 128.
+    # sorts to the end of the lexsort, and its high bit in byte 0 is what _is_filler tests. A genuine
+    # state can never collide with it, because pack_states' pad bit forces byte 0 < 128.
     if (deficit := states_size - states_p.shape[0]) > 0:
         states_p = np.append(
             states_p, np.full((deficit, states_p.shape[1]), 255, dtype=np.uint8), axis=0
@@ -269,7 +309,7 @@ def sqd(
     eigval = float(result[0])
     if return_eigvec:
         eigvec, states_u, subspace_dim = result[1:]
-        basis_states = np.unpackbits(states_u[:subspace_dim], axis=-1)[:, 1 : 1 + states.shape[1]]
+        basis_states = unpack_states(states_u[:subspace_dim], states.shape[1])
         return (eigval, np.array(eigvec[:subspace_dim]), basis_states)
     return eigval
 
@@ -301,10 +341,7 @@ def hproj(
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
     if not unique_states:
         states = np.unique(states, axis=0)
-    # PauliSumXZ always shifts every X/Z signature right by one bit, so the states must carry the
-    # same leading pad bit or the two disagree on bit alignment and every matrix element lands in
-    # the wrong column. This mirrors what sqd() does.
-    states_p = np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
+    states_p = pack_states(states)
 
     columns, elements = _hproj_cols_elems(hamiltonian, states_p)
     valid = columns != -1
@@ -348,6 +385,21 @@ def _hproj_cols_elems(hamiltonian: PauliSumXZ, states_p: StateList) -> tuple[jax
     return jax.lax.scan(get_from_one, None, hamiltonian.arrays)[1]
 
 
+def _is_filler(states_u: StateList) -> jax.Array:
+    """Return the 0/1 fill-in marker bit of each row of a uniquified state list.
+
+    Filler slots are all-ones rows (``255``); genuine states have byte 0 ``< 128`` because
+    :func:`pack_states` inserts a leading zero pad bit. So the high bit of byte 0 identifies fillers,
+    and testing it is equivalent to testing ``states_u[:, 0] == 255`` -- one spelling for all three
+    consumers, rather than two that a reader has to re-derive as equal.
+
+    Returned as the bit itself, not a bool, because the fillers sort to the end: the result is a
+    non-decreasing 0/1 array, which is what lets ``run_sqd`` locate the subspace boundary with a
+    ``searchsorted`` instead of a count.
+    """
+    return states_u[:, 0] >> 7
+
+
 def _spread_seed(
     states_size: int, states_u: StateList, dtype: DTypeLike, sharding: PartitionSpec | None
 ) -> jax.Array:
@@ -378,7 +430,7 @@ def _spread_seed(
     mixed = mixed ^ (mixed >> 16)
     # Map to [-1, 1). The distribution does not matter, only that no entry is systematically zero.
     vec = mixed.astype(dtype) * (2.0 / float(2**32)) - 1.0
-    return jnp.where(states_u[:, 0] == 255, jnp.zeros_like(vec), vec)
+    return jnp.where(_is_filler(states_u) == 1, jnp.zeros_like(vec), vec)
 
 
 @jax.jit(static_argnames=["states_size", "return_eigvec", "cache_level", "log_level"])
@@ -457,7 +509,7 @@ def run_sqd(
         else:
             diagonal = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u).real
         # Set the fill-in components to the maximum value so that argmin only sees the valid entries
-        diagonal = jnp.where(states_u[:, 0] == 255, jnp.max(diagonal), diagonal)
+        diagonal = jnp.where(_is_filler(states_u) == 1, jnp.max(diagonal), diagonal)
         imin = jnp.argmin(diagonal)
         # Weight the minimum-diagonal state heavily -- it is the best single guess available, and
         # keeping it dominant preserves this heuristic's fast convergence -- but add the spread seed
@@ -508,7 +560,7 @@ def run_sqd(
         if sharding:
             eigvec = jax.reshard(eigvec, PartitionSpec(None))
             states_u = jax.reshard(states_u, PartitionSpec(None))
-        subspace_dim = jnp.searchsorted(states_u[:, 0] >> 7, 1)
+        subspace_dim = jnp.searchsorted(_is_filler(states_u), 1)
         result += (eigvec, states_u, subspace_dim)
     return result
 
@@ -557,12 +609,23 @@ def _row_less_than(rows: jax.Array, targets: jax.Array) -> jax.Array:
 
     The first differing byte decides, so mask each byte position by "all higher bytes equal" and
     take any hit. Written without a loop carry so it stays one fused expression per search step.
+
+    The prefix-AND is accumulated in uint8, not bool: `jnp.cumprod` rejects a bool accumulator and
+    promotes to int64 under `jax_enable_x64`, materializing the `[N, B]` mask at 8 bytes per element
+    where 1 suffices. That is a dtype decision fixed before HLO, so XLA cannot undo it -- measured
+    192 MB of transients versus 23 MB at N=1M, B=12, and 1.53x on the J-fold precompute this path
+    feeds. Pin `dtype=` explicitly; the promotion comes back without it.
     """
     eq_prefix = jnp.cumprod(
         jnp.concatenate(
-            [jnp.ones((rows.shape[0], 1), bool), rows[:, :-1] == targets[:, :-1]], axis=1
+            [
+                jnp.ones((rows.shape[0], 1), jnp.uint8),
+                (rows[:, :-1] == targets[:, :-1]).astype(jnp.uint8),
+            ],
+            axis=1,
         ),
         axis=1,
+        dtype=jnp.uint8,
     ).astype(bool)
     return jnp.any(jnp.logical_and(eq_prefix, rows < targets), axis=1)
 
@@ -591,7 +654,8 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
     `np.unique(..., axis=0)`'s. Note `hproj`'s `unique_states=True` shortcut skips that `np.unique`,
     so a caller passing unsorted-but-unique states gets a wrong (and non-symmetric) matrix; that
     predates this implementation and is pinned by
-    `tests/test_sqd.py::TestHproj::test_unsorted_input_is_rejected`.
+    `tests/test_sqd.py::TestHproj::test_unsorted_input_with_unique_states_is_wrong` -- named for the
+    behaviour, since nothing is rejected: the result is silently wrong.
 
     Since `S` is sorted, finding `A` is a **binary search** of `S ^ X` into `S` -- not a reason to
     sort anything. The former implementation concatenated `S` and `S ^ X` into a `[2N, B]` array and
@@ -627,11 +691,14 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
 
     if nbytes <= 8:
         keys = _pack_state_keys(states)
-        pos = jnp.searchsorted(keys, _pack_state_keys(targets), side="left")
+        # One name for the search key, used by both the search and the hit test: that they are the
+        # same quantity is the whole correctness argument for the branch.
+        target_keys = _pack_state_keys(targets)
+        pos = jnp.searchsorted(keys, target_keys, side="left")
         # searchsorted returns N for a target above every key; clamp before gathering so the
         # equality test below stays in bounds.
         pos = jnp.minimum(pos, size - 1)
-        found = keys[pos] == _pack_state_keys(targets)
+        found = keys[pos] == target_keys
     else:
         # Explicit binary search on the rows themselves. Invariant: lo is the count of rows strictly
         # less than the target, so after ceil(log2(N)) + 1 halvings lo is the insertion point.
@@ -654,13 +721,23 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
     return xsource
 
 
+def _z_parity(states: StateList, zsignature: jax.Array) -> jax.Array:
+    """Return `popcount(state & z) mod 2` per state, the sign bit of one Z term.
+
+    Accumulated in uint8 and reduced with `& 1`: the parity is the only bit that matters, and both
+    diagonal builders must spell it the same way, since a mismatch in the reduction dtype or the mask
+    silently changes the sign of a term rather than raising.
+    """
+    return jnp.sum(jnp.bitwise_count(states & zsignature), axis=1, dtype=np.uint8) & 1
+
+
 @jax.jit
 def get_diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Array:
     """Return the packed sign bits."""
 
     def get_signs(carry, zsignature):
         out, ibyte, ibit = carry
-        sign_bits = jnp.sum(jnp.bitwise_count(states & zsignature), axis=1, dtype=np.uint8) & 1
+        sign_bits = _z_parity(states, zsignature)
         # bits and bytes are counted from the left
         out = out.at[:, ibyte].add(sign_bits << (7 - ibit), out_sharding=jax.typeof(out).sharding)
         ibyte, ibit = jax.lax.cond(ibit == 7, lambda: (ibyte + 1, 0), lambda: (ibyte, ibit + 1))
@@ -731,7 +808,7 @@ def get_diagonal(
     """Return the fully composed diagonals for one X signature."""
 
     def sign_bit(iterm):
-        return jnp.sum(jnp.bitwise_count(states & zsignatures[iterm]), axis=1, dtype=np.uint8) & 1
+        return _z_parity(states, zsignatures[iterm])
 
     return _accumulate_diagonal(coeffs, states, sign_bit)
 
