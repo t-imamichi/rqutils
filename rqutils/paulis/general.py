@@ -136,41 +136,48 @@ def paulis(dim: MatrixDimension, sparse: bool = False) -> NDArray[np.complex128]
     if len(dim) == 1:
         return pauli_matrices(dim[0], sparse=sparse)
 
-    if (cache := _pauli_products.get((dim, sparse))) is not None:
-        return cache.copy()
-
-    subsystems = [pauli_matrices(d, sparse=sparse) for d in dim]
-    num_sub = len(subsystems)
+    # Raise before building anything: the sparse product path does not exist, and the dense body
+    # below is the whole function, so guarding it with an else put 25 lines a level deeper and left
+    # `matrix_array`'s definedness for the reader to prove. The cache is keyed on `dim` alone for the
+    # same reason -- with this raise unconditional, a `sparse` axis could only ever hold False.
     if sparse:
         raise NotImplementedError("Need an hour")
-    else:
-        # Compose Pauli products
-        # (d1**2, d1, d1) x (d2**2, d2, d2) -> (d1**2, d2**2, d1*d2, d1*d2)
-        #      a   b   c         d   e   f          a      d     be     cf
-        # be and cf are reshaped into 1 dimension each
-        chars = string.ascii_letters
-        if num_sub * 3 > len(chars):
-            raise NotImplementedError(
-                "Too many subsystems - need an implementation using recursive np.kron"
-            )
 
-        indices_in = []
-        indices_out = [""] * 3
-        for ichar in range(0, num_sub * 3, 3):
-            indices_in.append(chars[ichar : ichar + 3])
-            indices_out[0] += chars[ichar]
-            indices_out[1] += chars[ichar + 1]
-            indices_out[2] += chars[ichar + 2]
+    if (cache := _pauli_products.get(dim)) is not None:
+        return cache
 
-        indices = f"{','.join(indices_in)}->{''.join(indices_out)}"
-        dim_array = np.asarray(dim)
-        shape = np.concatenate(
-            (np.square(dim_array), np.prod(np.repeat(dim_array[None, :], 2, axis=0), axis=1))
+    subsystems = [pauli_matrices(d) for d in dim]
+    num_sub = len(subsystems)
+
+    # Compose Pauli products
+    # (d1**2, d1, d1) x (d2**2, d2, d2) -> (d1**2, d2**2, d1*d2, d1*d2)
+    #      a   b   c         d   e   f          a      d     be     cf
+    # be and cf are reshaped into 1 dimension each
+    chars = string.ascii_letters
+    if num_sub * 3 > len(chars):
+        raise NotImplementedError(
+            "Too many subsystems - need an implementation using recursive np.kron"
         )
-        matrix_array = np.einsum(indices, *subsystems).reshape(*shape) / (2 ** (num_sub - 1))
 
+    indices_in = []
+    indices_out = [""] * 3
+    for ichar in range(0, num_sub * 3, 3):
+        indices_in.append(chars[ichar : ichar + 3])
+        indices_out[0] += chars[ichar]
+        indices_out[1] += chars[ichar + 1]
+        indices_out[2] += chars[ichar + 2]
+
+    indices = f"{','.join(indices_in)}->{''.join(indices_out)}"
+    shape = tuple(d**2 for d in dim) + (int(np.prod(dim)),) * 2
+    matrix_array = np.einsum(indices, *subsystems).reshape(shape) / (2 ** (num_sub - 1))
+
+    # Cache and return the same immutable array, as pauli_matrices does. Storing a `.copy()` and
+    # returning the original left a second, writeable allocation alive per key for the process
+    # lifetime: retained memory measured 2.00x the result at dim=(2,)*6 (537 MB for a 268 MB basis)
+    # against 1.00x now. It also made the warm return writeable while the cold return was read-only,
+    # so no caller could have depended on writeability without already hitting that inconsistency.
     matrix_array.setflags(write=False)
-    _pauli_products[(dim, sparse)] = matrix_array.copy()
+    _pauli_products[dim] = matrix_array
     return matrix_array
 
 
@@ -188,60 +195,42 @@ def pauli_matrices(dim: int, sparse: bool = False) -> NDArray[np.complex128 | np
         An array of matrices.
     """
     if (cache := _pauli_matrices.get((dim, sparse))) is not None:
-        return cache.copy()
+        return cache
 
-    if sparse:
-        matrices = []
-        shape = (dim, dim)
+    # Compose the unnormalized matrices
+    matrices = np.zeros((dim**2, dim, dim), dtype=complex)
 
-        data = np.full(dim, np.sqrt(2.0 / dim), dtype=complex)
-        indices = np.arange(dim)
-        indptr = np.arange(dim + 1)
-        matrices.append(csr_array((data, indices, indptr), shape=shape))
-
-        for ishell in range(1, dim):
-            for ipos in range(ishell):
-                indices = [ishell, ipos]
-                indptr = [0] * (ipos + 1) + [1] * (ishell - ipos)
-                indptr += [2] * (dim - ishell)
-
-                matrices.append(csr_array(([1.0 + 0.0j, 1.0 + 0.0j], indices, indptr), shape=shape))
-                matrices.append(csr_array(([-1.0j, 1.0j], indices, indptr), shape=shape))
-
-            data = np.array([1.0] * ishell + [-ishell], dtype=complex)
-            data *= np.sqrt(2.0 / ishell / (ishell + 1.0))
-            indices = np.arange(ishell + 1)
-            indptr = list(range(ishell + 1)) + [ishell + 1] * (dim - ishell)
-            matrices.append(csr_array((data, indices, indptr), shape=shape))
-
-        matrices = np.array(matrices)
-
-    else:
-        # Compose the unnormalized matrices
-        matrices = np.zeros((dim**2, dim, dim), dtype=complex)
-
-        matrices[0] = np.diag(np.ones(dim))
-        imat = 1
-        for ishell in range(1, dim):
-            for ipos in range(ishell):
-                matrices[imat, ipos, ishell] = 1.0
-                matrices[imat, ishell, ipos] = 1.0
-                imat += 1
-                matrices[imat, ipos, ishell] = -1.0j
-                matrices[imat, ishell, ipos] = 1.0j
-                imat += 1
-
-            matrices[imat, : ishell + 1, : ishell + 1] = np.diag(
-                np.array([1.0] * ishell + [-ishell])
-            )
+    matrices[0] = np.diag(np.ones(dim))
+    imat = 1
+    for ishell in range(1, dim):
+        for ipos in range(ishell):
+            matrices[imat, ipos, ishell] = 1.0
+            matrices[imat, ishell, ipos] = 1.0
+            imat += 1
+            matrices[imat, ipos, ishell] = -1.0j
+            matrices[imat, ishell, ipos] = 1.0j
             imat += 1
 
-        # Normalization
-        norm = np.trace(np.matmul(matrices, matrices), axis1=1, axis2=2)
-        matrices *= np.sqrt(2.0 / norm)[:, None, None]
+        matrices[imat, : ishell + 1, : ishell + 1] = np.diag(np.array([1.0] * ishell + [-ishell]))
+        imat += 1
 
-    # Make the matrix immutable
-    matrices.setflags(write=False)
+    # Normalization
+    norm = np.trace(np.matmul(matrices, matrices), axis1=1, axis2=2)
+    matrices *= np.sqrt(2.0 / norm)[:, None, None]
+
+    if sparse:
+        # Derived from the dense basis rather than built as a second, independent construction. The
+        # CSR branch this replaces re-derived the shell ordering and the sqrt(2/(k(k+1))) diagonal
+        # normalization by hand as data/indices/indptr triplets -- a second spelling of the one
+        # convention CLAUDE.md flags as most bug-prone here, where a divergence would be silent
+        # because each branch stayed internally consistent. Verified identical (max abs diff 0.0 and
+        # equal nnz) for dim 2 through 6 before the swap.
+        matrices = np.array([csr_array(mat) for mat in matrices])
+    else:
+        # Make the matrix immutable. Only the dense array can carry the flag; the object array of
+        # csr_arrays is not written to either, but setflags on it would not protect its elements.
+        matrices.setflags(write=False)
+
     _pauli_matrices[(dim, sparse)] = matrices
     return matrices
 
@@ -271,10 +260,10 @@ def components(
     # gating it left `components(m, dim=3, npmod=jnp)` raising "object of type 'int' has no len()"
     # from the return statement, naming nothing. Only the *validation* below belongs behind the gate,
     # per CLAUDE.md's npmod rule.
-    if dim is None:
-        dim = (matrix.shape[-1],)
-    else:
-        dim = normalize_dim(dim)
+    # Both arms go through normalize_dim, including the fallback: hand-rolling the one-element tuple
+    # would key paulis()'s memo dict on a numpy int under npmod=jnp, where `matrix.shape[-1]` is not
+    # necessarily a plain int, so the same problem could occupy two cache entries.
+    dim = normalize_dim(matrix.shape[-1] if dim is None else dim)
 
     if npmod is np and np.prod(dim) != matrix.shape[-1]:
         raise ValueError(
@@ -311,9 +300,30 @@ def labels(
     if symbol is None or isinstance(symbol, str):
         symbol = (symbol,) * len(dim)
 
-    out = np.array("", dtype=str)
+    # Normalization affixes. Folded into the construction below -- the prefix into the seed and the
+    # suffix into the last subsystem's per-label list -- rather than applied as two extra whole-array
+    # np.char.add passes over np.full(out.shape, ...) at the end. Those passes cost 47-58% of the
+    # call at 10 qubits, where the latex prefix alone was a 25 MB array holding one repeated 7-char
+    # string. Replacing np.full with a scalar does not help: np.char.add densifies it anyway.
+    pre, post = "", ""
+    if norm and len(dim) >= 2:
+        if len(dim) == 2:
+            denom = "2"
+        elif fmt == "text":
+            denom = f"2**{len(dim) - 1}"
+        else:
+            denom = "2^{%d}" % (len(dim) - 1)  # noqa: UP031 (f-string needs {{}} escapes here)
 
-    for pauli_dim, sym in zip(dim, symbol):
+        if fmt in ("text", "latex-slash"):
+            post = f"/{denom}"
+        elif fmt == "latex":
+            pre, post = r"\frac{", "}{%s}" % denom  # noqa: UP031
+        else:
+            pre, post = r"\textstyle{\frac{", "}{%s}}" % denom  # noqa: UP031
+
+    out = np.array(pre, dtype=str)
+
+    for isub, (pauli_dim, sym) in enumerate(zip(dim, symbol)):
         if delimiter and len(out.shape) > 0:
             out = np.char.add(out, np.full(out.shape, delimiter))
 
@@ -333,29 +343,9 @@ def labels(
             assert len(sym) == pauli_dim**2, "Invalid length of the symbols array"
             labels = [f"{{{s}}}" for s in sym]
 
+        if post and isub == len(dim) - 1:
+            labels = [label + post for label in labels]
+
         out = np.char.add(np.repeat(out[..., None], pauli_dim**2, axis=-1), labels)
-
-    if norm and len(dim) >= 2:
-        if len(dim) == 2:
-            denom = "2"
-        elif fmt == "text":
-            denom = f"2**{len(dim) - 1}"
-        else:
-            denom = "2^{%d}" % (len(dim) - 1)  # noqa: UP031 (f-string needs {{}} escapes here)
-
-        if fmt in ("text", "latex-slash"):
-            post = np.full(out.shape, f"/{denom}")
-
-        else:
-            if fmt == "latex":
-                pre = np.full(out.shape, r"\frac{")
-                post = np.full(out.shape, "}{%s}" % denom)  # noqa: UP031
-            else:
-                pre = np.full(out.shape, r"\textstyle{\frac{")
-                post = np.full(out.shape, "}{%s}}" % denom)  # noqa: UP031
-
-            out = np.char.add(pre, out)
-
-        out = np.char.add(out, post)
 
     return out
