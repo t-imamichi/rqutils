@@ -103,7 +103,7 @@ from scipy.sparse import csr_array
 from rqutils._types import MatrixDimension
 
 
-def _normalize_dim(dim: MatrixDimension) -> tuple[int, ...]:
+def normalize_dim(dim: MatrixDimension) -> tuple[int, ...]:
     """Return ``dim`` as a tuple of plain ints, treating a scalar as a single subsystem.
 
     A ``tuple(int)`` is what the memoization dicts in this module key on, so normalizing to exactly
@@ -131,7 +131,7 @@ def paulis(dim: MatrixDimension, sparse: bool = False) -> NDArray[np.complex128]
         An array of Pauli (product) matrices as an array. For `dim=(d1, d2, ...)`, the shape of
         the array is `(d1**2, d2**2, ..., d1*d2*..., d1*d2*...)`.
     """
-    dim = _normalize_dim(dim)
+    dim = normalize_dim(dim)
 
     if len(dim) == 1:
         return pauli_matrices(dim[0], sparse=sparse)
@@ -267,14 +267,14 @@ def components(
     Raises:
         ValueError: If `prod(dim)` does not match the matrix dimension.
     """
-    # _normalize_dim runs for every npmod -- `len(dim)` below needs a sequence either way, and
+    # normalize_dim runs for every npmod -- `len(dim)` below needs a sequence either way, and
     # gating it left `components(m, dim=3, npmod=jnp)` raising "object of type 'int' has no len()"
     # from the return statement, naming nothing. Only the *validation* below belongs behind the gate,
     # per CLAUDE.md's npmod rule.
     if dim is None:
         dim = (matrix.shape[-1],)
     else:
-        dim = _normalize_dim(dim)
+        dim = normalize_dim(dim)
 
     if npmod is np and np.prod(dim) != matrix.shape[-1]:
         raise ValueError(
@@ -306,7 +306,7 @@ def labels(
     Returns:
         An ndarray of type string and shape `(d1**2, d2**2, ...)`.
     """
-    dim = _normalize_dim(dim)
+    dim = normalize_dim(dim)
 
     if symbol is None or isinstance(symbol, str):
         symbol = (symbol,) * len(dim)

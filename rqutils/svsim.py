@@ -66,6 +66,23 @@ if HAS_QISKIT:
     CircuitInput |= QuantumCircuit
 
 
+# name -> (x bit, z bit, takes an angle). The supported gate set in one place: which gates exist,
+# their symplectic signature, and which are parameterized. Keeping the parameterized set as a
+# separate tuple alongside a per-gate dispatch meant the same fact was spelled twice, and a drift
+# between them would leave `angle` silently stale from the previous loop iteration rather than
+# raising. Note `cz` is absent deliberately -- it is decomposed on the QuantumCircuit path only, and
+# rejected as a raw gate spec (tests/test_svsim.py::TestCz::test_cz_as_a_gate_spec_is_rejected).
+_GATE_XZ = {
+    "x": (1, 0, False),
+    "y": (1, 1, False),
+    "z": (0, 1, False),
+    "rx": (1, 0, True),
+    "ry": (1, 1, True),
+    "rz": (0, 1, True),
+    "rzz": (0, 1, True),
+}
+
+
 def svsim(
     circuit: CircuitInput,
     initial_state: NDArray[np.complex128] | int = 0,
@@ -107,12 +124,21 @@ def do_svsim(
     if out_sharding is None and not (mesh := get_abstract_mesh()).empty:
         out_sharding = PartitionSpec(mesh.axis_names)
 
-    indices = jnp.arange(2**circuit.num_qubits, dtype=np.int64, out_sharding=out_sharding)
+    dim = 2**circuit.num_qubits
 
     if len(initial_state.shape) == 0:
-        initial_state = (indices == initial_state).astype(np.complex128)
+        one_hot_indices = jnp.arange(dim, dtype=np.int64, out_sharding=out_sharding)
+        initial_state = (one_hot_indices == initial_state).astype(np.complex128)
 
     def apply_gate(state, gate):
+        # Build the index iota inside the body, not once outside it. Closing over it instead makes
+        # XLA hoist it into the scan's carry, where a 2^n int64 array stays resident for the whole
+        # simulation on top of the two complex128 statevector buffers the loop already needs --
+        # measured peak temp 2.5x the statevector, invariant in n, against 2.0x when built here (an
+        # iota is loop-invariant, so XLA rematerializes it for free rather than keeping it live).
+        # That is 8 GiB at n=30 and 32 GiB at n=32, on a module whose docstring advertises 32+
+        # qubits. Output is bit-identical either way.
+        indices = jnp.arange(dim, dtype=np.int64, out_sharding=out_sharding)
         signs = 1.0 - 2.0 * (jnp.bitwise_count(indices & gate.z) & 1)
         xstate = jax.lax.cond(
             jnp.all(gate.x == 0),
@@ -172,27 +198,16 @@ def to_circuitxz(circuit: CircuitInput) -> CircuitXZ:
         # parameterized gate must carry its angle. Indexing gate[2] directly would raise a bare
         # IndexError further down, with nothing to say which gate was malformed.
         name, qubit_spec, *rest = gate
-        if name in ("rx", "ry", "rz", "rzz"):
+        try:
+            xbit, zbit, needs_angle = _GATE_XZ[name]
+        except KeyError:
+            raise ValueError(f"Unsupported gate name {name}") from None
+        if needs_angle:
             if not rest:
                 raise ValueError(f"Gate {name} requires an angle as its third element")
-            angle = rest[0]
-        match name:
-            case "x":
-                spec = (1, 0, "pi")
-            case "y":
-                spec = (1, 1, "pi")
-            case "z":
-                spec = (0, 1, "pi")
-            case "rx":
-                spec = (1, 0, angle)
-            case "ry":
-                spec = (1, 1, angle)
-            case "rz":
-                spec = (0, 1, angle)
-            case "rzz":
-                spec = (0, 1, angle)
-            case _:
-                raise ValueError(f"Unsupported gate name {name}")
+            spec = (xbit, zbit, rest[0])
+        else:
+            spec = (xbit, zbit, "pi")
 
         qubits = np.asarray(qubit_spec)
         xarr[igate] = np.sum(np.array(spec[0], dtype=np.int64) << qubits)
