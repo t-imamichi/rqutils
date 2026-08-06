@@ -160,8 +160,10 @@ SQD API
 
 .. autofunction:: sqd
 .. autofunction:: hproj
-.. autofunction:: pack_states
-.. autofunction:: unpack_states
+
+States are packed with :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states`, which inserts the
+pad bit that aligns them with the Hamiltonian's signatures, and recovered with
+:meth:`~rqutils.paulis.symplectic.PauliSumXZ.unpack_states`.
 """
 
 import functools
@@ -191,47 +193,6 @@ except ImportError:
     pass
 type Vector = np.ndarray[tuple[int], np.dtype[np.inexact]]
 type StateList = np.ndarray[tuple[int, int], np.dtype[np.uint8]]
-
-
-def pack_states(states: StateList) -> StateList:
-    """Pack binary states into bytes, inserting the leading pad bit that :class:`PauliSumXZ` expects.
-
-    :class:`PauliSumXZ` shifts every X/Z signature right by one bit unconditionally, so the states
-    must carry the same leading pad bit or the two disagree on bit alignment and every matrix element
-    lands in the wrong column. That failure is silent -- it returns a plausible wrong eigenvalue --
-    which is why this is one function rather than an idiom each call site restates. The same reason
-    ``PauliSumXZ`` dropped its ``add_padding`` flag: a bit layout no caller can get wrong beats an
-    invariant every caller has to remember.
-
-    The pad bit must be inserted with :func:`numpy.pad` before packing, not shifted afterwards,
-    because :func:`numpy.packbits` fills each byte from the most significant end.
-
-    The pad bit also makes byte 0 of any genuine state `< 128`, which is what lets ``255`` serve as
-    an unambiguous fill-in marker for the padded slots (see :func:`uniquify_states`).
-
-    Args:
-        states: Binary array of computational basis states, shape ``(num_states, num_qubits)``.
-
-    Returns:
-        Packed states, shape ``(num_states, ceil((num_qubits + 1) / 8))``.
-    """
-    return np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
-
-
-def unpack_states(states_p: StateList, num_qubits: int) -> StateList:
-    """Unpack states packed by :func:`pack_states`, dropping the leading pad bit.
-
-    The inverse of :func:`pack_states`; the two are defined together so the ``+1`` offset that the
-    pad bit imposes cannot drift between them.
-
-    Args:
-        states_p: Packed states, shape ``(num_states, num_bytes)``.
-        num_qubits: Number of qubits to recover, i.e. the original trailing dimension.
-
-    Returns:
-        Binary array of states, shape ``(num_states, num_qubits)``.
-    """
-    return np.unpackbits(states_p, axis=-1)[:, 1 : 1 + num_qubits]
 
 
 def sqd(
@@ -286,7 +247,7 @@ def sqd(
         LOG.debug("Adjusting states_size to make the array divisible by %d", mesh.size)
         states_size += mesh.size - resid
 
-    states_p = pack_states(states)
+    states_p = PauliSumXZ.pack_states(states)
     # Pad the *input* up to states_size too, not just the internal arrays. states_p is a traced
     # argument of run_sqd, so its leading dimension is part of the jit cache key: leaving it at the
     # raw input length retraces the whole solver on every distinct len(states), which is precisely
@@ -296,7 +257,7 @@ def sqd(
     #
     # 255 is the correct filler, and for the same reason uniquify_states uses it: an all-ones row
     # sorts to the end of the lexsort, and its high bit in byte 0 is what _is_filler tests. A genuine
-    # state can never collide with it, because pack_states' pad bit forces byte 0 < 128.
+    # state can never collide with it, because PauliSumXZ.pack_states' pad bit forces byte 0 < 128.
     if (deficit := states_size - states_p.shape[0]) > 0:
         states_p = np.append(
             states_p, np.full((deficit, states_p.shape[1]), 255, dtype=np.uint8), axis=0
@@ -309,7 +270,7 @@ def sqd(
     eigval = float(result[0])
     if return_eigvec:
         eigvec, states_u, subspace_dim = result[1:]
-        basis_states = unpack_states(states_u[:subspace_dim], states.shape[1])
+        basis_states = PauliSumXZ.unpack_states(states_u[:subspace_dim], states.shape[1])
         return (eigval, np.array(eigvec[:subspace_dim]), basis_states)
     return eigval
 
@@ -341,7 +302,7 @@ def hproj(
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
     if not unique_states:
         states = np.unique(states, axis=0)
-    states_p = pack_states(states)
+    states_p = PauliSumXZ.pack_states(states)
 
     columns, elements = _hproj_cols_elems(hamiltonian, states_p)
     valid = columns != -1
@@ -389,7 +350,7 @@ def _is_filler(states_u: StateList) -> jax.Array:
     """Return the 0/1 fill-in marker bit of each row of a uniquified state list.
 
     Filler slots are all-ones rows (``255``); genuine states have byte 0 ``< 128`` because
-    :func:`pack_states` inserts a leading zero pad bit. So the high bit of byte 0 identifies fillers,
+    :meth:`PauliSumXZ.pack_states` inserts a leading zero pad bit. So the high bit of byte 0 identifies fillers,
     and testing it is equivalent to testing ``states_u[:, 0] == 255`` -- one spelling for all three
     consumers, rather than two that a reader has to re-derive as equal.
 

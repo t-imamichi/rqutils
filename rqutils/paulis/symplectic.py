@@ -28,6 +28,11 @@ padding is intrinsic to the representation rather than optional, so the two side
 bit alignment -- a disagreement that is silent, since every matrix element lands in the wrong column
 while the result stays symmetric.
 
+Both sides of that alignment live here: :meth:`PauliSumXZ.from_paulisum` pads the signatures, and
+:meth:`PauliSumXZ.pack_states` pads the states consumers pair them with. Callers should reach for the
+latter rather than open-coding the ``pad``-then-``packbits`` idiom, so there is one definition of the
+layout rather than one per consumer.
+
 Note that ``np.packbits`` fills each byte from the most significant end, so a signature's payload
 occupies the *leading* entries of ``np.unpackbits`` rather than the trailing ones: bit 0 is the pad
 bit, and the :math:`n` payload bits are entries 1 through :math:`n` in Pauli-string character order,
@@ -66,6 +71,51 @@ class PauliSumXZ:
     z: np.ndarray[tuple[int, int, int], np.dtype[np.uint8]]
     c: np.ndarray[tuple[int, int], np.dtype[np.inexact]]
     num_qubits: int = field(metadata={"static": True})
+
+    @staticmethod
+    def pack_states(
+        states: np.ndarray[tuple[int, int], np.dtype[np.uint8]],
+    ) -> np.ndarray[tuple[int, int], np.dtype[np.uint8]]:
+        """Pack binary states into bytes with the leading pad bit this class's signatures carry.
+
+        The states side of the bit-alignment contract described under "Bit layout" above. It lives on
+        this class because this class is what *decides* the layout: :meth:`from_paulisum` inserts the
+        signature pad bit unconditionally, and this method inserts the matching state pad bit, so the
+        two halves cannot drift. Consumers call it rather than restating the idiom -- a disagreement
+        is silent, putting every matrix element in the wrong column while the result stays symmetric,
+        which is how ``rqutils.sqd.hproj`` once shipped a plausible wrong eigenvalue.
+
+        The pad bit must be inserted with :func:`numpy.pad` before packing, not shifted in afterwards,
+        because :func:`numpy.packbits` fills each byte from the most significant end.
+
+        It also makes byte 0 of any genuine state ``< 128``, which is what lets ``255`` serve as an
+        unambiguous fill-in marker for padded slots (see :func:`rqutils.sqd.uniquify_states`).
+
+        Args:
+            states: Binary array of computational basis states, shape ``(num_states, num_qubits)``.
+
+        Returns:
+            Packed states, shape ``(num_states, ceil((num_qubits + 1) / 8))``.
+        """
+        return np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
+
+    @staticmethod
+    def unpack_states(
+        states_p: np.ndarray[tuple[int, int], np.dtype[np.uint8]], num_qubits: int
+    ) -> np.ndarray[tuple[int, int], np.dtype[np.uint8]]:
+        """Unpack states packed by :meth:`pack_states`, dropping the leading pad bit.
+
+        The inverse of :meth:`pack_states`, defined alongside it so the ``+1`` offset the pad bit
+        imposes cannot drift between the two directions.
+
+        Args:
+            states_p: Packed states, shape ``(num_states, num_bytes)``.
+            num_qubits: Number of qubits to recover, i.e. the original trailing dimension.
+
+        Returns:
+            Binary array of states, shape ``(num_states, num_qubits)``.
+        """
+        return np.unpackbits(states_p, axis=-1)[:, 1 : 1 + num_qubits]
 
     @classmethod
     def from_paulisum(cls, paulisum: Any) -> "PauliSumXZ":
@@ -151,24 +201,21 @@ class PauliSumXZ:
         if np.all(phcoeffs.imag == 0.0):
             phcoeffs = phcoeffs.real
 
-        # A dummy identity Pauli at bit position 0, aligning with the pad bit that consumers insert
-        # into their state bitstrings.
+        # Insert the dummy identity Pauli at bit position 0 and pack. This is unconditional rather
+        # than opt-in: as a flag it was an invariant nothing could enforce, since the signature side
+        # and the state side lived in separate call sites with no check that they agreed. When they
+        # disagreed every matrix element landed in the wrong column, and the result stayed symmetric,
+        # so eigvalsh returned a plausible wrong ground energy -- that is how hproj shipped broken.
         #
-        # This is unconditional rather than opt-in. As a flag it was an invariant nothing could
-        # enforce: sqd packs its states with a leading pad bit and needs the signatures shifted to
-        # match, but the two decisions lived in separate call sites with no check that they agreed.
-        # When they disagreed, every matrix element landed in the wrong column and the result was
-        # still symmetric, so eigvalsh returned a plausible wrong ground energy -- that is exactly
-        # how hproj shipped broken. Making the padding intrinsic removes the possibility.
+        # The X side goes through pack_states, the same method consumers pad their states with, so the
+        # two halves of the alignment contract are one code path and not two that must agree. The Z
+        # signatures are (n_xgroups, n_zterms, n_qubits), so they pad axis 2 rather than axis 1 and
+        # cannot reuse it; the operation is otherwise identical.
         #
         # svsim, the only other consumer of this representation, is unaffected: it builds CircuitXZ
         # itself and never calls this method.
-        xsignatures = np.pad(xsignatures, {1: (1, 0)})
-        zsignatures = np.pad(zsignatures, {2: (1, 0)})
-
-        # Pack the bit signatures
-        xsignatures = np.packbits(xsignatures, axis=-1)
-        zsignatures = np.packbits(zsignatures, axis=-1)
+        xsignatures = cls.pack_states(xsignatures)
+        zsignatures = np.packbits(np.pad(zsignatures, {2: (1, 0)}), axis=-1)
         return cls(xsignatures, zsignatures, phcoeffs, num_qubits)
 
     @property

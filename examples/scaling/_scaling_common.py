@@ -63,15 +63,6 @@ class Problem:
         )
 
 
-def pack_states(states: np.ndarray) -> np.ndarray:
-    """Pack states with the leading pad bit, exactly as ``sqd`` and ``hproj`` do.
-
-    Duplicated from ``sqd`` deliberately: a POC that imports a private helper would break when the
-    library moves, and this one line is the alignment contract every consumer restates.
-    """
-    return np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
-
-
 def make_problem(
     num_qubits: int,
     num_states: int,
@@ -143,7 +134,7 @@ def make_problem(
     return Problem(
         hamiltonian=hamiltonian,
         states=states,
-        states_p=pack_states(states),
+        states_p=PauliSumXZ.pack_states(states),
         num_qubits=num_qubits,
         num_states=num_states,
     )

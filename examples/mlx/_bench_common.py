@@ -86,7 +86,7 @@ def build_solver_inputs(
             " Pauli strings must have an even number of Ys."
         )
 
-    states_p = np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
+    states_p = PauliSumXZ.pack_states(states)
     subspace_dim = int(np.unique(states_p, axis=0).shape[0])
     states_u = uniquify_states(states_p, subspace_dim)
 

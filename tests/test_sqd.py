@@ -41,7 +41,14 @@ CACHE_LEVELS = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
 
 
 def pack_padded(states):
-    """Pack states with the leading zero pad bit, exactly as ``sqd`` does internally."""
+    """Pack states with the leading zero pad bit, as ``PauliSumXZ.pack_states`` does.
+
+    Deliberately *not* a call to that method: this is the independent reference the suite compares
+    against, and the pad-bit alignment is exactly the kind of convention where a bug would make every
+    internal path agree on the same wrong answer. ``test_paulis_symplectic.py::TestPadding`` pins the
+    library's version against an independent unpacking, so a divergence surfaces there rather than
+    silently propagating through every test that packs states here.
+    """
     return np.packbits(np.pad(np.asarray(states, dtype=np.uint8), {1: (1, 0)}), axis=1)
 
 

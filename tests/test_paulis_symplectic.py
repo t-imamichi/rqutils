@@ -289,6 +289,60 @@ class TestPadding:
         hamiltonian = PauliSumXZ.from_paulisum(([string], [1.5]))
         assert hamiltonian.c[0][0] == pytest.approx(1.5 * expected)
 
+    @pytest.mark.parametrize("num_qubits", [1, 4, 7, 8, 9, 16, 17])
+    def test_pack_states_puts_the_payload_one_bit_right(self, num_qubits):
+        """``pack_states`` is the states half of the alignment contract, so it pads identically.
+
+        Checked bit-by-bit against an independent unpacking rather than against ``from_paulisum``:
+        both sides agreeing on a *wrong* shift is the failure mode this contract exists to prevent,
+        so a test that only compares them to each other would pass through it. The widths straddle
+        byte boundaries, where an off-by-one moves the payload into the wrong byte.
+        """
+        rng = np.random.default_rng(20260807 + num_qubits)
+        states = rng.integers(0, 2, size=(5, num_qubits), dtype=np.uint8)
+        packed = PauliSumXZ.pack_states(states)
+
+        assert packed.shape == (5, -(-(num_qubits + 1) // 8))
+        bits = np.unpackbits(packed, axis=1)
+        assert np.all(bits[:, 0] == 0), "pad bit must be zero"
+        assert np.array_equal(bits[:, 1 : 1 + num_qubits], states)
+        # Trailing bits are packbits' own zero fill, not payload.
+        assert np.all(bits[:, 1 + num_qubits :] == 0)
+
+    @pytest.mark.parametrize("num_qubits", [1, 4, 7, 8, 9, 16, 17])
+    def test_unpack_states_inverts_pack_states(self, num_qubits):
+        """The ``+1`` offset must agree between the two directions, or the round trip shifts."""
+        rng = np.random.default_rng(20260807 - num_qubits)
+        states = rng.integers(0, 2, size=(6, num_qubits), dtype=np.uint8)
+        recovered = PauliSumXZ.unpack_states(PauliSumXZ.pack_states(states), num_qubits)
+        assert np.array_equal(recovered, states)
+
+    @pytest.mark.parametrize("string", ["XIIXXIXII", "XI", "XXXXXXXX", "IIIIIIIIX"])
+    def test_pack_states_agrees_with_the_signature_padding(self, string):
+        """A state and the X signature of the same bitstring must land on identical bytes.
+
+        This is the contract itself: ``sqd`` XORs packed states against packed signatures, so if the
+        two paddings diverge the operation is nonsense. A Pauli string of Xs and Is has an X signature
+        that *is* the bitstring, in character order.
+
+        Both are compared against a third, independently computed byte sequence rather than only
+        against each other. ``from_paulisum`` pads its X side by *calling* ``pack_states``, so the two
+        agreeing proves only that one function is self-consistent -- break it and this assertion would
+        still hold while every packed state silently shifted. The expected bytes here are built from
+        the bit positions the "Bit layout" docstring specifies, so the test pins the layout itself.
+        """
+        num_qubits = len(string)
+        bits = [1 if ch == "X" else 0 for ch in string]
+        # Pad bit at index 0, payload at 1..n in character order, packbits' zero fill after.
+        expected_bits = np.array([0] + bits, dtype=np.uint8)
+        expected = np.packbits(np.pad(expected_bits, (0, -len(expected_bits) % 8)))
+
+        packed_state = PauliSumXZ.pack_states(np.array([bits], dtype=np.uint8))[0]
+        signature = np.atleast_1d(np.asarray(PauliSumXZ.from_paulisum(([string], [1.0])).x[0]))
+
+        assert np.array_equal(packed_state, expected), f"pack_states for {num_qubits} qubits"
+        assert np.array_equal(signature, expected), f"signature for {num_qubits} qubits"
+
 
 class TestDataclass:
     """``PauliSumXZ`` is a frozen, JAX-registered dataclass."""
