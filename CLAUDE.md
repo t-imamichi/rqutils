@@ -7,6 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Always use `uv run python` (not bare `python`) — the venv at `.venv` is managed by uv. No `timeout` on
 macOS (it is GNU coreutils) — use the Bash tool's own timeout rather than wrapping a command in it.
 
+**Check `git rev-list --left-right --count origin/<branch>...HEAD` before amending.** Work happens on
+feature branches (`metal`, not `main`) that get pushed mid-session, so "my commits are still local"
+goes stale within a turn — amend then and you rewrite published history. `git branch -r --contains
+<sha>` is the per-commit check.
+
 ```bash
 uv run python -c "import rqutils; print(rqutils.__version__)"
 
@@ -102,6 +107,29 @@ notebooks used as interactive scratchpads; pytest does not collect them.
 suite depends on it — and holds the shared reference helpers (dense Pauli sums, projections, gate
 unitaries), each validated against qiskit before being trusted as a reference.
 
+**The suite runs in ~6 s, not ~53 s — via caches `conftest.py` configures.** It sets `MPLCONFIGDIR`
+and `JAX_COMPILATION_CACHE_DIR` (plus `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0`, required
+because the default 1 s threshold excludes every kernel here — the largest single compile is ~0.44 s)
+before importing jax, with `os.environ.setdefault` so a value you exported always wins. Both are
+speed-only, unlike the x64 flag: nothing depends on them, and a warm cache was verified *unable* to
+mask a defect — reverting `_is_filler`'s `>> 7` to `>> 8` still fails the one test that catches it,
+since XLA keys on the computation. Expect ~53 s on a first run while the caches populate.
+**Don't chase test-body slowness**: measured, 72% of an uncached run is XLA compilation plus a
+matplotlib font-cache rebuild (`~/.matplotlib` is unwritable in a sandbox, and matplotlib's own
+fallback is a fresh temp dir per process, which never warms). The `range(2000)` accumulation loops in
+`test_ground_locg.py` that look expensive total 0.80 s, 2.3% of the suite — leave them alone.
+
+**Fixtures are built inside each test body, and there are no `@pytest.fixture` state generators.**
+This is deliberate: several tests pick a seed to produce a specific pathology (a decoupled seed
+state, a subspace that splits into two blocks, 13 Z terms in one X group) and assert the fixture
+still has it. Moving draws into fixtures would make RNG stream position depend on fixture ordering,
+which is invisible at the call site — `conftest.collapsing_states`' docstring records a measured
+instance (changing a preceding `real_pauli_strings` count from 5 to 6 moved a collapse from 7 uniques
+to 9). Keep new generators as plain functions taking `rng`; `unique_states`/`collapsing_states` are
+the pattern. Note only `collapsing_states` asserts its own precondition — `np.unique` makes
+`unique_states` distinct by construction, but its *row count* varies with the seed (7 draws over 4
+qubits measured 3–7 distinct rows across 200 seeds), so a caller needing a floor must assert it.
+
 **Tests are organized by defect.** Writing these suites found bugs in five of the seven modules, all
 of the same character: a plausible finite answer rather than a raise or a `NaN`. So when adding a
 test, name the defect it locks down and record the measured wrong value, and prefer an *independent*
@@ -122,9 +150,21 @@ absent — verify that, don't assume it from the parameter being unset.** Verify
 it targets by reverting the fix in place; a copy of the repo does not work, since the venv holds an
 editable install pointing at the original.
 
+**Mutation-testing recipe**, since "revert the fix in place" is easier said than done and this is the
+highest-yield tool in the repo — it found two silent coverage gaps and a false docstring claim in one
+session. Copy the file (`cp rqutils/sqd.py /tmp/x.bak`), rewrite one line with a Python one-liner that
+**asserts the anchor string exists** before substituting, run the suite, restore from the copy, and
+`diff -q` to prove the restore took. The assert is not optional: a silent no-match reports a false
+"no coverage", which is indistinguishable from the finding you are looking for. Two further traps.
+For a `@jax.jit`-decorated function, mutate in a **fresh subprocess** — patching in a live session
+reuses the compiled kernel and both arms return bit-identical numbers (`test_ground_locg.py`'s
+`TestBasisOrthogonality` records this). And check the mutant is *reachable* before concluding a guard
+is untested: some survive because the fixture never exercises them, which is a fixture finding, not a
+missing test.
+
 **A green suite after reverting a fix means the test is missing, not that the guard is dead.** Some
 guards are only reachable when *other* defects compound with them: neutering `ground_locg`'s
-`_reorthogonalize` (audit item I5) leaves all 375 tests passing and dense operators at shifts
+`_reorthogonalize` (audit item I5) leaves the whole suite passing and dense operators at shifts
 1e9–1e12 agreeing to 4e-15, because the measured drift needed I4's 2000-iteration runs to develop.
 Record the negative result in the function's docstring rather than writing a test that doesn't
 discriminate or deleting the guard.
