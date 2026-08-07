@@ -21,17 +21,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import herm
 
 import rqutils.paulis.general as pg
 
 SINGLE_DIMS = [2, 3, 4, 5]
 PRODUCT_DIMS = [(2, 2), (2, 3), (3, 2), (2, 2, 2)]
-
-
-def hermitian(dim, rng):
-    """Return a random ``dim``-by-``dim`` Hermitian matrix."""
-    mat = rng.normal(size=(dim, dim)) + 1.0j * rng.normal(size=(dim, dim))
-    return mat + mat.conjugate().T
 
 
 def basis_matrices(dim):
@@ -110,7 +105,7 @@ class TestComponents:
     def test_component_shape_for_products(self, dim):
         """The product case, where the ``1/2**(s-1)`` normalization factor enters."""
         rng = np.random.default_rng(20260804)
-        matrix = hermitian(int(np.prod(dim)), rng)
+        matrix = herm(int(np.prod(dim)), rng)
         components = pg.components(matrix, dim=dim)
         assert np.asarray(components).shape == tuple(d**2 for d in dim)
 
@@ -122,7 +117,7 @@ class TestComponents:
         error that broke ``svsim``.
         """
         rng = np.random.default_rng(20260804)
-        components = np.asarray(pg.components(hermitian(dim, rng), dim=dim))
+        components = np.asarray(pg.components(herm(dim, rng), dim=dim))
         assert np.abs(components.imag).max() < 1e-12
 
     def test_components_matches_the_documented_trace_formula(self):
@@ -133,7 +128,7 @@ class TestComponents:
         """
         rng = np.random.default_rng(20260804)
         dim = 4
-        matrix = hermitian(dim, rng)
+        matrix = herm(dim, rng)
         by_hand = np.array([np.trace(m @ matrix) / 2.0 for m in basis_matrices(dim)])
         assert np.allclose(np.asarray(pg.components(matrix, dim=dim)), by_hand)
 
@@ -186,14 +181,14 @@ class TestNpmodParity:
     @pytest.mark.parametrize("dim", [3, (2, 2), (2, 3)])
     def test_components_parity(self, dim):
         rng = np.random.default_rng(20260804)
-        matrix = hermitian(int(np.prod(np.atleast_1d(dim))), rng)
+        matrix = herm(int(np.prod(np.atleast_1d(dim))), rng)
         from_np = np.asarray(pg.components(matrix, dim=dim))
         from_jnp = np.asarray(pg.components(jnp.asarray(matrix), dim=dim, npmod=jnp))
         assert np.abs(from_np - from_jnp).max() < 1e-13
 
     def test_components_under_jit(self):
         rng = np.random.default_rng(20260804)
-        matrix = hermitian(4, rng)
+        matrix = herm(4, rng)
         traced = jax.jit(lambda m: pg.components(m, dim=4, npmod=jnp))
         assert np.allclose(
             np.asarray(traced(jnp.asarray(matrix))), np.asarray(pg.components(matrix, dim=4))
@@ -238,7 +233,7 @@ class TestShapesAndMemoization:
     def test_components_puts_component_axes_last(self, dim):
         """Component arrays are ``(..., d1**2, ...)``: the opposite convention from ``paulis``."""
         rng = np.random.default_rng(20260804)
-        matrix = hermitian(int(np.prod(dim)), rng)
+        matrix = herm(int(np.prod(dim)), rng)
         assert np.asarray(pg.components(matrix, dim=dim)).shape == tuple(d**2 for d in dim)
 
     def test_memoization_returns_consistent_values(self):

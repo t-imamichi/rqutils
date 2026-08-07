@@ -52,11 +52,12 @@ class TestProjectOut:
         the vector's actual norm, so the caller's renormalization uses the right divisor.
         """
         # Orthonormal basis: _project_out subtracts <e_i|v> e_i, leaving exactly [0, 0, 1].
+        # The returned norm is deliberately unused here -- the exact-value assertion below is
+        # strictly stronger than any bound on it, and >= 0.99 would be implied by it anyway. The
+        # non-orthonormal case below is where the norm itself is load-bearing.
         basis = (jnp.array([1.0, 0.0, 0.0]), jnp.array([0.0, 1.0, 0.0]))
-        out, norm = _project_out(basis, jnp.array([0.0, 0.0, 2.0]))
-        out = np.asarray(out)
-        assert np.linalg.norm(out) >= 0.99
-        assert np.allclose(out, [0.0, 0.0, 1.0])
+        out, _ = _project_out(basis, jnp.array([0.0, 0.0, 2.0]))
+        assert np.allclose(np.asarray(out), [0.0, 0.0, 1.0])
 
         # Non-orthonormal basis: _project_out subtracts <b|v> b without a Gram solve, so the
         # result falls short of unit norm. This discriminates "masked to >= 0.99" from
@@ -401,8 +402,16 @@ class TestGroundLocg:
     assertion in ``test_solves_and_converges`` below was, before this comment, believed to cover I5;
     it does not -- it was actually passing only because ``test_xinit_scale_invariance``'s old
     bit-exact-equality assertion happened to also break under the same mutant (see that test and
-    Finding 2 of the 2026-08-04 review). Reproducing I5 for real needs a fixture that drives |s| -> 0
-    near convergence for a large-shift operator; nobody has constructed one yet.
+    Finding 2 of the 2026-08-04 review).
+
+    I5 *is* pinned, just not from here: :class:`TestBasisOrthogonality` asserts ``|<x|y>|`` directly
+    off the per-iteration diagnostics at shifts up to 1e12, with measured neutered-guard values
+    (1.0e-08 at shift 1e9 against 3.8e-17 real). That is strictly better than waiting for the basis
+    collapse to corrupt theta -- it fails at the cause rather than three steps downstream -- so what
+    remains missing is only an end-to-end *wrong eigenvalue* fixture, which would need the
+    2000-iteration runs item I4's sign bug used to force. Not worth building: the fixed solver
+    converges in 8-46 iterations. I6-in-``body()`` has no coverage and no cheap fixture, since
+    reaching ``p_is_zero`` needs the residual to land in ``span{x, y}`` at an iteration >= 2.
     """
 
     @pytest.mark.parametrize("shift", [0.0, 1e3, -1e3, 1e6, 1e9])
@@ -592,10 +601,15 @@ class TestZeroResidualAfterSeedStep:
     which is exactly this input shape -- a one-hot vector against a diagonal operator is an exact
     eigenvector, giving an exactly-zero residual after the seed step.
 
-    These fixtures also give end-to-end coverage of items I6 and I7 (the zeroed-search-direction
-    guard and convergence-on-exhausted-search-space), which no other fixture in this suite reaches:
-    ``p_is_zero``/the residual-is-zero condition is never True in any of the random or shifted-``herm``
-    fixtures elsewhere in this file, since those all use generic, non-eigenvector initial guesses.
+    These fixtures cover the **seed-step analogue** of items I6/I7 -- the zeroed-direction guard as
+    ``body_iter1`` implements it -- and nothing else in this suite reaches even that, since every
+    other fixture here uses a generic, non-eigenvector initial guess.
+
+    They do **not** cover ``body()``'s own ``p_is_zero`` branch, and cannot: every test below asserts
+    ``niter == 0``, which means ``body_iter1`` already set ``converged``, the ``while_loop`` predicate
+    is False on entry, and ``body()`` never executes. Verified by neutering ``body()``'s
+    ``sas.at[2, 2]`` exclusion mask -- all 54 tests in this file stay green. ``TestGroundLocg``'s
+    class docstring records that gap; this class does not close it.
     """
 
     def test_one_by_one(self):

@@ -199,11 +199,11 @@ class TestCircuitStructure:
         with pytest.raises(ValueError, match="Unsupported gate name"):
             to_circuitxz([("h", [0])])
 
-    def test_rotation_without_angle_raises(self):
+    @pytest.mark.parametrize("name", ["rx", "ry", "rz", "rzz"])
+    def test_rotation_without_angle_raises(self, name):
         """A parameterized gate missing its angle must say so, not raise a bare IndexError."""
-        for name in ("rx", "ry", "rz", "rzz"):
-            with pytest.raises(ValueError, match="requires an angle"):
-                to_circuitxz([(name, [0])])
+        with pytest.raises(ValueError, match="requires an angle"):
+            to_circuitxz([(name, [0])])
 
     def test_circuitxz_passes_through(self):
         """``svsim`` accepts a prebuilt ``CircuitXZ``, and ``to_circuitxz`` is idempotent on one."""
@@ -342,7 +342,8 @@ class TestAgainstQiskit:
     workflow and the one that was broken.
     """
 
-    def test_transpiled_ghz(self):
+    @pytest.mark.parametrize("num_qubits", [3, 5])
+    def test_transpiled_ghz(self, num_qubits):
         """The shipped example's circuit, which previously reported a GHZ it had not produced.
 
         ``examples/svsim.py``'s only check was ``num_nonzero == 2``, which passed -- but the two
@@ -353,21 +354,18 @@ class TestAgainstQiskit:
         from qiskit import QuantumCircuit, transpile
         from qiskit.quantum_info import Statevector
 
-        for num_qubits in (3, 5):
-            circuit = QuantumCircuit(num_qubits)
-            circuit.h(0)
-            for qubit in range(num_qubits - 1):
-                circuit.cx(qubit, qubit + 1)
-            transpiled = transpile(
-                circuit, basis_gates=["rx", "ry", "rz", "rzz"], optimization_level=0
-            )
-            got = np.asarray(svsim(transpiled))
-            reference = np.asarray(Statevector(circuit))
-            assert phaseless_distance(got, reference) < 1e-12
-            nonzero = set(np.nonzero(np.abs(got) > 1e-9)[0].tolist())
-            assert nonzero == {0, 2**num_qubits - 1}, (
-                f"expected |0...0> and |1...1>, got indices {sorted(nonzero)}"
-            )
+        circuit = QuantumCircuit(num_qubits)
+        circuit.h(0)
+        for qubit in range(num_qubits - 1):
+            circuit.cx(qubit, qubit + 1)
+        transpiled = transpile(circuit, basis_gates=["rx", "ry", "rz", "rzz"], optimization_level=0)
+        got = np.asarray(svsim(transpiled))
+        reference = np.asarray(Statevector(circuit))
+        assert phaseless_distance(got, reference) < 1e-12
+        nonzero = set(np.nonzero(np.abs(got) > 1e-9)[0].tolist())
+        assert nonzero == {0, 2**num_qubits - 1}, (
+            f"expected |0...0> and |1...1>, got indices {sorted(nonzero)}"
+        )
 
     def test_trotter_step(self):
         """A Trotterized evolution step: ``skqd.md``'s headline measurement.

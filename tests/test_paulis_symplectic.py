@@ -17,29 +17,20 @@ effect was silently discarding the imaginary part of a non-Hermitian operator. S
 :class:`TestCoefficientDtype`.
 """
 
-import functools
 import warnings
 
 import numpy as np
 import pytest
-from conftest import _PAULI_MATRICES
+from conftest import dense_pauli_sum, gate_unitary
 
 from rqutils.paulis.symplectic import PauliSumXZ
 
-
-def dense_from_strings(pauli_strings, coeffs):
-    """Return ``sum(c * Q)`` as a dense matrix, via Kronecker products.
-
-    Character order is most-significant-qubit-first, matching Qiskit's ``SparsePauliOp``. Independent
-    of the bit-packing under test.
-    """
-    total = 0.0
-    for string, coeff in zip(pauli_strings, coeffs):
-        operator = functools.reduce(
-            np.kron, [_PAULI_MATRICES[char] for char in string], np.array([[1.0 + 0.0j]])
-        )
-        total = total + coeff * operator
-    return total
+# The dense references come from conftest (``dense_pauli_sum`` for the Kronecker sum, ``gate_unitary``
+# for a single-qubit Pauli embedded at a little-endian index). Both were previously reimplemented here
+# -- verified bit-exact against the conftest versions before the switch. The independence that matters
+# is from ``PauliSumXZ``, the code under test, and conftest shares no code with it either; a second
+# local copy bought nothing and duplicated the trickiest convention in this file (the
+# ``reversed(range(num_qubits))`` Kronecker ordering) twice over.
 
 
 def signature_bits(packed, num_qubits):
@@ -96,24 +87,16 @@ class TestPhaseConvention:
         coeff = complex(hamiltonian.c[0][0])
 
         # Z^z X^x with little-endian qubit indexing, then the coefficient (which carries the phase).
-        dimension = 2**num_qubits
-        operator = np.eye(dimension, dtype=np.complex128)
+        # gate_unitary("x"/"z", [q], n) returns the bare Pauli embedded at little-endian index q,
+        # which is exactly the single-qubit factor needed here.
+        operator = np.eye(2**num_qubits, dtype=np.complex128)
         for qubit in range(num_qubits):
             if xbits[qubit]:
-                operator = single_qubit(dimension, qubit, "X") @ operator
+                operator = gate_unitary("x", [qubit], num_qubits) @ operator
         for qubit in range(num_qubits):
             if zbits[qubit]:
-                operator = single_qubit(dimension, qubit, "Z") @ operator
-        assert np.allclose(coeff * operator, dense_from_strings([string], [1.0]))
-
-
-def single_qubit(dimension, qubit, letter):
-    """Return the ``dimension``-sized operator applying ``letter`` to little-endian ``qubit``."""
-    num_qubits = int(np.log2(dimension))
-    factors = [
-        _PAULI_MATRICES[letter if index == qubit else "I"] for index in reversed(range(num_qubits))
-    ]
-    return functools.reduce(np.kron, factors, np.array([[1.0 + 0.0j]]))
+                operator = gate_unitary("z", [qubit], num_qubits) @ operator
+        assert np.allclose(coeff * operator, dense_pauli_sum([string], [1.0]))
 
 
 class TestQubitOrdering:
@@ -374,10 +357,10 @@ class TestDataclass:
         rebuilt = jax.tree.unflatten(treedef, leaves)
         assert rebuilt.num_qubits == hamiltonian.num_qubits
 
-    def test_num_qubits_is_inferred(self):
-        for strings, expected in ((["X"], 1), (["XX"], 2), (["XIZI"], 4)):
-            hamiltonian = PauliSumXZ.from_paulisum((strings, [1.0]))
-            assert hamiltonian.num_qubits == expected
+    @pytest.mark.parametrize("strings,expected", [(["X"], 1), (["XX"], 2), (["XIZI"], 4)])
+    def test_num_qubits_is_inferred(self, strings, expected):
+        hamiltonian = PauliSumXZ.from_paulisum((strings, [1.0]))
+        assert hamiltonian.num_qubits == expected
 
 
 class TestValidation:

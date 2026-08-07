@@ -18,20 +18,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import scipy.linalg as sla
+from conftest import herm
 
 import rqutils.math as rm
 
 DIMS = [1, 2, 3, 5]
 
 
-def hermitian(dim, rng):
-    mat = rng.normal(size=(dim, dim)) + 1.0j * rng.normal(size=(dim, dim))
-    return mat + mat.conjugate().T
-
-
 def unitary(dim, rng):
     """A unitary matrix: normal but neither Hermitian nor anti-Hermitian."""
-    return sla.expm(1.0j * hermitian(dim, rng))
+    return sla.expm(1.0j * herm(dim, rng))
 
 
 class TestMatrixExp:
@@ -40,7 +36,7 @@ class TestMatrixExp:
     @pytest.mark.parametrize("dim", DIMS)
     def test_hermitian_input_with_hint(self, dim):
         rng = np.random.default_rng(20260804)
-        mat = hermitian(dim, rng)
+        mat = herm(dim, rng)
         got = np.asarray(rm.matrix_exp(mat, hermitian=1))
         assert np.abs(got - sla.expm(mat)).max() < 1e-11
 
@@ -48,7 +44,7 @@ class TestMatrixExp:
     def test_hermitian_input_without_hint(self, dim):
         """``hermitian=0`` uses the general ``eig`` path, which must agree with the ``eigh`` one."""
         rng = np.random.default_rng(20260804)
-        mat = hermitian(dim, rng)
+        mat = herm(dim, rng)
         got = np.asarray(rm.matrix_exp(mat, hermitian=0))
         assert np.abs(got - sla.expm(mat)).max() < 1e-10
 
@@ -60,7 +56,7 @@ class TestMatrixExp:
         a genuinely different code path from both ``hermitian=1`` and ``hermitian=0``.
         """
         rng = np.random.default_rng(20260804)
-        mat = 1.0j * hermitian(dim, rng)
+        mat = 1.0j * herm(dim, rng)
         got = np.asarray(rm.matrix_exp(mat, hermitian=-1))
         assert np.abs(got - sla.expm(mat)).max() < 1e-12
 
@@ -88,7 +84,7 @@ class TestMatrixExp:
     def test_batched_input(self, hint):
         """Leading axes are batch dimensions; each slice must be exponentiated independently."""
         rng = np.random.default_rng(20260804)
-        base = hermitian(4, rng)
+        base = herm(4, rng)
         if hint == -1:
             base = 1.0j * base
         batch = np.stack([base, 2.0 * base, -0.5 * base])
@@ -109,7 +105,7 @@ class TestMatrixAngle:
         is the branch cut. Scaling H into the branch first is what makes this a real test.
         """
         rng = np.random.default_rng(20260804)
-        generator = hermitian(5, rng)
+        generator = herm(5, rng)
         # Scale so every eigenvalue sits strictly inside (-pi, pi).
         generator *= np.pi * 0.9 / np.abs(np.linalg.eigvalsh(generator)).max()
         got = np.asarray(rm.matrix_angle(sla.expm(1.0j * generator)))
@@ -122,7 +118,7 @@ class TestMatrixAngle:
         of the same rotation, so this asserts the *rotation* matches even when the generator does not.
         """
         rng = np.random.default_rng(20260804)
-        generator = hermitian(4, rng)
+        generator = herm(4, rng)
         assert np.abs(np.linalg.eigvalsh(generator)).max() > np.pi, "fixture must exceed the branch"
         recovered = np.asarray(rm.matrix_angle(sla.expm(1.0j * generator)))
         assert np.abs(recovered - generator).max() > 1.0, "expected branch wrapping"
@@ -135,7 +131,7 @@ class TestWithDiagonals:
 
     def test_returns_the_transformed_eigenvalues(self):
         rng = np.random.default_rng(20260804)
-        mat = hermitian(5, rng)
+        mat = herm(5, rng)
         result = rm.matrix_exp(mat, hermitian=1, with_diagonals=True)
         assert len(result) == 2
         matrix_result, diagonals = np.asarray(result[0]), np.asarray(result[1])
@@ -149,7 +145,7 @@ class TestWithDiagonals:
 
     def test_single_return_without_the_flag(self):
         rng = np.random.default_rng(20260804)
-        got = rm.matrix_exp(hermitian(3, rng), hermitian=1)
+        got = rm.matrix_exp(herm(3, rng), hermitian=1)
         assert np.asarray(got).shape == (3, 3), "expected a bare array, not a tuple"
 
 
@@ -166,7 +162,7 @@ class TestHermitianHint:
         is a deliberate behaviour change and will fail here first.
         """
         rng = np.random.default_rng(20260804)
-        anti_hermitian = 1.0j * hermitian(5, rng)
+        anti_hermitian = 1.0j * herm(5, rng)
         with warnings.catch_warnings():
             warnings.simplefilter("error")  # no warning is emitted, so this must not trip
             got = np.asarray(rm.matrix_exp(anti_hermitian, hermitian=1))
@@ -178,7 +174,7 @@ class TestHermitianHint:
     def test_hint_true_equals_hint_one(self):
         """``hermitian`` is annotated ``int | bool``, so ``True`` must behave as ``1``."""
         rng = np.random.default_rng(20260804)
-        mat = hermitian(4, rng)
+        mat = herm(4, rng)
         assert np.allclose(
             np.asarray(rm.matrix_exp(mat, hermitian=True)),
             np.asarray(rm.matrix_exp(mat, hermitian=1)),
@@ -191,7 +187,7 @@ class TestNpmodParity:
     @pytest.mark.parametrize("hint", [0, 1, -1])
     def test_matrix_exp_parity(self, hint):
         rng = np.random.default_rng(20260804)
-        mat = hermitian(4, rng)
+        mat = herm(4, rng)
         if hint == -1:
             mat = 1.0j * mat
         from_np = np.asarray(rm.matrix_exp(mat, hermitian=hint))
@@ -201,7 +197,7 @@ class TestNpmodParity:
     def test_matrix_exp_under_jit(self):
         """The point of ``npmod`` is traceability, which only ``jit`` actually proves."""
         rng = np.random.default_rng(20260804)
-        mat = hermitian(4, rng)
+        mat = herm(4, rng)
         traced = jax.jit(lambda m: rm.matrix_exp(m, hermitian=1, npmod=jnp))
         assert (
             np.abs(
@@ -220,7 +216,7 @@ class TestNpmodParity:
     def test_with_diagonals_under_jit(self):
         """The tuple return has to survive tracing too, not just the single-array one."""
         rng = np.random.default_rng(20260804)
-        mat = hermitian(4, rng)
+        mat = herm(4, rng)
         traced = jax.jit(lambda m: rm.matrix_exp(m, hermitian=1, with_diagonals=True, npmod=jnp))
         matrix_result, diagonals = traced(jnp.asarray(mat))
         assert np.asarray(matrix_result).shape == (4, 4)
@@ -233,7 +229,7 @@ class TestMatrixUfunc:
     def test_arbitrary_operator(self):
         """``matrix_ufunc(sqrt, ...)`` on a positive-definite matrix is a matrix square root."""
         rng = np.random.default_rng(20260804)
-        mat = hermitian(4, rng)
+        mat = herm(4, rng)
         positive = mat @ mat.conjugate().T  # positive semidefinite, so sqrt is real
         root = np.asarray(rm.matrix_ufunc(np.sqrt, positive, hermitian=1))
         assert np.abs(root @ root - positive).max() < 1e-9
@@ -245,7 +241,7 @@ class TestMatrixUfunc:
         the unitary inversion shows up here with nothing else to hide behind.
         """
         rng = np.random.default_rng(20260804)
-        mat = hermitian(5, rng)
+        mat = herm(5, rng)
         assert (
             np.abs(np.asarray(rm.matrix_ufunc(lambda x: x, mat, hermitian=1)) - mat).max() < 1e-12
         )
