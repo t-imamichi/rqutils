@@ -4,9 +4,14 @@ Must be run by the user: mlx.core loads a Metal device even for mx.cpu arrays, s
 fails in a headless session with
   RuntimeError: [metal::load_device] No Metal device available
 
-THIS SCRIPT REQUIRES MLX AND A REAL METAL DEVICE (a Mac with MLX installed and GPU access) AND
-CANNOT RUN HEADLESS -- importing `mlx.core` is enough to require one. The numpy-shim counterpart in
-check_solver_headless.py is what validates the algorithm without hardware.
+THIS SCRIPT REQUIRES MLX AND CANNOT RUN HEADLESS -- importing `mlx.core` initializes a Metal device
+whatever backend the arrays then live on, so a sandboxed or virtualized macOS session without GPU
+access cannot run it at all. The numpy-shim counterpart in check_solver_headless.py is what
+validates the algorithm without hardware.
+
+The arithmetic below runs on the **CPU backend** (see the mx.set_default_device call), because f64
+is half of what this checks and Metal has no float64. So the Metal device is an import-time
+requirement here, not a compute one.
 
 Its remaining job is narrow: confirm that the port's real-MLX arithmetic agrees with an independent
 dense reference at both precisions. It no longer verifies any Metal Shading Language, because the
@@ -39,6 +44,13 @@ ps, cs, states = generate_problem(10, 20, 200, seed=1)
 inputs = build_solver_inputs(ps, cs, states)
 H, ref = dense_reference(inputs)
 print(f"reference ground energy = {ref:.12f}")
+
+# Run on the CPU backend, explicitly. MLX defaults to the GPU, and Metal has no float64 at all, so
+# without this the f64 arm dies with "float64 is not supported on the GPU" -- which is exactly what
+# happened when the per-arm mx.set_default_device call was removed along with the Metal device loop
+# it sat inside. The f64 arm is the reason this line exists, not a stylistic preference; the f32 arm
+# runs either way. examples/mlx/bench.py sets mx.cpu for its mlx arms for the same reason.
+mx.set_default_device(mx.cpu)
 
 failures = []
 for dtype, dtname, rtol in ((mx.float64, "f64", 1e-9), (mx.float32, "f32", 1e-4)):
