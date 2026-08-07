@@ -29,6 +29,11 @@ convergence. Those are items I1-I7 of ``docs/locg.md``; each was measured to fai
 a plausible wrong number rather than a raise or a ``NaN``. **When editing either file, change
 both.**
 
+That document is a **stale historical audit** of the pre-rewrite JAX module: its line numbers and
+severity rankings no longer apply, and it is cited here (and below) only for the I-numbers, which
+remain a stable index into the measured failure modes. The binding statement of each invariant is
+the JAX module's docstring next to the code.
+
 Five structural differences, all forced by MLX:
 
 * ``jax.lax.scan`` over X groups becomes a Python loop. J is static and small (tens), so

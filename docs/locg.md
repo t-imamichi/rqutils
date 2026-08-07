@@ -1,7 +1,43 @@
 # Robustness, accuracy, and speed review of `rqutils/ground_locg.py`
 
+> ## ⚠️ STALE — historical reference only
+>
+> **Every defect described in this document has been fixed.** It audits the *pre-rewrite*
+> `ground_locg.py` as of `143601c` (2026-08-04); the module was replaced in `8fa6be2` and has been
+> revised repeatedly since. Do not use this document to decide whether the current code is correct,
+> and do not cite it as a live description of behaviour.
+>
+> **Specifically stale:**
+>
+> - **All line numbers.** They refer to `143601c`. The file has since roughly doubled in length and
+>   every function moved. `eigenpair_3x3:453` and friends point at unrelated code today.
+> - **The "Scope and limitations" section's central claim.** It says "There is no pytest suite in
+>   this repository […] no tests were left behind, and no file under `rqutils/` was modified."
+>   Both halves are now false: `tests/test_ground_locg.py` exists and pins most of these items, and
+>   the module was rewritten.
+> - **The API gaps A1–A5.** A1 (no convergence flag) and A5 (`debug` unreachable) are implemented —
+>   `ground_locg` returns a 4-tuple ending in `converged` and forwards `debug`. A2 (`maxiter=0`
+>   returning `0.0`), A3 (`tol` from `xinit.dtype`) and A4 (unguarded zero `xinit`) are fixed too.
+> - **The severity of I5.** Still guarded, but no longer reachable from outside: neutering the
+>   re-orthogonalization leaves the whole test suite green, and dense operators at shifts 1e9–1e12
+>   agree to 4e-15 either way. The measured `|⟨x|y⟩| = 1.0` below required the *other* defects to
+>   compound with it — chiefly I4, which drove every run to 2000 iterations. With those fixed the
+>   same problems converge in 8–46 iterations and never enter the regime. See
+>   `_reorthogonalize`'s docstring.
+> - **S1 is done**, and the current loop carries `ax` in a `_State` NamedTuple. The 4-matvec
+>   figure describes code that no longer exists; today `body()` traces exactly 3.
+> - **The `jnp.linalg.eigh` compile-time argument** was already re-measured and reversed *within*
+>   this document; the surviving reason to keep the closed form is GPU fusability, not compile time.
+>
+> **What it is still good for:** the measurements. The randomized sweep counts, the failure modes
+> and the concrete replacement formulations — especially the `eigenpair_2x2` δ-sign warning and the
+> methodological note that aggregate random sampling does not exercise data-dependent branches
+> evenly — are why `tests/test_ground_locg.py` is organized by defect. The binding invariants now
+> live in `rqutils/ground_locg.py`'s module docstring, next to the code, and the tests enforce them.
+
 Assessment date: 2026-08-04. Investigated against branch `metal`; `ground_locg.py` last touched in
-`143601c`, all line numbers below refer to that revision.
+`143601c`, all line numbers below refer to that revision. **The findings below are written in the
+present tense against that revision; read every "is" as "was".**
 
 ## Short answer
 
@@ -216,6 +252,13 @@ own form would cancel instead.
 
 ### I5. Loss of $x$/$y$ orthogonality (line 302)
 
+> **Severity retracted.** The guard is in place (`_reorthogonalize`) and stays, but this item is not
+> independently reachable: neutering that function leaves the full test suite green, and dense
+> operators at shifts 1e9–1e12 return a $\theta$ matching `eigvalsh` to 4e-15 with or without it. The
+> 1.0 measurement below needed I4's 2000-iteration runs to develop; at the 8–46 iterations the fixed
+> solver takes, the drift never accumulates. So it could not be pinned by a test — recorded in
+> `_reorthogonalize`'s docstring so the passing suite is not read as evidence the guard is dead code.
+
 Line 302 builds
 
 ```python
@@ -301,6 +344,11 @@ iteration cost.
 
 ## API and usability gaps
 
+**All five are fixed.** `ground_locg` now returns `(eigval, eigvec, niter, converged)` and forwards
+`debug`; `maxiter=0` reports the seed Rayleigh quotient; `tol` derives from the promoted operator
+dtype; and the `xinit` normalization is guarded. The descriptions below are the pre-fix behaviour,
+kept because each records a measured way the old surface misled a caller.
+
 These are not numerical defects — they surfaced while instrumenting the solver and are recorded
 because each one can mislead a caller. Severity is lower than I1–I7 and none of them require the
 change set above.
@@ -369,6 +417,9 @@ diagnostic rows are post-convergence noise rather than part of the solve.
 
 ## Recommended change set
 
+**All of the below has been implemented.** Kept as the record of what was proposed and in what
+order; `8fa6be2` did items 1–6 and A1 together rather than in the two commits suggested here.
+
 Ordered by payoff. I4 and I5 are the highest-value items and are independent of the kernel work.
 
 1. **I4** — flip the `reltol` sign to `+ jnp.abs(theta)`. One line; 24–33× fewer iterations.
@@ -392,9 +443,13 @@ regression equally invisible.
 
 ## Scope and limitations of this investigation
 
-There is no pytest suite in this repository, so everything above was verified with throwaway
-`uv run python` scripts under `/tmp`; **no tests were left behind, and no file under `rqutils/` was
-modified.** The numbers in this document are measurements from those scripts, not projections.
+**Superseded.** At the time of writing there was no pytest suite in this repository, so everything
+below was verified with throwaway `uv run python` scripts under `/tmp`; no tests were left behind and
+no file under `rqutils/` was modified *by this investigation*. Both conditions have since changed:
+the module was rewritten in `8fa6be2` and `tests/test_ground_locg.py` now covers most of these items
+(and is deliberately organized by defect, following this document's closing warning). The numbers
+below are measurements from those throwaway scripts, not projections — that much still holds, and is
+the reason to keep this file.
 
 Verified: analytic-kernel accuracy against `numpy.linalg.eigh` over 20000 random Hermitian matrices
 (complex and real, scales $10^{-160}$ to $10^{300}$, exact and near degeneracies, rank-deficient and
