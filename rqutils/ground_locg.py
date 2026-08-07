@@ -234,6 +234,15 @@ from numpy.typing import DTypeLike, NDArray
 
 _SQRT3 = math.sqrt(3.0)
 
+# ground_locg's return is (eigval, eigvec, niter, converged), with the per-iteration diagnostics
+# appended when debug=True. Deliberately plain tuple aliases rather than a dataclass: the arity, not
+# the anonymity of the positions, is what a type checker needs to see here, and `ground_locg` is
+# published API that every caller destructures positionally (sqd.py, two scaling POCs, the MLX
+# bench). A caller reading the fifth element must narrow first -- `assert len(result) == 5` -- which
+# is also the only way a checker can tell the debug path was requested, since `debug` is static.
+_Result = tuple[float, NDArray, int, bool]
+_DebugResult = tuple[float, NDArray, int, bool, dict[str, jax.Array]]
+
 
 class _Seed(NamedTuple):
     """Output of the steepest-descent seed step, before a y direction exists."""
@@ -286,7 +295,7 @@ def ground_locg(
     vspace: tuple[int, DTypeLike] | None = None,
     debug: bool = False,
     log_level: int = logging.WARNING,
-) -> tuple[float, NDArray, int, bool]:
+) -> _Result | _DebugResult:
     r"""Single-vector LOBPCG.
 
     Args:
@@ -306,9 +315,12 @@ def ground_locg(
         log_level: Verbosity level.
 
     Returns:
-        The smallest eigenvalue, its eigenvector, the number of gradient descent iterations
-        performed, and whether the convergence criterion was met. Check the fourth value rather
-        than comparing the third against ``maxiter``, which is ambiguous.
+        ``(eigval, eigvec, niter, converged)`` -- the smallest eigenvalue, its eigenvector, the
+        number of gradient descent iterations performed, and whether the convergence criterion was
+        met. Check the fourth value rather than comparing the third against ``maxiter``, which is
+        ambiguous. With ``debug=True`` a fifth element is appended, a dict of stacked per-iteration
+        diagnostics; narrow on ``len(result) == 5`` before reading it, since ``debug`` is a static
+        flag that a type checker cannot follow into the return arity.
     """
     if callable(mat):
         return _ground_locg_callable(
