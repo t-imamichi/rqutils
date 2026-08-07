@@ -1,38 +1,56 @@
 r"""
-=========================================
-Single-vector LOBPCG on MLX (Apple Metal)
-=========================================
+=========================================================
+Single-vector LOBPCG on MLX (deprecated reference example)
+=========================================================
 
-.. currentmodule:: rqutils.ground_locg_mlx
+**Deprecated.** This is a readable reference implementation, kept as an example rather than as
+library code. The JAX implementation in ``rqutils.ground_locg`` measured faster than this port even
+on the MLX GPU backend, so there is no configuration in which running it is the right choice. It
+used to live at ``rqutils/ground_locg_mlx.py``; it was moved here because nothing in the package
+imported it, no pytest exercises it, and it is not part of the published API.
+
+Two fused Metal kernels (a gather-multiply-accumulate matvec and a 3x3 eigensolve) and the
+``device="cpu"|"gpu"`` parameter that selected them were removed when the port was deprecated,
+along with the two static MSL-source guards that covered them. What they were worth, the two
+verified *negative* results (a fused Rayleigh-Ritz reduction that ran slower, and a host-side
+per-iteration ``eigh`` that ran 1.37x slower), the full op-count history by backend, and the cost
+model behind all of it are recorded in ``docs/mlx-metal-kernels.md``, now a historical document.
 
 Overview
 ========
 
-An MLX port of :mod:`rqutils.ground_locg` and of ``rqutils.sqd.apply_h`` at
-``cache_level=(1, 2)``, for running
-the SQD eigensolver loop on Apple GPUs. The algorithm is the same single-vector LOBPCG -- see
-:mod:`rqutils.ground_locg` for the derivation, the Rayleigh-Ritz specialization, and the
-numerical analysis behind every guard reproduced here.
+An MLX port of ``rqutils.ground_locg`` and of ``rqutils.sqd.apply_h`` at ``cache_level=(1, 2)``.
+The algorithm is the same single-vector LOBPCG -- see ``rqutils.ground_locg`` for the
+derivation, the Rayleigh-Ritz specialization, and the numerical analysis behind every guard
+reproduced here.
 
 ``mlx`` is an optional, darwin-only extra (``uv run --extra mlx ...``); importing this module
-without it raises ``ImportError``. Nothing else in the package imports it.
+without it raises ``ImportError``.
+
+What remains is one path: the portable op-graph implementation, usable at float32 or float64, with
+``mx.compile`` applied unconditionally (it was the single largest measured win, 2.71x, and was
+never worth making selectable). Since the Metal kernels are gone, so is the float32-only
+constraint they imposed -- an f64 solve is no longer a special case.
 
 Relationship to the JAX implementation
 ======================================
 
-The numerics are kept deliberately in step with :mod:`rqutils.ground_locg`: both eigenpair
-kernels balance before forming their characteristic polynomials, :func:`eigenpair_3x3` takes its
-null vector from the rank-aware :func:`_nullvec_3x3`, both close with a Rayleigh-quotient polish,
+The numerics were kept deliberately in step with ``rqutils.ground_locg``: both eigenpair
+kernels balance before forming their characteristic polynomials, ``eigenpair_3x3`` takes its
+null vector from the rank-aware ``_nullvec_3x3``, both close with a Rayleigh-quotient polish,
 the iteration re-orthogonalizes ``t`` against the new ``x``, renormalizes the search direction,
 masks a zeroed direction out of Rayleigh-Ritz contention, and reports that condition as
 convergence. Those are items I1-I7 of ``docs/locg.md``; each was measured to fail *silently* --
-a plausible wrong number rather than a raise or a ``NaN``. **When editing either file, change
-both.**
+a plausible wrong number rather than a raise or a ``NaN``.
 
-That document is a **stale historical audit** of the pre-rewrite JAX module: its line numbers and
-severity rankings no longer apply, and it is cited here (and below) only for the I-numbers, which
-remain a stable index into the measured failure modes. The binding statement of each invariant is
-the JAX module's docstring next to the code.
+The "when editing either file, change both" rule that used to govern this pair is **retired** with
+the deprecation: ``rqutils.ground_locg`` is now free to evolve without a parity obligation
+here. Every guard below is still load-bearing for *this* file, so don't strip them from it either;
+just don't expect the two to stay aligned.
+
+``docs/locg.md`` is a **stale historical audit** of the pre-rewrite JAX module: its line numbers
+and severity rankings no longer apply, and it is cited here (and below) only for the I-numbers,
+which remain a stable index into the measured failure modes.
 
 Five structural differences, all forced by MLX:
 
@@ -45,51 +63,30 @@ Five structural differences, all forced by MLX:
 * All ``out_sharding=`` arguments are dropped; MLX has unified memory and no sharding.
 * The zero-residual guard at the seed step branches in Python on a synced ``float()`` rather
   than staying in the graph as a ``jnp.where``, since there is no ``lax.cond`` to fold it into.
-* **Everything is real-valued.** MLX has no complex128 anywhere and Metal has no float64 at
-  all, so :func:`eigenpair_2x2` and :func:`eigenpair_3x3` drop the ``.conjugate()`` calls and
-  real/imag norm splits their JAX counterparts need for the general complex-Hermitian case.
-  :func:`ground_locg_mlx` therefore **rejects complex input** rather than silently returning
-  wrong eigenvalues: an earlier version of this port relied on an upstream even-Y constraint to
-  keep coefficients real and admitted in its own docstring that nothing in the repo would catch
-  a regression there.
+* **Everything is real-valued.** MLX has no complex128 anywhere, so ``eigenpair_2x2`` and
+  ``eigenpair_3x3`` drop the ``.conjugate()`` calls and real/imag norm splits their JAX
+  counterparts need for the general complex-Hermitian case. ``ground_locg_mlx`` therefore
+  **rejects complex input** rather than silently returning wrong eigenvalues: an earlier version
+  of this port relied on an upstream even-Y constraint to keep coefficients real and admitted in
+  its own docstring that nothing in the repo would catch a regression there.
 
-The analytic 2x2/3x3 Rayleigh-Ritz step carries over directly, which is what makes this port
+The analytic 2x2/3x3 Rayleigh-Ritz step carries over directly, which is what made this port
 feasible at all.
 
 A sixth difference is not structural but a performance consequence of the same asymmetry, and it
 is why several expressions here look less like their JAX counterparts than a straight
 transcription would: **in JAX an unrolled Python loop over scalars is free, and in MLX it is
 not.** XLA fuses ``jnp.stack([normalize(c) for c in cands])`` into the surrounding ``jit``, so
-:mod:`rqutils.ground_locg` pays nothing for building its seven null-vector candidates one at a
+``rqutils.ground_locg`` pays nothing for building its seven null-vector candidates one at a
 time; MLX constructs one lazily-evaluated op per call, so the identical source shape became 18%
 of this port's entire per-iteration op count. The Rayleigh-Ritz step here therefore uses batched
 whole-array forms -- one broadcast cross product for all three orthogonal-complement candidates,
 one ``(7, 3)`` normalization, ``mx.diagonal``/``mx.roll`` instead of element-by-element
-``mx.stack`` -- and hoists its dtype-dependent constants into :data:`_CONST_CACHE` instead of
+``mx.stack`` -- and hoists its dtype-dependent constants into ``_CONST_CACHE`` instead of
 rebuilding them every iteration. Each was verified *bit-identical* to the form it replaced, not
 merely close. Measured with ``examples/mlx/count_ops.py``, the LOBPCG body went from 116 to 65.0 op
-constructions per iteration, and to 32.5 under ``device="gpu"``. This is the one respect in which
-"when you change one, change both" should *not* be applied mechanically: porting these batched
-forms back to JAX would be churn, since XLA already fuses what they hand-fuse. **The algebra is
-what must stay in step, not the op granularity.**
-
-Performance, and the measurements behind it
-===========================================
-
-:func:`ground_locg_mlx` takes a single ``device`` parameter. ``device="gpu"`` selects two fused
-Metal kernels -- :func:`_apply_h_xz_metal` for the matvec and :func:`_eigenpair_3x3_metal` for the
-Rayleigh-Ritz eigensolve -- and requires float32, since Metal has no float64. ``device="cpu"`` runs
-the portable op-graph path, which is the **only** route for an f64 solve. ``mx.compile`` is applied
-unconditionally in both cases; it was the single largest measured win (2.71x) and is no longer
-selectable.
-
-The measured wins, the two verified *negative* results (a fused Rayleigh-Ritz reduction that ran
-slower, and a host-side per-iteration ``eigh`` that ran 1.37x slower), the full op-count history
-with its backend split, and the cost model that explains all of them are in
-``docs/mlx-metal-kernels.md``. **Read that before proposing a fusion, a host-side eigensolve, or an
-"obvious" simplification here** -- several of the obvious ones were already tried and measured to
-lose. The short version of the transferable lesson: whether fusing wins is decided by **output
-parallelism, not launch count**.
+constructions per iteration. These batched forms are an MLX-specific concern: porting them back to
+JAX would be churn, since XLA already fuses what they hand-fuse.
 
 Verification
 ============
@@ -97,26 +94,8 @@ Verification
 MLX cannot initialize without a Metal device, which rules out headless testing.
 ``examples/mlx/check_solver_headless.py`` re-executes this module's source against a numpy shim
 bound to the name ``mx`` (no MLX, no GPU -- this is what validates the algorithm and the
-caller-facing contract), and ``examples/mlx/check_solver_device.py`` runs the real thing on both
-devices and both precisions, which requires a real Metal device.
-
-Neither exercises the Metal kernels' actual ``source`` strings: the shim reimplements the intended
-per-thread indexing in numpy rather than compiling the Metal C++ text, so it is blind to a bug in
-that text itself. Two static guards cover part of that gap -- every kernel source must qualify its
-math calls with ``metal::``, and none may declare an MSL-reserved identifier -- and both were
-verified to fire by breaking them deliberately. See ``docs/mlx-metal-kernels.md`` for the device
-validation status.
-
-MLX LOBPCG API
-==============
-
-.. autofunction:: ground_locg_mlx
-
-.. autofunction:: apply_h_xz
-
-.. autofunction:: eigenpair_2x2
-
-.. autofunction:: eigenpair_3x3
+caller-facing contract), and ``examples/mlx/check_solver_device.py`` runs the real thing at both
+precisions, which requires a real Metal device.
 """
 
 import math
@@ -146,7 +125,7 @@ _COMPILE_CHUNK = 10
 # Keyed by the dtype object rather than its name so this works identically under real MLX and under
 # the numpy shim in examples/mlx/check_solver_headless.py, whose dtypes are numpy types.
 # Unbounded in principle, bounded by {float32, float64} in practice -- this module rejects complex
-# input and Metal has no float64, so at most two entries are ever created.
+# input, so at most two entries are ever created.
 _CONST_CACHE = {}
 
 
@@ -207,7 +186,7 @@ def normalize(vector, norm=None):
     iteration.
 
     Module-level, mirroring ``rqutils.ground_locg.normalize``. It was previously a closure inside
-    :func:`ground_locg_mlx` over that solve's cached ``one``, which meant the zero-norm guard --
+    ``ground_locg_mlx`` over that solve's cached ``one``, which meant the zero-norm guard --
     load-bearing against NaN, and one of the invariants ``docs/locg.md`` covers -- had to be
     re-inlined at every other call site rather than shared.
     """
@@ -276,384 +255,17 @@ def apply_h_xz(vec, xsources, diagonals, chunk=16):
     return out
 
 
-_METAL_MATVEC_SOURCE = """
-    uint i = thread_position_in_grid.x;
-    if (i >= n_states) {
-        return;
-    }
-    T acc = 0;
-    for (uint j = 0; j < n_groups; ++j) {
-        // xsources/diagonals are row-major (J, N), so column i of group j lives at j*N + i.
-        // Adjacent threads read adjacent addresses, so these loads coalesce; only the
-        // vec[] gather is irregular, and vec is small enough to sit in cache.
-        uint off = j * n_states + i;
-        acc += vec[xsources[off]] * diagonals[off];
-    }
-    out[i] = acc;
-"""
-
-# Compiled-kernel cache, keyed by kernel name. `mx.fast.metal_kernel` compiles MSL, so each kernel
-# must be built exactly once and reused; this replaces what used to be three near-identical
-# `global _METAL_*_KERNEL` / `if ... is None` memos, one per kernel, differing only in the four
-# arguments below. Same "build once into a module dict" shape as _CONST_CACHE above.
-_KERNEL_CACHE = {}
-
-
-def _get_kernel(name, input_names, output_names, source):
-    """Build (once) and return the Metal kernel called ``name``."""
-    kernel = _KERNEL_CACHE.get(name)
-    if kernel is None:
-        kernel = _KERNEL_CACHE[name] = mx.fast.metal_kernel(
-            name=name,
-            input_names=input_names,
-            output_names=output_names,
-            source=source,
-        )
-    return kernel
-
-
-def _get_metal_matvec_kernel():
-    """Build (once) the fused gather-multiply-accumulate Metal kernel."""
-    return _get_kernel(
-        "sqd_apply_h_xz",
-        ["vec", "xsources", "diagonals", "n_groups", "n_states"],
-        ["out"],
-        _METAL_MATVEC_SOURCE,
-    )
-
-
-def _apply_h_xz_metal(vec, xsources, diagonals, threadgroup=256):
-    """Return Hv via a single fused custom Metal kernel.
-
-    :func:`apply_h_xz` expresses the matvec as a sequence of MLX ops, so each one launches its own
-    kernel and materializes a full intermediate array. This version computes
-    ``out[i] = sum_j vec[xsources[j, i]] * diagonals[j, i]`` in one launch with the accumulator
-    held in a per-thread register, so there are no intermediates at all.
-
-    Selected by ``ground_locg_mlx(..., device="gpu")``; private because ``device`` is the supported
-    way to reach it.
-
-    One thread owns one output element, which means no atomics are needed: thread ``i`` is the
-    only writer of ``out[i]``.
-
-    At J=100, N=893 this replaces 21 op launches (chunk=16) plus ~0.4 MB of intermediate
-    traffic per matvec with a single launch and none. The gather into ``vec`` stays irregular --
-    that is inherent to SQD -- but ``vec`` is only ~3.5 KiB at this N and sits in cache.
-
-    Metal is float32-only for this purpose (it has no float64 at all), so this path is usable
-    only by the f32 arms. Callers must check ``vec.dtype``; passing float64 raises.
-
-    The kernel's arithmetic was validated against ``apply_h`` at ``cache_level=(1, 2)``
-    by simulating the exact
-    per-thread indexing in numpy: max abs diff 2.7e-15, and 3.6e-15 against a dense ``H @ v``.
-
-    Args:
-        vec: The vector to multiply, shape ``(N,)``, float32.
-        xsources: Sanitized X-source indices, shape ``(J, N)``, int32.
-        diagonals: Sanitized diagonals, shape ``(J, N)``, float32.
-        threadgroup: Threads per threadgroup. 256 is a reasonable default on Apple GPUs.
-
-    Returns:
-        ``H @ vec``, algebraically identical to :func:`apply_h_xz`.
-
-    Raises:
-        ValueError: If ``vec`` is not float32, since Metal has no float64.
-    """
-    if vec.dtype != mx.float32:
-        raise ValueError(
-            f"_apply_h_xz_metal requires float32 (Metal has no float64), got {vec.dtype}. "
-            "Use apply_h_xz with device='cpu' for the f64 arms."
-        )
-
-    num_groups, num_states = xsources.shape
-    kernel = _get_metal_matvec_kernel()
-    outputs = kernel(
-        inputs=[vec, xsources, diagonals, num_groups, num_states],
-        template=[("T", mx.float32)],
-        grid=(num_states, 1, 1),
-        threadgroup=(min(threadgroup, num_states), 1, 1),
-        output_shapes=[(num_states,)],
-        output_dtypes=[mx.float32],
-    )
-    return outputs[0]
-
-
-_METAL_EIG3_SOURCE = """
-    // ONE thread does the whole 3x3 eigensolve. There is no output parallelism to exploit -- the
-    // result is one eigenvalue plus a 3-vector -- so this kernel exists purely to collapse ~34 op
-    // launches into 1, exactly the tradeoff that made the fused matvec a win and the fused
-    // Rayleigh-Ritz reduction a loss (docs/mlx-metal-kernels.md). Here there is no reduction to
-    // under-parallelize: the op-graph version launches 34 kernels to do scalar arithmetic on nine
-    // numbers, and every one of those launches is pure overhead.
-    if (thread_position_in_grid.x > 0) {
-        return;
-    }
-
-    // ---- load the matrix into registers -------------------------------------------------
-    T m[3][3];
-    for (uint i = 0; i < 3; ++i) {
-        for (uint j = 0; j < 3; ++j) {
-            m[i][j] = mat[i * 3 + j];
-        }
-    }
-
-    // ---- balance: shift traceless, scale by the largest entry ----------------------------
-    // Load-bearing (docs/locg.md items I1/I2): without it the characteristic polynomial's
-    // coefficients lose all significance for a large trace and `disc` goes negative -> NaN.
-    T shift = (m[0][0] + m[1][1] + m[2][2]) / (T)3.0;
-    T scale = 0;
-    for (uint i = 0; i < 3; ++i) {
-        for (uint j = 0; j < 3; ++j) {
-            scale = metal::max(scale, metal::abs(m[i][j]));
-        }
-    }
-    if (!(scale > (T)0.0)) {
-        scale = (T)1.0;
-    }
-    T b[3][3];
-    for (uint i = 0; i < 3; ++i) {
-        for (uint j = 0; j < 3; ++j) {
-            b[i][j] = (m[i][j] - (i == j ? shift : (T)0.0)) / scale;
-        }
-    }
-
-    // ---- characteristic polynomial of the traceless balanced matrix: x^3 + c1 x + c0 ------
-    T bd0 = b[0][0], bd1 = b[1][1], bd2 = b[2][2];
-    // modod in the op-graph order (1,0), (2,0), (2,1), squared.
-    T od0 = b[1][0] * b[1][0];
-    T od1 = b[2][0] * b[2][0];
-    T od2 = b[2][1] * b[2][1];
-    // sum(bd * roll(bd, 1)) = bd0*bd2 + bd1*bd0 + bd2*bd1, then minus sum(modod).
-    T c1 = (bd0 * bd2 + bd1 * bd0 + bd2 * bd1) - (od0 + od1 + od2);
-    // sum(bd * modod[::-1]) = bd0*od2 + bd1*od1 + bd2*od0.
-    T c0 = (bd0 * od2 + bd1 * od1 + bd2 * od0)
-           - (bd0 * bd1 * bd2)
-           - (T)2.0 * (b[0][2] * b[1][0] * b[2][1]);
-
-    // Both radicands are non-negative for a symmetric matrix; clamp against rounding.
-    T p = metal::max((T)(-3.0) * c1, (T)0.0);
-    T disc = metal::max((T)(-27.0) * c1 * c1 * c1 - (T)182.25 * c0 * c0, (T)0.0);
-    T phi = metal::atan2(metal::sqrt(disc), (T)(-13.5) * c0) / (T)3.0;
-    T cphi = metal::cos(phi);
-    T sphi = metal::sin(phi);
-    // Roots are (sqrt(p)/3) * {2cos(phi), -cos(phi) -+ sqrt(3) sin(phi)}; take the smallest.
-    T r0 = (T)2.0 * cphi;
-    T r1 = -cphi - (T)SQRT3_ * sphi;
-    T r2 = -cphi + (T)SQRT3_ * sphi;
-    T xmin = metal::min(r0, metal::min(r1, r2)) * metal::sqrt(p) / (T)3.0;
-
-    // ---- rank-aware null vector of (balanced - xmin I) -----------------------------------
-    // Item I3: seven candidates, winner chosen on the MEASURED residual |Mv|, not on a magnitude
-    // threshold -- for a degenerate eigenvalue the cross products do not vanish but decay only to
-    // O(eps |M|^2), which no fixed cutoff separates from a genuinely small rank-2 cross product.
-    T s[3][3];
-    for (uint i = 0; i < 3; ++i) {
-        for (uint j = 0; j < 3; ++j) {
-            s[i][j] = b[i][j] - (i == j ? xmin : (T)0.0);
-        }
-    }
-
-    // Columns of s. cands rows 0..2 are col_i x col_j for (0,1), (1,2), (2,0) -- the rank-2 case.
-    // The pairings are (k, (k+1) % 3), computed arithmetically rather than read from a local
-    // lookup table: a runtime-indexed `const uint[3]` inside a kernel body would be forced out of
-    // registers into memory, and the modulo of a loop counter is free by comparison.
-    T cands[7][3];
-    for (uint k = 0; k < 3; ++k) {
-        uint a = k;
-        uint bcol = (k + 1) % 3;
-        // col_a = (s[0][a], s[1][a], s[2][a]); cross product of the two columns.
-        cands[k][0] = s[1][a] * s[2][bcol] - s[2][a] * s[1][bcol];
-        cands[k][1] = s[2][a] * s[0][bcol] - s[0][a] * s[2][bcol];
-        cands[k][2] = s[0][a] * s[1][bcol] - s[1][a] * s[0][bcol];
-    }
-
-    // Rank 1: the null space is the orthogonal complement of the largest column; rows 3..5 are
-    // col x e_k for the standard basis vectors.
-    uint col_index = 0;
-    T best_colnorm = (T)(-1.0);
-    for (uint j = 0; j < 3; ++j) {
-        T cn = s[0][j] * s[0][j] + s[1][j] * s[1][j] + s[2][j] * s[2][j];
-        // Strict >, scanning j ascending, reproduces argmax's first-maximum tie-breaking.
-        if (cn > best_colnorm) {
-            best_colnorm = cn;
-            col_index = j;
-        }
-    }
-    T c[3] = {s[0][col_index], s[1][col_index], s[2][col_index]};
-    // col x e_0 = [0, c2, -c1]; col x e_1 = [-c2, 0, c0]; col x e_2 = [c1, -c0, 0].
-    cands[3][0] = (T)0.0;   cands[3][1] = c[2];     cands[3][2] = -c[1];
-    cands[4][0] = -c[2];    cands[4][1] = (T)0.0;   cands[4][2] = c[0];
-    cands[5][0] = c[1];     cands[5][1] = -c[0];    cands[5][2] = (T)0.0;
-    // Rank 0 (a multiple of the identity): every candidate above is zero, so offer e_0. Its
-    // residual is 0, so it wins by default.
-    cands[6][0] = (T)1.0;   cands[6][1] = (T)0.0;   cands[6][2] = (T)0.0;
-
-    // Normalize each candidate, leaving an exactly-zero row at zero rather than making NaN.
-    T norms[7];
-    for (uint k = 0; k < 7; ++k) {
-        T n = metal::sqrt(cands[k][0] * cands[k][0]
-                        + cands[k][1] * cands[k][1]
-                        + cands[k][2] * cands[k][2]);
-        norms[k] = n;
-        T den = (n == (T)0.0) ? (T)1.0 : n;
-        for (uint i = 0; i < 3; ++i) {
-            cands[k][i] /= den;
-        }
-    }
-
-    // Residual |s v| per candidate, matching the op-graph `cands @ mat.T` (mat here is `s`, which
-    // is symmetric, but transpose it explicitly so the transcription is order-for-order).
-    T resid[7];
-    T max_resid = (T)0.0;
-    for (uint k = 0; k < 7; ++k) {
-        T rv[3];
-        for (uint i = 0; i < 3; ++i) {
-            rv[i] = s[i][0] * cands[k][0] + s[i][1] * cands[k][1] + s[i][2] * cands[k][2];
-        }
-        resid[k] = metal::sqrt(rv[0] * rv[0] + rv[1] * rv[1] + rv[2] * rv[2]);
-        max_resid = metal::max(max_resid, resid[k]);
-    }
-    // A candidate that collapsed to zero is not a valid eigenvector; penalize it out of contention
-    // using the same finite penalty the op-graph path uses (MLX has no terse inf-fill idiom, and
-    // the comparison only needs an ordering).
-    for (uint k = 0; k < 7; ++k) {
-        if (!(norms[k] > (T)0.0)) {
-            resid[k] += max_resid + (T)1.0;
-        }
-    }
-    uint best = 0;
-    T best_resid = resid[0];
-    for (uint k = 1; k < 7; ++k) {
-        // Strict <, scanning k ascending, reproduces argmin's first-minimum tie-breaking.
-        if (resid[k] < best_resid) {
-            best_resid = resid[k];
-            best = k;
-        }
-    }
-    T v[3] = {cands[best][0], cands[best][1], cands[best][2]};
-
-    // ---- closing Rayleigh quotient -------------------------------------------------------
-    // Second order in the eigenvector error, so it recovers the precision Cardano alone loses
-    // (sqrt(eps) for a near-degenerate lowest pair).
-    T bv[3];
-    for (uint i = 0; i < 3; ++i) {
-        bv[i] = b[i][0] * v[0] + b[i][1] * v[1] + b[i][2] * v[2];
-    }
-    T rq = v[0] * bv[0] + v[1] * bv[1] + v[2] * bv[2];
-
-    theta[0] = rq * scale + shift;
-    for (uint i = 0; i < 3; ++i) {
-        kappa[i] = v[i];
-    }
-""".replace("SQRT3_", repr(_SQRT3))
-
-
-def _get_metal_eig3_kernel():
-    """Build (once) the fused 3x3 eigensolve Metal kernel."""
-    return _get_kernel(
-        "sqd_eigenpair_3x3",
-        ["mat"],
-        ["theta", "kappa"],
-        _METAL_EIG3_SOURCE,
-    )
-
-
-def _eigenpair_3x3_metal(mat):
-    """Lowest eigenpair of a real symmetric 3x3 matrix in a single fused Metal launch.
-
-    Algebraically the same computation as :func:`eigenpair_3x3` composed with
-    :func:`_nullvec_3x3` -- balance, Cardano, the rank-aware seven-candidate null-vector search,
-    and the closing Rayleigh quotient -- transcribed into one kernel so that ~34 op launches per
-    LOBPCG iteration (measured: 44% of the whole body, ``examples/mlx/count_ops.py``) become one.
-    Measured 1.75x per-iteration and 1.69x end-to-end with a bit-identical eigenvalue.
-
-    Selected by ``ground_locg_mlx(..., device="gpu")``; private because ``device`` is the supported
-    way to reach it.
-
-    **Why fusing wins here when it lost for the Rayleigh-Ritz reduction.** Its work does not scale
-    with N at all -- it is scalar arithmetic on nine numbers -- so there is nothing to parallelize
-    and nothing to *under*-parallelize. A single thread doing ~34 ops' worth of register arithmetic
-    replaces ~34 kernel launches whose only content is that same arithmetic. The fused
-    Rayleigh-Ritz reduction had the opposite profile and measured slower; see
-    ``docs/mlx-metal-kernels.md`` before fusing anything else here.
-
-    Every guard from the op-graph version is reproduced deliberately, not incidentally:
-
-    * **Balancing** before forming the characteristic polynomial (``docs/locg.md`` I1/I2) --
-      without it a large-trace matrix's coefficients lose all significance and ``disc`` goes
-      negative, yielding NaN.
-    * **The rank-aware seven-candidate search** (I3), selecting on the measured residual rather
-      than a magnitude threshold, with the zero-collapse penalty.
-    * **The closing Rayleigh quotient**, which is what recovers the precision Cardano alone loses
-      near degeneracy.
-    * **argmax/argmin tie-breaking**: both scans use a strict comparison over ascending indices,
-      which selects the *first* extremum exactly as MLX's reductions do. A non-strict comparison
-      would pick the last and could return a different (still valid, but different) candidate.
-
-    fp32 only, like every Metal kernel here -- Metal has no float64. The accuracy consequence is
-    inherited, not introduced: Cardano's method loses ~8 digits when two eigenvalues are nearly
-    degenerate (measured 3.6e-08 versus ``eigh``'s 1.8e-15), and ``rqutils.ground_locg``'s JAX
-    original exhibits *bit-identical* error on the same matrices. This kernel is that same
-    formulation, so an f32 solve using it is subject to the same fragility as an f32 solve without
-    it. Note this fragility has NOT been observed to cost iterations: in a controlled run the f64
-    arms of both frameworks converged in 220 (MLX) versus 217 (JAX) iterations to the same
-    eigenvalue. See ``docs/mlx-metal-kernels.md``.
-
-    Args:
-        mat: A 3x3 real symmetric matrix, float32. Only the diagonal and lower triangle are read
-            for the polynomial, matching the op-graph version.
-
-    Returns:
-        ``(theta, kappa)`` -- the smallest eigenvalue as a scalar array and its unit eigenvector,
-        the same pair :func:`eigenpair_3x3` returns.
-
-    Raises:
-        ValueError: If ``mat`` is not float32, since Metal has no float64.
-    """
-    if mat.dtype != mx.float32:
-        raise ValueError(
-            f"_eigenpair_3x3_metal requires float32 (Metal has no float64), got {mat.dtype}. "
-            "Use device='cpu' for the f64 arms."
-        )
-    kernel = _get_metal_eig3_kernel()
-    outputs = kernel(
-        inputs=[mat],
-        template=[("T", mx.float32)],
-        # One thread total: there is no output parallelism in a 3x3 eigensolve. The grid must still
-        # be at least one threadgroup, and the kernel returns early for any thread beyond the first.
-        grid=(1, 1, 1),
-        threadgroup=(1, 1, 1),
-        output_shapes=[(1,), (3,)],
-        output_dtypes=[mx.float32, mx.float32],
-    )
-    # theta is shaped (1,) because MLX kernels need an explicit output shape; squeeze it to the
-    # scalar the op-graph path returns so the two are drop-in interchangeable.
-    return outputs[0][0], outputs[1]
-
-
-def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None, device="cpu"):
+def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None):
     """Single-vector LOBPCG in MLX.
 
     Args:
-        mat: Callable mapping ``(vec, *args)`` to ``A @ vec``. Pair it with ``device``:
-            :func:`apply_h_xz` for ``device="cpu"``, :func:`_apply_h_xz_metal` for
-            ``device="gpu"``. This function never substitutes a matvec of its own.
+        mat: Callable mapping ``(vec, *args)`` to ``A @ vec`` -- ``apply_h_xz`` for an SQD
+            projected Hamiltonian. This function never substitutes a matvec of its own.
         xinit: Initial vector. Must have nonvanishing overlap with the ground state.
         args: Extra arguments forwarded to ``mat``.
         maxiter: Maximum gradient-descent iterations.
         tol: Convergence tolerance. ``None`` uses the dtype epsilon. ``0.`` disables the
             check, running exactly ``maxiter`` iterations with no device sync at all.
-        device: Which implementation of the Rayleigh-Ritz eigensolve to use. ``"cpu"`` (default)
-            is the portable op-graph :func:`eigenpair_3x3`, and is the **only** route for a
-            float64 solve. ``"gpu"`` is the fused single-launch :func:`_eigenpair_3x3_metal`,
-            which requires float32 since Metal has no float64. Bound once here rather than per
-            iteration, so it cannot introduce a per-iteration device sync.
-
-            Two things this parameter deliberately does *not* do. It does not inspect or replace
-            ``mat`` -- see above. And it does not call ``mx.set_default_device``: array placement
-            is the caller's job, and silently mutating process-global state the caller already
-            manages would be worse than making them do it. ``device`` names which kernels this
-            solve uses, not where its arrays live.
 
     Returns:
         ``(eigenvalue, eigenvector, iterations, converged)``. Check the fourth value rather than
@@ -669,8 +281,6 @@ def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None, device="cpu"):
 
     Raises:
         ValueError: If ``xinit`` is complex. Every kernel here assumes real symmetric input.
-        ValueError: If ``device`` is not ``"cpu"`` or ``"gpu"``, or if ``device="gpu"`` is
-            combined with a non-float32 ``xinit``.
     """
     xinit = mx.array(xinit)
     # Test the dtype's name rather than comparing against mx.complex64: this holds under real MLX
@@ -678,30 +288,13 @@ def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None, device="cpu"):
     # dtypes the port actually uses.
     if "complex" in str(xinit.dtype):
         # The kernels below drop the .conjugate() calls their JAX counterparts need, so complex
-        # input would silently produce wrong eigenvalues. MLX has no complex128 at all and Metal
-        # no float64, so this port is real-only by construction -- fail loudly instead.
+        # input would silently produce wrong eigenvalues. MLX has no complex128 at all, so this
+        # port is real-only by construction -- fail loudly instead.
         raise ValueError(
             f"ground_locg_mlx is real-symmetric only, got {xinit.dtype}. MLX has no complex128 "
             "and the eigenpair kernels here omit the conjugations the complex case requires; use "
             "rqutils.ground_locg (JAX) for a complex-Hermitian operator."
         )
-    if device not in ("cpu", "gpu"):
-        raise ValueError(f"device must be 'cpu' or 'gpu', got {device!r}")
-    if device == "gpu" and xinit.dtype != mx.float32:
-        # Validate HERE, not inside _eigenpair_3x3_metal, for three reasons. The message can name
-        # the parameter the caller actually set. It fires before the seed step spends three
-        # matvecs. And decisively: the seed_converged early return below exits without entering
-        # the loop at all, so a guard pushed down into the kernel would never fire on a
-        # diagonal-operator seed and an f64 device='gpu' call would silently succeed -- exactly the
-        # "plausible wrong configuration accepted quietly" class this module's guards exist for.
-        raise ValueError(
-            f"device='gpu' requires float32 (Metal has no float64), got {xinit.dtype}. Use "
-            "device='cpu' for an f64 solve."
-        )
-    # Bind the implementation once, before iterating: the dtype is fixed for the whole solve, so
-    # a per-iteration dispatch would buy nothing and might force a device sync inside the
-    # compiled body (see the design doc -- unverified, and avoided rather than risked).
-    solve_eig3 = _eigenpair_3x3_metal if device == "gpu" else eigenpair_3x3
     check_convergence = tol != 0.0
     if tol is None:
         # Compare the dtype object directly rather than parsing its repr: this works
@@ -793,7 +386,7 @@ def ground_locg_mlx(mat, xinit, args=(), maxiter=1000, tol=None, device="cpu"):
         # mx.compile, so the selection must remain part of the traced graph, and MLX has no
         # functional `.at[].set()` that composes with a traced predicate.
         sas_mat = mx.where(p_is_zero, sas_mat * p_keep + excluded * p_mask, sas_mat)
-        theta, kappa = solve_eig3(sas_mat)
+        theta, kappa = eigenpair_3x3(sas_mat)
         tmp_s = ycurr * kappa[1] + tmp_p * kappa[2]
         norm_s = mx.linalg.norm(tmp_s)
         tmp_t = tmp_s * (kappa[0] / mx.where(norm_s == 0.0, one, norm_s)) - xcurr * norm_s
@@ -926,7 +519,7 @@ def _compute_sas(vectors, mvs):
     sequentially. The symmetrization is kept: it is what makes the two triangles agree exactly,
     and it costs 2 ops against the 3x3 result rather than anything O(N).
 
-    Unlike :func:`_project_out`, this function carries no accumulation-order contract -- its own
+    Unlike ``_project_out``, this function carries no accumulation-order contract -- its own
     symmetrization already averages away the rounding difference between the two triangles -- so
     reassociating the sum here is safe in a way it would *not* be there. Do not apply the same
     transformation to ``_project_out``: those passes guard against catastrophic cancellation
@@ -936,8 +529,7 @@ def _compute_sas(vectors, mvs):
     One visible consequence, expected and benign: because the accumulation order changes, **f32
     eigenvalues shift in their last one or two digits** relative to runs recorded before this
     change (e.g. -5.3960409164 versus -5.3960399628, ~1.8e-7 relative, against an f32 eps of
-    1.19e-7), and the f32 arms no longer agree digit-for-digit across device settings.
-    Iteration counts are unchanged and the correctness gate passes with a >500x margin at
+    1.19e-7). Iteration counts are unchanged and the correctness gate passes with a >500x margin at
     ``rtol=1e-4``. f64 is unaffected at the printed precision. Do not treat an f32 last-digit
     difference against a pre-matmul recorded value as a regression.
     """
@@ -956,7 +548,7 @@ def _project_out(basis, vector):
     normalization can reintroduce basis components through catastrophic cancellation and wreck the
     Rayleigh-Ritz conditioning.
 
-    **Deliberately NOT batched into a matmul, unlike :func:`_compute_sas`.** The eight ``mx.sum``
+    **Deliberately NOT batched into a matmul, unlike ``_compute_sas``.** The eight ``mx.sum``
     reductions here (four passes x two basis vectors, 13 ops/iteration total) could become one
     stacked ``B @ v`` per pass, which is what made ``_compute_sas`` 14.2 -> 2.3 ops. It is not
     done here because a matmul reassociates the summation order, and this function's whole purpose
@@ -1119,7 +711,7 @@ def eigenpair_3x3(mat):
     scaled by its largest entry -- before the characteristic polynomial is formed: without that,
     the coefficients of a large-trace matrix lose all significance and the radicand of the square
     root goes negative, yielding NaN (``docs/locg.md`` items I1/I2). The null vector comes from
-    :func:`_nullvec_3x3`, which is rank-aware rather than using one fixed column pair (item I3),
+    ``_nullvec_3x3``, which is rank-aware rather than using one fixed column pair (item I3),
     and the closing Rayleigh quotient recovers the precision Cardano alone loses.
 
     Assumes ``mat`` is real symmetric, not just Hermitian: the JAX original's ``.conjugate()``

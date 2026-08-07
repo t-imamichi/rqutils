@@ -72,29 +72,14 @@ assert out.returncode == 0, out.stderr
 assert "per_it_ms" in out.stdout and "jax-cpu-f64" in out.stdout, out.stdout
 print("OK  text report renders")
 
-# 6. --matvec: a JAX arm must refuse "metal" (MLX-only kernel). Driven through subprocess like
-# every other check here -- importing bench.py would pull in mlx.core and need a Metal device,
-# which is exactly what this file avoids.
-out = subprocess.run(
-    BASE + ["--arm", "jax-cpu-f32", "--matvec", "metal"],
-    capture_output=True,
-    text=True,
-    check=False,
-)
-assert out.returncode != 0, f"jax-cpu-f32 accepted --matvec metal:\n{out.stdout}"
-assert "metal" in (out.stdout + out.stderr), (
-    f"rejection did not mention metal:\n{out.stdout}\n{out.stderr}"
-)
-print("OK  --matvec metal refused for a jax arm")
-
-# --chunk must be honoured and must not change the answer: the chunked gather is now the default
+# 6. --chunk must be honoured and must not change the answer: the chunked gather is now the default
 # matvec for both frameworks, so a chunk-size-dependent eigenvalue would mean an indexing bug in
 # the one code path every arm goes through. Nothing else here exercises --chunk.
 out_default = subprocess.run(
     BASE + ["--arm", "jax-cpu-f64", "--json"], capture_output=True, text=True, check=False
 )
 out_chunk8 = subprocess.run(
-    BASE + ["--arm", "jax-cpu-f64", "--matvec", "chunked", "--chunk", "8", "--json"],
+    BASE + ["--arm", "jax-cpu-f64", "--chunk", "8", "--json"],
     capture_output=True,
     text=True,
     check=False,
@@ -111,27 +96,10 @@ assert abs(row_chunk8["eigval"] - row_default["eigval"]) < 1e-9, (
 )
 print("OK  --chunk 8 passes its gate and leaves the eigenvalue unchanged")
 
-# An unknown --matvec value must be rejected by argparse rather than falling through to a default.
-out = subprocess.run(
-    BASE + ["--arm", "jax-cpu-f64", "--matvec", "bogus"],
-    capture_output=True,
-    text=True,
-    check=False,
-)
-assert out.returncode != 0, "--matvec bogus was accepted"
-print("OK  --matvec bogus rejected")
-
-# The removed flags must be gone from the parser, not silently ignored: a stale script passing
-# --sas/--eig/--compile-body should fail loudly rather than appear to have configured something.
-for dead_flag in ("--sas", "--eig", "--compile-body"):
-    out = subprocess.run(
-        BASE + ["--arm", "jax-cpu-f64", dead_flag, "metal"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert out.returncode != 0, f"{dead_flag} is still accepted by the parser"
-print("OK  --sas/--eig/--compile-body are rejected (collapsed into --matvec and the arm name)")
+# A loop asserting the removed flags (--sas/--eig/--compile-body, and later --matvec) are rejected
+# used to sit here. Removed: argparse rejects any unrecognized option unconditionally, so those four
+# subprocesses were testing the standard library rather than anything in bench.py. The check that
+# does carry signal is `--arm bogus` above, which exercises a `choices=` list this file maintains.
 
 # 7. The sparse reference path: above DENSE_REFERENCE_MAX_DIM (5000), dense_reference's (N, N)
 # array stops being allocatable at large N, so the gate must fall back to sparse_reference and

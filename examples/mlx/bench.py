@@ -1,4 +1,4 @@
-"""Benchmark the SQD eigensolver loop across JAX and MLX, CPU and GPU.
+"""Benchmark the SQD eigensolver loop across JAX and MLX.
 
 Only the solver loop is compared. Setup (uniquification, X-source lookup, diagonal
 composition) always runs in JAX on CPU and is not timed, so every arm consumes identical
@@ -16,7 +16,7 @@ JAX arm needs its own process. --all re-executes this script once per arm and co
 
 .. code-block:: sh
 
-    uv run --extra mlx --extra qiskit python examples/mlx/bench.py --arm mlx-gpu-f32
+    uv run --extra mlx --extra qiskit python examples/mlx/bench.py --arm mlx-cpu-f32
     uv run --extra mlx --extra qiskit python examples/mlx/bench.py --all --num-qubits 10
     uv run --extra mlx --extra qiskit python examples/mlx/bench.py --all --num-qubits 10 \
         --json > results.json
@@ -50,6 +50,11 @@ and is gone), and MLX compilation went from opt-in to always-on. Both changes ar
 exact -- eigenvalues are unaffected beyond f32 last-digit noise -- but every timing number
 recorded against the old defaults describes a different configuration. See
 ``docs/mlx-metal-kernels.md``.
+
+CAVEAT -- the ``mlx-gpu-f32`` arm and the ``--matvec`` flag are gone. Both existed to select the
+two fused Metal kernels, which were removed when the MLX port was deprecated: JAX measured faster
+even on the MLX GPU backend. The MLX arms here run the portable op-graph path on the MLX CPU
+backend, which is what remains. ``docs/mlx-metal-kernels.md`` keeps the kernel measurements.
 """
 
 import argparse
@@ -58,7 +63,7 @@ import os
 import subprocess
 import sys
 
-ARMS = ("jax-cpu-f64", "jax-cpu-f32", "jax-metal-f32", "mlx-cpu-f64", "mlx-cpu-f32", "mlx-gpu-f32")
+ARMS = ("jax-cpu-f64", "jax-cpu-f32", "jax-metal-f32", "mlx-cpu-f64", "mlx-cpu-f32")
 
 # Relative tolerance for the correctness gate, by precision.
 RTOL = {"f64": 1e-9, "f32": 1e-4}
@@ -137,24 +142,16 @@ def parse_args(argv=None):
         help="Iteration count for the fixed-work measurement.",
     )
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument(
-        "--matvec",
-        choices=("chunked", "metal"),
-        default="chunked",
-        help="Matvec kernel, applied to BOTH jax and mlx arms so the comparison "
-        "stays about the solver loop rather than the matvec (Optimization "
-        '1). "chunked" (default) gathers --chunk X-groups per flat take, '
-        'cutting op count from 3*J to roughly 3*ceil(J/chunk). "metal" is an '
-        "MLX-only fused kernel and is rejected for the jax arms. NOTE: the "
-        'old "loop" (group-at-a-time) choice is gone -- it measured 8.106 '
-        "ms/iter, the slowest of every configuration tried, so per_it_ms "
-        "recorded against it is not comparable to anything measured now.",
-    )
+    # The chunked gather is now the only matvec, applied to BOTH frameworks so the comparison stays
+    # about the solver loop rather than the matvec. The `--matvec` flag that used to select between
+    # it, an MLX-only fused Metal kernel, and a group-at-a-time loop is gone: the Metal kernel was
+    # removed on deprecation, and the loop measured 8.106 ms/iter, the slowest of every
+    # configuration tried. per_it_ms recorded against either is not comparable to anything now.
     parser.add_argument(
         "--chunk",
         type=int,
         default=16,
-        help="Chunk size for --matvec chunked (default 16 -> ~14.3x fewer ops "
+        help="X-groups gathered per flat take (default 16 -> ~14.3x fewer ops "
         "at J=100, temporary bounded to chunk*N).",
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of a table.")
@@ -363,12 +360,8 @@ def run_arm(arm, options):
     result["setup_s"] = setup_s
     result["status"] = "ok"
     # Self-describing options: a saved per_it_ms/eigval is useless for comparison unless the
-    # matvec/compile settings that produced it travel with it.
-    result["matvec"] = options.matvec
-    result["chunk"] = options.chunk if options.matvec == "chunked" else None
-    # `device` is derived from the arm name, not a flag -- see _time_mlx. Recorded because it
-    # selects which eigensolve ran, which per_it_ms depends on heavily (1.75x).
-    result["device"] = device if framework == "mlx" else None
+    # settings that produced it travel with it.
+    result["chunk"] = options.chunk
     return result
 
 
@@ -389,18 +382,9 @@ def _time_jax(arm, inputs, precision, options, matrix, matvec_probe):
     diagonals = jnp.asarray(inputs.diagonals, dtype=dtype)
     vinit = jnp.asarray(inputs.vinit, dtype=dtype)
 
-    # --matvec selects the kernel used by the solver loop, applied identically to the jax and mlx
-    # arms (Optimization 1) -- see apply_h_xz_chunked's docstring in _bench_common.py for the
-    # op-count/memory tradeoff. The chunked gather is now the only non-Metal choice: the
-    # group-at-a-time "loop" variant was the slowest configuration measured and is gone from both
-    # frameworks, so this stays symmetric.
-    if options.matvec == "metal":
-        # Fail loudly rather than silently substituting a different kernel: a "metal" row that
-        # actually timed the JAX kernel would be a fabricated comparison.
-        raise SystemExit(
-            f"{arm}: --matvec metal is an MLX-only custom Metal kernel and has no JAX "
-            "equivalent. Use --matvec chunked for the jax arms."
-        )
+    # The chunked gather, applied identically to the jax and mlx arms (Optimization 1) -- see
+    # apply_h_xz_chunked's docstring in _bench_common.py for the op-count/memory tradeoff. Keeping
+    # both frameworks on the same matvec is what makes this a solver-loop comparison.
     matvec_fn = functools.partial(apply_h_xz_chunked, chunk=options.chunk)
 
     # Gate: the ported matvec and the original must agree on the same input, probed with a
@@ -445,37 +429,20 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _bench_common import timeit
 
-    from rqutils.ground_locg_mlx import _apply_h_xz_metal, apply_h_xz, ground_locg_mlx
+    # `solver`, not `rqutils.ground_locg_mlx`: the MLX port was moved out of the package into
+    # examples/mlx/ on deprecation. Kept function-local, like the jax imports, so the jax arms never
+    # import mlx (importing mlx.core requires a Metal device).
+    from solver import apply_h_xz, ground_locg_mlx
 
-    # --matvec selects the kernel, mirroring _time_jax exactly (Optimization 1) -- see
-    # apply_h_xz's docstring for the op-count/memory tradeoff.
-    if options.matvec == "metal":
-        # One fused custom Metal kernel instead of a sequence of MLX ops. Metal has no float64, so
-        # this path is f32-only; refuse rather than silently running a different kernel than the one
-        # the row claims to be timing.
-        if precision != "f32":
-            raise SystemExit(
-                f"{arm}: --matvec metal requires float32 (Metal has no float64). Use an f32 "
-                "arm, or --matvec chunked for the f64 arms."
-            )
-        matvec_fn = _apply_h_xz_metal
-    else:
-        matvec_fn = functools.partial(apply_h_xz, chunk=options.chunk)
+    # The chunked gather, mirroring _time_jax exactly (Optimization 1) -- see apply_h_xz's docstring
+    # for the op-count/memory tradeoff. The fused Metal alternative selected by the old
+    # `--matvec metal` was removed when the port was deprecated.
+    matvec_fn = functools.partial(apply_h_xz, chunk=options.chunk)
 
-    # The solver's `device` comes from the ARM NAME, which already encodes it (see ARMS and
-    # run_arm's split) -- deliberately not a separate --device flag, which would be a second and
-    # contradictable source of truth for something --arm already fixes. It selects the eigensolve:
-    # "gpu" the fused Metal kernel, "cpu" the portable op-graph one.
-    #
-    # Note this makes the fused eigensolve unreachable for mlx-cpu-f32, which the old --eig flag
-    # could have combined. Nobody measured that pairing; it is a deliberate loss, not an oversight.
-    solver_device = "gpu" if device == "gpu" else "cpu"
-    if solver_device == "gpu" and precision != "f32":
-        raise SystemExit(
-            f"{arm}: device='gpu' requires float32 (Metal has no float64); this arm is {precision}."
-        )
-
-    mx.set_default_device(mx.cpu if device == "cpu" else mx.gpu)
+    # Every MLX arm is a CPU-backend arm now: ARMS no longer contains mlx-gpu-f32, since the two
+    # fused Metal kernels it existed to reach are gone. `device` is still derived from the arm name
+    # (see run_arm's split) rather than a flag, which keeps --arm the single source of truth.
+    mx.set_default_device(mx.cpu)
     dtype = mx.float64 if precision == "f64" else mx.float32
     # Pass dtype at CONSTRUCTION, never construct-then-cast: MLX's docs state that "NumPy
     # arrays with type float64 will be default converted to MLX arrays with type float32"
@@ -534,7 +501,6 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
             args=(xsources, diagonals),
             maxiter=options.fixed_iters,
             tol=0.0,
-            device=solver_device,
         )
 
     compile_s, fixed_s = timeit(fixed, options.repeat, sync)
@@ -548,7 +514,6 @@ def _time_mlx(arm, inputs, device, precision, options, matrix, matvec_probe):
             vinit,
             args=(xsources, diagonals),
             tol=SOLVE_TOL[precision],
-            device=solver_device,
         )
 
     _, solve_s = timeit(solve, options.repeat, sync)
@@ -588,8 +553,6 @@ def run_all(options):
             str(options.fixed_iters),
             "--seed",
             str(options.seed),
-            "--matvec",
-            options.matvec,
             "--chunk",
             str(options.chunk),
         ]
@@ -639,12 +602,8 @@ def report(results, as_json):
             print(f"{row['arm']:<15}{row.get('status', '?'):>10}  {row.get('reason', '')}")
             continue
         # Self-describing options string: a saved per_it_ms/eigval is useless for comparison
-        # unless the matvec/compile settings that produced it travel with it (WIRING requirement).
-        opt = f"matvec={row.get('matvec', 'loop')}"
-        if row.get("matvec") == "chunked":
-            opt += f"(chunk={row.get('chunk')})"
-        if row.get("device"):
-            opt += f" device={row['device']}"
+        # unless the settings that produced it travel with it (WIRING requirement).
+        opt = f"chunk={row.get('chunk')}"
         if row.get("reference_path") == "sparse":
             opt += " reference=sparse"
         print(

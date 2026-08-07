@@ -22,20 +22,19 @@ import types
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# HERE is examples/mlx/, so the package root is two levels up.
-SRC = os.path.join(os.path.dirname(os.path.dirname(HERE)), "rqutils", "ground_locg_mlx.py")
+# The module under test sits beside this script: it was moved out of the package into examples/mlx/
+# when the MLX port was deprecated, so this is a plain local join rather than a walk up to rqutils/.
+SRC = os.path.join(HERE, "solver.py")
 
 # Functions in the module under test that we attribute ops to. Anything constructed outside these
 # (e.g. directly in ground_locg_mlx's body) is attributed to its own frame name.
 _TRACKED = (
     "apply_h_xz",
-    "_apply_h_xz_metal",
     "_compute_sas",
     "_project_out",
     "eigenpair_2x2",
     "eigenpair_3x3",
     "_nullvec_3x3",
-    "_eigenpair_3x3_metal",
     "iter_body",
     "chunk_body",
     "normalize",
@@ -117,40 +116,6 @@ def build_shim():
     shim.Dtype = type(np.dtype("float64"))
     shim.finfo = np.finfo
 
-    def _shim_metal_kernel(name, input_names, output_names, source, **kwargs):
-        def call_matvec(inputs, output_dtypes=None, **kw):
-            vec, xsources, diagonals, num_groups, num_states = inputs
-            xs_flat = np.asarray(xsources).reshape(-1)
-            dg_flat = np.asarray(diagonals).reshape(-1)
-            vec_np = np.asarray(vec)
-            out = np.zeros(num_states, dtype=np.dtype(output_dtypes[0]))
-            for j in range(num_groups):
-                off = j * num_states
-                out = (
-                    out + vec_np[xs_flat[off : off + num_states]] * dg_flat[off : off + num_states]
-                )
-            return [out]
-
-        def call_eig3(inputs, output_dtypes=None, **kw):
-            # Only the op COUNT matters here: one launch replaces the whole eigensolve. The
-            # arithmetic is validated in check_solver_headless.py, so this returns a
-            # cheap-but-valid eigenpair via numpy rather than re-deriving Cardano.
-            (mat,) = inputs
-            m = np.asarray(mat, dtype=np.float64)
-            vals, vecs = np.linalg.eigh((m + m.T) * 0.5)
-            return [
-                np.array([vals[0]], dtype=np.dtype(output_dtypes[0])),
-                np.asarray(vecs[:, 0], dtype=np.dtype(output_dtypes[1])),
-            ]
-
-        # One launch per kernel call, attributed to the calling function.
-        if name == "sqd_apply_h_xz":
-            return _counting(call_matvec, "metal_kernel:matvec")
-        if name == "sqd_eigenpair_3x3":
-            return _counting(call_eig3, "metal_kernel:eig3")
-        raise AssertionError(f"no shim for kernel {name!r}")
-
-    shim.fast = types.SimpleNamespace(metal_kernel=_shim_metal_kernel)
     return shim
 
 
@@ -193,78 +158,80 @@ def main():
     num_states = xsources.shape[1]
     vinit = np.random.default_rng(0).normal(size=num_states)
 
-    # The two configurations ground_locg_mlx now offers. device="gpu" is f32-only, since Metal has
-    # no float64; device="cpu" is the only route for an f64 solve and so is measured at f64.
-    for label, matvec, dtype, device in (
-        ("cpu (op-graph eig, f64)", module.apply_h_xz, np.float64, "cpu"),
-        ("gpu (fused matvec + eig, f32)", module._apply_h_xz_metal, np.float32, "gpu"),
-    ):
-        COUNTS.clear()
-        iters = 6
-        _ENABLED[0] = True
-        module.ground_locg_mlx(
-            matvec,
-            vinit.astype(dtype),
-            args=(xsources, diagonals.astype(dtype)),
-            maxiter=iters,
-            tol=0.0,
-            device=device,
+    # ONE arm. ground_locg_mlx has no options left -- the `device` parameter that used to select two
+    # fused Metal kernels went away with them on deprecation -- and the op count does not depend on
+    # the dtype, so there is nothing left to compare against.
+    #
+    # A second f32 arm was tried and removed: because _CONST_CACHE is keyed by dtype and populated on
+    # first use, whichever precision runs first pays 3 one-time `array` constructions and the second
+    # row reads ~0.5 ops/iter lower (visible as `array:0.5` under --by-op at 6 iterations). That is
+    # cache warm-up rather than a per-iteration difference, so the extra row cost a paragraph of
+    # explanation to avoid being misread and added no signal.
+    dtype = np.float64
+    COUNTS.clear()
+    iters = 6
+    _ENABLED[0] = True
+    module.ground_locg_mlx(
+        module.apply_h_xz,
+        vinit.astype(dtype),
+        args=(xsources, diagonals.astype(dtype)),
+        maxiter=iters,
+        tol=0.0,
+    )
+    _ENABLED[0] = False
+
+    per_func = collections.Counter()
+    for (func, _op), n in COUNTS.items():
+        per_func[func] += n
+    # Attribute only the steady-state loop body: seed-iteration ops are paid once, not
+    # per iteration, so dividing them by `iters` would understate the per-iteration cost of
+    # the body and overstate the seed's.
+    #
+    # NOTE what this total does NOT include: the matvec implementation's own ops. `matvec` below
+    # is ground_locg_mlx's internal closure, not `apply_h_xz`, so the gather ops are attributed to
+    # that frame and fall outside this filter. That is why this still reports the same 65.0 as
+    # every previous op-graph measurement even across matvec changes: this number measures the
+    # Rayleigh-Ritz-and-below body, and comparing matvecs is bench.py's job (they differ in
+    # launches AND in memory traffic, which no op count sees).
+    body = {
+        f: n
+        for f, n in per_func.items()
+        if f
+        in (
+            "iter_body",
+            "_compute_sas",
+            "_project_out",
+            "eigenpair_3x3",
+            "_nullvec_3x3",
+            "matvec",
+            # converged() runs once per iteration whenever tol != 0, so its ops are part of the
+            # per-iteration cost. It was previously listed in _TRACKED but omitted here, which
+            # understated the body total for any convergence-checking solve. Note the measurement
+            # above runs with tol=0.0 (fixed-iteration), so it contributes 0 here -- include it so a
+            # future tol!=0 measurement is not silently short.
+            "converged",
+            "normalize",
         )
-        _ENABLED[0] = False
+    }
+    total_body = sum(body.values())
+    print(f"\n=== op constructions, {iters} iterations (f64) ===")
+    print(f"{'function':<22}{'total':>8}{'per_iter':>10}{'share':>8}")
+    print("-" * 48)
+    for func, n in sorted(body.items(), key=lambda kv: -kv[1]):
+        print(f"{func:<22}{n:>8}{n / iters:>10.1f}{n / total_body * 100:>7.1f}%")
+    print("-" * 48)
+    print(f"{'TOTAL (body)':<22}{total_body:>8}{total_body / iters:>10.1f}")
 
-        per_func = collections.Counter()
-        for (func, _op), n in COUNTS.items():
-            per_func[func] += n
-        # Attribute only the steady-state loop body: seed-iteration ops are paid once, not
-        # per iteration, so dividing them by `iters` would understate the per-iteration cost of
-        # the body and overstate the seed's.
-        #
-        # NOTE what this total does NOT include: the matvec implementation's own ops. `matvec` below
-        # is ground_locg_mlx's internal closure, not `apply_h_xz`/`_apply_h_xz_metal`, so the gather
-        # ops are attributed to those frames and fall outside this filter. That is why the cpu arm
-        # reports the same 65.0 as every previous op-graph measurement even though the matvec it uses
-        # changed: this number measures the Rayleigh-Ritz-and-below body, and comparing matvecs is
-        # bench.py's job (they differ in launches AND in memory traffic, which no op count sees).
-        body = {
-            f: n
-            for f, n in per_func.items()
-            if f
-            in (
-                "iter_body",
-                "_compute_sas",
-                "_project_out",
-                "eigenpair_3x3",
-                "_eigenpair_3x3_metal",
-                "_nullvec_3x3",
-                "matvec",
-                # converged() runs once per iteration whenever tol != 0, so its ops are part of the
-                # per-iteration cost. It was previously listed in _TRACKED but omitted here, which
-                # understated the body total for any convergence-checking solve. Note the arms below
-                # run with tol=0.0 (fixed-iteration), so it contributes 0 there -- include it so a
-                # future tol!=0 measurement is not silently short.
-                "converged",
-                "normalize",
-            )
-        }
-        total_body = sum(body.values())
-        print(f"\n=== {label}: op constructions, {iters} iterations ===")
-        print(f"{'function':<22}{'total':>8}{'per_iter':>10}{'share':>8}")
-        print("-" * 48)
-        for func, n in sorted(body.items(), key=lambda kv: -kv[1]):
-            print(f"{func:<22}{n:>8}{n / iters:>10.1f}{n / total_body * 100:>7.1f}%")
-        print("-" * 48)
-        print(f"{'TOTAL (body)':<22}{total_body:>8}{total_body / iters:>10.1f}")
-
-        if "--by-op" in sys.argv:
-            # Per-op breakdown within each function, so a regression can be traced to the
-            # individual construction that caused it rather than just the function total.
-            for func in sorted(body, key=lambda f: -per_func[f]):
-                ops = collections.Counter()
-                for (owner, op), n in COUNTS.items():
-                    if owner == func:
-                        ops[op] += n
-                detail = "  ".join(f"{op}:{n / iters:g}" for op, n in ops.most_common())
-                print(f"    {func:<20}{detail}")
+    if "--by-op" in sys.argv:
+        # Per-op breakdown within each function, so a regression can be traced to the
+        # individual construction that caused it rather than just the function total.
+        for func in sorted(body, key=lambda f: -per_func[f]):
+            ops = collections.Counter()
+            for (owner, op), n in COUNTS.items():
+                if owner == func:
+                    ops[op] += n
+            detail = "  ".join(f"{op}:{n / iters:g}" for op, n in ops.most_common())
+            print(f"    {func:<20}{detail}")
 
 
 if __name__ == "__main__":

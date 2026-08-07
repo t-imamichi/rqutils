@@ -658,8 +658,13 @@ def _subtract_projections(basis, vector):
 
     All inner products are taken before any subtraction, so a multi-element basis is projected out
     in one pass rather than sequentially. Deliberately *not* batched into a matmul: reassociating the
-    summation order measured consistently worse in the near-degenerate regime this exists for (see
-    ``ground_locg_mlx._project_out``'s docstring for the numbers).
+    summation order measured consistently worse in the near-degenerate regime this exists for. Over
+    4000 adversarial cases with ``r`` placed almost entirely inside ``span(x, y)`` plus an orthogonal
+    part of size 1e-14..1e-6, both forms hold residual orthogonality at machine epsilon, but the
+    matmul is consistently worse -- worst ``|<b|p>|`` of 8.3e-17 against 6.2e-17. Neither form is
+    broken, so this is a judgement call rather than a measured failure: a few ops are not worth a
+    33% erosion of the quantity these guards exist to protect. Re-run that comparison before
+    "optimizing" this.
     """
     ips = [jnp.sum(vb.conjugate() * vector) for vb in basis]
     for vb, ip in zip(basis, ips):

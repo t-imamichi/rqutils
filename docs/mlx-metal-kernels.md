@@ -1,4 +1,19 @@
-# Fused Metal kernels and op-count reduction for `rqutils/ground_locg_mlx.py`
+# Fused Metal kernels and op-count reduction for the MLX LOBPCG port
+
+> **HISTORICAL RECORD (2026-08-07).** Every Metal kernel described below has been **removed from the
+> tree**, along with the `device="cpu"|"gpu"` parameter that selected them and the two static MSL
+> source guards that covered them. The MLX port was deprecated because the JAX solver
+> (`rqutils/ground_locg.py`) measured faster even on the MLX GPU backend, so no kernel here had a
+> performance case left to make. The port survives as a deprecated reference example.
+>
+> Nothing below was retracted -- the measurements are kept verbatim, because they are the reason not
+> to rewrite these kernels from scratch. Two things to know when reading it. Any claim about what
+> `ground_locg_mlx` *offers* (its `device` parameter, its arms, its op-count split by backend) is
+> superseded; only one op-graph path exists now, at 65.0 ops/iter. And if a kernel is ever revived,
+> revive the MSL static guards with it: a numpy shim never compiles the MSL text, so nothing
+> headless can cover a bug in it.
+>
+> Original header follows.
 
 Record date: 2026-08-05. Measurements taken on branch `metal` against an Apple M1 (7-core GPU)
 unless stated otherwise. This document is the standing home for findings that outlived the code
@@ -7,7 +22,7 @@ option axes that existed only to select between a winner and a loser were collap
 `device="cpu"|"gpu"` parameter.
 
 Read this before proposing a fusion, a host-side eigensolve, or an "obvious" simplification in
-`ground_locg_mlx.py`. Several of the obvious ones were already tried and measured to lose.
+the MLX port. Several of the obvious ones were already tried and measured to lose.
 
 ## Short answer
 
