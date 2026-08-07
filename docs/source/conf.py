@@ -37,8 +37,16 @@ extensions = [
     'sphinx.ext.autodoc',
     'sphinx.ext.apidoc',
     'sphinx.ext.autosummary',
+    # The tutorial pages under tutorials/ are scaffolding: each section holds a `.. todo::` block
+    # outlining what it will cover. Without this extension those blocks render as *nothing*, so the
+    # stubs would silently build as a set of empty headings.
+    'sphinx.ext.todo',
     #'sphinx_autodoc_typehints'
 ]
+
+# Render the todo blocks rather than dropping them -- they are the content of the tutorial stubs at
+# present. Set to False once the tutorials carry real prose and the todos become genuine reminders.
+todo_include_todos = True
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
