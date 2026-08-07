@@ -530,6 +530,52 @@ class TestGroundLocg:
             assert np.shape(diagnostics[key])[0] == maxiter + 2, f"{key} row count"
 
 
+class TestBasisOrthogonality:
+    """Item I5: ``{x, y}`` must stay orthonormal, because Rayleigh-Ritz assumes it.
+
+    ``t = kappa_0 s / |s| - |s| x`` is orthogonal to ``x`` in exact arithmetic, so
+    ``_reorthogonalize`` is algebraically a no-op and removing it breaks no other assertion in this
+    file -- theta still matches ``eigvalsh``. What it breaks is the *basis*, and only later does that
+    corrupt theta (the audit measured a full collapse to 1.0, but needed the 2000-iteration runs that
+    item I4's sign error used to force; the fixed solver converges in 8-46).
+
+    So this asserts the invariant directly off the per-iteration diagnostics rather than waiting for
+    a wrong eigenvalue. Measured with the guard neutered in a fresh subprocess (it must be a
+    subprocess -- both callers are ``@jax.jit``-decorated, so patching in a live session reuses the
+    compiled kernel and both arms return bit-identical numbers):
+
+        shift 0     3.8e-17 -> 9.7e-17
+        shift 1e6   5.6e-17 -> 2.5e-12
+        shift 1e9   3.8e-17 -> 1.0e-08
+        shift 1e12  5.6e-17 -> 7.6e-13
+
+    The 1e-13 threshold below sits far under every neutered value and far above every real one.
+    """
+
+    @pytest.mark.parametrize("shift", [0.0, 1e6, 1e9, 1e12])
+    def test_x_y_stay_orthogonal_at_large_shift(self, shift):
+        """A large trace is what drives ``|s| -> 0`` cancellation into ``y``."""
+        n = 200
+        rng = np.random.default_rng(20260807)
+        mat = symmetrize(rng.normal(size=(n, n))) + shift * np.eye(n)
+        xinit = rng.normal(size=n)
+
+        # debug=True runs scan with no early exit, so every iteration is inspected -- including the
+        # post-convergence tail, which is where |s| is smallest and cancellation worst.
+        result = ground_locg(jnp.asarray(mat), jnp.asarray(xinit), maxiter=60, debug=True)
+        assert len(result) == 5  # also narrows the annotated 4-tuple for the type checker
+        diagnostics = result[4]
+        xs = np.asarray(diagnostics["x"])
+        ys = np.asarray(diagnostics["y"])
+        overlap = np.abs(np.einsum("ij,ij->i", xs.conjugate(), ys))
+
+        worst = overlap.max()
+        assert worst < 1e-13, (
+            f"worst |<x|y>| = {worst:.3e} at shift {shift:.0e}; the Rayleigh-Ritz step solves a "
+            "standard eigenproblem and assumes an orthonormal basis"
+        )
+
+
 class TestZeroResidualAfterSeedStep:
     """``body_iter1`` must guard a zeroed post-seed residual the same way ``body()`` does.
 

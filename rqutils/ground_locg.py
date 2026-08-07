@@ -621,14 +621,20 @@ def _reorthogonalize(vector, against, passes=2):
     One pass is not enough for the same reason :func:`_project_out` runs twice; the second removes
     what the first pass's own rounding reintroduced.
 
-    **Not covered by any test, and deleting it does not currently fail one.** Verified by neutering
-    this function in place: the whole suite still passes, and dense random operators at shifts 1e9
-    to 1e12 return a theta matching ``eigvalsh`` to 4e-15 either way. That 1.0 measurement was taken
-    against the *pre-rewrite* module, where this defect compounded with the unbalanced kernels and
-    the ``reltol`` sign error that drove every run to 2000 iterations; with those fixed the same
-    problems converge in 8-46 iterations and never reach the regime. So the guard is cheap insurance
-    against a mode that is real but no longer reachable from the outside -- do not read the passing
-    suite as evidence it is dead code, and do not remove it to "prove" a test catches it.
+    **Measurably load-bearing, but no test currently fails without it.** Removing it degrades the
+    worst :math:`|\\langle x | y \\rangle|` over 60 iterations from ~5e-17 to 2.5e-12 at shift 1e6
+    and **1.0e-08 at shift 1e9** -- eight orders of magnitude -- while theta still matches
+    ``eigvalsh``, which is why the suite stays green. The drift is underway but has not yet collapsed
+    the basis; the audit's :math:`|\\langle x|y\\rangle| = 1.0` needed the 2000-iteration runs that
+    the ``reltol`` sign error (item I4) used to force, and the fixed solver converges in 8-46.
+
+    So a discriminating test is *available* and should be written: drive a large-shift operator for
+    many iterations with ``debug=True`` and assert the per-iteration
+    :math:`|\\langle x|y\\rangle|` stays near machine epsilon. It does not exist yet.
+
+    When A/B-ing this function, patch it in a **fresh subprocess before any tracing**. Both callers
+    are ``@jax.jit``-decorated, so reassigning it in a live session silently reuses the compiled
+    kernel and both arms return bit-identical numbers that look like "no effect".
     """
     for _ in range(passes):
         vector = vector - against * jnp.sum(against.conjugate() * vector)
