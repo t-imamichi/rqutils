@@ -87,7 +87,8 @@ One `tests/test_<module>.py` per module. All seven are covered — `ground_locg`
 `paulis/general`, `paulis/symplectic`, `qprint`, `math` — but **only single-device**: no *test*
 exercises a multi-device mesh. `sqd`'s mesh-size padding and, through it, `ground_locg`'s
 `out_sharding` contract are now covered by `examples/scaling/poc7_sharding.py` (see below) rather than
-by pytest; **`svsim`'s `out_sharding` is still exercised by nothing.** `rqutils/ground_locg_mlx.py`
+by pytest — run it after any change to `ground_locg`'s reductions or helper signatures, not just
+after touching `sqd`; **`svsim`'s `out_sharding` is still exercised by nothing.** `rqutils/ground_locg_mlx.py`
 needs a Metal device and is checked by `examples/mlx/check_solver_headless.py` (numpy shim, runs
 anywhere) and `examples/mlx/check_solver_device.py` (real device) instead. `tests/` also contains three Jupyter
 notebooks used as interactive scratchpads; pytest does not collect them.
@@ -103,6 +104,13 @@ reference (a dense construction, scipy, qiskit) over self-consistency — severa
 internal code path agree on the same wrong number. Verify a new test actually fails against the bug
 it targets by reverting the fix in place; a copy of the repo does not work, since the venv holds an
 editable install pointing at the original.
+
+**A green suite after reverting a fix means the test is missing, not that the guard is dead.** Some
+guards are only reachable when *other* defects compound with them: neutering `ground_locg`'s
+`_reorthogonalize` (audit item I5) leaves all 375 tests passing and dense operators at shifts
+1e9–1e12 agreeing to 4e-15, because the measured drift needed I4's 2000-iteration runs to develop.
+Record the negative result in the function's docstring rather than writing a test that doesn't
+discriminate or deleting the guard.
 
 **Multi-device paths are testable on CPU — use it.**
 `XLA_FLAGS=--xla_force_host_platform_device_count=4` gives virtual devices that exercise every
@@ -169,7 +177,7 @@ so if you touch it, note that a test only catches the overrun when the subspace'
 collide and partners genuinely exist; `packbits` puts low qubit indices in the *leading* bytes, the
 reverse of the qubit numbering, and getting that backwards makes the test pass vacuously.
 
-**`ground_locg.py`** — single-vector (block-size-1) LOBPCG specialization used as `sqd`'s eigensolver, with the Rayleigh–Ritz step solved analytically (`eigenpair_2x2`, `eigenpair_3x3` via Cardano) instead of via `eigh`, to keep memory down for huge vectors. It is sharding-transparent **only if the `mat` callable preserves output sharding** — that contract is why every `apply_*` in `sqd.py` passes `out_sharding=jax.typeof(vec).sharding`. Every guard in it is load-bearing and was measured: `docs/locg.md` catalogues seven defects (I1–I7) that each failed *silently*, returning a plausible wrong number rather than raising. Don't "simplify" the balancing, the re-orthogonalizations, or the zero-direction masks. **`docs/locg.md` is stale** — it audits the pre-rewrite module, so its line numbers, its "no pytest suite exists" scope note, and its A1–A5 gaps (all since fixed) don't apply; cite it for the I-numbers and the measurements only, and read the module docstring for what currently holds. One severity is actively retracted there: I5's guard stays, but neutering it now leaves the suite green, because the 1.0 drift needed I4's 2000-iteration runs to develop.
+**`ground_locg.py`** — single-vector (block-size-1) LOBPCG specialization used as `sqd`'s eigensolver, with the Rayleigh–Ritz step solved analytically (`eigenpair_2x2`, `eigenpair_3x3` via Cardano) instead of via `eigh`, to keep memory down for huge vectors. It is sharding-transparent **only if the `mat` callable preserves output sharding** — that contract is why every `apply_*` in `sqd.py` passes `out_sharding=jax.typeof(vec).sharding`. Every guard in it is load-bearing and was measured: `docs/locg.md` catalogues seven defects (I1–I7) that each failed *silently*, returning a plausible wrong number rather than raising. Don't "simplify" the balancing, the re-orthogonalizations, or the zero-direction masks. **`docs/locg.md` is stale** — it audits the pre-rewrite module, so its line numbers, its "no pytest suite exists" scope note, and its A1–A5 gaps (all since fixed) don't apply; cite it for the I-numbers and the measurements only, and read the module docstring for what currently holds. One severity is actively retracted there: I5's guard stays, but neutering it now leaves the suite green, because the 1.0 drift needed I4's 2000-iteration runs to develop. Two traps when editing it. `body_iter1`'s exclusion bound (`2|rho| + 1`) is **not** `body()`'s (`max(diag) + sum(|diag|) + 1`) specialized to one entry — that form gives merely `1.0` for the negative `rho` of a ground-state search, so "unifying" them weakens the guard; both are valid, and the comments say so. And MLX's one-matmul `_compute_sas` does **not** port here: measured 98.7 ms against the scatter form's 27.7 ms at N=16.8M, because stacking three huge vectors is two 402 MB temporaries per iteration — the copy this module exists to avoid.
 
 **`ground_locg_mlx.py`** — an MLX port of the above plus `sqd.py`'s cached matvec, for Apple GPUs. **It duplicates the algorithm deliberately; when you change one, change both.** It is real-symmetric only (MLX has no complex128, Metal no float64) and raises on complex input rather than silently dropping imaginary parts. `mlx` is a darwin-only extra, so importing this module without it raises `ImportError`. MLX cannot initialize without a Metal device, so headless verification goes through `examples/mlx/check_solver_headless.py`, which re-executes the module's source against a numpy shim; `examples/mlx/check_solver_device.py` is the real-device counterpart.
 
