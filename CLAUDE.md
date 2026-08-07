@@ -106,7 +106,19 @@ unitaries), each validated against qiskit before being trusted as a reference.
 of the same character: a plausible finite answer rather than a raise or a `NaN`. So when adding a
 test, name the defect it locks down and record the measured wrong value, and prefer an *independent*
 reference (a dense construction, scipy, qiskit) over self-consistency — several bugs made every
-internal code path agree on the same wrong number. Verify a new test actually fails against the bug
+internal code path agree on the same wrong number.
+
+**A concrete instance of that trap, worth reading before writing a padding/shape test.**
+`test_states_size_padding_does_not_change_the_answer` compares padded `sqd` calls against an
+*unpadded* `sqd` call, and cannot catch a broken filler mask: its fixture is 12 random 4-bit states,
+which collapse to 7 uniques, so even the "baseline" arm already carries filler slots and is corrupted
+identically. Both sides drift together and it passes. Measured — changing `_is_filler`'s
+`states_u[:, 0] >> 7` to `>> 8` (a uint8 shifted by 8 is 0, so every filler reads as a genuine state)
+left all 65 sqd tests green while `sqd` returned −1.2 against a true −0.8297058541. Same for deleting
+`run_sqd`'s filler-diagonal masking. `test_filler_slots_are_excluded_against_a_dense_reference` closes
+both, using a fixture that is *already unique* (so `states_size=None` is a genuinely filler-free
+control) and a dense reference. **A "does X change the answer?" test needs an arm where X is truly
+absent — verify that, don't assume it from the parameter being unset.** Verify a new test actually fails against the bug
 it targets by reverting the fix in place; a copy of the repo does not work, since the venv holds an
 editable install pointing at the original.
 

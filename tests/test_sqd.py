@@ -551,6 +551,46 @@ class TestSqdEndToEnd:
                 baseline, rel=1e-10
             )
 
+    def test_filler_slots_are_excluded_against_a_dense_reference(self):
+        """Filler slots must be excluded, checked against DENSE rather than an unpadded ``sqd`` call.
+
+        Sibling of ``test_states_size_padding_does_not_change_the_answer``, which cannot catch this.
+        That test's fixture is 12 random 4-bit states, which collapse to 7 uniques -- so *every* arm,
+        including its unpadded "baseline", already carries filler slots and is corrupted identically
+        by a broken filler mask. Both sides drift together and the comparison passes. Measured: with
+        ``_is_filler``'s ``>> 7`` changed to ``>> 8`` (a uint8 shifted by 8 is 0, marking every filler
+        as a genuine state), the entire 65-test sqd suite stays green.
+
+        This fixture instead uses 4 states that are ALREADY unique, so ``states_size=None`` needs no
+        padding at all and is a genuinely filler-free control, and compares against an independent
+        dense projection. Two distinct guards are pinned, both measured to return a plausible wrong
+        answer of -1.2 against the true -0.8297058541:
+
+        * ``_is_filler``'s high-bit test (``states_u[:, 0] >> 7``) -- three call sites depend on it.
+        * ``run_sqd``'s filler-diagonal masking (``jnp.where(_is_filler(...) == 1, max, diagonal)``),
+          which keeps a filler's zero diagonal from being selected as the minimum eigenvalue.
+
+        A filler slot is all-ones (255) and ``pack_states`` reserves a leading zero pad bit, so a
+        genuine state's byte 0 is always < 128 -- that asymmetry is the whole mechanism.
+        """
+        strings = ["ZIII", "IZII", "XXII", "IIZI"]
+        coeffs = [1.0, -0.5, 0.3, 0.7]
+        states = np.array(
+            [[int(c) for c in s] for s in ("0000", "0011", "0101", "1001")], dtype=np.uint8
+        )
+        assert len(np.unique(states, axis=0)) == len(states), "fixture must start filler-free"
+
+        reference = float(
+            np.linalg.eigvalsh(project_dense(strings, np.array(coeffs), states).real).min()
+        )
+        # states_size=None is the filler-free control; 8 and 16 add 4 and 12 filler slots.
+        for states_size in (None, 8, 16):
+            got = eigval_of(strings, coeffs, states, states_size=states_size)
+            assert got == pytest.approx(reference, rel=1e-9), (
+                f"states_size={states_size}: sqd gave {got}, dense reference is {reference} -- "
+                "filler slots leaked into the subspace"
+            )
+
     def test_states_size_below_input_length_raises(self):
         rng = np.random.default_rng(20260804)
         states = rng.integers(0, 2, size=(12, 4)).astype(np.uint8)
@@ -668,11 +708,12 @@ class TestMatvecKernels:
             apply_h(np.zeros(4), (np.zeros((1, 1), dtype=np.uint8),) * 3, None, cache_level)
 
     def test_fully_cached_level_matches_dense(self):
-        """``cache_level=(1, 2)``, the level ``examples/bench_mlx.py`` and the MLX port mirror.
+        """``cache_level=(1, 2)``, the level ``examples/mlx/`` mirrors.
 
         Overlaps :meth:`test_every_cache_level_matches_dense` by design: this one fixes the input
-        that ``ground_locg_mlx.apply_h_xz_mlx`` was validated against, so it stays a named pin for
-        the ported kernel even as the grid test's parametrization changes.
+        that the MLX port's ``apply_h_xz`` was validated against, so it stays a named pin for the
+        ported kernel even as the grid test's parametrization changes. That port is deprecated and
+        now lives at ``examples/mlx/solver.py``; the pin costs nothing and is kept.
         """
         from rqutils.paulis.symplectic import PauliSumXZ
 
