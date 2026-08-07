@@ -22,7 +22,13 @@ passed while every kernel returned the same wrong number.
 
 import numpy as np
 import pytest
-from conftest import lowest_projected, project_dense, real_pauli_strings
+from conftest import (
+    collapsing_states,
+    lowest_projected,
+    project_dense,
+    real_pauli_strings,
+    unique_states,
+)
 
 from rqutils.sqd import (
     apply_h,
@@ -330,7 +336,7 @@ class TestHproj:
         strings = real_pauli_strings(num_qubits, 6, rng)
         coeffs = rng.normal(size=len(strings))
         # Sparse draw from a 32-state space, so some X-partners necessarily fall outside.
-        states = np.unique(rng.integers(0, 2, size=(7, num_qubits)).astype(np.uint8), axis=0)
+        states = unique_states(7, num_qubits, rng)
 
         matrix = hproj((strings, coeffs.tolist()), states).toarray()
         assert matrix.shape == (states.shape[0], states.shape[0])
@@ -415,7 +421,7 @@ class TestSqdInitialVector:
         coupled, so it passed even before the fix.
         """
         rng = np.random.default_rng(11)
-        states = np.unique(rng.integers(0, 2, size=(12, 4)).astype(np.uint8), axis=0)
+        states = unique_states(12, 4, rng)
         reference = lowest_projected([pauli], [1.0], states)
         assert eigval_of([pauli], [1.0], states) == pytest.approx(reference, abs=1e-10)
 
@@ -506,7 +512,7 @@ class TestSqdEndToEnd:
         rng = np.random.default_rng(20260804)
         strings = real_pauli_strings(4, 5, rng)
         coeffs = rng.normal(size=len(strings))
-        unique = np.unique(rng.integers(0, 2, size=(10, 4)).astype(np.uint8), axis=0)
+        unique = unique_states(10, 4, rng)
         duplicated = np.concatenate([unique, unique[:3]], axis=0)
         assert eigval_of(strings, coeffs, duplicated) == pytest.approx(
             eigval_of(strings, coeffs, unique), rel=1e-10
@@ -523,7 +529,7 @@ class TestSqdEndToEnd:
         num_qubits = 4
         strings = real_pauli_strings(num_qubits, 5, rng)
         coeffs = rng.normal(size=len(strings))
-        states = np.unique(rng.integers(0, 2, size=(12, num_qubits)).astype(np.uint8), axis=0)
+        states = unique_states(12, num_qubits, rng)
 
         eigval, eigvec, basis = sqd((strings, coeffs.tolist()), states, return_eigvec=True)
         assert basis.shape == (len(eigvec), num_qubits)
@@ -536,35 +542,55 @@ class TestSqdEndToEnd:
         residual = np.linalg.norm(matrix @ eigvec - eigval * eigvec)
         assert residual < 1e-8 * max(1.0, np.abs(matrix).max())
 
-    def test_states_size_padding_does_not_change_the_answer(self):
+    def test_states_size_padding_is_shape_invariant_only(self):
         """``states_size`` only pins array shapes to avoid JIT recompilation.
 
-        Padding to a larger size adds 255-filler slots, which must stay out of the result entirely.
+        Shape invariance ONLY. ``sqd``-vs-``sqd`` is the right reference for that -- the ``rel=1e-10``
+        below is defensible precisely because both arms are the same iterative eigensolver on the same
+        subspace, which a dense comparison could not match (the sqd-vs-dense arm of
+        :meth:`TestHproj.test_agrees_with_sqd_on_a_subspace_with_a_decoupled_state` needs ``abs=1e-6``,
+        four orders looser).
+
+        It does **not** check that filler slots stay out of the result, and cannot: this fixture
+        collapses under uniquification, so every arm including ``baseline`` carries fillers and a
+        broken filler mask corrupts them identically.
+        :meth:`test_filler_slots_are_excluded_against_a_dense_reference` owns that measurement and
+        pins the exclusion, against a dense reference and a filler-free control arm. Don't delete it
+        as redundant with this one.
+
+        The ``24`` arm is not redundant with ``16``: relative to the 12-row input it puts filler rows
+        in the *majority*, so a future defect whose behaviour depends on fillers outnumbering genuine
+        states is covered by it and not by 16.
         """
         rng = np.random.default_rng(20260804)
         strings = real_pauli_strings(4, 5, rng)
         coeffs = rng.normal(size=len(strings))
-        states = rng.integers(0, 2, size=(12, 4)).astype(np.uint8)
+        # collapsing_states, not a bare draw: the collapse is a precondition here (it is what makes
+        # every arm carry fillers, per the docstring), and the helper asserts it rather than trusting
+        # the seed. Were a future edit to make this fixture distinct, the test would silently become
+        # the filler-free-vs-padded comparison the sibling owns.
+        states = collapsing_states(12, 4, rng)
         baseline = eigval_of(strings, coeffs, states)
         for states_size in (16, 24):
             assert eigval_of(strings, coeffs, states, states_size=states_size) == pytest.approx(
                 baseline, rel=1e-10
             )
 
-    def test_filler_slots_are_excluded_against_a_dense_reference(self):
+    @pytest.mark.parametrize("states_size", [None, 8])
+    def test_filler_slots_are_excluded_against_a_dense_reference(self, states_size):
         """Filler slots must be excluded, checked against DENSE rather than an unpadded ``sqd`` call.
 
-        Sibling of ``test_states_size_padding_does_not_change_the_answer``, which cannot catch this.
-        That test's fixture is 12 random 4-bit states, which collapse to 7 uniques -- so *every* arm,
-        including its unpadded "baseline", already carries filler slots and is corrupted identically
-        by a broken filler mask. Both sides drift together and the comparison passes. Measured: with
-        ``_is_filler``'s ``>> 7`` changed to ``>> 8`` (a uint8 shifted by 8 is 0, marking every filler
-        as a genuine state), the entire 65-test sqd suite stays green.
+        Sibling of ``test_states_size_padding_is_shape_invariant_only``, which cannot catch this:
+        its fixture collapses under uniquification, so every arm including its "baseline" already
+        carries filler slots and drifts identically. Measured, with ``_is_filler``'s ``>> 7`` changed
+        to ``>> 8`` (a uint8 shifted by 8 is 0, marking every filler as a genuine state): the whole
+        sqd suite stays green *except* this test.
 
         This fixture instead uses 4 states that are ALREADY unique, so ``states_size=None`` needs no
-        padding at all and is a genuinely filler-free control, and compares against an independent
-        dense projection. Two distinct guards are pinned, both measured to return a plausible wrong
-        answer of -1.2 against the true -0.8297058541:
+        padding at all and is a genuinely filler-free control -- the only arm that stays correct under
+        that mutation, which is what separates "filler handling broke" from "the solver broke".
+        Two distinct guards are pinned, both measured to return a plausible wrong answer of -1.2
+        against the true -0.8297058541:
 
         * ``_is_filler``'s high-bit test (``states_u[:, 0] >> 7``) -- three call sites depend on it.
         * ``run_sqd``'s filler-diagonal masking (``jnp.where(_is_filler(...) == 1, max, diagonal)``),
@@ -572,24 +598,29 @@ class TestSqdEndToEnd:
 
         A filler slot is all-ones (255) and ``pack_states`` reserves a leading zero pad bit, so a
         genuine state's byte 0 is always < 128 -- that asymmetry is the whole mechanism.
+
+        **Not subsumed by the eight other tests here that compare a filler-carrying fixture against
+        a dense reference** (``test_all_kernels_agree_with_reference`` and friends). Those look like
+        they should catch it and do not -- measured. A broken mask leaves the extra filler diagonals
+        at zero, which perturbs the reported minimum only for some spectra; theirs happen to survive.
+        That non-catch is spectrum-dependent and therefore not something to rely on, which is why the
+        control arm below is explicit rather than incidental.
+
+        Only two arms: a third at 16 was measured to fail to the same wrong value as 8, while costing
+        a further ~0.4 s -- each distinct ``states_size`` is a separate jit trace of the whole solver
+        (see :meth:`test_states_size_actually_prevents_recompilation`).
         """
         strings = ["ZIII", "IZII", "XXII", "IIZI"]
         coeffs = [1.0, -0.5, 0.3, 0.7]
-        states = np.array(
-            [[int(c) for c in s] for s in ("0000", "0011", "0101", "1001")], dtype=np.uint8
-        )
+        states = np.array([[0, 0, 0, 0], [0, 0, 1, 1], [0, 1, 0, 1], [1, 0, 0, 1]], dtype=np.uint8)
         assert len(np.unique(states, axis=0)) == len(states), "fixture must start filler-free"
 
-        reference = float(
-            np.linalg.eigvalsh(project_dense(strings, np.array(coeffs), states).real).min()
+        reference = lowest_projected(strings, coeffs, states)
+        got = eigval_of(strings, coeffs, states, states_size=states_size)
+        assert got == pytest.approx(reference, rel=1e-9), (
+            f"states_size={states_size}: sqd gave {got}, dense reference is {reference} -- "
+            "filler slots leaked into the subspace"
         )
-        # states_size=None is the filler-free control; 8 and 16 add 4 and 12 filler slots.
-        for states_size in (None, 8, 16):
-            got = eigval_of(strings, coeffs, states, states_size=states_size)
-            assert got == pytest.approx(reference, rel=1e-9), (
-                f"states_size={states_size}: sqd gave {got}, dense reference is {reference} -- "
-                "filler slots leaked into the subspace"
-            )
 
     def test_states_size_below_input_length_raises(self):
         rng = np.random.default_rng(20260804)
@@ -636,7 +667,7 @@ class TestMatvecKernels:
         num_qubits = 4
         strings = real_pauli_strings(num_qubits, 5, rng)
         coeffs = rng.normal(size=len(strings))
-        states = np.unique(rng.integers(0, 2, size=(12, num_qubits)).astype(np.uint8), axis=0)
+        states = unique_states(12, num_qubits, rng)
 
         hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_u = uniquify_states(pack_padded(states), states.shape[0])
@@ -665,7 +696,7 @@ class TestMatvecKernels:
         num_qubits = 4
         strings = real_pauli_strings(num_qubits, 6, rng)
         coeffs = rng.normal(size=len(strings))
-        states = np.unique(rng.integers(0, 2, size=(12, num_qubits)).astype(np.uint8), axis=0)
+        states = unique_states(12, num_qubits, rng)
 
         hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_u = uniquify_states(pack_padded(states), states.shape[0])
@@ -721,7 +752,7 @@ class TestMatvecKernels:
         num_qubits = 4
         strings = real_pauli_strings(num_qubits, 5, rng)
         coeffs = rng.normal(size=len(strings))
-        states = np.unique(rng.integers(0, 2, size=(12, num_qubits)).astype(np.uint8), axis=0)
+        states = unique_states(12, num_qubits, rng)
 
         hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_u = uniquify_states(pack_padded(states), states.shape[0])

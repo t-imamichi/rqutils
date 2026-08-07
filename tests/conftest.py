@@ -171,3 +171,41 @@ def real_pauli_strings(num_qubits, count, rng, letters="IXYZ"):
         seen.add(candidate)
         strings.append(candidate)
     return strings
+
+
+def unique_states(num_draws, num_qubits, rng):
+    """Return a lex-sorted, duplicate-free state array drawn from ``rng``.
+
+    ``sqd`` pads a state list up to ``states_size`` with all-ones (255) *filler* rows, and
+    uniquification produces the same fillers wherever the input collapsed. So whether a fixture's
+    rows are already distinct decides whether that fixture exercises the filler path at all -- which
+    makes it a *precondition* of any test whose reference is another arm of itself, not an incidental
+    property. Naming it here is what stops the seven call sites from each looking like an unexplained
+    ``np.unique``.
+
+    Note the returned row count is ``<= num_draws`` and varies with the seed: 7 draws over 4 qubits
+    measured anywhere from 3 to 7 distinct rows across 200 seeds. Callers needing a floor should
+    assert it; callers needing an exact count should not use random draws at all.
+
+    See :func:`collapsing_states` for the deliberate opposite.
+    """
+    draws = rng.integers(0, 2, size=(num_draws, num_qubits)).astype(np.uint8)
+    return np.unique(draws, axis=0)
+
+
+def collapsing_states(num_draws, num_qubits, rng):
+    """Return a state array that is guaranteed to contain duplicates, and assert it does.
+
+    The counterpart to :func:`unique_states`, for tests that need filler slots present in *every*
+    arm. Draw enough rows that collision is overwhelmingly likely, then check rather than assume --
+    an unrelated edit upstream of the draw shifts the RNG stream and can silently turn a collapsing
+    fixture into a distinct one (measured: changing a preceding ``real_pauli_strings`` count from 5
+    to 6 moved the collapse from 7 uniques to 9). A test whose blind spot depends on the collapse
+    would then quietly start testing something else.
+    """
+    draws = rng.integers(0, 2, size=(num_draws, num_qubits)).astype(np.uint8)
+    assert len(np.unique(draws, axis=0)) < num_draws, (
+        f"{num_draws} draws over {num_qubits} qubits did not collide -- this fixture must collapse; "
+        "raise num_draws or lower num_qubits"
+    )
+    return draws
