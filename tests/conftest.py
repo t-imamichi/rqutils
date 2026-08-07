@@ -3,7 +3,41 @@
 ``jax_enable_x64`` is set here, at conftest import time, so that it takes effect before any test
 module imports ``rqutils``. This is load-bearing rather than incidental: without x64 JAX silently
 produces float32/complex64 and every tolerance in this suite is wrong by nine orders of magnitude.
+``conftest.py`` is the only file pytest guarantees to import before the test modules, which is why
+this cannot move to a plain helper module.
+
+Two caches are also pointed at writable directories below, purely for speed -- measured 53.3 s ->
+31.5 s -> 10.4 s on this suite (5.1x). Unlike the x64 flag these are **not** load-bearing: nothing
+here depends on them, both defer to a value the caller already set, and a cache miss only costs
+time. See the comments at each for what they buy and why the default is wrong for this repo.
+
+Seeds are constructed *inside each test body*, deliberately, and there are no ``@pytest.fixture``
+state generators in this suite. Several tests pick a specific seed to produce a specific pathology
+(a decoupled seed state, a subspace that splits into two blocks, 13 Z terms in one X group) and
+assert that the fixture still has that property. Moving the draws into fixtures would make RNG
+stream position depend on fixture ordering, which is invisible at the call site -- see
+:func:`collapsing_states`, whose docstring records a measured instance of exactly that hazard.
+Please keep new fixtures as plain functions taking ``rng``.
 """
+
+import os
+import tempfile
+
+# Both of the following must be set BEFORE jax/matplotlib are imported, which is what puts them
+# above the `import jax` line rather than in a fixture.
+#
+# matplotlib rebuilds its font cache from scratch on every interpreter start when MPLCONFIGDIR is
+# unwritable -- ~24 s, paid by `import rqutils.qprint` (which imports pyplot eagerly) and so by
+# tests/test_qprint.py. `~/.matplotlib` is not writable in a sandboxed session, and matplotlib's
+# own fallback is a fresh temp dir per process, which never warms. A stable temp dir does.
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "rqutils-mplconfig"))
+# JAX recompiles all ~250 XLA kernels every run without a persistent cache (~23 s of the suite).
+# MIN_COMPILE_TIME_SECS is required alongside the directory: the default 1.0 s threshold excludes
+# nearly every kernel here, the largest single compile being ~0.44 s, so the cache would stay empty.
+os.environ.setdefault(
+    "JAX_COMPILATION_CACHE_DIR", os.path.join(tempfile.gettempdir(), "rqutils-jaxcache")
+)
+os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
 
 import jax
 
