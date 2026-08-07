@@ -21,17 +21,23 @@ from rqutils.ground_locg import _project_out, eigenpair_2x2, eigenpair_3x3, grou
 
 
 class TestProjectOut:
-    """``_project_out`` returns either exactly zero or a vector of norm >= 0.99 (item I6)."""
+    """``_project_out`` returns either exactly zero or a vector of norm >= 0.99 (item I6).
+
+    It returns ``(vector, norm)``; the norm is handed back rather than recomputed by the caller
+    because that would be a second O(N) reduction over a vector of up to 1e8 elements.
+    """
 
     def test_vector_in_basis_span_returns_exactly_zero(self):
         """A residual lying wholly in span{x, y} must come back as exact zero, not as noise.
 
         The zeroing guard is what item I7's convergence check keys off: a zeroed search direction
-        means {x, y} already spans the residual, so no further iteration can lower theta.
+        means {x, y} already spans the residual, so no further iteration can lower theta. The
+        returned norm must be exactly 0.0 alongside it, since that is the flag body() tests.
         """
         basis = (jnp.array([1.0, 0.0, 0.0]), jnp.array([0.0, 1.0, 0.0]))
-        out = np.asarray(_project_out(basis, jnp.array([1.0, 1.0, 0.0])))
-        assert np.array_equal(out, np.zeros(3))
+        out, norm = _project_out(basis, jnp.array([1.0, 1.0, 0.0]))
+        assert np.array_equal(np.asarray(out), np.zeros(3))
+        assert float(norm) == 0.0, "a zeroed vector must report norm 0, or p_is_zero never fires"
 
     def test_orthogonal_vector_is_not_normalized_to_unity(self):
         """The postcondition is norm >= 0.99, NOT norm == 1.
@@ -40,13 +46,15 @@ class TestProjectOut:
         At shift 1e9 a |p| of 0.999 displaced theta by 2e6, below the true minimum. This test exists
         so that a future edit "tidying" the trailing subtraction into a normalization fails loudly.
 
-        Two assertions: (1) the orthonormal case must return exactly [0,0,1], and (2) a tilted
+        Three assertions: (1) the orthonormal case must return exactly [0,0,1], (2) a tilted
         (non-orthonormal) basis must return a result with norm strictly between 0.99 and 1.0,
-        proving the vector is not renormalized to unity.
+        proving the vector is not renormalized to unity, and (3) the returned norm must agree with
+        the vector's actual norm, so the caller's renormalization uses the right divisor.
         """
         # Orthonormal basis: _project_out subtracts <e_i|v> e_i, leaving exactly [0, 0, 1].
         basis = (jnp.array([1.0, 0.0, 0.0]), jnp.array([0.0, 1.0, 0.0]))
-        out = np.asarray(_project_out(basis, jnp.array([0.0, 0.0, 2.0])))
+        out, norm = _project_out(basis, jnp.array([0.0, 0.0, 2.0]))
+        out = np.asarray(out)
         assert np.linalg.norm(out) >= 0.99
         assert np.allclose(out, [0.0, 0.0, 1.0])
 
@@ -54,10 +62,12 @@ class TestProjectOut:
         # result falls short of unit norm. This discriminates "masked to >= 0.99" from
         # "renormalized to unity". The result must be strictly less than 1.0.
         basis = (jnp.array([1.0, 0.0, 0.0]), jnp.array([0.3, np.sqrt(1.0 - 0.3**2), 0.0]))
-        out = np.asarray(_project_out(basis, jnp.array([0.3, 0.4, 1.0])))
-        norm = np.linalg.norm(out)
-        assert norm >= 0.99, f"Norm {norm} dropped below 0.99"
-        assert norm < 1.0, f"Norm {norm} is not strictly less than 1.0; likely renormalized"
+        out, norm = _project_out(basis, jnp.array([0.3, 0.4, 1.0]))
+        out = np.asarray(out)
+        actual = np.linalg.norm(out)
+        assert actual >= 0.99, f"Norm {actual} dropped below 0.99"
+        assert actual < 1.0, f"Norm {actual} is not strictly less than 1.0; likely renormalized"
+        assert float(norm) == pytest.approx(actual), "returned norm disagrees with the vector"
 
 
 def two_by_two(rng, delta_sign):

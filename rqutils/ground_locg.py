@@ -108,8 +108,14 @@ Numerical considerations
 ========================
 
 Naive transcriptions of the steps above are numerically fragile in ways that fail *silently*: they
-return a plausible number that is simply wrong, rather than raising or producing ``NaN``. The
-measurements behind each item below are recorded in ``docs/locg.md``.
+return a plausible number that is simply wrong, rather than raising or producing ``NaN``.
+
+The measurements behind each item below were originally recorded in ``docs/locg.md``. **That
+document describes the pre-rewrite module and is now stale** -- its line numbers, its "no pytest
+suite exists" scope note, and several of its severity claims no longer hold, and at least one
+failure mode it measured is no longer reachable now that the defects it compounded with are fixed
+(see :func:`_reorthogonalize`). Read it as history; the invariant that is actually binding is the
+one stated here next to the code, and ``tests/test_ground_locg.py`` is what enforces it.
 
 Analytic eigenpair kernels
 --------------------------
@@ -153,9 +159,9 @@ accurate to ten digits (measured :math:`|\langle v_{\mathrm{true}} | v \rangle| 
 :math:`\theta` error of 1.2e-10). :func:`_nullvec_3x3`'s cross products are the fragile step, and
 once they lose the eigenvector the polish has nothing to recover from. So when auditing this module,
 check the eigenvector and not only :math:`\theta` -- the caller propagates the vector, since
-:math:`\kappa` becomes the next iteration's search direction. ``docs/locg.md`` records the measured
-sweep; it has *not* been shown that the iteration ever builds such a projected matrix, since
-:func:`_project_out` keeps the basis orthonormal by construction.
+:math:`\kappa` becomes the next iteration's search direction. It has *not* been shown that the
+iteration ever builds such a projected matrix, since :func:`_project_out` keeps the basis
+orthonormal by construction.
 
 Iteration
 ---------
@@ -167,17 +173,16 @@ Iteration
   exhausts ``maxiter``. Note :math:`|\theta|` rather than :math:`+\theta`: for the
   negative-definite operators typical of a ground-state search, :math:`+\theta` cancels in turn.
 
-- **Basis orthogonality.** :math:`t = \kappa_0 s / |s| - |s| x` is a difference of two quantities
-  both nearly parallel to :math:`x` as :math:`|s| \to 0`, so :math:`y` drifts into :math:`x` until
-  the nominally three-dimensional search space collapses. Because the Rayleigh-Ritz step solves a
-  *standard* (non-generalized) eigenproblem, which presumes an orthonormal basis, the consequence is
-  a returned :math:`\theta` **below the true minimum eigenvalue** -- silently wrong rather than
-  merely imprecise. :math:`t` is re-orthogonalized against the new :math:`x` before normalization.
+- **Basis orthogonality.** :math:`t` is re-orthogonalized against the new :math:`x` before
+  normalization, or :math:`y` drifts into :math:`x` and the standard Rayleigh-Ritz step returns a
+  :math:`\theta` below the true minimum. See :func:`_reorthogonalize`, whose docstring also records
+  why no test pins it.
 
 - **Search direction normalization.** :func:`_project_out` guarantees only
   :math:`\|p\| \ge 0.99`, and a short :math:`p` scales :math:`\mathrm{sas}_{22}` by :math:`|p|^2`,
   which for a large positive shift is a spuriously low diagonal that Rayleigh-Ritz then selects.
-  :math:`p` is renormalized before the projected eigensolve.
+  :math:`p` is renormalized before the projected eigensolve, using the norm :func:`_project_out`
+  returns alongside it rather than a second reduction over a vector of up to :math:`10^8` elements.
 
 - **Exhausted search space.** When :func:`_project_out` returns exactly zero, row and column 2 of
   the projected matrix vanish; for a positive-definite :math:`A` that zero diagonal is the
@@ -194,8 +199,10 @@ Distributed arrays
 
 This function works transparently over distributed (sharded) input :math:`v_0` if the callable
 passed as the ``mat`` argument preserves the sharding in the output. The re-orthogonalization
-described above introduces two additional inner products per iteration; these follow the same
-reduction pattern as the existing ones but have not been exercised on a multi-device mesh.
+described above introduces two additional inner products per iteration, following the same reduction
+pattern as the existing ones. ``examples/scaling/poc7_sharding.py`` exercises this on a four-device
+mesh (virtual CPU devices via ``XLA_FLAGS=--xla_force_host_platform_device_count=4``), agreeing with
+the single-device result to 8.9e-16; real multi-GPU behaviour remains unverified.
 
 References
 ==========
@@ -218,6 +225,7 @@ Single-vector LOBPCG API
 import logging
 import math
 from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -225,6 +233,37 @@ from jax.sharding import PartitionSpec, get_abstract_mesh
 from numpy.typing import DTypeLike, NDArray
 
 _SQRT3 = math.sqrt(3.0)
+
+
+class _Seed(NamedTuple):
+    """Output of the steepest-descent seed step, before a y direction exists."""
+
+    x: jax.Array
+    r: jax.Array
+    ax: jax.Array
+    rho: jax.Array
+
+
+class _State(NamedTuple):
+    """The ``while_loop`` / ``scan`` carry.
+
+    A NamedTuple rather than a bare tuple because this is a registered pytree -- it flattens to the
+    identical carry with no extra ops -- and the fields were previously read positionally as
+    ``state[0]``, ``state[1]``, ``state[-4:]`` and assembled by splicing one function's return tuple
+    into a different order. Inserting a field silently shifted every index, with all four vector
+    entries the same shape and both scalars interchangeable, so nothing would have failed loudly.
+
+    ``ax`` is carried so that the projected matrix can reuse the image of ``x`` computed at the end
+    of the previous iteration -- three matrix-vector products per iteration instead of four.
+    """
+
+    niter: jax.Array | int
+    converged: jax.Array
+    theta: jax.Array
+    x: jax.Array
+    y: jax.Array
+    r: jax.Array
+    ax: jax.Array
 
 
 def normalize(vector: jax.Array, norm: jax.Array | None = None) -> jax.Array:
@@ -343,8 +382,9 @@ def _ground_locg_callable(
         sas = compute_sas(
             (xcurr, ycurr, rcurr), tuple(matvec(v, *args) for v in (xcurr, ycurr, rcurr))
         )
-        axcurr = matvec(xcurr, *args)
-        rho = jnp.sum(xcurr.conjugate() * axcurr).real  # turns out to be faster than dot()
+        # rho is <x|Ax>, which compute_sas has just computed as the [0, 0] entry. Recomputing it
+        # here cost a fourth matvec that XLA did not eliminate.
+        rho = sas[0, 0].real
 
         if kappa is None:
             kappa = jnp.zeros(3, dtype=xcurr.dtype)
@@ -371,10 +411,9 @@ def _ground_locg_callable(
         ax = matvec(xcurr, *args)
         rho = jnp.sum(xcurr.conjugate() * ax).real
         rnext = ax - rho * xnext
-        if debug:
-            diag = diagnostics(xnext, jnp.zeros_like(xnext), rnext, rho)
-            return xnext, rnext, ax, rho, diag
-        return xnext, rnext, ax, rho
+        seed = _Seed(x=xnext, r=rnext, ax=ax, rho=rho)
+        diag = diagnostics(xnext, jnp.zeros_like(xnext), rnext, rho) if debug else None
+        return seed, diag
 
     def body_iter1(xcurr, rcurr, axcurr, rho):
         # Same zero-search-direction guard as body(), adapted from 3x3 to this step's 2x2 projected
@@ -388,47 +427,54 @@ def _ground_locg_callable(
         tmp_p = normalize(rcurr, norm_r)
         # Reuse Ax from body_iter0 rather than recomputing it inside compute_sas.
         sas = compute_sas((xcurr, tmp_p), (axcurr, matvec(tmp_p, *args)))
-        # Lift the p diagonal out of contention, exactly as body() does for sas[2, 2]: the excluded
-        # value is larger in magnitude than any entry already in play, so Rayleigh-Ritz cannot pick
-        # it. With p excluded, the 2x2 solve collapses onto x alone, returning theta = rho (the
-        # Rayleigh quotient of xcurr, already computed in body_iter0 and passed in) and kappa = [1,
-        # 0], so xnext == xcurr below and no new search direction is introduced.
-        excluded = jnp.abs(rho) + jnp.abs(rho) + 1.0
+        # Lift the p diagonal out of contention, serving the same purpose as body()'s mask on
+        # sas[2, 2]: the excluded value strictly exceeds any entry still in play, so Rayleigh-Ritz
+        # cannot pick it. With p excluded, the 2x2 solve collapses onto x alone, returning
+        # theta = rho (the Rayleigh quotient of xcurr, already computed in body_iter0 and passed in)
+        # and kappa = [1, 0], so xnext == xcurr below and no new search direction is introduced.
+        #
+        # Note this bound is *not* body()'s formula specialized to one surviving entry: that form
+        # gives rho + |rho| + 1, which is merely 1.0 for the negative rho of a ground-state search.
+        # Both bounds are valid -- each exceeds the only retained entry, sas[0, 0] = rho -- but they
+        # are different expressions, so don't "unify" them without redoing the bound argument.
+        excluded = 2.0 * jnp.abs(rho) + 1.0
         sas = jnp.where(r_is_zero, sas.at[1, 1].set(excluded.astype(sas.dtype)), sas)
         theta, kappa = eigenpair_2x2(sas)
         tmp_t = tmp_p * kappa[0] - xcurr * kappa[1]
         tmp_u = xcurr * kappa[0] + tmp_p * kappa[1]
         xnext = normalize(tmp_u)
-        # Re-orthogonalize for the same reason as in body(); see the module docstring.
-        for _ in range(2):
-            tmp_t -= xnext * jnp.sum(xnext.conjugate() * tmp_t)
-        ynext = normalize(tmp_t)
+        ynext = normalize(_reorthogonalize(tmp_t, xnext))
         axnext = matvec(xnext, *args)
         rnext = axnext - theta * xnext
         # As in body(): a zeroed residual means {x} (here, in place of {x, y}) already spans the
         # relevant space, so no further iteration can lower theta. Report convergence immediately.
-        converged = r_is_zero
-        if debug:
-            diag = diagnostics(
-                xnext, ynext, rnext, theta, jnp.insert(kappa, 1, 0.0), converged=converged
-            )
-            return xnext, ynext, rnext, axnext, theta, converged, diag
-        return xnext, ynext, rnext, axnext, theta, converged
+        #
+        # This flag must seed the loop state rather than a hardcoded False, or while_loop would
+        # spend an iteration re-deriving what is already known -- and, worse, feed a zeroed search
+        # direction into body()'s Rayleigh-Ritz step.
+        state = _State(
+            niter=0, converged=r_is_zero, theta=theta, x=xnext, y=ynext, r=rnext, ax=axnext
+        )
+        diag = (
+            diagnostics(xnext, ynext, rnext, theta, jnp.insert(kappa, 1, 0.0), converged=r_is_zero)
+            if debug
+            else None
+        )
+        return state, diag
 
     def body(state):
-        xcurr, ycurr, rcurr, axcurr = state[-4:]
+        xcurr, ycurr, rcurr, axcurr = state.x, state.y, state.r, state.ax
         if log_level <= logging.DEBUG:
-            jax.debug.print("LOCG iteration {}", state[0])
+            jax.debug.print("LOCG iteration {}", state.niter)
 
         # Residual basis selection.
         # R is supposed to be already orthogonal to X, but we find that it's necessary to project
         # out with respect to both X and P to get good convergence of the residual.
-        tmp_p = _project_out((xcurr, ycurr), rcurr)
         # _project_out only guarantees |tmp_p| >= 0.99, but the Rayleigh-Ritz step below solves a
         # standard eigenproblem and so assumes an orthonormal basis: a short tmp_p scales sas[2, 2]
         # by |tmp_p|^2, which for a large positive shift is a spuriously low diagonal that gets
         # selected in place of the true minimizer.
-        norm_p = jnp.linalg.norm(tmp_p)
+        tmp_p, norm_p = _project_out((xcurr, ycurr), rcurr)
         p_is_zero = norm_p == 0.0
         tmp_p = normalize(tmp_p, norm_p)
         # Projected eigensolve. xcurr is the previous iteration's xnext, so its image is already
@@ -450,13 +496,7 @@ def _ground_locg_callable(
         tmp_t = tmp_s * (kappa[0] / jnp.where(norm_s == 0.0, 1.0, norm_s)) - xcurr * norm_s
         tmp_u = xcurr * kappa[0] + tmp_s
         xnext = normalize(tmp_u)
-        # tmp_t is a difference of two quantities both nearly parallel to xcurr as norm_s -> 0, so
-        # catastrophic cancellation lets ynext drift into xnext. Once <x|y> is O(1) the basis is no
-        # longer orthonormal and the standard Rayleigh-Ritz above returns a theta *below* the true
-        # minimum eigenvalue -- a silent wrong answer rather than a visible failure.
-        for _ in range(2):
-            tmp_t -= xnext * jnp.sum(xnext.conjugate() * tmp_t)
-        ynext = normalize(tmp_t)
+        ynext = normalize(_reorthogonalize(tmp_t, xnext))
         axnext = matvec(xnext, *args)
         rnext = axnext - xnext * theta
         # Use the intermediate AX for relative tolerance.
@@ -493,7 +533,15 @@ def _ground_locg_callable(
         if log_level <= logging.DEBUG:
             jax.debug.print("Residual {}, reltol {}, converged: {}", norm_rnext, reltol, converged)
 
-        state = (state[0] + 1, converged, theta, xnext, ynext, rnext, axnext)
+        state = _State(
+            niter=state.niter + 1,
+            converged=converged,
+            theta=theta,
+            x=xnext,
+            y=ynext,
+            r=rnext,
+            ax=axnext,
+        )
         if debug:
             return state, diagnostics(xnext, ynext, rnext, theta, kappa, reltol, converged)
         return state
@@ -520,12 +568,10 @@ def _ground_locg_callable(
     )
     xinit = xinit.astype(work_dtype)
 
-    vs_iter0 = body_iter0(xinit)
-    if debug:
-        diag0 = jax.tree.map(lambda a: jnp.expand_dims(a, 0), vs_iter0[-1])
+    seed, diag0 = body_iter0(xinit)
     # Seed theta with the Rayleigh quotient of xinit so that maxiter=0 returns a meaningful value
     # rather than the state initializer.
-    rho_init = vs_iter0[3]
+    rho_init = seed.rho
 
     if tol is None:
         # Derive the tolerance from the operator, not from the initial guess: a float32 xinit on a
@@ -533,9 +579,9 @@ def _ground_locg_callable(
         # work_dtype above is already that promotion.
         tol = float(jnp.finfo(work_dtype).eps)
 
-    vs_iter1 = body_iter1(vs_iter0[0], vs_iter0[1], vs_iter0[2], rho_init)
+    state, diag1 = body_iter1(seed.x, seed.r, seed.ax, rho_init)
     if debug:
-        diag1 = jax.tree.map(lambda a: jnp.expand_dims(a, 0), vs_iter1[-1])
+        diag0, diag1 = jax.tree.map(lambda a: jnp.expand_dims(a, 0), (diag0, diag1))
 
     if maxiter == 0:
         # No iteration is permitted, so report the seed pair.
@@ -547,36 +593,65 @@ def _ground_locg_callable(
             return rho_init, xinit, 0, empty, diagnostics_out
         return rho_init, xinit, 0, empty
 
-    # body_iter1's own converged flag (a zeroed post-seed residual) must seed the loop state rather
-    # than a hardcoded False, or while_loop would spend an iteration re-deriving what is already
-    # known -- and, worse, feed a zeroed search direction into body()'s Rayleigh-Ritz step.
-    state = (0, vs_iter1[5], vs_iter1[4]) + vs_iter1[:4]
     if debug:
         state, diagnostics_out = jax.lax.scan(lambda s, _: body(s), state, length=maxiter)
         diagnostics_out = jax.tree.map(
             lambda d0, d1, dr: jnp.concatenate([d0, d1, dr], axis=0), diag0, diag1, diagnostics_out
         )
     else:
-        state = jax.lax.while_loop(lambda s: jnp.logical_and(s[0] < maxiter, ~s[1]), body, state)
+        state = jax.lax.while_loop(
+            lambda s: jnp.logical_and(s.niter < maxiter, ~s.converged), body, state
+        )
 
-    niter = state[0]
-    converged = state[1]
-    eigval = state[2]
-    xfinal = state[3]
     if debug:
-        return eigval, xfinal, niter, converged, diagnostics_out
-    return eigval, xfinal, niter, converged
+        return state.theta, state.x, state.niter, state.converged, diagnostics_out
+    return state.theta, state.x, state.niter, state.converged
+
+
+def _reorthogonalize(vector, against, passes=2):
+    """Re-orthogonalize ``vector`` against a single unit vector, repeatedly.
+
+    :math:`t = \\kappa_0 s / |s| - |s| x` is a difference of two quantities both nearly parallel to
+    :math:`x` as :math:`|s| \\to 0`, so catastrophic cancellation lets :math:`y` drift into
+    :math:`x`. Once :math:`\\langle x | y \\rangle` is :math:`O(1)` the basis is no longer
+    orthonormal, and because the Rayleigh-Ritz step solves a *standard* eigenproblem it then returns
+    a :math:`\\theta` **below** the true minimum eigenvalue -- a silent wrong answer rather than a
+    visible failure. Measured :math:`|\\langle x | y \\rangle| = 1.0` at shift 1e9 without this.
+
+    One pass is not enough for the same reason :func:`_project_out` runs twice; the second removes
+    what the first pass's own rounding reintroduced.
+
+    **Not covered by any test, and deleting it does not currently fail one.** Verified by neutering
+    this function in place: the whole suite still passes, and dense random operators at shifts 1e9
+    to 1e12 return a theta matching ``eigvalsh`` to 4e-15 either way. That 1.0 measurement was taken
+    against the *pre-rewrite* module, where this defect compounded with the unbalanced kernels and
+    the ``reltol`` sign error that drove every run to 2000 iterations; with those fixed the same
+    problems converge in 8-46 iterations and never reach the regime. So the guard is cheap insurance
+    against a mode that is real but no longer reachable from the outside -- do not read the passing
+    suite as evidence it is dead code, and do not remove it to "prove" a test catches it.
+    """
+    for _ in range(passes):
+        vector = vector - against * jnp.sum(against.conjugate() * vector)
+    return vector
+
+
+def _subtract_projections(basis, vector):
+    """Subtract the projection of ``vector`` onto each basis element.
+
+    All inner products are taken before any subtraction, so a multi-element basis is projected out
+    in one pass rather than sequentially. Deliberately *not* batched into a matmul: reassociating the
+    summation order measured consistently worse in the near-degenerate regime this exists for (see
+    ``ground_locg_mlx._project_out``'s docstring for the numbers).
+    """
+    ips = [jnp.sum(vb.conjugate() * vector) for vb in basis]
+    for vb, ip in zip(basis, ips):
+        vector = vector - vb * ip
+    return vector
 
 
 def _project_out(basis, vector):
     for _ in range(2):
-        ips = []
-        for vb in basis:
-            ips.append(jnp.sum(vb.conjugate() * vector))
-        for vb, ip in zip(basis, ips):
-            vector -= vb * ip
-        norm = jnp.linalg.norm(vector)
-        vector /= jnp.where(norm == 0.0, 1.0, norm)
+        vector = normalize(_subtract_projections(basis, vector))
 
     # Comments from the original function:
     # ================
@@ -594,15 +669,14 @@ def _project_out(basis, vector):
     # that [basis, U] is zero-or-orthogonal is ensured.
     # ================
     for _ in range(2):
-        ips = []
-        for vb in basis:
-            ips.append(jnp.sum(vb.conjugate() * vector))
-        for vb, ip in zip(basis, ips):
-            vector -= vb * ip
+        vector = _subtract_projections(basis, vector)
 
     # Note the postcondition: the returned vector is either exactly zero or has norm >= 0.99. It is
-    # NOT normalized -- callers feeding it to a standard Rayleigh-Ritz step must renormalize.
-    return vector * (jnp.linalg.norm(vector) >= 0.99).astype(vector.dtype)
+    # NOT normalized -- callers feeding it to a standard Rayleigh-Ritz step must renormalize. The
+    # norm is returned alongside it because every caller needs it for exactly that, plus the
+    # zero test; recomputing it outside would be a second O(N) reduction over a huge vector.
+    norm = jnp.linalg.norm(vector)
+    return vector * (norm >= 0.99).astype(vector.dtype), jnp.where(norm >= 0.99, norm, 0.0)
 
 
 @jax.jit
@@ -636,9 +710,7 @@ def eigenpair_2x2(mat: jax.Array) -> tuple[jax.Array, jax.Array]:
     )
     # rad == 0 means a multiple of the identity, for which any unit vector is an eigenvector.
     norm = jnp.linalg.norm(vec)
-    vec = jnp.where(
-        norm > 0.0, vec / jnp.where(norm > 0.0, norm, 1.0), jnp.array([1.0, 0.0], dtype=mat.dtype)
-    )
+    vec = jnp.where(norm > 0.0, normalize(vec, norm), jnp.array([1.0, 0.0], dtype=mat.dtype))
     # Rayleigh quotient: second order in the eigenvector error, so it recovers full precision where
     # the closed form alone reaches only sqrt(eps).
     return jnp.vdot(vec, jnp.dot(balanced, vec)).real * scale, vec
@@ -647,7 +719,7 @@ def eigenpair_2x2(mat: jax.Array) -> tuple[jax.Array, jax.Array]:
 def _nullvec_3x3(mat: jax.Array) -> jax.Array:
     """Return a unit null vector of a singular 3x3 Hermitian matrix, robust to any rank.
 
-    Six candidates are generated and the one with the smallest residual :math:`|Mv|` is returned.
+    Seven candidates are generated and the one with the smallest residual :math:`|Mv|` is returned.
     Selecting on the measured residual rather than on a magnitude threshold matters because the
     rank-2 and rank-1 constructions below fail in ways that a threshold cannot cleanly separate: for
     a degenerate eigenvalue the cross products do not vanish but decay only to
@@ -718,6 +790,9 @@ def eigenpair_3x3(mat: jax.Array) -> tuple[jax.Array, jax.Array]:
         - 2.0 * (balanced[0, 2] * balanced[1, 0] * balanced[2, 1]).real
     )
     # Both radicands are non-negative for a Hermitian matrix; clamp them against rounding.
+    # disc is Cardano's p^3 - q^2 for q = -13.5 * c0, written out in c1 and c0 because the factored
+    # form is not bit-identical (182.25 == 13.5**2, and -27 c1^3 == p^3 exactly, but grouping the
+    # products differently moves the last few digits -- measured 9.2e-13 worst relative deviation).
     p = jnp.maximum(-3.0 * c1, 0.0)
     disc = jnp.maximum(-27.0 * c1 * c1 * c1 - 182.25 * c0 * c0, 0.0)
     phi = jnp.atan2(jnp.sqrt(disc), -13.5 * c0) / 3.0
