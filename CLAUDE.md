@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Always use `uv run python` (not bare `python`) — the venv at `.venv` is managed by uv. No `timeout` on
 macOS (it is GNU coreutils) — use the Bash tool's own timeout rather than wrapping a command in it.
+The shell is fish: **quote grep globs** (`--include="*.py"`). Unquoted, fish fails with
+`(eval):1: no matches found` before grep runs — which looks like "no results", not "no command".
 
 **Check `git rev-list --left-right --count origin/<branch>...HEAD` before amending.** Work happens on
 feature branches (`metal`, not `main`) that get pushed mid-session, so "my commits are still local"
@@ -260,6 +262,44 @@ What remains there: one op-graph path at f32 or f64, unconditional `mx.compile`,
 **Sharding is implicit** — the library reads `jax.sharding.get_abstract_mesh()`; it is the *caller's* job to set the mesh. The examples establish the expected pattern: a single axis named `'x'` with `AxisType.Explicit`, plus `jax.config.update('jax_enable_x64', True)` (without x64 you silently get complex64/int32 — you'll see truncation warnings).
 
 **Docstrings feed the published API reference.** Every module opens with a raw docstring that is a full reST document: over/underlined title, `.. currentmodule::`, prose with `.. math::` derivations of the normalization conventions, and an explicit API section (`.. autofunction::` / `.. autoclass::` / `.. autosummary::`). Function docstrings are Google-style (`Args:` / `Returns:` / `Raises:`) via napoleon. Adding a public module requires **both** those directives **and** a manual line in the `toctree` of `docs/source/index.rst`.
+
+**Docstrings with LaTeX must be raw strings.** `"""... :math:`\alpha` ..."""` compiles `\a` to a BEL
+byte: the rendered reference is corrupted while ruff, `ty` and pytest all pass, since it is valid
+Python. Sweep after touching any docstring containing a backslash — this found exactly one offender
+(`hproj`) across the package. Also brace `:math:` exponents (`2^{31}`, not `2^31`); unbraced renders
+as `2³1` and nothing warns.
+
+```bash
+uv run python -c "
+import rqutils.sqd, rqutils.ground_locg, rqutils.svsim, rqutils.qprint
+import rqutils.math as rm, rqutils.paulis.general as pg, rqutils.paulis.symplectic as ps
+bad = [(m.__name__, n) for m in (rqutils.sqd, rqutils.ground_locg, rqutils.svsim, rqutils.qprint, rm, pg, ps)
+       for n, o in list(vars(m).items()) + [('<module>', m)]
+       if isinstance(getattr(o, '__doc__', None), str) and any(c in o.__doc__ for c in '\x07\x08\x0b\x0c')]
+print('control-char docstrings:', bad)"
+```
+
+**`.. autoclass::` needs `:members:` or member docstrings are unpublished.** `PauliSumXZ`'s four
+documented public members rendered nowhere until it was added; `CircuitXZ` is deliberately bare (no
+documented members, so the flag is a no-op). Confirm by grepping the built HTML for an
+`id="...<name>"` anchor, not by reading the source. The docs build has **one** standing warning
+(`rqutils.paulis.rst` not in any toctree — a `sphinx-apidoc` package stub); anything beyond that is
+yours. Note `grep -c warning` on the build output counts Sphinx's own summary line too.
+
+**Writing `Raises:` sections finds bugs.** You cannot document a raise without reading its condition,
+which caught three wrong claims in one pass: `apply_h`'s `states` arg omitted `(1, 1)` from the
+no-states-needed set, `components`' documented `ValueError` is gated on `npmod is np` (so under
+`npmod=jnp` a bad `dim` gives an opaque `dot_general` TypeError instead), and `ground_locg` accepts a
+bare Python `int` for `xinit` despite reading `.dtype` — both callers are `jax.jit`-wrapped, so it
+arrives as a 0-d tracer. Trigger every raise you document.
+
+**Verify the referent, not just that the pointer resolves.** Two cross-references in `tests/` were
+"fixed" by removing dead paths while their surrounding claims stayed wrong: a `3.6e-15` agreement
+figure that was a one-off observed value rather than the actual `1e-9` gate, and an `hproj` workaround
+described as live when the file it points at records the bug as fixed. Read the target. Same rule for
+cost figures — A/B the whole call against the pre-change revision in a worktree (`git worktree add`,
+`PYTHONPATH` at it, since the venv's editable install otherwise serves HEAD to both arms): timing a
+guard predicate alone measured 3.4–3.8% where the end-to-end cost was 12–14%.
 
 ## Known rough edges
 
