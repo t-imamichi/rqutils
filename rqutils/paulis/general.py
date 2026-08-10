@@ -120,16 +120,19 @@ def normalize_dim(dim: MatrixDimension) -> tuple[int, ...]:
     return tuple(map(int, dim))
 
 
-def paulis(dim: MatrixDimension, sparse: bool = False) -> NDArray[np.complex128] | tuple[csr_array]:
+def paulis(dim: MatrixDimension, sparse: bool = False) -> NDArray[np.complex128 | np.object_]:
     r"""Return an array of generalized Pauli matrices or matrix products of given dimension(s).
 
     Args:
         dim: Dimension(s) of the Pauli matrices.
-        sparse: Whether to return the matrices as an array (dtype=object) of CSR arrays.
+        sparse: Whether to return the matrices as an array (dtype=object) of CSR arrays. Only
+            supported for a single subsystem.
 
     Returns:
-        An array of Pauli (product) matrices as an array. For `dim=(d1, d2, ...)`, the shape of
-        the array is `(d1**2, d2**2, ..., d1*d2*..., d1*d2*...)`.
+        An array of Pauli (product) matrices. For a multi-subsystem `dim=(d1, d2, ...)`, the shape
+        is `(d1**2, d2**2, ..., d1*d2*..., d1*d2*...)`; for a single subsystem `dim=d` it is
+        `(d**2, d, d)`. With `sparse=True` the result is instead a 1D `dtype=object` array of shape
+        `(d**2,)` holding CSR arrays.
     """
     dim = normalize_dim(dim)
 

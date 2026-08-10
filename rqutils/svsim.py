@@ -98,7 +98,8 @@ def svsim(
 
     A gate specifier is a 2-tuple ``(name, qubit)`` (for nonparametric gates) or a 3-tuple
     ``(name, qubit, angle)`` (rotation gates). The gate name must be one of ``x``, ``y``, ``z``,
-    ``cz``, ``rx``, ``ry``, ``rz``, or ``rzz``.
+    ``rx``, ``ry``, ``rz``, or ``rzz``. Note ``cz`` is *not* valid here: it is decomposed only on the
+    ``QuantumCircuit`` path and is rejected as a raw gate spec.
 
     Args:
         circuit: Quantum circuit to simulate.

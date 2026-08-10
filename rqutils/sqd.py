@@ -52,8 +52,8 @@ signature (for example, XIZ and YZI will belong to the same group). For each X s
 be multiple Z signatures and the corresponding phased coefficients (:math:`\alpha (-i)^{xz}` above).
 The X and Z signatures are bit-packed into arrays of 8-bit integers.
 
-The input states are then sorted and similarly bit-packed to allow bitwise operations between the
-states and the X/Z signatures. The resulting array :math:`S = [s^{0}, \dots, s^{N-1}]` is the basis
+The input states are then similarly bit-packed, to allow bitwise operations between the states and
+the X/Z signatures, and sorted. The resulting array :math:`S = [s^{0}, \dots, s^{N-1}]` is the basis
 on which the Hamiltonian is projected. We then define the initial vector of length :math:`N` as the
 input to the LOBPCG function.
 
@@ -145,8 +145,8 @@ aggressive caching strategy described above will be possible this way.
 
 However, there is a limit to scaling in :math:`N` (SQD subspace dimension) imposed by the need to
 sort the states list during the initial uniquification. That sort must take place within a single
-device, with at most :math:`2^32` elements involved, so it caps the achievable :math:`N` at
-:math:`2^31`. Source index identification no longer contributes: it is a binary search into the
+device, with at most :math:`2^{32}` elements involved, so it caps the achievable :math:`N` at
+:math:`2^{31}`. Source index identification no longer contributes: it is a binary search into the
 already-sorted state list rather than a sort of a stacked :math:`2N` array, which is why the cap
 comes from :func:`uniquify_states` alone -- see :func:`get_xsource` for that change and what it was
 measured to be worth. A comparable limit is set by the GPU memory, which is at most O(100)GB per
@@ -278,7 +278,7 @@ def sqd(
 def hproj(
     hamiltonian: HamiltonianInput, states: StateList, unique_states: bool = False
 ) -> csr_array:
-    """Return the Hamiltonian projected onto the given subspace.
+    r"""Return the Hamiltonian projected onto the given subspace.
 
     The Hamiltonian can be given in three different forms:
 

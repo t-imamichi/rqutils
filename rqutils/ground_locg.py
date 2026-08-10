@@ -175,8 +175,8 @@ Iteration
 
 - **Basis orthogonality.** :math:`t` is re-orthogonalized against the new :math:`x` before
   normalization, or :math:`y` drifts into :math:`x` and the standard Rayleigh-Ritz step returns a
-  :math:`\theta` below the true minimum. See :func:`_reorthogonalize`, whose docstring also records
-  why no test pins it.
+  :math:`\theta` below the true minimum. See :func:`_reorthogonalize`, whose docstring records the
+  measured drift and how to A/B it correctly.
 
 - **Search direction normalization.** :func:`_project_out` guarantees only
   :math:`\|p\| \ge 0.99`, and a short :math:`p` scales :math:`\mathrm{sas}_{22}` by :math:`|p|^2`,
@@ -633,16 +633,16 @@ def _reorthogonalize(vector, against, passes=2):
     One pass is not enough for the same reason :func:`_project_out` runs twice; the second removes
     what the first pass's own rounding reintroduced.
 
-    **Measurably load-bearing, but no test currently fails without it.** Removing it degrades the
-    worst :math:`|\\langle x | y \\rangle|` over 60 iterations from ~5e-17 to 2.5e-12 at shift 1e6
-    and **1.0e-08 at shift 1e9** -- eight orders of magnitude -- while theta still matches
-    ``eigvalsh``, which is why the suite stays green. The drift is underway but has not yet collapsed
-    the basis; the audit's :math:`|\\langle x|y\\rangle| = 1.0` needed the 2000-iteration runs that
-    the ``reltol`` sign error (item I4) used to force, and the fixed solver converges in 8-46.
-
-    So a discriminating test is *available* and should be written: drive a large-shift operator for
-    many iterations with ``debug=True`` and assert the per-iteration
-    :math:`|\\langle x|y\\rangle|` stays near machine epsilon. It does not exist yet.
+    **Measurably load-bearing, and pinned by**
+    ``tests/test_ground_locg.py::TestBasisOrthogonality``. Removing it degrades the worst
+    :math:`|\\langle x | y \\rangle|` over 60 iterations from ~5e-17 to 2.5e-12 at shift 1e6 and
+    **1.0e-08 at shift 1e9** -- eight orders of magnitude -- and that test fails 3 of its 4 arms as a
+    result. Note theta still matches ``eigvalsh`` throughout, so *nothing else* in the suite notices:
+    the drift is underway but has not yet collapsed the basis, and the audit's
+    :math:`|\\langle x|y\\rangle| = 1.0` needed the 2000-iteration runs that the ``reltol`` sign
+    error (item I4) used to force, where the fixed solver converges in 8-46. That is why the
+    invariant is asserted directly off the ``debug=True`` per-iteration diagnostics rather than by
+    waiting for a wrong eigenvalue.
 
     When A/B-ing this function, patch it in a **fresh subprocess before any tracing**. Both callers
     are ``@jax.jit``-decorated, so reassigning it in a live session silently reuses the compiled

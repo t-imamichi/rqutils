@@ -91,7 +91,7 @@ def qprint(
 
     Args:
         qobj: Input quantum object.
-        fmt: Print format (`'braket'` or `'pauli'`).
+        fmt: Content format (`'braket'`, `'pauli'`, or `'matrix'`).
         amp_norm: Specification of the normalization of amplitudes by (numeric devisor, unit in
             LaTeX).
         phase_norm: Specification of the normalization of phases by (numeric devisor, unit in
@@ -748,7 +748,10 @@ class QPrintPauli(QPrintBase):
     Args:
         qobj: A square matrix (shape `(d1*d2*..., d1*d2*...)`), a structured components array
             (shape `(d1**2, d2**2, ...)`), or a fully flattened components array. Argument `dim` is
-            required in the first and third cases.
+            required for the square matrix. For the other two it is optional: when omitted, each
+            axis is taken to be one subsystem of dimension `sqrt(len(axis))`, so a flattened array
+            is read as a single subsystem and a `ValueError` is raised if any axis length is not a
+            perfect square. Pass `dim` to interpret a flattened array as multiple subsystems.
         amp_norm: Specification of the normalization of amplitudes by (numeric devisor, unit in
             LaTeX).
         phase_norm: Specification of the normalization of phases by (numeric devisor, unit in

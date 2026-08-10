@@ -62,8 +62,8 @@ def matrix_ufunc(
         with_diagonals: If True, also return the array ``operator(eigenvalues)``.
 
     Returns:
-        An array corresponding to `operator(mat)`. If `diagonals==True`, another array corresponding
-        to `operator(eigvals)`.
+        An array corresponding to `operator(mat)`. If `with_diagonals==True`, another array
+        corresponding to `operator(eigvals)`.
     """
     if hermitian in (1, True):
         eigvals, eigcols = npmod.linalg.eigh(mat)
