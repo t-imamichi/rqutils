@@ -31,6 +31,7 @@ from conftest import (
 )
 
 from rqutils.sqd import (
+    _is_lex_sorted,
     apply_h,
     compute_diagonal,
     get_diag_signs,
@@ -267,27 +268,31 @@ class TestUniquifyStates:
 class TestHproj:
     """``hproj`` builds the projected Hamiltonian densely (sparse), as a debug/reference path."""
 
-    def test_unsorted_input_with_unique_states_is_wrong(self):
-        """Defect: ``unique_states=True`` accepts unsorted states and returns a wrong matrix.
+    def test_unsorted_input_with_unique_states_raises(self):
+        """``unique_states=True`` rejects unsorted states instead of projecting them wrongly.
 
         ``get_xsource`` requires a lex-sorted ``S``. Both production callers satisfy it -- ``run_sqd``
         via ``uniquify_states``, ``hproj`` via ``np.unique(..., axis=0)`` -- but ``hproj``'s
         ``unique_states=True`` shortcut skips that ``np.unique``, so a caller who has already
-        deduplicated *without* sorting silently violates the precondition.
+        deduplicated *without* sorting violates the precondition.
 
-        This predates the search-based ``get_xsource``: the sort-based implementation was equally
-        wrong on unsorted input, just wrong differently. The test pins the *detectable signature*
-        rather than the specific wrong numbers, since those are implementation-dependent: the
-        returned matrix is **not symmetric**, which a Hermitian projection must always be. It exists
-        so that anyone tightening this into a raise has a named test to flip, and so the asymmetry is
-        not mistaken for a regression in the search.
+        This is the flipped form of ``test_unsorted_input_with_unique_states_is_wrong``, which pinned
+        the old behaviour: the returned matrix was **not symmetric**, which a Hermitian projection
+        must always be. That was a silent wrong answer, so the shortcut now validates sortedness and
+        raises instead.
+
+        The sorted arm below is what keeps this honest: a guard that rejected *everything* would also
+        satisfy the ``raises`` assertions.
         """
         # Unique but NOT sorted: row order is 1000, 0000, 0001.
         unsorted = np.array([[1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 1]], dtype=np.uint8)
-        bad = hproj((["IIIX"], [1.0]), unsorted, unique_states=True).toarray().real
-        assert not np.allclose(bad, bad.T), (
-            "unsorted input happened to give a symmetric matrix; this test's premise is stale"
-        )
+        with pytest.raises(ValueError, match="uniquified and lex-sorted"):
+            hproj((["IIIX"], [1.0]), unsorted, unique_states=True)
+
+        # Duplicate rows are rejected too: "uniquified" is the other half of the precondition.
+        dup = np.array([[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 1]], dtype=np.uint8)
+        with pytest.raises(ValueError, match="uniquified and lex-sorted"):
+            hproj((["IIIX"], [1.0]), dup, unique_states=True)
 
         # The same states, sorted, give the correct symmetric coupling 0000 <-> 0001.
         good = hproj((["IIIX"], [1.0]), np.unique(unsorted, axis=0), unique_states=True)
@@ -296,6 +301,55 @@ class TestHproj:
         expected = np.zeros((3, 3))
         expected[0, 1] = expected[1, 0] = 1.0
         assert np.allclose(good, expected)
+
+    def test_is_lex_sorted_discriminates(self):
+        """``_is_lex_sorted`` must agree with ``np.unique``, including where bytes tie.
+
+        Row lex order is decided by the *first differing byte*, so the traps are pairs that agree on
+        a prefix. A check written as ``np.all(np.diff(keys) > 0)`` over per-row sums, or one comparing
+        only byte 0, passes the obvious cases and still admits ``[[0, 9], [0, 3]]``.
+        """
+        cases = [
+            (np.array([[0, 0], [0, 1], [1, 0]], np.uint8), True),
+            (np.array([[0, 9], [0, 3]], np.uint8), False),  # ties on byte 0, decided by byte 1
+            (np.array([[0, 3], [0, 9]], np.uint8), True),
+            (np.array([[1, 0], [0, 255]], np.uint8), False),  # larger row sum, still unsorted
+            (np.array([[5, 5]], np.uint8), True),  # single row is trivially sorted
+            (np.array([[7, 7], [7, 7]], np.uint8), False),  # duplicates are not *strictly* sorted
+        ]
+        for rows, expected in cases:
+            assert _is_lex_sorted(rows) is expected, f"{rows.tolist()} -> expected {expected}"
+            # Cross-check against the ordering hproj's default path actually produces.
+            if expected:
+                assert np.array_equal(rows, np.unique(rows, axis=0))
+
+        # Zero rows: no adjacent pair exists, so vacuously sorted rather than an IndexError.
+        assert _is_lex_sorted(np.zeros((0, 4), np.uint8)) is True
+
+    def test_padded_uniquify_output_is_rejected(self):
+        """A padded ``uniquify_states`` result must NOT pass, since ``hproj`` cannot mask fillers.
+
+        Filler slots are all-``255`` rows, so two or more are duplicates and fail the strictness test.
+        This is the one way the sortedness guard could surprise a caller -- ``uniquify_states`` output
+        is otherwise exactly what ``get_xsource`` wants -- so it is pinned rather than left to be
+        rediscovered. ``sqd`` trims fillers before returning its basis, which is why
+        ``examples/scaling/poc7_sharding.py`` can hand that basis straight to ``hproj``.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        rng = np.random.default_rng(3)
+        states = rng.integers(0, 2, size=(12, 4), dtype=np.uint8)
+        packed = PauliSumXZ.pack_states(states)
+
+        # states_size=12 happens to leave a single filler, which is still strictly increasing.
+        one_filler = np.asarray(uniquify_states(packed, 12))
+        assert int((one_filler[:, 0] >> 7).sum()) == 1
+        assert _is_lex_sorted(one_filler) is True
+
+        # Pad further and the duplicate 255 rows are rejected.
+        many_fillers = np.asarray(uniquify_states(packed, 16))
+        assert int((many_fillers[:, 0] >> 7).sum()) > 1
+        assert _is_lex_sorted(many_fillers) is False
 
     def test_matches_dense_reference(self):
         """``hproj`` packed states WITHOUT the pad bit while padding the Hamiltonian.
