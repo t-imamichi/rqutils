@@ -293,7 +293,12 @@ def hproj(
         hamiltonian: Hamiltonian to be projected and diagonalized.
         states: Binary array of computational basis states to project the Hamiltonian onto. Shape
             (subspace_dim, num_qubits).
-        unique_states: Whether the states can be assumed to be already uniquified and sorted.
+        unique_states: Whether ``states`` can be assumed to be already uniquified **and
+            lex-sorted**, skipping the internal ``np.unique(..., axis=0)``. Both halves are
+            required: :func:`get_xsource` binary-searches into ``states``, so passing rows that are
+            unique but *unsorted* silently returns a wrong, non-symmetric matrix rather than
+            raising. Sort with ``np.unique(states, axis=0)`` if in doubt. Pinned by
+            ``tests/test_sqd.py::TestHproj::test_unsorted_input_with_unique_states_is_wrong``.
 
     Returns:
         The projected Hamiltonian as a sparse matrix.
