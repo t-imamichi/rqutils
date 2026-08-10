@@ -356,10 +356,11 @@ class TestHproj:
 
         ``PauliSumXZ`` shifts every X/Z signature one bit right for the pad bit, so unpadded states
         disagree with them on alignment and every matrix element lands in the wrong column. Measured
-        before the fix on this input: lowest eigenvalue -1.398 against a true -2.191. A benchmark
-        under ``examples/`` had worked around it by avoiding ``hproj`` entirely, noting that it
-        "raises a shape-mismatch TypeError". The padding was an opt-in ``add_padding`` flag at the
-        time, which is what let the two sides disagree; it is now unconditional.
+        before the fix on this input: lowest eigenvalue -1.398 against a true -2.191. The padding was
+        an opt-in ``add_padding`` flag at the time, which is what let the two sides disagree; it is
+        now unconditional, so they cannot. A benchmark under ``examples/`` builds its own dense
+        reference instead of calling ``hproj`` -- once because of this bug, now for independence,
+        since a gate that reruns the code under test proves nothing.
         """
         rng = np.random.default_rng(20260804)
         num_qubits = 5

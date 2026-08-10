@@ -111,9 +111,10 @@ def project_dense(pauli_strings, coeffs, states):
 
     Independent of ``rqutils.sqd``'s entire packing/padding/uniquification/matvec chain, so
     agreement with it is real evidence rather than a tautology. A benchmark under ``examples/`` keeps
-    an equivalent brute-force reference, gated against the sqd path and agreed to 3.6e-15; this one
-    is written out again rather than imported so the test suite does not depend on ``examples/``,
-    which is script territory carrying its own optional-dependency imports.
+    an equivalent brute-force reference, gated at a 1e-9 relative tolerance against a second
+    independent dense construction (observed agreement ~3.6e-15); this one is written out again
+    rather than imported so the test suite does not depend on ``examples/``, which is script
+    territory carrying its own optional-dependency imports.
     """
     num_qubits = states.shape[1]
     full = dense_pauli_sum(pauli_strings, coeffs)
