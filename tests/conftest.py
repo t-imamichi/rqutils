@@ -110,11 +110,10 @@ def project_dense(pauli_strings, coeffs, states):
     """Return the Pauli sum projected onto the subspace spanned by ``states``, densely.
 
     Independent of ``rqutils.sqd``'s entire packing/padding/uniquification/matvec chain, so
-    agreement with it is real evidence rather than a tautology. This mirrors
-    ``examples/_bench_common.brute_force_reference``, which is gated against the sqd path in
-    ``examples/check_bench_common.py`` and agreed to 3.6e-15; it is duplicated here rather than
-    imported so the test suite does not depend on ``examples/`` (script territory, and those
-    modules import qiskit and mlx).
+    agreement with it is real evidence rather than a tautology. A benchmark under ``examples/`` keeps
+    an equivalent brute-force reference, gated against the sqd path and agreed to 3.6e-15; this one
+    is written out again rather than imported so the test suite does not depend on ``examples/``,
+    which is script territory carrying its own optional-dependency imports.
     """
     num_qubits = states.shape[1]
     full = dense_pauli_sum(pauli_strings, coeffs)

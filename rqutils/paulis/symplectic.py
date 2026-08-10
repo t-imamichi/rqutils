@@ -236,9 +236,9 @@ class PauliSumXZ:
         # Narrow to float64 when the folded phase left everything real, i.e. when every Pauli string
         # has an even number of Ys. An odd-Y string cannot be real in this convention -- the
         # (-i)^{x.z} phase turns real input complex -- so `.c` stays complex128 there by
-        # construction, not by mistake. Callers that require float64 (the MLX benchmark, which has
-        # no complex128 available) check `.c.dtype`; there is deliberately no flag to request
-        # realness, since no flag can grant it.
+        # construction, not by mistake. Callers restricted to float64 (a backend with no complex128,
+        # say) check `.c.dtype`; there is deliberately no flag to request realness, since no flag can
+        # grant it.
         if np.all(phcoeffs.imag == 0.0):
             phcoeffs = phcoeffs.real
 

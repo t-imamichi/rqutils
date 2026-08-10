@@ -200,9 +200,9 @@ class TestCoefficientDtype:
         """An odd-Y string cannot be real in this convention, and that is not an error.
 
         The ``(-i)^{x.z}`` phase makes real input complex by construction, so complex128 here is the
-        correct answer rather than a failure to force realness -- hence no warning. Callers that
-        genuinely need float64 (the MLX benchmark, which has no complex128 available) check
-        ``.c.dtype``; ``examples/_bench_common.build_solver_inputs`` raises on exactly that.
+        correct answer rather than a failure to force realness -- hence no warning. Callers restricted
+        to float64 (a backend with no complex128, say) check ``.c.dtype`` and raise on exactly that;
+        there is deliberately no flag to request realness, since no flag could grant it.
         """
         with warnings.catch_warnings():
             warnings.simplefilter("error")

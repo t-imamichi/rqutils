@@ -356,8 +356,8 @@ class TestHproj:
 
         ``PauliSumXZ`` shifts every X/Z signature one bit right for the pad bit, so unpadded states
         disagree with them on alignment and every matrix element lands in the wrong column. Measured
-        before the fix on this input: lowest eigenvalue -1.398 against a true -2.191.
-        ``examples/_bench_common`` had worked around it by not using ``hproj`` at all, noting it
+        before the fix on this input: lowest eigenvalue -1.398 against a true -2.191. A benchmark
+        under ``examples/`` had worked around it by avoiding ``hproj`` entirely, noting that it
         "raises a shape-mismatch TypeError". The padding was an opt-in ``add_padding`` flag at the
         time, which is what let the two sides disagree; it is now unconditional.
         """
@@ -783,7 +783,7 @@ class TestMatvecKernels:
 
     @pytest.mark.parametrize("cache_level", [(0, 0), (0, 1), (0, 2), (1, 0)])
     def test_omitting_states_raises(self, cache_level):
-        """Only ``(1, 2)`` can run without the state list; the rest must say so, not crash later.
+        """Only ``(1, 1)`` and ``(1, 2)`` can run without the state list; the rest must say so.
 
         ``(1, 1)`` and ``(1, 2)`` read neither signature array, which is what lets a caller drop S
         after caching. For the other four, a missing S would otherwise surface as an opaque failure
@@ -793,12 +793,15 @@ class TestMatvecKernels:
             apply_h(np.zeros(4), (np.zeros((1, 1), dtype=np.uint8),) * 3, None, cache_level)
 
     def test_fully_cached_level_matches_dense(self):
-        """``cache_level=(1, 2)``, the level ``examples/mlx/`` mirrors.
+        """``cache_level=(1, 2)``, the fully-precomputed level, against a dense reference.
 
-        Overlaps :meth:`test_every_cache_level_matches_dense` by design: this one fixes the input
-        that the MLX port's ``apply_h_xz`` was validated against, so it stays a named pin for the
-        ported kernel even as the grid test's parametrization changes. That port is deprecated and
-        now lives at ``examples/mlx/solver.py``; the pin costs nothing and is kept.
+        Overlaps :meth:`test_every_cache_level_matches_dense` by design, and is kept separate because
+        this level is the special case: with both the source indices and the diagonals precomputed it
+        reads neither signature array, so it can run with ``states=None``. That makes it the positive
+        control for the guard :meth:`test_omitting_states_raises` exercises from the other side --
+        here passing None must *not* raise, and the answer must still match the dense projection.
+        Fixing the input rather than parametrizing keeps that pin stable as the grid test's
+        parametrization changes.
         """
         from rqutils.paulis.symplectic import PauliSumXZ
 
