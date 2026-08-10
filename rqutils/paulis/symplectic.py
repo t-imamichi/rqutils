@@ -65,7 +65,22 @@ except ImportError:
 @register_dataclass
 @dataclass(frozen=True)
 class PauliSumXZ:
-    """Symplectic (XZ) representation of a sum of Pauli strings."""
+    """Symplectic (XZ) representation of a sum of Pauli strings.
+
+    Construct with :meth:`from_paulisum`; the fields are not meant to be assembled by hand, since the
+    pad-bit alignment described under "Bit layout" above is what makes them consumable.
+
+    Attributes:
+        x: Packed unique X signatures, shape ``(num_xgroups, ceil((num_qubits + 1) / 8))``.
+        z: Packed Z signatures per X group, zero-padded to a rectangle, shape
+            ``(num_xgroups, max_zterms, ceil((num_qubits + 1) / 8))``.
+        c: Phase-folded coefficients, shape ``(num_xgroups, max_zterms)``. **float64 exactly when
+            every Pauli string has an even number of Ys, complex128 otherwise** -- an odd-Y string
+            cannot be real in the :math:`Q = (-i)^{x \\cdot z} Z^z X^x` convention, because the folded
+            phase turns real input complex. Check ``.c.dtype`` if you need float64; there is
+            deliberately no flag to request it, since no flag could grant it.
+        num_qubits: Number of qubits, static under JAX transforms.
+    """
 
     x: np.ndarray[tuple[int, int], np.dtype[np.uint8]]
     z: np.ndarray[tuple[int, int, int], np.dtype[np.uint8]]
@@ -119,6 +134,32 @@ class PauliSumXZ:
 
     @classmethod
     def from_paulisum(cls, paulisum: Any) -> "PauliSumXZ":
+        """Build the packed representation from a Pauli sum.
+
+        The only constructor, and the signature half of the bit-alignment contract: it inserts the
+        pad bit at position 0 unconditionally, matching what :meth:`pack_states` inserts on the state
+        side. Terms are grouped by unique X signature, the Z groups zero-padded to a rectangle, the
+        :math:`(-i)^{\\mathrm{popcount}(x \\wedge z)}` phase folded into the coefficients, and the
+        result bit-packed.
+
+        Duplicate Pauli strings are summed and zero-coefficient terms dropped, so the term count of
+        the result can be below that of the input.
+
+        Args:
+            paulisum: Either a ``(paulis, coeffs)`` tuple of a Pauli-string sequence and a matching
+                coefficient sequence, or a qiskit ``SparsePauliOp``. Qiskit's ``.x``/``.z`` are
+                reversed on ingest, since this class is little-endian in qubit order.
+
+        Returns:
+            The packed representation.
+
+        Raises:
+            ValueError: If the Pauli and coefficient sequences differ in length; if the Pauli strings
+                are not all the same length; if ``paulisum`` is neither a tuple nor a
+                ``SparsePauliOp``; or if any coefficient has a nonzero imaginary part, since a
+                complex coefficient makes the operator non-Hermitian and every consumer of this class
+                assumes Hermiticity. There is no flag to bypass the last check.
+        """
         if isinstance(paulisum, tuple):  # ([paulis], [coeffs])
             paulis, coeffs = paulisum
             if len(paulis) != len(coeffs):
@@ -220,4 +261,10 @@ class PauliSumXZ:
 
     @property
     def arrays(self) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """The packed ``(x, z, c)`` arrays, for splatting into a traced function.
+
+        Returns:
+            ``(x, z, c)``: the packed X signatures, the packed Z signatures, and the phase-folded
+            coefficients. See the class docstring for shapes and for ``c``'s dtype rule.
+        """
         return self.x, self.z, self.c

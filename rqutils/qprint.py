@@ -111,7 +111,16 @@ def qprint(
         output: Output method (`'text'`, `'latex'`, or `'mpl'`).
 
     Returns:
-        Object to be printed.
+        Object to be printed: for `output='text'` the `QPrintBase` subclass instance itself, whose
+        `__repr__` renders lazily; for `'latex'` a string; for `'mpl'` a matplotlib Figure.
+
+    Raises:
+        NotImplementedError: If `fmt` is not one of `'braket'`, `'pauli'`, `'matrix'`; if `output` is
+            not one of `'text'`, `'latex'`, `'mpl'`; or if `qobj` is of a type none of the content
+            classes accept.
+        ValueError: Propagated from the content class for an input whose shape or `dim` is
+            inconsistent -- see :class:`QPrintBraKet`, :class:`QPrintPauli`, :class:`QPrintMatrix`.
+        RuntimeError: If `output='mpl'` and matplotlib is not installed.
     """
     if fmt == "braket":
         pobj = QPrintBraKet(
@@ -458,6 +467,15 @@ class QPrintBase(ABC):
         return global_sign, global_amp, global_phase, terms
 
     def _qobj_data(self, qobj):
+        """Normalize a supported input to ``(qobj, data)``, where ``data`` holds the amplitudes.
+
+        The type-dispatch shared by all three ``fmt`` classes; subclasses extend it and call up. A
+        qutip ``Qobj`` also has its subsystem dimensions read off here when ``dim`` was not given.
+
+        Raises:
+            NotImplementedError: If ``qobj`` is not a qutip ``Qobj``, a scipy CSR matrix, or a numpy
+                array. This is the error every subclass surfaces for an unsupported input type.
+        """
         if HAS_QUTIP and isinstance(qobj, Qobj):
             if self._dim is None:
                 # dims[0] is the row (ket) space and dims[1] the column (bra) space. For a bra,
@@ -614,7 +632,15 @@ class QPrintBraKet(QPrintBase):
         amp_cutoff: Ignore terms with absolute amplitudes less than ``max(abs(amplitudes))`` times
             this value.
         lhs_label: If not None, prepend 'label = ' to the printout.
+        dim: Subsystem dimensions. If None, the object is treated as a single system of its full
+            dimension.
         binary: Show bra and ket indices in binary.
+
+    Raises:
+        ValueError: If the product of ``dim`` does not match the object's dimension, or if
+            ``binary=True`` for subsystem dimensions that are not powers of two.
+        NotImplementedError: If ``qobj`` is not a supported type (inherited from
+            :meth:`QPrintBase._qobj_data`).
     """
 
     class QobjType(Enum):
@@ -767,6 +793,12 @@ class QPrintPauli(QPrintBase):
             matrix or a 1D array.
         symbol: Pauli matrix symbols.
         delimiter: Pauli product delimiter.
+
+    Raises:
+        ValueError: If ``dim`` is None and any axis length of a components array is not a perfect
+            square, so the subsystem dimensions cannot be inferred ("qobj shape is invalid").
+        NotImplementedError: If ``qobj`` is not a supported type (inherited from
+            :meth:`QPrintBase._qobj_data`).
     """
 
     def __init__(
@@ -859,6 +891,11 @@ class QPrintMatrix(QPrintBase):
         amp_cutoff: Ignore terms with absolute amplitudes less than ``max(abs(amplitudes))`` times
             this value.
         lhs_label: If not None, prepend 'label = ' to the printout.
+
+    Raises:
+        ValueError: If ``qobj`` is not a square matrix.
+        NotImplementedError: If ``qobj`` is not a supported type (inherited from
+            :meth:`QPrintBase._qobj_data`).
     """
 
     def _qobj_data(self, qobj):

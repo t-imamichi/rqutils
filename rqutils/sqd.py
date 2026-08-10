@@ -227,14 +227,25 @@ def sqd(
         states: Binary array of computational basis states to project the Hamiltonian onto. Shape
             (subspace_dim, num_qubits).
         states_size: Fix the size of the states array used in computation to the specified value so
-            that compilation is not triggered at each call with slightly different array sizes.
+            that compilation is not triggered at each call with slightly different array sizes. Must
+            be at least ``states.shape[0]``. On a non-empty mesh this is rounded **up** to the next
+            multiple of ``mesh.size``, so the value used internally may exceed the one passed; that
+            widens the coalescing this argument exists for rather than defeating it (measured on a
+            4-device mesh, ``states_size`` 33 through 36 all share one compiled kernel -- 707 ms to
+            compile, then ~16 ms -- while 37 rounds to 40 and compiles afresh). The padding is not
+            observable in the result: filler slots are excluded from the projection and trimmed from
+            the returned basis.
         return_eigvec: Whether to return the eigenvector (coefficients and unique state bitstrings).
         cache_level: Switches for caching the results of source indices and sign bits / diagonals.
             See the module documentation for the detailed discussion of the resource tradeoff involved.
 
     Returns:
         Calculated ground state energy, or a tuple of energy, ground state vector, and sorted
-        uniquified states (if return_eigvec=True).
+        uniquified states (if return_eigvec=True). The returned states are the genuine unique rows
+        only, never the filler slots, so their count can be below ``states_size``.
+
+    Raises:
+        ValueError: If ``states_size`` is smaller than ``states.shape[0]``.
     """
     if states_size is None:
         states_size = states.shape[0]
@@ -877,12 +888,16 @@ def apply_h(
             ``(xsignatures, diag_signs, coeffs)``. ``(0, 2)``: ``(xsignatures, diagonals)``.
             ``(1, 0)``: ``(xsources, zsignatures, coeffs)``. ``(1, 1)``:
             ``(xsources, diag_signs, coeffs)``. ``(1, 2)``: ``(xsources, diagonals)``.
-        states: Uniquified state list. Required unless ``cache_level == (1, 2)``, which reads
-            neither the X signatures nor the Z signatures and so needs no states at all.
+        states: Uniquified state list. Required whenever either element of ``cache_level`` is 0,
+            i.e. for every combination except ``(1, 1)`` and ``(1, 2)`` -- those two read neither the
+            X signatures nor the Z signatures, so they need no states at all.
         cache_level: Caching strategy, as documented on :func:`sqd`.
 
     Returns:
         :math:`Hv`.
+
+    Raises:
+        ValueError: If ``states`` is None while ``cache_level`` has a 0 in either position.
     """
     if (cache_level[0] == 0 or cache_level[1] == 0) and states is None:
         raise ValueError(f"states is required for cache_level={cache_level}")

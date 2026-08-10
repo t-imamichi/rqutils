@@ -157,7 +157,22 @@ def do_svsim(
 
 
 def to_circuitxz(circuit: CircuitInput) -> CircuitXZ:
-    """Translate circuit data given as a list of GateSpecs or a QuantumCircuit into signatures."""
+    """Translate circuit data given as a list of GateSpecs or a QuantumCircuit into signatures.
+
+    A ``CircuitXZ`` is returned unchanged, so this is idempotent and cheap to call defensively.
+
+    Args:
+        circuit: A qiskit ``QuantumCircuit``, an existing :class:`CircuitXZ`, or a list of gate
+            specifiers. See :func:`svsim` for the gate-specifier format and the supported names;
+            note ``cz`` is valid only on the ``QuantumCircuit`` path, where it is decomposed.
+
+    Returns:
+        The circuit as ``(x, z, cos, sin)`` signature arrays.
+
+    Raises:
+        ValueError: If a gate name is not one of the supported set, or if a rotation gate is given
+            as a 2-tuple with no angle.
+    """
     if isinstance(circuit, CircuitXZ):
         return circuit
 

@@ -133,6 +133,12 @@ def paulis(dim: MatrixDimension, sparse: bool = False) -> NDArray[np.complex128 
         is `(d1**2, d2**2, ..., d1*d2*..., d1*d2*...)`; for a single subsystem `dim=d` it is
         `(d**2, d, d)`. With `sparse=True` the result is instead a 1D `dtype=object` array of shape
         `(d**2,)` holding CSR arrays.
+
+    Raises:
+        NotImplementedError: If `sparse=True` with more than one subsystem (the sparse product path
+            does not exist), or if `dim` has more than ~17 subsystems -- the products are built with
+            a single `np.einsum` using 3 index letters per subsystem, which exhausts the available
+            letters.
     """
     dim = normalize_dim(dim)
 
@@ -251,13 +257,19 @@ def components(
             matrices.
         dim: Subsystem dimensions. The product of subsystem dimensions must match the matrix
             dimension. If None, the matrix is assumed to represent a single system.
+        npmod: Numeric module. Pass `jax.numpy` for traceable execution; see the `npmod` section of
+            ``CLAUDE.md`` for the validation-gating rule this follows.
 
     Returns:
         A complex array of shape `(..., d1**2, d2**2, ...)` where `d1`, `d2`, ... are the subsystem
         dimensions.
 
     Raises:
-        ValueError: If `prod(dim)` does not match the matrix dimension.
+        ValueError: If `prod(dim)` does not match the matrix dimension. **Only under `npmod is np`**
+            -- the check cannot run on traced values, so under `npmod=jax.numpy` a mismatched `dim`
+            instead surfaces as an opaque `TypeError` from the contraction ("dot_general requires
+            contracting dimensions to have the same shape"). Validate before tracing if you need the
+            named error.
     """
     # normalize_dim runs for every npmod -- `len(dim)` below needs a sequence either way, and
     # gating it left `components(m, dim=3, npmod=jnp)` raising "object of type 'int' has no len()"
@@ -289,7 +301,11 @@ def labels(
 
     Args:
         dim: Dimension(s) of the Pauli matrices.
-        symbol: Base symbol.
+        symbol: Base symbol, applied to every subsystem when given as a str, or per subsystem when
+            given as a sequence. Three modes: None uses `I/X/Y/Z` for a qubit and `λ_i` otherwise;
+            a non-empty str `s` gives `s_i`; and the empty string gives bare numeric labels `i`
+            (still `I/X/Y/Z` for a qubit). A per-subsystem entry may itself be a sequence of
+            `dim**2` explicit labels.
         delimiter: Delimiter between the symbols for multibody labels.
         norm: Include the normalization factors.
         fmt: Output format. Allowed values are 'text', 'latex', 'latex-text',
@@ -297,6 +313,11 @@ def labels(
 
     Returns:
         An ndarray of type string and shape `(d1**2, d2**2, ...)`.
+
+    Raises:
+        AssertionError: If a `symbol` entry is a sequence whose length is not `dim**2` for its
+            subsystem. Reachable from caller-supplied data, so it is a contract, not an internal
+            invariant -- but it is an `assert`, so it vanishes under `python -O`.
     """
     dim = normalize_dim(dim)
 

@@ -299,10 +299,14 @@ def ground_locg(
     r"""Single-vector LOBPCG.
 
     Args:
-        mat: Matrix :math:`A`, either as an Array or a function :math:`x \mapsto Ax`.
-        xinit: Initial vector. If given as an integer (requires ``vspace`` if ``mat`` is callable),
-            a one-hot vector is created internally. Must have a non-vanishing overlap with
-            :math:`v_0`.
+        mat: Matrix :math:`A`, either as an Array or a function :math:`x \mapsto Ax`. **On a mesh, a
+            callable must preserve its input's sharding in the output** -- this routine is
+            sharding-transparent only through that contract, which is why every ``apply_*`` in
+            :mod:`rqutils.sqd` passes ``out_sharding=jax.typeof(vec).sharding``.
+        xinit: Initial vector, or an integer index selecting a one-hot vector (which requires
+            ``vspace`` if ``mat`` is callable). A plain Python ``int`` is accepted -- the
+            implementations inspect ``xinit.dtype``, but both are ``jax.jit``-wrapped, so an ``int``
+            arrives as a 0-d traced array. Must have a non-vanishing overlap with :math:`v_0`.
         args: Additional arguments to callable ``mat``.
         maxiter: Maximum number of gradient descent iterations.
         tol: Convergence condition. If None, the machine epsilon of the operator dtype is used.
@@ -321,6 +325,11 @@ def ground_locg(
         ambiguous. With ``debug=True`` a fifth element is appended, a dict of stacked per-iteration
         diagnostics; narrow on ``len(result) == 5`` before reading it, since ``debug`` is a static
         flag that a type checker cannot follow into the return arity.
+
+    Raises:
+        ValueError: If ``xinit`` is an integer and ``mat`` is a callable but ``vspace`` is None. The
+            vector space cannot be inferred from a callable, and without this the one-hot
+            construction would fail with an opaque "NoneType is not subscriptable".
     """
     if callable(mat):
         return _ground_locg_callable(
