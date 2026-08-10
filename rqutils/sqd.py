@@ -135,6 +135,16 @@ memory. This is because :math:`S` will not be used after caching both the source
 bits / coefficient sums. Since :math:`S` occupies :math:`\lceil n/8 \rceil N` bytes of memory,
 caching setting should be adjusted according to the values of :math:`n` and :math:`\{K^{(j)}\}_j`.
 
+**How expensive, concretely: the source-index setup dominates the solve, so this is not a symmetric
+memory-for-speed dial.** Weighted by call count, the :math:`J`-fold :func:`get_xsource` precompute
+measured **66-97%** of an entire solve -- 97.5% at 10 iterations, 66.4% at 200 (3064 ms of setup
+against 8.35 ms per matvec iteration, N=200k, J=50; see ``docs/scaling-pocs.md``). Turning source-index
+caching *off* therefore pays that cost once per matvec rather than once per solve, which is a far
+larger effect than the :math:`4 J N` bytes it reclaims -- measured end-to-end at N=3k, n=12, J=23,
+``(0, 2)`` is 10.9x slower than ``(1, 2)`` and ``(0, 0)`` is 7.2x slower than ``(1, 0)``, all four
+returning the same energy. Prefer ``cache_level[0] = 1`` unless the memory genuinely will not fit; the
+diagonal axis is where the real memory-versus-speed judgement lies.
+
 Distributed arrays and scaling limits
 =====================================
 

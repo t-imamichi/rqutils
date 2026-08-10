@@ -45,6 +45,7 @@ Symplectic Pauli sum representation API
 =======================================
 
 .. autoclass:: PauliSumXZ
+   :members:
 """
 
 from dataclasses import dataclass, field

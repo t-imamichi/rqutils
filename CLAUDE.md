@@ -195,14 +195,16 @@ Seven largely independent modules under `rqutils/`; nothing but `sqd.py → {pau
 **`sqd.py`** — sample-based quantum diagonalization: project a large Pauli-sum Hamiltonian onto the subspace spanned by a list of computational-basis bitstrings and solve matrix-free. `sqd(...)` is the entry point; `hproj(...)` is the dense/debug path. Two conventions dominate:
 
 - States carry **one extra zero pad bit at position 0** before `packbits`. `PauliSumXZ` reserves the same bit in its signatures unconditionally, so the two are aligned by construction — this used to be an opt-in `add_padding` flag, and the two sides disagreeing is how `hproj` shipped broken. Filler slots produced by uniquification are `255`, detected via `states_u[:, 0] >> 7`.
-- `cache_level=(source_indices, diagonals)` selects among six matvec strategies trading memory for speed. They are one kernel, `apply_h`, indexed by that 2×3 grid; `cache_level` **must** stay static (it is bound via `functools.partial`, since `ground_locg` splats `args` positionally and `static_argnames` would never see it). `states_size` exists solely to pin array shapes and prevent JIT recompilation.
+- `cache_level=(source_indices, diagonals)` selects among six matvec strategies. Only the *diagonal* axis is a genuine memory-for-speed trade; the source-index axis is near-free to enable and very expensive to disable (see below). They are one kernel, `apply_h`, indexed by that 2×3 grid; `cache_level` **must** stay static (it is bound via `functools.partial`, since `ground_locg` splats `args` positionally and `static_argnames` would never see it). `states_size` exists solely to pin array shapes and prevent JIT recompilation.
 
 Two measured facts about the cost, from the six scaling POCs under `examples/scaling/` (findings in
 `docs/scaling-pocs.md`). **`get_xsource` setup dominates** — weighted by call count it is 66–97% of a
 solve (3.1 s against 79 ms of matvec loop at 10 iterations, N=200k, J=50), so the `2N` sort is not
 merely the `N ≤ 2^31` ceiling but the main cost at every size measured, while `matvec/J` is flat at
-~0.16 ms and confirms the `O(J·N)` model. The caching docstring above, which frames the tradeoff as
-memory-versus-speed, will mislead you about where the time goes.
+~0.16 ms and confirms the `O(J·N)` model. The module docstring's caching section now carries this
+magnitude and the resulting advice (prefer `cache_level[0] = 1`), rather than byte counts alone —
+independently reproduced end-to-end at N=3k, n=12, J=23: `(0, 2)` is 10.9× slower than `(1, 2)` and
+`(0, 0)` is 7.2× slower than `(1, 0)`, all four levels returning the same energy.
 
 Because that change landed, **the POCs under `examples/scaling/` no longer have a baseline in the
 library, and must not be pointed at one.** `poc1.xsource_sort_legacy` is a verbatim copy of the
@@ -263,4 +265,5 @@ What remains there: one op-graph path at f32 or f64, unconditional `mx.compile`,
 
 - `paulis(dim)` for multiple subsystems uses `np.einsum` with 3 letters per subsystem, capping at ~17 subsystems; `sparse=True` for products raises `NotImplementedError`.
 - `sqd` is limited to `N ≤ 2^31` subspace states because `uniquify_states` sorts the state list (`jax.lax.sort`) within a single device. `get_xsource` no longer contributes — it is a binary search into the already-sorted list, not a sort of a stacked `2N` array.
+- **`hproj(unique_states=True)` now raises on unsorted or duplicate-containing input, where it used to return a wrong matrix.** A behavioural change, not just a docs fix, so it is the one thing in this cleanup that can break a downstream caller — though "break" means they were silently receiving a non-symmetric projection. `get_xsource` binary-searches into `states`, so both halves of "uniquified and lex-sorted" are load-bearing; the check is host-side numpy at 12–14% of `hproj`, on that opt-in path only. Pass `np.unique(states, axis=0)`, or leave `unique_states=False`. There is no CHANGELOG in this repo — if one is ever added, this belongs in it.
 - `run_sqd`'s initial vector is a deterministic pseudo-random spread (`_spread_seed`), not a one-hot: a one-hot cannot leave the connected component of the projected Hamiltonian that contains it, so a subspace whose Hamiltonian splits into disconnected blocks silently returned that block's minimum with `converged=True`. `vinit_from_min_diag` still weights the minimum-diagonal state heavily on top of the spread. Don't "simplify" either back to a one-hot — `tests/test_sqd.py::TestSqdInitialVector` covers both failure modes.
