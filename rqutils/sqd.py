@@ -944,18 +944,41 @@ def _accumulate_diagonal(
     0.279 ms against 0.382 ms. A caller who needs the gradient passes ``nterms`` regardless of
     ``K``, since correctness of the derivative is not a speed question.
 
-    **Verified negative result: do not unroll the X-group loop to give each group its own count.**
-    ``apply_h`` scans over X groups, so one trip count must serve all of them and skewed
-    ``nzterms`` (a nearest-neighbour chain plus one long-range term measures ``(27, 1, 1, ...)``)
-    waste most of the scanned slots -- 88% in that case. Replacing the group ``lax.scan`` with a
-    Python loop does cut the runtime, by 7.5x on exactly that skewed fixture, but it is still the
-    wrong trade three ways over. Compile time grows linearly with :math:`J` (49 ms flat against
-    443 ms at ``J=14``, 4233 ms at ``J=257``), the break-even is **~2000-2600 matvec calls** where a
-    solve runs tens to low hundreds, and on unskewed Hamiltonians the runtime gain collapses to
-    0.86-3.03x because the benefit is only ``max(nzterms) / mean(nzterms)``. Unrolling the one-shot
-    ``cache_level[1] == 2`` precompute is worse still -- net 0.69x at ``J=11`` falling to 0.04x at
-    ``J=356``, since a single call can never amortize the compile. The unroll also reassociates the
-    accumulation, so results move by ~1e-15 rather than staying bit-identical.
+    **Whether to unroll the X-group loop for per-group counts depends on skew, and the answer is not
+    uniform.** ``apply_h`` scans over X groups, so one trip count serves all of them and every group
+    pays the widest group's extent. Replacing that ``lax.scan`` with a Python loop lets each group use
+    its own ``nzterms``, at the cost of a compile that grows with :math:`J`. The deciding quantity is
+    the **skew**, ``max(nzterms) / mean(nzterms)`` -- not :math:`J`, which is what an earlier revision
+    of this note swept and why it recorded a blanket "do not unroll".
+
+    Measured, local two-body operators with long-range Z strings added, at :math:`N = 4096`:
+
+    =====  ==========  ==============  ==================
+    skew   real slots  unroll speedup  break-even (calls)
+    =====  ==========  ==============  ==================
+    4.2x   23.8%       1.19x           2120
+    5.9x   16.9%       2.84x           166
+    8.5x   11.8%       4.43x           89
+    12.8x  7.8%        7.88x           49
+    17.1x  5.9%        14.57x          6
+    25.6x  3.9%        23.26x          4
+    =====  ==========  ==============  ==================
+
+    The extra compile cost is bounded (32 ms at :math:`J=10` to 183 ms at :math:`J=60`) while the
+    per-call saving is not, so skew decides the asymptotics. A solve runs tens to low hundreds of
+    matvec calls, so **below ~6x skew the scan wins and above ~13x the unroll wins**, with a marginal
+    band between. Ordinary Hamiltonians sit at the low end -- a nearest-neighbour chain plus one
+    long-range term measures ``(27, 1, 1, ...)``, skew ~9x, break-even ~89 -- which is why the shipped
+    default is the single ``max``. **Rotated operators sit at the high end**: a caller reported a
+    782x197 rectangle with median 2 terms per group, 1.4% of slots real, and measured routing a cost
+    function through ``apply_h`` at 2x slower (n=20) to 9.7x slower (n=100) than a hand-rolled
+    nonzero-only contraction. For that regime per-group counts, or a segment-sum over a flat nonzero
+    list, is the right structure and this function's single static ``nterms`` is not.
+
+    Two caveats that hold at any skew. Unrolling the one-shot ``cache_level[1] == 2`` precompute is
+    always a loss -- net 0.69x at ``J=11`` falling to 0.04x at ``J=356`` -- since a single call cannot
+    amortize the compile. And the unroll reassociates the accumulation, so results move by ~1e-15
+    rather than staying bit-identical.
 
     Do **not** "simplify" this to a scan over the full rectangle instead. That is differentiable too
     and equally exact, but it discards the early exit, and the padding fraction is large -- 78.9% at

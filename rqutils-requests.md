@@ -1,5 +1,13 @@
 # rqutils change requests from the SKQD/basis-optimization side
 
+> **Status: all four shipped** on `metal` (rev `d452c383`) and adopted by `spinchain`. One caveat that
+> matters for anyone reading A1 as a template: A1 works exactly as specified -- `expval` is now
+> differentiable w.r.t. coefficients -- but the *use* it was requested for did not survive
+> measurement. Routing basis optimization's cost through the shared `expval` is 2x slower at n=20 and
+> 9.7x slower at n=100, because `apply_h` takes one static `nterms` for all X groups while a rotated
+> operator has median 2 terms per group and a max of 197 (1.4% of slots real). Per-group `nterms`, or
+> a segment-sum layout, would be needed to close that. See the note at the end of A1.
+
 Four requests against `rqutils` 0.2.0 (`github.com/t-imamichi/rqutils`, branch `metal`), written from
 the `spinchain` side. Every claim below was measured on that version; each item states the exact call
 site, a self-contained reproduction, and what `spinchain` deletes or stops guarding if it lands.
@@ -117,12 +125,23 @@ No `rqutils` source was modified to establish this.
 
 ### What lands in spinchain if this ships
 
-`spinchain/skqd/basis_opt.py` currently hand-rolls the projected quadratic form as a precomputed
+`spinchain/skqd/basis_opt.py` hand-rolls the projected quadratic form as a precomputed
 `(term, row, col, phase)` triple list — `_contraction_triples`, **54 lines** — purely because
-`expval` is not differentiable. That is deleted, and the differentiable cost function (Eq. 8 of
-arXiv:2606.15983) routes through `sqd_backend.expval` like every other observable in the codebase.
-The module docstring's standing note that "`rqutils.sqd.apply_h` cannot be differentiated" is removed
-with it.
+`expval` is not differentiable. The intent was to delete it and route Eq. 8 through
+`sqd_backend.expval` like every other observable.
+
+**Measured outcome: that swap was tried and reverted.** It is exact (~5e-16 against a dense Qiskit
+conjugation, value and gradient) but **2x slower at n=20 and 9.7x at n=100**. `apply_h` takes one
+static `nterms` for every X group, and a rotated operator's sparsity is the opposite of a
+Hamiltonian's: at n=100 its 2151 labels form a 782x197 rectangle with median 2 terms per group and a
+max of 197, so **1.4% of slots hold real terms** and every group pays the widest group's extent. The
+triple list enumerates only nonzeros and has no padding. Closing this needs **per-group `nterms`** (or
+a segment-sum over a flat nonzero list) rather than a single scalar.
+
+What `spinchain` did keep from A1: `_expval_kernel` now takes `nterms` and `expvals` passes
+`max(nzterms)`, so `expval` is differentiable for any future caller. On js operators `max(nzterms)` is
+1-2, so this is speed-neutral (13.4 -> 13.3 ms on the shipped 36-operator n=13 sweep, identical
+values).
 
 ---
 
