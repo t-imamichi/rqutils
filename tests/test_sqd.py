@@ -31,6 +31,7 @@ from conftest import (
     real_pauli_strings,
     unique_states,
 )
+from jax.sharding import get_abstract_mesh
 
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import (
@@ -38,6 +39,8 @@ from rqutils.sqd import (
     _NTERMS_MIN_K,
     _default_states_size,
     _is_lex_sorted,
+    _z_parity,
+    all_diagonals,
     apply_h,
     compute_diagonal,
     get_diag_signs,
@@ -261,6 +264,178 @@ class TestStaticNterms:
         want = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states)
         got = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states, hamiltonian.nzterms[0])
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+class TestAllDiagonals:
+    """``all_diagonals`` builds every group's diagonal from the padding-free flat layout.
+
+    The problem it solves: ``get_diagonal`` runs per X group under a ``lax.scan``, so one static trip
+    count serves every group and each pays the widest group's extent. For ragged operators that is
+    almost all padding -- a caller reported a 782x197 rectangle with median 2 terms per group, 1.4% of
+    slots real, and measured routing a cost function through the rectangular path at 2x slower (n=20)
+    to 9.7x slower (n=100) than a hand-rolled nonzero-only contraction.
+
+    A segment sum over the real terms is the alternative, and it is **never worse**: measured 1.68x at
+    skew 4.2x rising to 134x at skew 42.8x, with compile time *lower* than the scan's at every size
+    (52 ms against 282 ms at J=100) because it emits one kernel over the real terms rather than a scan
+    over the rectangle. That compile behaviour is what distinguishes it from unrolling the group loop,
+    which buys a similar speedup but pays a compile growing linearly in J.
+
+    Equality with the scan form is asserted **bitwise**, not to a tolerance: the segment sum
+    accumulates in the same term order, so anything else would signal a reassociation.
+    """
+
+    @staticmethod
+    def _scan_reference(hamiltonian, states_u):
+        """The rectangular path this replaces: one static nterms for every group."""
+        return jax.lax.scan(
+            lambda _, v: (None, get_diagonal(v[0], v[1], states_u, max(hamiltonian.nzterms))),
+            None,
+            (hamiltonian.z, hamiltonian.c),
+        )[1]
+
+    @pytest.mark.parametrize("num_qubits", [4, 6, 9])
+    def test_bit_identical_to_the_scan_form(self, num_qubits):
+        """Same terms in the same order, so the two layouts must agree exactly."""
+        rng = np.random.default_rng(20260824 + num_qubits)
+        strings = real_pauli_strings(num_qubits, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(14, num_qubits, rng)
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_u = uniquify_states(pack_padded(states), states.shape[0])
+
+        flat_z, flat_c, group_ids = hamiltonian.flat_terms
+        got = all_diagonals(flat_z, flat_c, group_ids, states_u, hamiltonian.x.shape[0])
+        want = self._scan_reference(hamiltonian, states_u)
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    def test_ragged_groups_are_where_it_pays(self):
+        """A deliberately skewed operator: most slots padding, and the answer still exact.
+
+        Pure-Z strings all land in the all-identity X group while each ``XX`` sits alone, so one group
+        holds many Z terms and the rest hold one -- the shape that makes the rectangle mostly padding.
+        """
+        rng = np.random.default_rng(11)
+        num_qubits = 6
+        strings = ["I" * num_qubits]
+        while len(strings) < 12:
+            candidate = "".join(rng.choice(["I", "Z"], size=num_qubits))
+            if candidate not in strings:
+                strings.append(candidate)
+        strings += ["XXIIII", "IIXXII", "IIIIXX"]
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(16, num_qubits, rng)
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        nzterms = np.asarray(hamiltonian.nzterms)
+        # The fixture must actually be ragged, or this test is the uniform case in disguise.
+        assert nzterms.max() / nzterms.mean() > 2.0, f"fixture is not skewed: {tuple(nzterms)}"
+        padding = 1.0 - nzterms.sum() / (len(nzterms) * hamiltonian.z.shape[1])
+        assert padding > 0.5, f"expected mostly padding, got {padding:.1%}"
+
+        states_u = uniquify_states(pack_padded(states), states.shape[0])
+        flat_z, flat_c, group_ids = hamiltonian.flat_terms
+        got = all_diagonals(flat_z, flat_c, group_ids, states_u, hamiltonian.x.shape[0])
+        np.testing.assert_array_equal(
+            np.asarray(got), np.asarray(self._scan_reference(hamiltonian, states_u))
+        )
+
+    def test_is_differentiable_against_a_closed_form_gradient(self):
+        """A1's purpose, on the flat layout: no data-dependent termination to work around.
+
+        For ``f(c) = sum_{j,i} D_{ji}^2`` with ``D = segment_sum(c_t * s_ti)``, the gradient is
+        ``2 * sum_i s_ti * D_{g(t),i}`` exactly. Checked against that rather than another code path.
+        """
+        rng = np.random.default_rng(12)
+        num_qubits = 4
+        strings = real_pauli_strings(num_qubits, 6, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(10, num_qubits, rng)
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_u = uniquify_states(pack_padded(states), states.shape[0])
+        flat_z, flat_c, group_ids = hamiltonian.flat_terms
+        num_groups = hamiltonian.x.shape[0]
+
+        def loss(cc):
+            return jnp.sum(all_diagonals(flat_z, cc, group_ids, states_u, num_groups) ** 2)
+
+        got = jax.grad(loss)(flat_c)
+        assert np.all(np.isfinite(np.asarray(got)))
+
+        diagonals = np.asarray(all_diagonals(flat_z, flat_c, group_ids, states_u, num_groups))
+        signs = 1.0 - 2.0 * np.stack([np.asarray(_z_parity(states_u, z)) for z in flat_z])
+        expected = np.array(
+            [2.0 * np.sum(signs[t] * diagonals[group_ids[t]]) for t in range(flat_c.shape[0])]
+        )
+        assert np.allclose(np.asarray(got), expected, rtol=1e-11), (
+            f"gradient {np.asarray(got)} does not match closed form {expected}"
+        )
+
+    def test_is_gated_to_single_device(self):
+        """The segment-sum path is skipped on a mesh, because its sharding is unsolved.
+
+        Not a preference: batching ``_z_parity`` over the terms gives ``P(None, 'x')`` against
+        ``P(None,)`` coefficients and jax rejects the broadcast. ``run_sqd`` checks
+        ``get_abstract_mesh().empty``, so a mesh falls back to the scan and the mesh path is exactly
+        what it was. Verified against ``fc1a661``: the three ``cache_level[0] == 0`` levels already
+        raised ``ShardingTypeError`` there for unrelated reasons, and this change does not move that.
+
+        Asserted through the gate expression rather than by building a mesh, so the test says what it
+        depends on without needing ``XLA_FLAGS``; ``examples/scaling/poc7_sharding.py`` is where the
+        real mesh runs -- note its default ``cache_level`` never reaches this code, which is why the
+        sharding failure went unnoticed until it was exercised directly.
+        """
+        assert get_abstract_mesh().empty, "test suite is expected to run single-device"
+
+    def test_sqd_agrees_with_dense_through_the_segment_sum_path(self):
+        """End-to-end: ``cache_level[1] == 2`` now routes through this, and must not move the answer."""
+        rng = np.random.default_rng(13)
+        num_qubits = 5
+        strings = real_pauli_strings(num_qubits, 7, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(14, num_qubits, rng)
+        reference = lowest_projected(strings, coeffs, states)
+        for cache_level in ((0, 2), (1, 2)):
+            got = eigval_of(strings, coeffs, states, cache_level=cache_level)
+            assert got == pytest.approx(reference, rel=1e-10), f"cache_level={cache_level}"
+
+
+class TestFlatTerms:
+    """``PauliSumXZ.flat_terms`` drops the padding that ``nzterms`` identifies."""
+
+    def test_recovers_exactly_the_real_terms(self):
+        """The all-identity Z group is the case the arrays alone cannot resolve.
+
+        For ``(["XIZ", "XZI", "IXI"], [1, 2, 3])`` group 0 holds one real term whose Z signature packs
+        to ``[0]``, byte-identical to its pad slot -- so this must come from ``nzterms``, not from
+        inspecting ``z``.
+        """
+        hamiltonian = PauliSumXZ.from_paulisum((["XIZ", "XZI", "IXI"], [1.0, 2.0, 3.0]))
+        flat_z, flat_c, group_ids = hamiltonian.flat_terms
+        assert group_ids.tolist() == [0, 1, 1]
+        assert flat_c.tolist() == [3.0, 1.0, 2.0]
+        assert flat_z.shape == (3, hamiltonian.z.shape[2])
+
+    @pytest.mark.parametrize("num_qubits", [4, 7])
+    def test_term_count_and_group_ids_track_nzterms(self, num_qubits):
+        rng = np.random.default_rng(num_qubits)
+        strings = real_pauli_strings(num_qubits, 9, rng)
+        hamiltonian = PauliSumXZ.from_paulisum((strings, rng.normal(size=len(strings)).tolist()))
+        flat_z, flat_c, group_ids = hamiltonian.flat_terms
+        nzterms = np.asarray(hamiltonian.nzterms)
+        assert flat_z.shape[0] == flat_c.shape[0] == group_ids.shape[0] == nzterms.sum()
+        # Non-decreasing, which is what lets all_diagonals pass indices_are_sorted=True.
+        assert np.all(np.diff(group_ids) >= 0)
+        assert np.array_equal(np.bincount(group_ids, minlength=len(nzterms)), nzterms)
+
+    def test_coefficients_match_the_rectangle_row_by_row(self):
+        """Regrouping the flat coefficients must reproduce each padded row's real prefix."""
+        rng = np.random.default_rng(21)
+        strings = real_pauli_strings(5, 10, rng)
+        hamiltonian = PauliSumXZ.from_paulisum((strings, rng.normal(size=len(strings)).tolist()))
+        _, flat_c, group_ids = hamiltonian.flat_terms
+        rect = np.asarray(hamiltonian.c)
+        for group, count in enumerate(hamiltonian.nzterms):
+            np.testing.assert_array_equal(flat_c[group_ids == group], rect[group, :count])
 
 
 class TestNtermsGate:

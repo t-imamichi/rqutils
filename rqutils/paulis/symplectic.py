@@ -298,6 +298,32 @@ class PauliSumXZ:
         return cls(xsignatures, zsignatures, phcoeffs, num_qubits, tuple(counts.tolist()))
 
     @property
+    def flat_terms(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The real Z terms with their padding removed, plus the X group each belongs to.
+
+        The rectangular ``(z, c)`` layout pads every X group out to ``max(nzterms)``, which is what
+        lets one ``lax.scan`` walk the groups. That is the right trade when the groups are of similar
+        size and the wrong one when they are not: a rotated operator can be 782x197 with a median of
+        2 terms per group, so 98.6% of the slots are padding and every group pays the widest group's
+        extent. This property is the alternative layout for that case -- see
+        :func:`rqutils.sqd.all_diagonals`, which consumes it.
+
+        Derived from :attr:`nzterms`, which is the only record of where each group's real terms end
+        (a pad slot's Z signature is byte-identical to a genuine all-identity one, so the arrays alone
+        cannot say). Not stored: it is a host-side reshape of data already held, and materializing it
+        would double the memory for callers who never take this path.
+
+        Returns:
+            ``(z, c, group_ids)``: the real Z signatures, shape ``(num_terms, num_bytes)``; their
+            phase-folded coefficients, shape ``(num_terms,)``; and the index of the X group each term
+            belongs to, shape ``(num_terms,)``, non-decreasing. ``num_terms`` is ``sum(nzterms)``.
+        """
+        counts = np.asarray(self.nzterms)
+        keep = np.arange(self.z.shape[1])[None, :] < counts[:, None]
+        group_ids = np.repeat(np.arange(counts.shape[0]), counts)
+        return np.asarray(self.z)[keep], np.asarray(self.c)[keep], group_ids
+
+    @property
     def arrays(self) -> tuple[jax.Array, jax.Array, jax.Array]:
         """The packed ``(x, z, c)`` arrays, for splatting into a traced function.
 

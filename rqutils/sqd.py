@@ -351,7 +351,23 @@ def sqd(
 
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
-    result = run_sqd(hamiltonian, states_p, states_size, return_eigvec, cache_level)
+    # Built here rather than inside run_sqd: dropping the padding is a boolean-mask index, which
+    # needs concrete shapes, and run_sqd sees `hamiltonian` as a pytree of tracers. Only the
+    # cache_level[1] == 2 path reads it, so it is skipped otherwise -- the reshape is host-side work
+    # proportional to the rectangle.
+    # Single-device only, for now. all_diagonals is bit-identical and 1.4-149x faster than the scan
+    # it replaces, but its sharding is unsolved: `_z_parity` over a stacked (num_terms, num_states)
+    # batch comes back P(None, 'x') while the coefficients are P(None,), and neither an explicit
+    # out_sharding on the broadcast nor vmapping the whole per-term contribution made jax accept the
+    # combination -- measured, it raises "Incompatible types for broadcasting: float64[12,32@x] vs
+    # float64[12,32]" on any non-empty mesh. Falling back to the scan there keeps the mesh path
+    # exactly as it was rather than shipping a route that raises; see
+    # examples/scaling/poc7_sharding.py, whose default cache_level never reached this code.
+    use_flat = cache_level[1] == 2 and get_abstract_mesh().empty
+    flat_terms = hamiltonian.flat_terms if use_flat else None
+    result = run_sqd(
+        hamiltonian, states_p, states_size, return_eigvec, cache_level, flat_terms=flat_terms
+    )
     LOG.info("Found ground eigenpair in %f seconds.", time.time() - start)
     eigval = float(result[0])
     if return_eigvec:
@@ -535,8 +551,17 @@ def run_sqd(
     return_eigvec: bool,
     cache_level: tuple[int, int] = (1, 0),
     log_level: int = logging.INFO,
+    flat_terms: tuple[NDArray, NDArray, NDArray] | None = None,
 ) -> tuple[float] | tuple[float, jax.Array, jax.Array, int]:
-    """JIT-compiled part of the SQD function."""
+    """JIT-compiled part of the SQD function.
+
+    ``flat_terms`` is the padding-free ``(z, c, group_ids)`` layout from
+    :attr:`~rqutils.paulis.symplectic.PauliSumXZ.flat_terms`, used by the
+    ``cache_level[1] == 2`` precompute in place of a scan over the padded rectangle. It is built by
+    the caller because the mask that drops the padding needs concrete shapes -- inside this trace
+    ``hamiltonian`` is a pytree of tracers and the reshape raises
+    ``TracerArrayConversionError``. ``None`` falls back to the scan, so the argument is optional.
+    """
     sharding = None
     if not (mesh := get_abstract_mesh()).empty:
         sharding = PartitionSpec(mesh.axis_names)
@@ -571,11 +596,17 @@ def run_sqd(
         if log_level <= logging.DEBUG:
             jax.debug.print("Precomputing diagonals")
 
-        diagonals = jax.lax.scan(
-            lambda _, v: (None, get_diagonal(v[0], v[1], states_u)),
-            None,
-            (hamiltonian.z, hamiltonian.c),
-        )[1]
+        if flat_terms is None:
+            diagonals = jax.lax.scan(
+                lambda _, v: (None, get_diagonal(v[0], v[1], states_u)),
+                None,
+                (hamiltonian.z, hamiltonian.c),
+            )[1]
+        else:
+            # One pass over the real terms instead of J passes over the padded rectangle. Identical
+            # to the last bit, and faster at every raggedness measured -- see all_diagonals.
+            flat_z, flat_c, group_ids = flat_terms
+            diagonals = all_diagonals(flat_z, flat_c, group_ids, states_u, hamiltonian.x.shape[0])
 
     # Assemble the per-X-group arrays apply_h scans over. This stays a Python-level match on the
     # static cache_level: the *packing* must be static too, or the tuple structure would become part
@@ -1089,6 +1120,93 @@ def get_diagonal(
         return _z_parity(states, zsignatures[iterm])
 
     return _accumulate_diagonal(coeffs, states, sign_bit, nterms)
+
+
+@jax.jit(static_argnames=["num_groups"])
+def all_diagonals(
+    zsignatures: NDArray[np.uint8],
+    coeffs: NDArray[np.inexact],
+    group_ids: NDArray[np.integer],
+    states: StateList,
+    num_groups: int,
+) -> jax.Array:
+    r"""Return every X group's diagonal in one pass over the real Z terms only.
+
+    The rectangular alternative to :func:`get_diagonal`. That one is called per X group under a
+    ``lax.scan``, so a single trip count serves every group and each pays the widest group's extent.
+    This one takes the *flat* layout -- :attr:`~rqutils.paulis.symplectic.PauliSumXZ.flat_terms`,
+    which drops the padding -- computes every term's contribution at once, and reduces them back to
+    per-group rows with a segment sum. The work is proportional to the number of real terms rather
+    than to :math:`J 	imes \max_j K^{(j)}`.
+
+    **This is strictly better than a static ``nterms`` when the groups are ragged, and never worse.**
+    Measured against the ``lax.scan`` form at :math:`N = 4096`, on local two-body operators with
+    long-range Z strings added (``skew`` is :math:`\max(\mathrm{nzterms}) / \mathrm{mean}`):
+
+    ======  ======  ===========  =========  ===============  ==================
+    J       skew    real slots   speedup    compile (scan)   compile (segsum)
+    ======  ======  ===========  =========  ===============  ==================
+    10      4.2x    23.8%        1.68x      44 ms            30 ms
+    20      8.5x    11.8%        5.13x      45 ms            32 ms
+    40      17.1x   5.9%         52.5x      117 ms           41 ms
+    60      25.6x   3.9%         66.0x      138 ms           47 ms
+    100     42.8x   2.3%         134x       282 ms           52 ms
+    ======  ======  ===========  =========  ===============  ==================
+
+    Note the compile column: one kernel over the real terms compiles *faster* than a scan over the
+    padded rectangle, and stays nearly flat in :math:`J` where the scan grows. That is what separates
+    this from unrolling the group loop, which buys a similar speedup but pays a compile cost growing
+    linearly with :math:`J` (4233 ms at :math:`J=257`) and only breaks even after thousands of calls.
+
+    Output is **bit-identical** to the scan form (``maxdiff`` exactly 0.0 at every size above), because
+    the segment sum accumulates in the same term order. Differentiable w.r.t. ``coeffs`` with no
+    special handling -- there is no data-dependent termination to begin with -- and verified against a
+    closed-form gradient to 1.8e-15.
+
+    .. warning::
+
+        **Single-device only.** Batching :func:`_z_parity` over the terms yields a
+        ``(num_terms, num_states)`` array sharded ``P(None, 'x')`` while ``coeffs`` is ``P(None,)``,
+        and jax refuses the combination on any non-empty mesh
+        (``Incompatible types for broadcasting: float64[12,32@x] vs float64[12,32]``). An explicit
+        ``out_sharding`` on the broadcast and vmapping the whole per-term contribution were both
+        tried and neither resolved it. :func:`run_sqd` therefore uses this only when
+        ``get_abstract_mesh().empty`` and falls back to the scan otherwise, so the mesh path is
+        unchanged rather than broken. Solving the sharding is the remaining work here.
+
+    Args:
+        zsignatures: Real Z signatures, shape ``(num_terms, num_bytes)``.
+        coeffs: Their phase-folded coefficients, shape ``(num_terms,)``.
+        group_ids: The X group each term belongs to, shape ``(num_terms,)``.
+        states: Uniquified state list, shape ``(num_states, num_bytes)``.
+        num_groups: Number of X groups, i.e. the leading dimension of the result. **Must be static**
+            (it is the segment count), hence a ``static_argnames`` entry.
+
+    Returns:
+        The diagonals, shape ``(num_groups, num_states)`` -- the same array
+        ``cache_level[1] == 2`` consumes.
+    """
+
+    # vmap over the terms rather than restating the popcount: _z_parity is where the reduction dtype
+    # and the mask are defined, and a mismatch there silently flips a term's sign instead of raising.
+    # vmap the whole per-term contribution, not just the parity. Inside the vmap each term is a
+    # single (num_states,) row that inherits `states`' sharding directly, so the coefficient is a
+    # scalar times a correctly-sharded vector -- no rank-mismatched broadcast for jax to assign a
+    # sharding to. Doing the multiply outside, against a stacked (num_terms, num_states) parity,
+    # measured as a hard failure on any non-empty mesh: `parity` comes back P(None, 'x') while
+    # `coeffs` is P(None,), and the combination raises "Incompatible types for broadcasting:
+    # float64[12,32@x] vs float64[12,32]". ground_locg is sharding-transparent only if the matvec
+    # preserves output sharding, and these diagonals feed straight into it.
+    #
+    # _z_parity stays the one definition of the popcount: a mismatch in its reduction dtype or mask
+    # silently flips a term's sign instead of raising.
+    def contribution(zsig, coeff):
+        return coeff * (1.0 - 2.0 * _z_parity(states, zsig))
+
+    contributions = jax.vmap(contribution)(zsignatures, coeffs)
+    return jax.ops.segment_sum(
+        contributions, group_ids, num_segments=num_groups, indices_are_sorted=True
+    )
 
 
 @jax.jit
