@@ -886,6 +886,19 @@ def _accumulate_diagonal(
     caller who needs the gradient passes ``nterms`` regardless of ``K``, since correctness of the
     derivative is not a speed question.
 
+    **Verified negative result: do not unroll the X-group loop to give each group its own count.**
+    ``apply_h`` scans over X groups, so one trip count must serve all of them and skewed
+    ``nzterms`` (a nearest-neighbour chain plus one long-range term measures ``(27, 1, 1, ...)``)
+    waste most of the scanned slots -- 88% in that case. Replacing the group ``lax.scan`` with a
+    Python loop does cut the runtime, by 7.5x on exactly that skewed fixture, but it is still the
+    wrong trade three ways over. Compile time grows linearly with :math:`J` (49 ms flat against
+    443 ms at ``J=14``, 4233 ms at ``J=257``), the break-even is **~2000-2600 matvec calls** where a
+    solve runs tens to low hundreds, and on unskewed Hamiltonians the runtime gain collapses to
+    0.86-3.03x because the benefit is only ``max(nzterms) / mean(nzterms)``. Unrolling the one-shot
+    ``cache_level[1] == 2`` precompute is worse still -- net 0.69x at ``J=11`` falling to 0.04x at
+    ``J=356``, since a single call can never amortize the compile. The unroll also reassociates the
+    accumulation, so results move by ~1e-15 rather than staying bit-identical.
+
     Do **not** "simplify" this to a scan over the full rectangle instead. That is differentiable too
     and equally exact, but it discards the early exit, and the padding fraction is large -- 78.9% at
     13 qubits, 90.4% at 30. Measured 2.334 ms at 400k states, 8.4x the static scan.
