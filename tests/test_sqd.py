@@ -613,9 +613,16 @@ class TestSqdEndToEnd:
         pins the exclusion, against a dense reference and a filler-free control arm. Don't delete it
         as redundant with this one.
 
-        The ``24`` arm is not redundant with ``16``: relative to the 12-row input it puts filler rows
+        The ``32`` arm is not redundant with ``24``: relative to the 12-row input it puts filler rows
         in the *majority*, so a future defect whose behaviour depends on fillers outnumbering genuine
-        states is covered by it and not by 16.
+        states is covered by it and not by 24.
+
+        **The arms start at 24, not 16, because ``states_size=None`` buckets to the next power of
+        two.** A 12-row fixture defaults to 16, so a ``16`` arm would be bit-identical to ``baseline``
+        by construction and the comparison would degenerate to ``x == x`` -- passing while testing
+        nothing. The assertion below pins that: every arm must exceed the baseline's own effective
+        size. This is the padding-test trap in reverse, and the reason the arms are asserted rather
+        than merely chosen.
         """
         rng = np.random.default_rng(20260804)
         strings = real_pauli_strings(4, 5, rng)
@@ -626,7 +633,14 @@ class TestSqdEndToEnd:
         # the filler-free-vs-padded comparison the sibling owns.
         states = collapsing_states(12, 4, rng)
         baseline = eigval_of(strings, coeffs, states)
-        for states_size in (16, 24):
+        # The default is the next power of two, so the baseline is not unpadded -- it is padded to
+        # this. Every arm must differ from it, or that arm compares the baseline against itself.
+        baseline_size = 1 << max((states.shape[0] - 1).bit_length(), 1)
+        for states_size in (24, 32):
+            assert states_size != baseline_size, (
+                f"states_size={states_size} equals the default bucket for a "
+                f"{states.shape[0]}-row fixture; this arm would compare the baseline to itself"
+            )
             assert eigval_of(strings, coeffs, states, states_size=states_size) == pytest.approx(
                 baseline, rel=1e-10
             )
@@ -641,9 +655,16 @@ class TestSqdEndToEnd:
         to ``>> 8`` (a uint8 shifted by 8 is 0, marking every filler as a genuine state): the whole
         sqd suite stays green *except* this test.
 
-        This fixture instead uses 4 states that are ALREADY unique, so ``states_size=None`` needs no
-        padding at all and is a genuinely filler-free control -- the only arm that stays correct under
-        that mutation, which is what separates "filler handling broke" from "the solver broke".
+        This fixture instead uses 4 states that are ALREADY unique, so the ``states_size=None`` arm is
+        a genuinely filler-free control -- the only arm that stays correct under that mutation, which
+        is what separates "filler handling broke" from "the solver broke".
+
+        **Why ``None`` is filler-free here is arithmetic, not structure**, and the assertion below
+        pins it. ``None`` means the next power of two at or above the input length, so it is
+        filler-free only when that length is *already* a power of two: 4 rows bucket to 4. A 5-row
+        fixture would bucket to 8 and this arm would silently become a third padded arm, destroying
+        the control and the mutation-discriminating property above with it. Do not change the fixture
+        row count to a non-power-of-two.
         Two distinct guards are pinned, both measured to return a plausible wrong answer of -1.2
         against the true -0.8297058541:
 
@@ -669,6 +690,12 @@ class TestSqdEndToEnd:
         coeffs = [1.0, -0.5, 0.3, 0.7]
         states = np.array([[0, 0, 0, 0], [0, 0, 1, 1], [0, 1, 0, 1], [1, 0, 0, 1]], dtype=np.uint8)
         assert len(np.unique(states, axis=0)) == len(states), "fixture must start filler-free"
+        # The states_size=None arm is the filler-free control only if the default bucket adds no rows.
+        # Uniqueness alone is not enough -- the row count must itself be a power of two.
+        assert 1 << max((states.shape[0] - 1).bit_length(), 1) == states.shape[0], (
+            f"{states.shape[0]}-row fixture does not bucket to itself, so states_size=None pads and "
+            "the filler-free control arm is lost (see docstring)"
+        )
 
         reference = lowest_projected(strings, coeffs, states)
         got = eigval_of(strings, coeffs, states, states_size=states_size)

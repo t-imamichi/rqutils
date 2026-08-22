@@ -238,7 +238,13 @@ def sqd(
             (subspace_dim, num_qubits).
         states_size: Fix the size of the states array used in computation to the specified value so
             that compilation is not triggered at each call with slightly different array sizes. Must
-            be at least ``states.shape[0]``. On a non-empty mesh this is rounded **up** to the next
+            be at least ``states.shape[0]``. Defaults to the next power of two at or above
+            ``states.shape[0]``, which is the rule every caller with a growing subspace needs (a
+            Krylov or configuration-recovery loop sees a fresh dimension per call, so an
+            exact-length default would retrace on every one; measured 1.76x over five growing
+            dimensions, energies agreeing to 8.9e-16 -- padding moves the last ULP by changing the
+            reduction order, so this is not a bitwise-identical transformation). On a non-empty mesh
+            this is rounded **up** to the next
             multiple of ``mesh.size``, so the value used internally may exceed the one passed; that
             widens the coalescing this argument exists for rather than defeating it (measured on a
             4-device mesh, ``states_size`` 33 through 36 all share one compiled kernel -- 707 ms to
@@ -258,7 +264,21 @@ def sqd(
         ValueError: If ``states_size`` is smaller than ``states.shape[0]``.
     """
     if states_size is None:
-        states_size = states.shape[0]
+        # Bucket to the next power of two rather than using the raw length. Growing, all-distinct
+        # subspace dimensions are the *normal* SQD access pattern, not an edge case: a Krylov or
+        # configuration-recovery loop presents a dimension it has never seen before on every call, so
+        # a raw-length default retraces the whole solver every time -- which is exactly what
+        # states_size exists to prevent. Bucketing collapses those into one kernel per octave
+        # (measured 1.76x over five growing dimensions 60..260 at n=10; a caller reported 1.25x on
+        # the same shape of experiment and 1.43x over the first five rungs of an n=13 job).
+        #
+        # Energies agree to 8.9e-16, not bitwise: padding changes the reduction order over the filler
+        # slots, so the last ULP can move. That is far below the eigensolver's own tolerance, but it
+        # is a real difference -- don't assert bitwise equality across two states_size values.
+        #
+        # Purely a shape knob: the padding is not observable, since filler slots are excluded from the
+        # projection and trimmed off the returned basis below. Pass an explicit value to override.
+        states_size = 1 << max((states.shape[0] - 1).bit_length(), 1)
     if states_size < states.shape[0]:
         raise ValueError("states_size smaller than the states array length")
     if not isinstance(hamiltonian, PauliSumXZ):
