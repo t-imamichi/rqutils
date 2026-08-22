@@ -30,7 +30,6 @@ qutip = ["qutip"]
 qiskit = ["qiskit[visualization]"]
 docs = ["sphinx", "sphinx-rtd-theme"]
 dev = ["pytest", "pytest-xdist", "pytest-sugar", "ruff", "ty"]
-mlx = ["mlx"]
 
 [project.urls]
 Homepage = "https://github.com/UTokyo-ICEPP/rqutils"
