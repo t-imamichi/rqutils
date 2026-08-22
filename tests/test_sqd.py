@@ -34,6 +34,7 @@ from conftest import (
 
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import (
+    _NTERMS_MIN_K,
     _is_lex_sorted,
     apply_h,
     compute_diagonal,
@@ -234,6 +235,50 @@ class TestStaticNterms:
         want = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states)
         got = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states, hamiltonian.nzterms[0])
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+class TestNtermsGate:
+    """``run_sqd`` binds ``nterms`` only where the fixed-length scan is actually faster.
+
+    The defect this locks down was self-inflicted: binding ``nterms`` unconditionally made every
+    small-``K`` Hamiltonian slower, because a ``lax.scan`` carries a fixed per-call cost the
+    ``while_loop`` does not. Measured with a *tight* count, ratio ``while``/``scan``: 0.62x at
+    ``K=2``, 0.80x at 4, 0.88x at 6, 1.03x at 8. The crossover is a kernel property, not a padding
+    one -- a tight count loses just as badly as a padded one below ``K=8``.
+
+    Only the *gating* is asserted here, not the timing: a wall-clock assertion on a 12%-noise arm
+    would be flaky. The value must be unaffected either way, which is what the end-to-end kernels in
+    :class:`TestSqdEndToEnd` already cover across all six cache levels.
+    """
+
+    def test_gate_threshold_is_documented_and_used(self):
+        """The constant exists and sits at the measured crossover."""
+        assert _NTERMS_MIN_K == 8
+
+    @pytest.mark.parametrize("cache_level", [(1, 0), (1, 1)])
+    def test_small_and_large_k_agree_across_the_gate(self, cache_level):
+        """A Hamiltonian either side of the threshold must give the same energy.
+
+        ``ZZ`` chains only (one Z term per X group) put every group at ``nzterms == 1``, far below the
+        gate; adding a long-range Z string per group pushes the max above it. Both must agree with the
+        dense reference, so the gate cannot be changing results -- only which kernel runs.
+        """
+        rng = np.random.default_rng(20260823)
+        num_qubits = 6
+        small = [
+            "".join("Z" if q in (i, i + 1) else "I" for q in range(num_qubits))
+            for i in range(num_qubits - 1)
+        ]
+        assert max(PauliSumXZ.from_paulisum((small, [1.0] * len(small))).nzterms) < _NTERMS_MIN_K
+
+        large = small + ["ZZZZZZ", "ZIZIZI", "IZIZIZ", "ZZZIII", "IIIZZZ", "ZIIIIZ", "IZZZZI"]
+        assert max(PauliSumXZ.from_paulisum((large, [1.0] * len(large))).nzterms) >= _NTERMS_MIN_K
+
+        states = unique_states(10, num_qubits, rng)
+        for strings in (small, large):
+            coeffs = rng.normal(size=len(strings))
+            got = eigval_of(strings, coeffs, states, cache_level=cache_level)
+            assert got == pytest.approx(lowest_projected(strings, coeffs, states), abs=1e-6)
 
 
 class TestNzterms:

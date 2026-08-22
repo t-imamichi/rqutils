@@ -542,11 +542,20 @@ def run_sqd(
     # nterms is bound here for the same reason cache_level is: it must be static, and ground_locg
     # splats args positionally. max() rather than per-group, because apply_h's scan body traces once
     # -- one trip count has to serve every group, and the max is the tightest correct value.
+    #
+    # Bound only above _NTERMS_MIN_K, because the fixed-length scan is not free: measured against the
+    # while_loop it loses below ~8 terms and wins above (see _NTERMS_MIN_K). The solver does not need
+    # differentiability -- a caller who does passes nterms to apply_h directly -- so here the only
+    # question is speed, and below the crossover the while_loop is the faster kernel.
+    #
     # _apply_h_resolved, not the public apply_h: the tuple is assembled above under a static
     # cache_level precisely so the packing stays static, which is the resolved kernel's contract. The
     # public entry point exists to stop *callers* mispairing the two; here they are built together.
+    solver_nterms = max(hamiltonian.nzterms)
     matvec = functools.partial(
-        _apply_h_resolved, cache_level=cache_level, nterms=max(hamiltonian.nzterms)
+        _apply_h_resolved,
+        cache_level=cache_level,
+        nterms=solver_nterms if solver_nterms >= _NTERMS_MIN_K else None,
     )
     args = (scanned, states_u if needs_states else None)
 
@@ -828,6 +837,18 @@ def get_diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Arr
     return jax.lax.scan(get_signs, (init, 0, 0), zsignatures)[0][0]
 
 
+# Term count at or above which a fixed-length scan beats the data-dependent while_loop. The scan
+# carries a fixed per-call cost that the while_loop does not, so the crossover is a property of the
+# kernel rather than of the padding: measured at N=2^16 with a *tight* count (no padding scanned at
+# all), the ratio while/scan is 0.62x at K=2, 0.80x at 4, 0.88x at 6, 1.03x at 8, and stays above 1
+# through K=32. Padding shifts the magnitude, not the crossover. The measurement noise band on this
+# arm is 12%, so treat a ratio within that of 1.0 as unresolved and prefer the while_loop.
+#
+# This gates speed only. Differentiability always requires nterms, so apply_h honours whatever a
+# caller passes; this constant only decides what run_sqd binds for itself.
+_NTERMS_MIN_K = 8
+
+
 def _accumulate_diagonal(
     coeffs: NDArray[np.inexact],
     template: jax.Array,
@@ -852,10 +873,18 @@ def _accumulate_diagonal(
     never appears in the termination condition.
 
     A static ``nterms`` replaces the data-dependent condition with a ``lax.scan`` of known extent,
-    which is differentiable and *also faster* -- there is no trade here. Measured at ``K=29`` with 3
-    real terms, jitted: 0.279 ms against the ``while_loop``'s 0.382 ms at 400k states, output
-    identical to the last bit (``maxdiff`` exactly 0.0 at 8k, 64k and 400k). A ``while_loop``
-    re-evaluates a data-dependent gather every trip and cannot be unrolled; a static extent fuses.
+    which is differentiable and, **above roughly 8 terms, also faster**. The output is identical to
+    the last bit either way (``maxdiff`` exactly 0.0, measured at 8k, 64k and 400k states).
+
+    **It is not uniformly faster, and the crossover is a property of the kernel rather than of the
+    padding.** A ``lax.scan`` carries a fixed per-call cost the ``while_loop`` does not, so with a
+    *tight* count -- no padding scanned at all -- the ratio ``while``/``scan`` measures 0.62x at
+    ``K=2``, 0.80x at 4, 0.88x at 6, 1.03x at 8, then stays above 1 through ``K=32``. At ``K=29``
+    with 3 real terms it is 1.09x, and at 400k states 0.279 ms against 0.382 ms. Padding moves the
+    magnitude, not the crossover. The noise band on this arm is 12%, so a ratio within that of 1.0 is
+    unresolved. :data:`_NTERMS_MIN_K` is where :func:`run_sqd` draws the line for its own use; a
+    caller who needs the gradient passes ``nterms`` regardless of ``K``, since correctness of the
+    derivative is not a speed question.
 
     Do **not** "simplify" this to a scan over the full rectangle instead. That is differentiable too
     and equally exact, but it discards the early exit, and the padding fraction is large -- 78.9% at
