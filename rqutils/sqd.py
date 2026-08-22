@@ -145,6 +145,13 @@ larger effect than the :math:`4 J N` bytes it reclaims -- measured end-to-end at
 returning the same energy. Prefer ``cache_level[0] = 1`` unless the memory genuinely will not fit; the
 diagonal axis is where the real memory-versus-speed judgement lies.
 
+**Selecting a strategy at the** :func:`apply_h` **boundary.** Name the arrays you have and the
+strategy follows from them. The tuple form that took its meaning from ``cache_level`` positionally is
+deprecated: nothing verified that the tuple matched the level declared, and supplying X signatures
+while declaring precomputed sources silently computed a different operator (measured 0.44 max abs
+error, no exception). A dtype or shape assertion cannot close that gap -- stacked Z signatures and
+sign bits are both uint8 of rank 3 -- so the representations are distinguished by name instead.
+
 Distributed arrays and scaling limits
 =====================================
 
@@ -179,6 +186,7 @@ pad bit that aligns them with the Hamiltonian's signatures, and recovered with
 import functools
 import logging
 import time
+import warnings
 from collections.abc import Callable, Sequence
 from numbers import Number
 
@@ -231,6 +239,12 @@ def sqd(
     Cache level is a 2-tuple where the first element specifies the caching of the source indices
     (0=no caching, 1=cached) and the second specifies the caching of the diagonal elements (0=no
     caching, 1=cache sign bits, 2=cache diagonals).
+
+    On :func:`sqd` this tuple is the supported spelling -- the arrays are assembled internally, so
+    there is nothing for a caller to mispair. A caller invoking :func:`apply_h` directly should name
+    the arrays instead (``xsources=``/``xsignatures=``, ``diagonals=``/``diag_signs=``/
+    ``zsignatures=``); the equivalent positional tuple is deprecated there because nothing could check
+    it against the level declared.
 
     Args:
         hamiltonian: Hamiltonian to be projected and diagonalized.
@@ -528,7 +542,12 @@ def run_sqd(
     # nterms is bound here for the same reason cache_level is: it must be static, and ground_locg
     # splats args positionally. max() rather than per-group, because apply_h's scan body traces once
     # -- one trip count has to serve every group, and the max is the tightest correct value.
-    matvec = functools.partial(apply_h, cache_level=cache_level, nterms=max(hamiltonian.nzterms))
+    # _apply_h_resolved, not the public apply_h: the tuple is assembled above under a static
+    # cache_level precisely so the packing stays static, which is the resolved kernel's contract. The
+    # public entry point exists to stop *callers* mispairing the two; here they are built together.
+    matvec = functools.partial(
+        _apply_h_resolved, cache_level=cache_level, nterms=max(hamiltonian.nzterms)
+    )
     args = (scanned, states_u if needs_states else None)
 
     def vinit_from_min_diag():
@@ -869,8 +888,21 @@ def _accumulate_diagonal(
 
     # out_sharding is load-bearing, on both paths: ground_locg is sharding-transparent only if the
     # matvec preserves its output sharding, and this init is what sets it for the diagonal.
+    #
+    # Take only the leading axis of template's spec: template is 2-D (states is (N, B), diag_signs is
+    # (N, ceil(K/8))) while this output is 1-D (N,), so copying the spec wholesale hands a rank-2
+    # P('x', None) to a rank-1 array. On a single device the mesh is empty and the mismatch is
+    # invisible, which is why the pytest suite never saw it; on any real mesh it raised
+    # "Length of sharding.spec (2) must be equal to aval's ndim (1)" before this could return.
+    # Rebuild against template's own mesh rather than handing over a bare PartitionSpec, which jax
+    # rejects outside a mesh context ("Using PartitionSpec when you are not under a mesh context").
+    template_sharding = jax.typeof(template).sharding
     init = jnp.zeros(
-        template.shape[0], dtype=coeffs.dtype, out_sharding=jax.typeof(template).sharding
+        template.shape[0],
+        dtype=coeffs.dtype,
+        out_sharding=jax.sharding.NamedSharding(
+            template_sharding.mesh, PartitionSpec(template_sharding.spec[0])
+        ),
     )
     if nterms is None:
         return jax.lax.while_loop(cond_fn, add_diag, (init, 0))[0]
@@ -951,7 +983,7 @@ def apply_xgrp(
 
 
 @jax.jit(static_argnames=["cache_level", "nterms"])
-def apply_h(
+def _apply_h_resolved(
     vec: NDArray[np.inexact],
     scanned: tuple[NDArray, ...],
     states: StateList | None = None,
@@ -978,6 +1010,11 @@ def apply_h(
     ``cache_level`` is static, so each combination traces to the same code the six separate kernels
     did -- the selection happens once at trace time, not per group. It must stay static: passing it
     as a traced value would retrace on every matvec call inside the solver loop.
+
+    This is the resolved kernel: ``cache_level`` and the tuple layout are already agreed. It is
+    private because that agreement is unenforceable at this boundary -- see :func:`apply_h`, the
+    public entry point, which derives ``cache_level`` from named arrays so a mismatch cannot be
+    expressed.
 
     Args:
         vec: Vector to multiply.
@@ -1020,3 +1057,148 @@ def apply_h(
         return out + apply_xgrp(xsource, diagonal, vec), None
 
     return jax.lax.scan(fn, jnp.zeros_like(vec), scanned)[0]
+
+
+# The six valid (source-index, diagonal) input sets, keyed by the cache_level they imply. Each entry
+# is (x-axis keyword, diagonal-axis keywords) -- the tuple order apply_xgrp's scan expects.
+_XSOURCE_KEYWORDS = {"xsources": 1, "xsignatures": 0}
+_DIAGONAL_KEYWORDS = {"diagonals": 2, "diag_signs": 1, "zsignatures": 0}
+
+
+def apply_h(
+    vec: NDArray[np.inexact],
+    scanned: tuple[NDArray, ...] | None = None,
+    states: StateList | None = None,
+    cache_level: tuple[int, int] | None = None,
+    nterms: int | None = None,
+    *,
+    xsources: NDArray[np.int32] | None = None,
+    xsignatures: NDArray[np.uint8] | None = None,
+    zsignatures: NDArray[np.uint8] | None = None,
+    diag_signs: NDArray[np.uint8] | None = None,
+    diagonals: NDArray[np.inexact] | None = None,
+    coeffs: NDArray[np.inexact] | None = None,
+) -> jax.Array:
+    r"""Return :math:`Hv`, with the caching strategy named rather than positional.
+
+    Name the per-X-group arrays you have and the strategy follows from them:
+
+    .. code-block:: python
+
+        apply_h(vec, xsources=xsrc, diag_signs=signs, coeffs=c, states=states)   # was (1, 1)
+        apply_h(vec, xsignatures=x, diagonals=diags, states=states)              # was (0, 2)
+
+    **Why this replaces the positional form.** ``cache_level`` selected, *positionally*, how the
+    members of a ``scanned`` tuple were interpreted, and nothing checked that the tuple matched the
+    level declared. Passing raw X signatures while claiming ``cache_level[0] == 1`` -- which promises
+    precomputed X *sources* -- raised nothing and silently computed a different operator (measured
+    0.44 max abs error on a 5-state subspace). An index array and a signature array are
+    indistinguishable at that boundary: both are integer-typed with compatible shapes. Worse, the
+    obvious cheap mitigation does not work -- a dtype or rank assertion cannot separate
+    ``zsignatures`` from ``diag_signs``, since stacked they are *both* uint8 of rank 3, and shapes
+    collide outright when the subspace size equals the packed byte width.
+
+    Naming each representation makes the six valid combinations the only constructible ones, so a
+    mispairing is a :exc:`TypeError` here instead of a wrong number later. Note the honest limit: this
+    removes the *mispairing* class, not a caller who passes the wrong array under the right name.
+
+    Args:
+        vec: Vector to multiply.
+        scanned: Deprecated. The positional tuple form, paired with ``cache_level``; see
+            :func:`_apply_h_resolved` for its layouts. Emits a :exc:`DeprecationWarning`.
+        states: Uniquified state list. Required whenever the X signatures or the Z signatures are
+            supplied, i.e. for every combination except ``xsources`` with ``diag_signs`` and
+            ``xsources`` with ``diagonals`` -- those two read neither, so they need no states at all.
+        cache_level: Deprecated, and only meaningful with ``scanned``.
+        nterms: Static number of Z terms to sum per X group. Pass it to make this differentiable with
+            respect to the coefficients; use ``max(hamiltonian.nzterms)``. Ignored when ``diagonals``
+            is given, since no accumulation happens then. See :func:`_accumulate_diagonal`.
+        xsources: Precomputed source indices per X group, shape ``(num_xgroups, num_states)``. The
+            cheap axis to enable and very expensive to disable -- prefer it (see the module docs).
+        xsignatures: Packed X signatures, shape ``(num_xgroups, num_bytes)``. The sources are derived
+            per call, which measured 66-97% of an entire solve.
+        zsignatures: Packed Z signatures per X group. Needs ``coeffs`` and ``states``.
+        diag_signs: Precomputed packed sign bits per X group. Needs ``coeffs``.
+        diagonals: Fully precomputed diagonals per X group. Needs neither ``coeffs`` nor ``states``.
+        coeffs: Phase-folded coefficients per X group. Required with ``zsignatures`` or
+            ``diag_signs``, and rejected with ``diagonals``.
+
+    Returns:
+        :math:`Hv`.
+
+    Raises:
+        TypeError: If the named arrays do not form exactly one of the six valid combinations -- none
+            or both of the X-axis arrays, none or several of the diagonal-axis arrays, ``coeffs``
+            missing where it is needed or supplied where it is not, or the named form mixed with
+            ``scanned``/``cache_level``.
+        ValueError: If ``states`` is needed but None.
+    """
+    if scanned is not None or cache_level is not None:
+        named = {
+            name: value
+            for name, value in (
+                ("xsources", xsources),
+                ("xsignatures", xsignatures),
+                ("zsignatures", zsignatures),
+                ("diag_signs", diag_signs),
+                ("diagonals", diagonals),
+                ("coeffs", coeffs),
+            )
+            if value is not None
+        }
+        if named:
+            raise TypeError(
+                "apply_h: the deprecated scanned/cache_level form cannot be mixed with the named "
+                f"arrays {sorted(named)}; pass only one form"
+            )
+        if scanned is None:
+            raise TypeError("apply_h: cache_level requires scanned")
+        warnings.warn(
+            "apply_h's positional (scanned, cache_level) form is deprecated: the pairing is "
+            "unchecked, and mispairing it silently computes a different operator. Pass the arrays "
+            "by name instead (xsources=/xsignatures=, diagonals=/diag_signs=/zsignatures=, "
+            "coeffs=).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return _apply_h_resolved(
+            vec, scanned, states, (1, 2) if cache_level is None else cache_level, nterms
+        )
+
+    # Resolve each axis independently, so the error names the axis that is wrong. Spelled out rather
+    # than read from locals(): a comprehension has its own scope, which makes locals()-based lookup
+    # correct here only by accident of where it is evaluated.
+    supplied = {
+        "xsources": xsources,
+        "xsignatures": xsignatures,
+        "zsignatures": zsignatures,
+        "diag_signs": diag_signs,
+        "diagonals": diagonals,
+    }
+    xgiven = [name for name in _XSOURCE_KEYWORDS if supplied[name] is not None]
+    dgiven = [name for name in _DIAGONAL_KEYWORDS if supplied[name] is not None]
+    if len(xgiven) != 1:
+        raise TypeError(
+            "apply_h: pass exactly one of xsources= or xsignatures= "
+            f"(got {sorted(xgiven) or 'neither'})"
+        )
+    if len(dgiven) != 1:
+        raise TypeError(
+            "apply_h: pass exactly one of diagonals=, diag_signs= or zsignatures= "
+            f"(got {sorted(dgiven) or 'none'})"
+        )
+    xname, dname = xgiven[0], dgiven[0]
+    xaxis, daxis = _XSOURCE_KEYWORDS[xname], _DIAGONAL_KEYWORDS[dname]
+
+    # coeffs is not optional-with-a-default: it is required by exactly two of the three diagonal
+    # forms and meaningless in the third, so silently ignoring a stray one would hide a mistake.
+    if daxis == 2:
+        if coeffs is not None:
+            raise TypeError(f"apply_h: coeffs= is not used with {dname}=; drop it")
+    elif coeffs is None:
+        raise TypeError(f"apply_h: {dname}= requires coeffs=")
+
+    xarray = xsources if xaxis == 1 else xsignatures
+    darray = {2: diagonals, 1: diag_signs, 0: zsignatures}[daxis]
+    scanned = (xarray, darray) if daxis == 2 else (xarray, darray, coeffs)
+    return _apply_h_resolved(vec, scanned, states, (xaxis, daxis), nterms)

@@ -208,7 +208,7 @@ class TestStaticNterms:
         )[1]
 
         def loss(vec):
-            return jnp.sum(apply_h(vec, (xsources, diagonals), None, (1, 2)) ** 2)
+            return jnp.sum(apply_h(vec, xsources=xsources, diagonals=diagonals) ** 2)
 
         grad = jax.grad(loss)(jnp.ones(states.shape[0]))
         assert np.all(np.isfinite(np.asarray(grad)))
@@ -912,7 +912,13 @@ class TestMatvecKernels:
         vector = rng.normal(size=states.shape[0])
 
         got = np.asarray(
-            apply_h(vector, (hamiltonian.x, hamiltonian.z, hamiltonian.c), states_u, (0, 0))
+            apply_h(
+                vector,
+                xsignatures=hamiltonian.x,
+                zsignatures=hamiltonian.z,
+                coeffs=hamiltonian.c,
+                states=states_u,
+            )
         ).real
         assert np.abs(got - matrix @ vector).max() < 1e-12
 
@@ -940,28 +946,40 @@ class TestMatvecKernels:
         vector = rng.normal(size=states.shape[0])
         matrix = project_dense(strings, coeffs, states).real
 
-        xgroup = hamiltonian.x
+        # The keyword name IS the cache_level now, so the grid is expressed as the mapping from one
+        # to the other. That mapping is the thing under test: a wrong entry here would feed the
+        # wrong representation under the right name, which is the one failure the named API cannot
+        # catch for us (see apply_h's docstring), hence the dense reference below.
         if cache_level[0] == 1:
-            xgroup = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
+            kwargs = {
+                "xsources": np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
+            }
+        else:
+            kwargs = {"xsignatures": hamiltonian.x}
         match cache_level[1]:
             case 0:
-                scanned = (xgroup, hamiltonian.z, hamiltonian.c)
+                kwargs |= {"zsignatures": hamiltonian.z, "coeffs": hamiltonian.c}
             case 1:
-                signs = np.stack([np.asarray(get_diag_signs(z, states_u)) for z in hamiltonian.z])
-                scanned = (xgroup, signs, hamiltonian.c)
+                kwargs |= {
+                    "diag_signs": np.stack(
+                        [np.asarray(get_diag_signs(z, states_u)) for z in hamiltonian.z]
+                    ),
+                    "coeffs": hamiltonian.c,
+                }
             case 2:
-                diagonals = np.stack(
-                    [
-                        np.asarray(get_diagonal(z, c, states_u).real)
-                        for z, c in zip(hamiltonian.z, hamiltonian.c)
-                    ]
-                )
-                scanned = (xgroup, diagonals)
+                kwargs |= {
+                    "diagonals": np.stack(
+                        [
+                            np.asarray(get_diagonal(z, c, states_u).real)
+                            for z, c in zip(hamiltonian.z, hamiltonian.c)
+                        ]
+                    )
+                }
 
         needs_states = cache_level[0] == 0 or cache_level[1] == 0
-        got = np.asarray(
-            apply_h(vector, scanned, states_u if needs_states else None, cache_level)
-        ).real
+        if needs_states:
+            kwargs["states"] = states_u
+        got = np.asarray(apply_h(vector, **kwargs)).real
         assert np.abs(got - matrix @ vector).max() < 1e-12
 
     @pytest.mark.parametrize("cache_level", [(0, 0), (0, 1), (0, 2), (1, 0)])
@@ -972,8 +990,157 @@ class TestMatvecKernels:
         after caching. For the other four, a missing S would otherwise surface as an opaque failure
         deep inside ``get_xsource``/``get_diagonal``.
         """
+        dummy = np.zeros((1, 1), dtype=np.uint8)
+        kwargs = {"xsources" if cache_level[0] == 1 else "xsignatures": dummy}
+        match cache_level[1]:
+            case 0:
+                kwargs |= {"zsignatures": np.zeros((1, 1, 1), np.uint8), "coeffs": np.zeros((1, 1))}
+            case 1:
+                kwargs |= {"diag_signs": dummy, "coeffs": np.zeros((1, 1))}
+            case 2:
+                kwargs |= {"diagonals": np.zeros((1, 1))}
+        # The arrays are deliberately bogus: this must fail on the missing states, before anything
+        # looks at their contents.
         with pytest.raises(ValueError, match="states is required"):
-            apply_h(np.zeros(4), (np.zeros((1, 1), dtype=np.uint8),) * 3, None, cache_level)
+            apply_h(np.zeros(4), **kwargs)
+
+    def test_mispairing_is_now_unconstructible(self):
+        """The silent-wrong-answer path: an X signature passed where an X *source* was promised.
+
+        The defect, measured on this exact fixture before the fix: ``cache_level=(1, 1)`` with
+        ``hamiltonian.x`` in slot 0 instead of the precomputed sources returned
+        ``[-0.02, 0.02, 0.02, -0.02, 0.02]`` against the correct
+        ``[0.2, -0.1, 0.46, 0.22, 0.2]`` -- **max abs error 0.44, no exception**. An index array and a
+        signature array are both integer-typed with compatible shapes, so the boundary could not tell
+        them apart.
+
+        Note what is *not* fixable by a cheaper dtype or rank assertion, which is why the API changed
+        rather than gaining a check: stacked ``diag_signs`` and ``zsignatures`` are **both uint8 of
+        rank 3**, so no assertion separates the ``(1, 0)`` and ``(1, 1)`` cells. Measured shapes on a
+        4-qubit, 5-state fixture: ``xsources`` ``(3, 5)`` int32 against ``x`` ``(3, 1)`` uint8 -- and
+        those shapes collide outright whenever the subspace size equals the packed byte width.
+        """
+        rng = np.random.default_rng(20260823)
+        num_qubits = 4
+        strings = ["XXII", "IZZI", "IIYY", "ZIIZ"]
+        coeffs = np.array([0.5, -0.3, 0.7, 0.2])
+        states = unique_states(6, num_qubits, rng)
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_u = uniquify_states(pack_padded(states), states.shape[0])
+        vector = rng.normal(size=states.shape[0])
+        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
+        signs = np.stack([np.asarray(get_diag_signs(z, states_u)) for z in hamiltonian.z])
+
+        # The two representations really are interchangeable at the old boundary...
+        assert xsources.dtype != hamiltonian.x.dtype, "fixture no longer contrasts the dtypes"
+        # ...and for the diagonal axis not even that holds.
+        assert signs.dtype == hamiltonian.z.dtype == np.uint8
+        assert signs.ndim == hamiltonian.z.ndim == 3
+
+        correct = np.asarray(
+            apply_h(
+                vector, xsources=xsources, diag_signs=signs, coeffs=hamiltonian.c, states=states_u
+            )
+        )
+        # Naming the X axis twice is a TypeError, not a silent reinterpretation.
+        with pytest.raises(TypeError, match="exactly one of xsources= or xsignatures="):
+            apply_h(
+                vector,
+                xsources=xsources,
+                xsignatures=hamiltonian.x,
+                diag_signs=signs,
+                coeffs=hamiltonian.c,
+                states=states_u,
+            )
+        # And the (1, 0)/(1, 1) confusion no dtype check could catch is a TypeError too.
+        with pytest.raises(
+            TypeError, match="exactly one of diagonals=, diag_signs= or zsignatures="
+        ):
+            apply_h(
+                vector,
+                xsources=xsources,
+                diag_signs=signs,
+                zsignatures=hamiltonian.z,
+                coeffs=hamiltonian.c,
+                states=states_u,
+            )
+        # The legacy tuple form still lets the mispairing through -- pinned so the deprecation
+        # message keeps being justified by a real defect rather than by taste.
+        with pytest.warns(DeprecationWarning):
+            mispaired = np.asarray(
+                apply_h(
+                    vector,
+                    (hamiltonian.x, signs, hamiltonian.c),
+                    states_u,
+                    (1, 1),
+                )
+            )
+        assert np.abs(mispaired - correct).max() > 0.1, (
+            "the legacy path is expected to still produce a wrong answer; if it now raises or agrees, "
+            "this test's premise has changed"
+        )
+
+    def test_coeffs_requirement_is_enforced_per_diagonal_form(self):
+        """``coeffs`` is required by two of the three diagonal forms and meaningless in the third."""
+        rng = np.random.default_rng(3)
+        states = unique_states(5, 4, rng)
+        hamiltonian = PauliSumXZ.from_paulisum((["ZIII", "XXII"], [1.0, 0.4]))
+        states_u = uniquify_states(pack_padded(states), states.shape[0])
+        vector = rng.normal(size=states.shape[0])
+        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
+        diagonals = np.stack(
+            [
+                np.asarray(get_diagonal(z, c, states_u).real)
+                for z, c in zip(hamiltonian.z, hamiltonian.c)
+            ]
+        )
+
+        with pytest.raises(TypeError, match="zsignatures= requires coeffs="):
+            apply_h(vector, xsources=xsources, zsignatures=hamiltonian.z, states=states_u)
+        with pytest.raises(TypeError, match="coeffs= is not used with diagonals="):
+            apply_h(vector, xsources=xsources, diagonals=diagonals, coeffs=hamiltonian.c)
+
+    def test_legacy_tuple_form_still_works_but_warns(self):
+        """Deprecated, not removed: an existing caller keeps working until it migrates."""
+        rng = np.random.default_rng(9)
+        states = unique_states(7, 4, rng)
+        strings = real_pauli_strings(4, 5, rng)
+        coeffs = rng.normal(size=len(strings))
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_u = uniquify_states(pack_padded(states), states.shape[0])
+        vector = rng.normal(size=states.shape[0])
+        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
+        diagonals = np.stack(
+            [
+                np.asarray(get_diagonal(z, c, states_u).real)
+                for z, c in zip(hamiltonian.z, hamiltonian.c)
+            ]
+        )
+
+        want = np.asarray(apply_h(vector, xsources=xsources, diagonals=diagonals))
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            got = np.asarray(apply_h(vector, (xsources, diagonals), None, (1, 2)))
+        np.testing.assert_array_equal(got, want)
+
+    def test_mixing_the_two_forms_raises(self):
+        """A half-migrated call site is a mistake, not a merge of the two conventions."""
+        rng = np.random.default_rng(10)
+        states = unique_states(5, 4, rng)
+        hamiltonian = PauliSumXZ.from_paulisum((["ZIII", "XXII"], [1.0, 0.4]))
+        states_u = uniquify_states(pack_padded(states), states.shape[0])
+        vector = rng.normal(size=states.shape[0])
+        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
+        diagonals = np.stack(
+            [
+                np.asarray(get_diagonal(z, c, states_u).real)
+                for z, c in zip(hamiltonian.z, hamiltonian.c)
+            ]
+        )
+
+        with pytest.raises(TypeError, match="cannot be mixed with the named arrays"):
+            apply_h(vector, (xsources, diagonals), None, (1, 2), xsources=xsources)
+        with pytest.raises(TypeError, match="cache_level requires scanned"):
+            apply_h(vector, cache_level=(1, 2))
 
     def test_fully_cached_level_matches_dense(self):
         """``cache_level=(1, 2)``, the fully-precomputed level, against a dense reference.
@@ -1006,5 +1173,5 @@ class TestMatvecKernels:
         matrix = project_dense(strings, coeffs, states).real
         vector = rng.normal(size=states.shape[0])
 
-        got = np.asarray(apply_h(vector, (xsources, diagonals), None, (1, 2))).real
+        got = np.asarray(apply_h(vector, xsources=xsources, diagonals=diagonals)).real
         assert np.abs(got - matrix @ vector).max() < 1e-12
