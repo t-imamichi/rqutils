@@ -1059,12 +1059,6 @@ def _apply_h_resolved(
     return jax.lax.scan(fn, jnp.zeros_like(vec), scanned)[0]
 
 
-# The six valid (source-index, diagonal) input sets, keyed by the cache_level they imply. Each entry
-# is (x-axis keyword, diagonal-axis keywords) -- the tuple order apply_xgrp's scan expects.
-_XSOURCE_KEYWORDS = {"xsources": 1, "xsignatures": 0}
-_DIAGONAL_KEYWORDS = {"diagonals": 2, "diag_signs": 1, "zsignatures": 0}
-
-
 def apply_h(
     vec: NDArray[np.inexact],
     scanned: tuple[NDArray, ...] | None = None,
@@ -1165,30 +1159,27 @@ def apply_h(
             vec, scanned, states, (1, 2) if cache_level is None else cache_level, nterms
         )
 
-    # Resolve each axis independently, so the error names the axis that is wrong. Spelled out rather
-    # than read from locals(): a comprehension has its own scope, which makes locals()-based lookup
-    # correct here only by accident of where it is evaluated.
-    supplied = {
-        "xsources": xsources,
-        "xsignatures": xsignatures,
-        "zsignatures": zsignatures,
-        "diag_signs": diag_signs,
-        "diagonals": diagonals,
-    }
-    xgiven = [name for name in _XSOURCE_KEYWORDS if supplied[name] is not None]
-    dgiven = [name for name in _DIAGONAL_KEYWORDS if supplied[name] is not None]
+    # Each axis is (name, cache_level digit, array). Pairing the three here means the axis is
+    # resolved, validated and unpacked from one list, with no lookup table to keep in step.
+    xaxis_options = [("xsources", 1, xsources), ("xsignatures", 0, xsignatures)]
+    daxis_options = [
+        ("diagonals", 2, diagonals),
+        ("diag_signs", 1, diag_signs),
+        ("zsignatures", 0, zsignatures),
+    ]
+    xgiven = [opt for opt in xaxis_options if opt[2] is not None]
+    dgiven = [opt for opt in daxis_options if opt[2] is not None]
     if len(xgiven) != 1:
         raise TypeError(
             "apply_h: pass exactly one of xsources= or xsignatures= "
-            f"(got {sorted(xgiven) or 'neither'})"
+            f"(got {sorted(name for name, _, _ in xgiven) or 'neither'})"
         )
     if len(dgiven) != 1:
         raise TypeError(
             "apply_h: pass exactly one of diagonals=, diag_signs= or zsignatures= "
-            f"(got {sorted(dgiven) or 'none'})"
+            f"(got {sorted(name for name, _, _ in dgiven) or 'none'})"
         )
-    xname, dname = xgiven[0], dgiven[0]
-    xaxis, daxis = _XSOURCE_KEYWORDS[xname], _DIAGONAL_KEYWORDS[dname]
+    (_, xaxis, xarray), (dname, daxis, darray) = xgiven[0], dgiven[0]
 
     # coeffs is not optional-with-a-default: it is required by exactly two of the three diagonal
     # forms and meaningless in the third, so silently ignoring a stray one would hide a mistake.
@@ -1198,7 +1189,5 @@ def apply_h(
     elif coeffs is None:
         raise TypeError(f"apply_h: {dname}= requires coeffs=")
 
-    xarray = xsources if xaxis == 1 else xsignatures
-    darray = {2: diagonals, 1: diag_signs, 0: zsignatures}[daxis]
     scanned = (xarray, darray) if daxis == 2 else (xarray, darray, coeffs)
     return _apply_h_resolved(vec, scanned, states, (xaxis, daxis), nterms)
