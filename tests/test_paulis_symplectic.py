@@ -229,6 +229,91 @@ class TestCoefficientDtype:
             PauliSumXZ.from_paulisum(qiskit.quantum_info.SparsePauliOp(["XX"], [1.0 + 1.0j]))
 
 
+class TestHermiticityTolerance:
+    """The realness check compares against ``atol``, not against exact zero.
+
+    The defect: a mathematically Hermitian operator whose Pauli coefficients were obtained
+    *numerically* was refused outright. Conjugating a Hermitian matrix by a non-Clifford circuit and
+    decomposing the result -- the standard way to build a rotated Hamiltonian -- leaves rounding at
+    the 1e-16 level in the coefficients. Measured over 18 such operators (n = 3, 4, 5 x 6 seeds) the
+    exact check rejected **18/18**, with a largest coefficient ``|imag|`` of **3.3e-16** against the
+    operators' own hermiticity error of **2.7e-15**: the residue was an order of magnitude *smaller*
+    than the property the check was testing for.
+
+    This is not a return to the removed ``force_real`` flag, which took ``.real`` of genuinely
+    complex input. See :class:`TestCoefficientDtype`, whose two exact-``1+1j`` tests still raise.
+
+    **Every test here asserts its own fixture's residue is nonzero**, because the natural fixture for
+    this bug often has residue exactly ``0.0`` -- the requester measured exactly that across 120 XXZ
+    light-cone operators, whose conjugations round cleanly onto binary fractions. Without that
+    assertion a passing test would prove only that a real operator is accepted, which was never in
+    doubt.
+    """
+
+    @staticmethod
+    def _rotated_hermitian(n, seed):
+        """A Hermitian matrix conjugated by a non-Clifford circuit, decomposed into Paulis."""
+        qiskit = pytest.importorskip("qiskit")
+        from qiskit.quantum_info import Operator, SparsePauliOp
+
+        rng = np.random.default_rng(seed)
+        mat = rng.normal(size=(2**n, 2**n)) + 1j * rng.normal(size=(2**n, 2**n))
+        ham = mat + mat.conj().T
+        circuit = qiskit.QuantumCircuit(n)
+        for qubit in range(n):
+            circuit.ry(0.37 * (qubit + 1), qubit)
+        for qubit in range(n - 1):
+            circuit.cx(qubit, qubit + 1)
+        unitary = Operator(circuit).to_matrix()
+        return SparsePauliOp.from_operator(unitary @ ham @ unitary.conj().T)
+
+    @pytest.mark.parametrize("num_qubits", [3, 4])
+    def test_hermitian_to_rounding_is_accepted(self, num_qubits):
+        """A numerically decomposed Hermitian operator must not be refused."""
+        op = self._rotated_hermitian(num_qubits, seed=num_qubits)
+        residue = np.abs(np.asarray(op.coeffs).imag).max()
+        # Without this the test is vacuous: a fixture with residue 0.0 would pass under the old
+        # exact check too, proving nothing about the tolerance.
+        assert residue > 0.0, (
+            "fixture has no imaginary residue, so it cannot exercise the tolerance"
+        )
+        assert residue < 1e-12, f"residue {residue:.3e} is not within the default atol"
+
+        psum = PauliSumXZ.from_paulisum(op)
+        assert psum.num_qubits == num_qubits
+
+    def test_residue_above_atol_still_raises(self):
+        """A tolerance must not become a licence to discard real signal.
+
+        ``1e-6`` is six orders above the default ``atol`` -- the case ``force_real`` used to swallow.
+        """
+        with pytest.raises(ValueError, match="must be real for the Hamiltonian to be Hermitian"):
+            PauliSumXZ.from_paulisum((["XX", "ZZ"], [1.0, 0.5 + 1e-6j]))
+
+    def test_atol_zero_restores_the_exact_check(self):
+        """``atol=0.0`` is the old behaviour, so a caller who wants exactness can still have it."""
+        op = self._rotated_hermitian(3, seed=3)
+        assert np.abs(np.asarray(op.coeffs).imag).max() > 0.0
+        with pytest.raises(ValueError, match="must be real for the Hamiltonian to be Hermitian"):
+            PauliSumXZ.from_paulisum(op, atol=0.0)
+
+    def test_tolerated_residue_is_dropped_not_folded_into_the_result(self):
+        """Accepting a residue must not let it leak into ``.c``.
+
+        ``coeffs.real`` is taken after the check, so a tolerated 1e-16 imaginary part is discarded
+        rather than propagated. Compared against the same operator with its coefficients rounded
+        exactly real, which is what the tolerance claims the input is equivalent to.
+        """
+        qiskit = pytest.importorskip("qiskit")
+        op = self._rotated_hermitian(3, seed=11)
+        assert np.abs(np.asarray(op.coeffs).imag).max() > 0.0
+
+        exact = qiskit.quantum_info.SparsePauliOp(op.paulis, np.asarray(op.coeffs).real)
+        got = PauliSumXZ.from_paulisum(op)
+        want = PauliSumXZ.from_paulisum(exact)
+        np.testing.assert_array_equal(np.asarray(got.c), np.asarray(want.c))
+
+
 class TestPadding:
     """The pad bit at position 0 is intrinsic: every signature is shifted right by one bit.
 
