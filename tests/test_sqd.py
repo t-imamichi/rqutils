@@ -34,6 +34,7 @@ from conftest import (
 
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import (
+    _MAX_STATES,
     _NTERMS_MIN_K,
     _is_lex_sorted,
     apply_h,
@@ -467,6 +468,16 @@ class TestUniquifyStates:
 
 class TestHproj:
     """``hproj`` builds the projected Hamiltonian densely (sparse), as a debug/reference path."""
+
+    def test_subspace_above_the_int32_ceiling_raises(self):
+        """``hproj`` reaches ``get_xsource`` too, so it shares ``sqd``'s int32 ceiling.
+
+        ``2**31`` rows cannot be allocated, so the shape is produced by ``np.broadcast_to`` (a view,
+        no allocation) -- enough to reach a guard that reads ``states.shape[0]``.
+        """
+        states = np.broadcast_to(np.zeros(2, dtype=np.uint8), (2**31, 2))
+        with pytest.raises(ValueError, match="exceeds the .* limit imposed by int32"):
+            hproj((["ZI"], [1.0]), states, unique_states=True)
 
     def test_unsorted_input_with_unique_states_raises(self):
         """``unique_states=True`` rejects unsorted states instead of projecting them wrongly.
@@ -903,6 +914,23 @@ class TestSqdEndToEnd:
             f"states_size={states_size}: sqd gave {got}, dense reference is {reference} -- "
             "filler slots leaked into the subspace"
         )
+
+    def test_states_size_above_the_int32_ceiling_raises(self):
+        """The 2^31 limit the module documents as hard was documented but never enforced.
+
+        Subspace positions are int32 throughout -- ``uniquify_states``' iota and ``get_xsource``'s
+        returned indices, which use ``-1`` as the absent marker -- so a size at or above ``2**31``
+        wraps to ``-2147483648`` and yields a corrupted permutation rather than an error. That is a
+        plausible finite answer, the failure mode this module exists to guard against.
+
+        Unreachable on real hardware (``2**31`` states is 4.3 GB of packed states before any vector),
+        so the check is asserted against the *argument* rather than by allocating anything.
+        """
+        states = np.array([[0, 0], [1, 1]], dtype=np.uint8)
+        with pytest.raises(ValueError, match="exceeds the .* limit imposed by int32"):
+            sqd((["ZI"], [1.0]), states, states_size=2**31)
+        # One below the ceiling is accepted as an argument (it fails later on memory, not validation).
+        assert _MAX_STATES == 2**31 - 1
 
     def test_states_size_below_input_length_raises(self):
         rng = np.random.default_rng(20260804)
