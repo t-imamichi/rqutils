@@ -81,12 +81,27 @@ class PauliSumXZ:
             phase turns real input complex. Check ``.c.dtype`` if you need float64; there is
             deliberately no flag to request it, since no flag could grant it.
         num_qubits: Number of qubits, static under JAX transforms.
+        nzterms: Number of genuine (non-padding) Z terms in each X group, one entry per group, static
+            under JAX transforms. ``z`` and ``c`` are rectangles padded to ``max(nzterms)``, so this
+            is the only record of where the real terms end.
+
+            **It cannot be recovered from the arrays afterwards**, which is why it is stored. A pad
+            slot's Z signature packs to all-zero bytes -- and so does a genuine all-identity Z
+            signature, so ``z`` cannot distinguish them. ``c``'s trailing zeros are only pad because
+            :meth:`from_paulisum` drops zero-coefficient terms, which makes counting them a
+            coincidence rather than a fact.
+
+            Consumers needing a static trip count over the real terms use this instead of a
+            data-dependent loop; see :func:`rqutils.sqd.apply_h`'s ``nterms``. Being static, it joins
+            the JIT cache key: two Hamiltonians with identical shapes but different term counts
+            compile separately, the same trade ``num_qubits`` already makes.
     """
 
     x: np.ndarray[tuple[int, int], np.dtype[np.uint8]]
     z: np.ndarray[tuple[int, int, int], np.dtype[np.uint8]]
     c: np.ndarray[tuple[int, int], np.dtype[np.inexact]]
     num_qubits: int = field(metadata={"static": True})
+    nzterms: tuple[int, ...] = field(metadata={"static": True})
 
     @staticmethod
     def pack_states(
@@ -277,7 +292,10 @@ class PauliSumXZ:
         # itself and never calls this method.
         xsignatures = cls.pack_states(xsignatures)
         zsignatures = np.packbits(np.pad(zsignatures, {2: (1, 0)}), axis=-1)
-        return cls(xsignatures, zsignatures, phcoeffs, num_qubits)
+        # counts is the per-group real-term count; keep it rather than letting it fall out of scope.
+        # Nothing downstream can rederive it (see the nzterms docstring), and a static trip count over
+        # the real terms is what makes the diagonal accumulation differentiable.
+        return cls(xsignatures, zsignatures, phcoeffs, num_qubits, tuple(int(n) for n in counts))
 
     @property
     def arrays(self) -> tuple[jax.Array, jax.Array, jax.Array]:

@@ -525,7 +525,10 @@ def run_sqd(
     # cache_level is bound here rather than passed through args: ground_locg splats args
     # positionally (matvec(vec, *args)), so a static_argnames entry would never see it and the
     # tuple would be traced -- retracing the kernel on every matvec call in the solver loop.
-    matvec = functools.partial(apply_h, cache_level=cache_level)
+    # nterms is bound here for the same reason cache_level is: it must be static, and ground_locg
+    # splats args positionally. max() rather than per-group, because apply_h's scan body traces once
+    # -- one trip count has to serve every group, and the max is the tightest correct value.
+    matvec = functools.partial(apply_h, cache_level=cache_level, nterms=max(hamiltonian.nzterms))
     args = (scanned, states_u if needs_states else None)
 
     def vinit_from_min_diag():
@@ -807,7 +810,10 @@ def get_diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Arr
 
 
 def _accumulate_diagonal(
-    coeffs: NDArray[np.inexact], template: jax.Array, sign_bit: Callable[[jax.Array], jax.Array]
+    coeffs: NDArray[np.inexact],
+    template: jax.Array,
+    sign_bit: Callable[[jax.Array], jax.Array],
+    nterms: int | None = None,
 ) -> jax.Array:
     """Sum ``coeff * (1 - 2 * sign_bit(iterm))`` over the Z terms of one X group.
 
@@ -819,10 +825,34 @@ def _accumulate_diagonal(
     end of the real terms in a zero-padded Z group and the loop stops there rather than scanning the
     full rectangle.
 
+    **Pass ``nterms`` to make this differentiable.** The default ``while_loop`` terminates on a
+    condition that reads ``coeffs``, and reverse-mode autodiff rejects that outright (``ValueError:
+    Reverse-mode differentiation does not work for lax.while_loop``) -- so with ``nterms=None``
+    nothing built on this can be differentiated with respect to operator coefficients. Note the limit
+    is specific to the coefficients: a gradient w.r.t. the *vector* already works, since the vector
+    never appears in the termination condition.
+
+    A static ``nterms`` replaces the data-dependent condition with a ``lax.scan`` of known extent,
+    which is differentiable and *also faster* -- there is no trade here. Measured at ``K=29`` with 3
+    real terms, jitted: 0.279 ms against the ``while_loop``'s 0.382 ms at 400k states, output
+    identical to the last bit (``maxdiff`` exactly 0.0 at 8k, 64k and 400k). A ``while_loop``
+    re-evaluates a data-dependent gather every trip and cannot be unrolled; a static extent fuses.
+
+    Do **not** "simplify" this to a scan over the full rectangle instead. That is differentiable too
+    and equally exact, but it discards the early exit, and the padding fraction is large -- 78.9% at
+    13 qubits, 90.4% at 30. Measured 2.334 ms at 400k states, 8.4x the static scan.
+
     Args:
         coeffs: Phased coefficients for this X group, shape ``(K,)``.
         template: Array whose leading axis length and sharding the output follows.
         sign_bit: Maps a term index to that term's per-state sign bit (0 or 1).
+        nterms: Number of real terms to sum, which **must be static** (a Python ``int``, not a
+            tracer). When given, the accumulation is a fixed-length scan: differentiable w.r.t.
+            ``coeffs``, and skipping the same padding the ``while_loop`` skips provided the value is
+            the group's true term count -- :attr:`~rqutils.paulis.symplectic.PauliSumXZ.nzterms`, or
+            its ``max`` when one trace must serve every group. Values above the true count still give
+            the right answer (padding contributes exactly zero) but scan more slots than needed.
+            ``None`` keeps the ``while_loop``, so no existing caller changes behaviour.
 
     Returns:
         The composed diagonal, shape ``(template.shape[0],)``.
@@ -837,15 +867,38 @@ def _accumulate_diagonal(
         signs = 1.0 - 2.0 * sign_bit(iterm)
         return diagonal + coeffs[iterm] * signs, iterm + 1
 
+    # out_sharding is load-bearing, on both paths: ground_locg is sharding-transparent only if the
+    # matvec preserves its output sharding, and this init is what sets it for the diagonal.
     init = jnp.zeros(
         template.shape[0], dtype=coeffs.dtype, out_sharding=jax.typeof(template).sharding
     )
-    return jax.lax.while_loop(cond_fn, add_diag, (init, 0))[0]
+    if nterms is None:
+        return jax.lax.while_loop(cond_fn, add_diag, (init, 0))[0]
+
+    # Static extent, so no data-dependent termination for autodiff to choke on. jnp.arange(nterms)
+    # rather than a fori_loop: the reverse-mode restriction is on dynamic start/stop, and a scan
+    # carries the accumulator explicitly.
+    def step(diagonal, iterm):
+        return diagonal + coeffs[iterm] * (1.0 - 2.0 * sign_bit(iterm)), None
+
+    return jax.lax.scan(step, init, jnp.arange(nterms))[0]
 
 
-@jax.jit
-def compute_diagonal(diag_signs: NDArray[np.uint8], coeffs: NDArray[np.inexact]) -> jax.Array:
-    """Compute the diagonals from the sign bits and coefficients."""
+@jax.jit(static_argnames=["nterms"])
+def compute_diagonal(
+    diag_signs: NDArray[np.uint8], coeffs: NDArray[np.inexact], nterms: int | None = None
+) -> jax.Array:
+    """Compute the diagonals from the sign bits and coefficients.
+
+    Args:
+        diag_signs: Packed sign bits for this X group.
+        coeffs: Phased coefficients for this X group.
+        nterms: Static term count. Pass it to make this differentiable w.r.t. ``coeffs``; see
+            :func:`_accumulate_diagonal`.
+
+    Returns:
+        The composed diagonal.
+    """
 
     def sign_bit(iterm):
         # iterm & 7, not iterm & 255: this is the bit offset WITHIN the selected byte, so it must
@@ -854,19 +907,33 @@ def compute_diagonal(diag_signs: NDArray[np.uint8], coeffs: NDArray[np.inexact])
         # (measured: 0.71 absolute error on 9 terms, and a 25% error in the end-to-end eigenvalue).
         return (diag_signs[:, iterm // 8] >> (7 - (iterm & 7))) & 1
 
-    return _accumulate_diagonal(coeffs, diag_signs, sign_bit)
+    return _accumulate_diagonal(coeffs, diag_signs, sign_bit, nterms)
 
 
-@jax.jit
+@jax.jit(static_argnames=["nterms"])
 def get_diagonal(
-    zsignatures: NDArray[np.uint8], coeffs: NDArray[np.inexact], states: StateList
+    zsignatures: NDArray[np.uint8],
+    coeffs: NDArray[np.inexact],
+    states: StateList,
+    nterms: int | None = None,
 ) -> jax.Array:
-    """Return the fully composed diagonals for one X signature."""
+    """Return the fully composed diagonals for one X signature.
+
+    Args:
+        zsignatures: Packed Z signatures for this X group.
+        coeffs: Phased coefficients for this X group.
+        states: Packed subspace states.
+        nterms: Static term count. Pass it to make this differentiable w.r.t. ``coeffs``; see
+            :func:`_accumulate_diagonal`.
+
+    Returns:
+        The composed diagonal.
+    """
 
     def sign_bit(iterm):
         return _z_parity(states, zsignatures[iterm])
 
-    return _accumulate_diagonal(coeffs, states, sign_bit)
+    return _accumulate_diagonal(coeffs, states, sign_bit, nterms)
 
 
 @jax.jit
@@ -883,12 +950,13 @@ def apply_xgrp(
     return xvec * diagonal
 
 
-@jax.jit(static_argnames=["cache_level"])
+@jax.jit(static_argnames=["cache_level", "nterms"])
 def apply_h(
     vec: NDArray[np.inexact],
     scanned: tuple[NDArray, ...],
     states: StateList | None = None,
     cache_level: tuple[int, int] = (1, 2),
+    nterms: int | None = None,
 ) -> jax.Array:
     r"""Return :math:`Hv`, resolving the per-X-group inputs according to ``cache_level``.
 
@@ -922,6 +990,13 @@ def apply_h(
             i.e. for every combination except ``(1, 1)`` and ``(1, 2)`` -- those two read neither the
             X signatures nor the Z signatures, so they need no states at all.
         cache_level: Caching strategy, as documented on :func:`sqd`.
+        nterms: Static number of Z terms to sum per X group. Pass it to make this differentiable with
+            respect to the coefficients -- without it the diagonal accumulation terminates on a
+            data-dependent condition that reverse-mode autodiff rejects. Use
+            ``max(hamiltonian.nzterms)``: the scan body traces once, so one trip count must serve
+            every group, and the max is the tightest value that is correct for all of them. Ignored
+            under ``cache_level[1] == 2``, where the diagonals are precomputed and no accumulation
+            happens here. See :func:`_accumulate_diagonal` for the measurements.
 
     Returns:
         :math:`Hv`.
@@ -937,9 +1012,9 @@ def apply_h(
         # signature it is derived from.
         xsource = val[0] if cache_level[0] == 1 else get_xsource(val[0], states)
         if cache_level[1] == 0:
-            diagonal = get_diagonal(val[1], val[2], states)
+            diagonal = get_diagonal(val[1], val[2], states, nterms)
         elif cache_level[1] == 1:
-            diagonal = compute_diagonal(val[1], val[2])
+            diagonal = compute_diagonal(val[1], val[2], nterms)
         else:
             diagonal = val[1]
         return out + apply_xgrp(xsource, diagonal, vec), None

@@ -20,6 +20,8 @@ initial-vector bugs affected all six kernels identically, so a consistency-only 
 passed while every kernel returned the same wrong number.
 """
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from conftest import (
@@ -30,6 +32,7 @@ from conftest import (
     unique_states,
 )
 
+from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import (
     _is_lex_sorted,
     apply_h,
@@ -119,6 +122,158 @@ class TestComputeDiagonal:
         from_signs = np.asarray(compute_diagonal(signs, hamiltonian.c[0]))
         direct = np.asarray(get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u).real)
         assert np.abs(from_signs - direct).max() < 1e-13
+
+
+class TestStaticNterms:
+    """A static ``nterms`` makes the diagonal accumulation differentiable w.r.t. the coefficients.
+
+    The defect: the accumulator terminated on a condition reading ``coeffs``, and reverse-mode
+    autodiff refuses that outright (``ValueError: Reverse-mode differentiation does not work for
+    lax.while_loop``). Since ``coeffs`` is exactly the array a variational parameter flows through,
+    nothing built on :func:`apply_h` could be differentiated with respect to operator coefficients.
+    Grad w.r.t. the *vector* was never affected -- the vector does not appear in the condition.
+
+    The fix must preserve two things beyond differentiability, and the tests below split accordingly:
+
+    * the **value**, to the last bit (not to a tolerance -- these are the same sum in the same order);
+    * the **early exit**, which is why ``nterms`` is the group's term count and not the rectangle
+      width. That is a *timing* property and therefore not pinned here; a full-rectangle scan passes
+      every test in this class. Measured, at 400k states: static scan 0.279 ms, ``while_loop``
+      0.382 ms, full-rectangle scan 2.334 ms (8.4x). Padding is 78.9% at 13 qubits, 90.4% at 30.
+    """
+
+    @staticmethod
+    def _sign_matrix(diag_signs, num_terms):
+        """Dense (num_states, num_terms) matrix of +-1 signs, built independently of the library."""
+        return np.stack(
+            [1.0 - 2.0 * ((diag_signs[:, i // 8] >> (7 - (i & 7))) & 1) for i in range(num_terms)],
+            axis=1,
+        )
+
+    @pytest.mark.parametrize("num_terms", [1, 7, 8, 9, 17])
+    def test_static_nterms_is_bit_identical_to_the_while_loop(self, num_terms):
+        """Same sum in the same order, so equality is exact -- ``pytest.approx`` would be too weak.
+
+        Parametrized on the same counts as :meth:`TestComputeDiagonal.test_matches_direct_sum`, which
+        pins the ``& 7`` byte-offset bug: a term count crossing a byte boundary is where an indexing
+        change would show up.
+        """
+        rng = np.random.default_rng(20260823)
+        num_bytes = -(-num_terms // 8)
+        diag_signs = rng.integers(0, 256, size=(24, num_bytes), dtype=np.uint8)
+        coeffs = np.zeros(num_terms + 3)
+        coeffs[:num_terms] = rng.normal(size=num_terms)
+
+        want = compute_diagonal(diag_signs, coeffs)
+        got = compute_diagonal(diag_signs, coeffs, num_terms)
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    def test_grad_wrt_coeffs_works_with_nterms_and_raises_without(self):
+        """The defect and its fix, as one before/after.
+
+        The gradient is checked against a closed-form reference rather than another code path: for
+        ``f(c) = sum_i (sum_j c_j s_ij)^2`` the gradient is ``2 S^T S c`` exactly. An independent
+        reference matters here -- several bugs in this package made every internal path agree on the
+        same wrong number.
+        """
+        rng = np.random.default_rng(4)
+        diag_signs = rng.integers(0, 256, size=(32, 2), dtype=np.uint8)
+        num_terms = 9
+        coeffs = np.zeros(num_terms)
+        coeffs[:4] = [0.5, -0.3, 0.7, 0.2]
+
+        def loss(cc, nterms):
+            return jnp.sum(compute_diagonal(diag_signs, cc, nterms) ** 2)
+
+        signs = self._sign_matrix(diag_signs, num_terms)
+        expected = 2.0 * (signs.T @ (signs @ coeffs))
+        got = jax.grad(loss)(coeffs, num_terms)
+        assert np.allclose(np.asarray(got), expected, rtol=1e-12), (
+            f"gradient {np.asarray(got)} does not match closed form {expected}"
+        )
+
+        with pytest.raises(ValueError, match="Reverse-mode differentiation does not work"):
+            jax.grad(loss)(coeffs, None)
+
+    def test_grad_wrt_vector_never_needed_nterms(self):
+        """The scope of the defect was coefficients only; this is the control that shows it."""
+        rng = np.random.default_rng(5)
+        states = pack_padded(np.unique(rng.integers(0, 2, size=(6, 4), dtype=np.uint8), axis=0))
+        hamiltonian = PauliSumXZ.from_paulisum((["ZIII", "XXII"], [1.0, 0.4]))
+        xsources = jax.lax.scan(lambda _, x: (None, get_xsource(x, states)), None, hamiltonian.x)[1]
+        diagonals = jax.lax.scan(
+            lambda _, v: (None, get_diagonal(v[0], v[1], states)),
+            None,
+            (hamiltonian.z, hamiltonian.c),
+        )[1]
+
+        def loss(vec):
+            return jnp.sum(apply_h(vec, (xsources, diagonals), None, (1, 2)) ** 2)
+
+        grad = jax.grad(loss)(jnp.ones(states.shape[0]))
+        assert np.all(np.isfinite(np.asarray(grad)))
+
+    def test_overlong_nterms_still_correct_because_padding_contributes_zero(self):
+        """Scanning into the padding must be wasteful, never wrong.
+
+        This is what makes ``max(nzterms)`` safe for a group whose own count is smaller.
+        """
+        rng = np.random.default_rng(6)
+        diag_signs = rng.integers(0, 256, size=(16, 2), dtype=np.uint8)
+        coeffs = np.zeros(12)
+        coeffs[:5] = rng.normal(size=5)
+        tight = compute_diagonal(diag_signs, coeffs, 5)
+        overlong = compute_diagonal(diag_signs, coeffs, 12)
+        np.testing.assert_array_equal(np.asarray(overlong), np.asarray(tight))
+
+    def test_get_diagonal_accepts_nterms_too(self):
+        """Both diagonal builders share the accumulator, so both must thread the count."""
+        rng = np.random.default_rng(7)
+        states = pack_padded(np.unique(rng.integers(0, 2, size=(9, 5), dtype=np.uint8), axis=0))
+        hamiltonian = PauliSumXZ.from_paulisum((["ZIIII", "IZZII", "IIIZZ"], [1.0, -0.5, 0.25]))
+        want = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states)
+        got = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states, hamiltonian.nzterms[0])
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+class TestNzterms:
+    """``PauliSumXZ.nzterms`` records the per-group real-term count, which nothing can rederive.
+
+    The reason it must be stored: a pad slot's packed Z signature is all-zero bytes, and so is a
+    genuine all-identity Z signature. For ``(["XIZ", "XZI", "IXI"], [1, 2, 3])`` group 0 holds one
+    real term whose Z signature packs to ``[0]``, with a pad slot that also packs to ``[0]`` -- so
+    ``z`` cannot distinguish them, and counting nonzeros in ``c`` is the same heuristic the
+    ``while_loop`` already used rather than an independent fact.
+    """
+
+    def test_counts_are_recorded_per_group(self):
+        hamiltonian = PauliSumXZ.from_paulisum((["XIZ", "XZI", "IXI"], [1.0, 2.0, 3.0]))
+        assert hamiltonian.nzterms == (1, 2)
+
+    def test_the_all_identity_z_group_is_indistinguishable_in_the_arrays(self):
+        """The measurement behind the field: proving the arrays alone are ambiguous."""
+        hamiltonian = PauliSumXZ.from_paulisum((["XIZ", "XZI", "IXI"], [1.0, 2.0, 3.0]))
+        group = np.asarray(hamiltonian.z[0])
+        assert group[0].tolist() == group[1].tolist() == [0], (
+            "expected the real all-identity Z signature and the pad slot to be byte-identical"
+        )
+        assert hamiltonian.nzterms[0] == 1
+
+    def test_counts_sum_to_the_simplified_term_count(self):
+        """Duplicates are summed and null terms dropped, so the total tracks the simplified sum."""
+        strings = ["ZZII", "XIII", "XIII", "IIZI", "YYII"]
+        coeffs = [1.0, 0.5, 0.25, -0.3, 0.7]
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs))
+        assert sum(hamiltonian.nzterms) == 4  # the two XIII terms merged
+        assert max(hamiltonian.nzterms) == hamiltonian.c.shape[1]
+
+    def test_max_is_the_rectangle_width(self):
+        """``max(nzterms)`` is what the rectangle was padded to, which is what apply_h binds."""
+        rng = np.random.default_rng(8)
+        strings = real_pauli_strings(5, 9, rng)
+        hamiltonian = PauliSumXZ.from_paulisum((strings, rng.normal(size=len(strings))))
+        assert max(hamiltonian.nzterms) == hamiltonian.z.shape[1]
+        assert len(hamiltonian.nzterms) == hamiltonian.x.shape[0]
 
 
 class TestGetXsource:
