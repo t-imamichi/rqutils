@@ -370,9 +370,17 @@ def hproj(
             lex-sorted**, skipping the internal ``np.unique(..., axis=0)``. Both halves are
             required, because :func:`get_xsource` binary-searches into ``states``; violating either
             raises :class:`ValueError`. Sortedness is validated on this path (host-side numpy,
-            measured 12-14% of the call), so an unsorted subspace is rejected rather than silently
+            measured 12-18% of the call), so an unsorted subspace is rejected rather than silently
             projected into a wrong, non-symmetric matrix as it was before. Leave this ``False`` to
             skip the check and have ``hproj`` sort for you.
+
+            **Passing ``True`` with already-unique states is the faster path, not merely a way to
+            avoid repeating work.** The validation is an O(N) adjacent-row comparison in place of
+            ``np.unique``'s O(N log N) sort -- 0.12 ms against 2.96 ms at N=4064, ~24x cheaper -- so
+            end-to-end ``hproj`` measures 1.4x faster at N=466, rising to 2.6x at N=2545 as the sort
+            it displaces grows. Beware two wrong numbers when re-measuring: a cold-versus-warm
+            comparison reads 55x, and timing the validation predicate alone reads 4.8-6.6% rather
+            than the 12-18% an A/B of the whole call gives.
 
     Returns:
         The projected Hamiltonian as a sparse matrix.
@@ -399,8 +407,18 @@ def hproj(
         states = np.unique(states, axis=0)
     else:
         # get_xsource binary-searches into `states`, so unsorted rows silently produced a wrong,
-        # non-symmetric matrix. Validated rather than documented away, at 12-14% of hproj and only on
-        # this opt-in path -- the branch above is sorted by construction and pays nothing.
+        # non-symmetric matrix. Validated rather than documented away, and only on this opt-in path --
+        # the branch above is sorted by construction and pays nothing.
+        #
+        # Cost re-confirmed by A/B against 2a89f94~1 (the revision before this guard), per the
+        # whole-call rule: 1.052 -> 1.239 ms at N=1580 and 1.131 -> 1.276 ms at N=2545, i.e. 17.8% and
+        # 12.8%. Timing _is_lex_sorted alone instead reads 4.8-6.6% -- the same predicate-only
+        # underestimate CLAUDE.md warns about, so do not "correct" this figure downward from it.
+        #
+        # Worth it regardless, because the guard displaces np.unique's O(N log N) sort with an O(N)
+        # adjacent-row comparison: passing already-unique states makes hproj 1.4x faster at N=466,
+        # rising to 2.6x at N=2545. This path is the faster one, not merely a way to skip work you
+        # have already done.
         if not _is_lex_sorted(states):
             raise ValueError(
                 "unique_states=True requires `states` to be uniquified and lex-sorted, but the "
