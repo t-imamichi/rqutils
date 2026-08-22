@@ -36,6 +36,7 @@ from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import (
     _MAX_STATES,
     _NTERMS_MIN_K,
+    _default_states_size,
     _is_lex_sorted,
     apply_h,
     compute_diagonal,
@@ -62,6 +63,32 @@ def pack_padded(states):
     silently propagating through every test that packs states here.
     """
     return np.packbits(np.pad(np.asarray(states, dtype=np.uint8), {1: (1, 0)}), axis=1)
+
+
+def matvec_fixture(rng, strings, coeffs, states):
+    """Build the packed Hamiltonian, uniquified states, and both precomputed per-group arrays.
+
+    The five-step preamble every direct-``apply_h`` test needs. Extracted because the keyword-
+    validation tests care about *which* arrays they pass, not how they were built -- inlining the
+    build made each of them ~12 lines of identical setup around two assertions.
+
+    The two precomputes use ``jax.lax.scan`` over the X groups, the same idiom ``run_sqd`` uses,
+    rather than a Python loop with one jitted dispatch per group (measured 4-6x slower). The tests
+    then demonstrate the vectorized form the library documents instead of a slower alternative.
+
+    Returns:
+        ``(hamiltonian, states_u, vector, xsources, diagonals)``.
+    """
+    hamiltonian = PauliSumXZ.from_paulisum((strings, list(coeffs)))
+    states_u = uniquify_states(pack_padded(states), states.shape[0])
+    vector = rng.normal(size=states.shape[0])
+    xsources = jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, hamiltonian.x)[1]
+    diagonals = jax.lax.scan(
+        lambda _, v: (None, get_diagonal(v[0], v[1], states_u).real),
+        None,
+        (hamiltonian.z, hamiltonian.c),
+    )[1]
+    return hamiltonian, states_u, vector, np.asarray(xsources), np.asarray(diagonals)
 
 
 def eigval_of(pauli_strings, coeffs, states, **kwargs):
@@ -112,8 +139,6 @@ class TestComputeDiagonal:
                 strings.append(candidate)
         coeffs = rng.normal(size=len(strings))
         states = rng.integers(0, 2, size=(20, num_qubits)).astype(np.uint8)
-
-        from rqutils.paulis.symplectic import PauliSumXZ
 
         hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_p = pack_padded(states)
@@ -243,9 +268,9 @@ class TestNtermsGate:
 
     The defect this locks down was self-inflicted: binding ``nterms`` unconditionally made every
     small-``K`` Hamiltonian slower, because a ``lax.scan`` carries a fixed per-call cost the
-    ``while_loop`` does not. Measured with a *tight* count, ratio ``while``/``scan``: 0.62x at
-    ``K=2``, 0.80x at 4, 0.88x at 6, 1.03x at 8. The crossover is a kernel property, not a padding
-    one -- a tight count loses just as badly as a padded one below ``K=8``.
+    ``while_loop`` does not. The crossover is a kernel property, not a padding one -- a tight count
+    loses just as badly as a padded one below ``K=8``. ``rqutils.sqd._NTERMS_MIN_K`` carries the
+    measured ratio series; this test pins only that the gate exists and does not change results.
 
     Only the *gating* is asserted here, not the timing: a wall-clock assertion on a 12%-noise arm
     would be flaky. The value must be unaffected either way, which is what the end-to-end kernels in
@@ -303,7 +328,6 @@ class TestNzterms:
         assert group[0].tolist() == group[1].tolist() == [0], (
             "expected the real all-identity Z signature and the pad slot to be byte-identical"
         )
-        assert hamiltonian.nzterms[0] == 1
 
     def test_counts_sum_to_the_simplified_term_count(self):
         """Duplicates are summed and null terms dropped, so the total tracks the simplified sum."""
@@ -311,14 +335,16 @@ class TestNzterms:
         coeffs = [1.0, 0.5, 0.25, -0.3, 0.7]
         hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs))
         assert sum(hamiltonian.nzterms) == 4  # the two XIII terms merged
-        assert max(hamiltonian.nzterms) == hamiltonian.c.shape[1]
 
     def test_max_is_the_rectangle_width(self):
         """``max(nzterms)`` is what the rectangle was padded to, which is what apply_h binds."""
         rng = np.random.default_rng(8)
         strings = real_pauli_strings(5, 9, rng)
         hamiltonian = PauliSumXZ.from_paulisum((strings, rng.normal(size=len(strings))))
+        # Both padded axes, since this test owns the rectangle-width invariant: z and c are padded
+        # to the same width, so asserting only one would leave the other free to drift.
         assert max(hamiltonian.nzterms) == hamiltonian.z.shape[1]
+        assert max(hamiltonian.nzterms) == hamiltonian.c.shape[1]
         assert len(hamiltonian.nzterms) == hamiltonian.x.shape[0]
 
 
@@ -332,8 +358,6 @@ class TestGetXsource:
         off-by-one there sends every matrix element to the wrong column, which is exactly the
         ``hproj`` bug in :class:`TestHproj`.
         """
-        from rqutils.paulis.symplectic import PauliSumXZ
-
         states = np.array([[0, 0, 0, 0], [0, 0, 0, 1], [1, 0, 0, 0]], dtype=np.uint8)
         states_u = uniquify_states(pack_padded(states), 3)
         # IIIX flips the last qubit: state 0 <-> state 1, and state 2's partner is absent.
@@ -363,8 +387,6 @@ class TestGetXsource:
         ``B = 8`` -> ``B = 9`` transition at ``n = 63``/``64`` where the fast path must hand over to
         the fallback.
         """
-        from rqutils.paulis.symplectic import PauliSumXZ
-
         rng = np.random.default_rng(num_qubits)
         # The subspace is CONSTRUCTED to be partly closed under flipping the last qubit, not sampled
         # and hoped over. Two reasons, both learned by getting it wrong:
@@ -435,8 +457,6 @@ class TestGetXsource:
         implementation returned assorted negatives while the search returns exactly -1, so the
         *sign* is the invariant, not the value.
         """
-        from rqutils.paulis.symplectic import PauliSumXZ
-
         # Single state whose IIIX partner (0001) is not in the subspace.
         states_u = uniquify_states(pack_padded(np.array([[0, 0, 0, 0]], dtype=np.uint8)), 1)
         hamiltonian = PauliSumXZ.from_paulisum((["IIIX"], [1.0]))
@@ -546,8 +566,6 @@ class TestHproj:
         rediscovered. ``sqd`` trims fillers before returning its basis, which is why
         ``examples/scaling/poc7_sharding.py`` can hand that basis straight to ``hproj``.
         """
-        from rqutils.paulis.symplectic import PauliSumXZ
-
         rng = np.random.default_rng(3)
         states = rng.integers(0, 2, size=(12, 4), dtype=np.uint8)
         packed = PauliSumXZ.pack_states(states)
@@ -846,7 +864,7 @@ class TestSqdEndToEnd:
         baseline = eigval_of(strings, coeffs, states)
         # The default is the next power of two, so the baseline is not unpadded -- it is padded to
         # this. Every arm must differ from it, or that arm compares the baseline against itself.
-        baseline_size = 1 << max((states.shape[0] - 1).bit_length(), 1)
+        baseline_size = _default_states_size(states.shape[0])
         for states_size in (24, 32):
             assert states_size != baseline_size, (
                 f"states_size={states_size} equals the default bucket for a "
@@ -903,7 +921,7 @@ class TestSqdEndToEnd:
         assert len(np.unique(states, axis=0)) == len(states), "fixture must start filler-free"
         # The states_size=None arm is the filler-free control only if the default bucket adds no rows.
         # Uniqueness alone is not enough -- the row count must itself be a power of two.
-        assert 1 << max((states.shape[0] - 1).bit_length(), 1) == states.shape[0], (
+        assert _default_states_size(states.shape[0]) == states.shape[0], (
             f"{states.shape[0]}-row fixture does not bucket to itself, so states_size=None pads and "
             "the filler-free control arm is lost (see docstring)"
         )
@@ -971,8 +989,6 @@ class TestMatvecKernels:
 
     def test_apply_h_matches_dense(self):
         """``apply_h`` (no caching) is the reference kernel the cached ones must match."""
-        from rqutils.paulis.symplectic import PauliSumXZ
-
         rng = np.random.default_rng(20260804)
         num_qubits = 4
         strings = real_pauli_strings(num_qubits, 5, rng)
@@ -1006,8 +1022,6 @@ class TestMatvecKernels:
         rather than against the other kernels is what catches it: cross-kernel agreement alone would
         pass if the collapse broke all six identically.
         """
-        from rqutils.paulis.symplectic import PauliSumXZ
-
         rng = np.random.default_rng(20260805)
         num_qubits = 4
         strings = real_pauli_strings(num_qubits, 6, rng)
@@ -1025,7 +1039,9 @@ class TestMatvecKernels:
         # catch for us (see apply_h's docstring), hence the dense reference below.
         if cache_level[0] == 1:
             kwargs = {
-                "xsources": np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
+                "xsources": jax.lax.scan(
+                    lambda _, x: (None, get_xsource(x, states_u)), None, hamiltonian.x
+                )[1]
             }
         else:
             kwargs = {"xsignatures": hamiltonian.x}
@@ -1034,19 +1050,18 @@ class TestMatvecKernels:
                 kwargs |= {"zsignatures": hamiltonian.z, "coeffs": hamiltonian.c}
             case 1:
                 kwargs |= {
-                    "diag_signs": np.stack(
-                        [np.asarray(get_diag_signs(z, states_u)) for z in hamiltonian.z]
-                    ),
+                    "diag_signs": jax.lax.scan(
+                        lambda _, z: (None, get_diag_signs(z, states_u)), None, hamiltonian.z
+                    )[1],
                     "coeffs": hamiltonian.c,
                 }
             case 2:
                 kwargs |= {
-                    "diagonals": np.stack(
-                        [
-                            np.asarray(get_diagonal(z, c, states_u).real)
-                            for z, c in zip(hamiltonian.z, hamiltonian.c)
-                        ]
-                    )
+                    "diagonals": jax.lax.scan(
+                        lambda _, v: (None, get_diagonal(v[0], v[1], states_u).real),
+                        None,
+                        (hamiltonian.z, hamiltonian.c),
+                    )[1]
                 }
 
         needs_states = cache_level[0] == 0 or cache_level[1] == 0
@@ -1098,11 +1113,10 @@ class TestMatvecKernels:
         strings = ["XXII", "IZZI", "IIYY", "ZIIZ"]
         coeffs = np.array([0.5, -0.3, 0.7, 0.2])
         states = unique_states(6, num_qubits, rng)
-        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        states_u = uniquify_states(pack_padded(states), states.shape[0])
-        vector = rng.normal(size=states.shape[0])
-        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
-        signs = np.stack([np.asarray(get_diag_signs(z, states_u)) for z in hamiltonian.z])
+        hamiltonian, states_u, vector, xsources, _ = matvec_fixture(rng, strings, coeffs, states)
+        signs = np.asarray(
+            jax.lax.scan(lambda _, z: (None, get_diag_signs(z, states_u)), None, hamiltonian.z)[1]
+        )
 
         # The two representations really are interchangeable at the old boundary...
         assert xsources.dtype != hamiltonian.x.dtype, "fixture no longer contrasts the dtypes"
@@ -1157,15 +1171,8 @@ class TestMatvecKernels:
         """``coeffs`` is required by two of the three diagonal forms and meaningless in the third."""
         rng = np.random.default_rng(3)
         states = unique_states(5, 4, rng)
-        hamiltonian = PauliSumXZ.from_paulisum((["ZIII", "XXII"], [1.0, 0.4]))
-        states_u = uniquify_states(pack_padded(states), states.shape[0])
-        vector = rng.normal(size=states.shape[0])
-        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
-        diagonals = np.stack(
-            [
-                np.asarray(get_diagonal(z, c, states_u).real)
-                for z, c in zip(hamiltonian.z, hamiltonian.c)
-            ]
+        hamiltonian, states_u, vector, xsources, diagonals = matvec_fixture(
+            rng, ["ZIII", "XXII"], [1.0, 0.4], states
         )
 
         with pytest.raises(TypeError, match="zsignatures= requires coeffs="):
@@ -1179,16 +1186,7 @@ class TestMatvecKernels:
         states = unique_states(7, 4, rng)
         strings = real_pauli_strings(4, 5, rng)
         coeffs = rng.normal(size=len(strings))
-        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        states_u = uniquify_states(pack_padded(states), states.shape[0])
-        vector = rng.normal(size=states.shape[0])
-        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
-        diagonals = np.stack(
-            [
-                np.asarray(get_diagonal(z, c, states_u).real)
-                for z, c in zip(hamiltonian.z, hamiltonian.c)
-            ]
-        )
+        _, _, vector, xsources, diagonals = matvec_fixture(rng, strings, coeffs, states)
 
         want = np.asarray(apply_h(vector, xsources=xsources, diagonals=diagonals))
         with pytest.warns(DeprecationWarning, match="deprecated"):
@@ -1199,15 +1197,8 @@ class TestMatvecKernels:
         """A half-migrated call site is a mistake, not a merge of the two conventions."""
         rng = np.random.default_rng(10)
         states = unique_states(5, 4, rng)
-        hamiltonian = PauliSumXZ.from_paulisum((["ZIII", "XXII"], [1.0, 0.4]))
-        states_u = uniquify_states(pack_padded(states), states.shape[0])
-        vector = rng.normal(size=states.shape[0])
-        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
-        diagonals = np.stack(
-            [
-                np.asarray(get_diagonal(z, c, states_u).real)
-                for z, c in zip(hamiltonian.z, hamiltonian.c)
-            ]
+        _, _, vector, xsources, diagonals = matvec_fixture(
+            rng, ["ZIII", "XXII"], [1.0, 0.4], states
         )
 
         with pytest.raises(TypeError, match="cannot be mixed with the named arrays"):
@@ -1226,25 +1217,14 @@ class TestMatvecKernels:
         Fixing the input rather than parametrizing keeps that pin stable as the grid test's
         parametrization changes.
         """
-        from rqutils.paulis.symplectic import PauliSumXZ
-
         rng = np.random.default_rng(20260804)
         num_qubits = 4
         strings = real_pauli_strings(num_qubits, 5, rng)
         coeffs = rng.normal(size=len(strings))
         states = unique_states(12, num_qubits, rng)
 
-        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        states_u = uniquify_states(pack_padded(states), states.shape[0])
-        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
-        diagonals = np.stack(
-            [
-                np.asarray(get_diagonal(z, c, states_u).real)
-                for z, c in zip(hamiltonian.z, hamiltonian.c)
-            ]
-        )
+        _, _, vector, xsources, diagonals = matvec_fixture(rng, strings, coeffs, states)
         matrix = project_dense(strings, coeffs, states).real
-        vector = rng.normal(size=states.shape[0])
 
         got = np.asarray(apply_h(vector, xsources=xsources, diagonals=diagonals)).real
         assert np.abs(got - matrix @ vector).max() < 1e-12

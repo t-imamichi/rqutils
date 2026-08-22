@@ -21,7 +21,7 @@ import warnings
 
 import numpy as np
 import pytest
-from conftest import dense_pauli_sum, gate_unitary
+from conftest import dense_pauli_sum, gate_unitary, herm
 
 from rqutils.paulis.symplectic import PauliSumXZ
 
@@ -257,8 +257,7 @@ class TestHermiticityTolerance:
         from qiskit.quantum_info import Operator, SparsePauliOp
 
         rng = np.random.default_rng(seed)
-        mat = rng.normal(size=(2**n, 2**n)) + 1j * rng.normal(size=(2**n, 2**n))
-        ham = mat + mat.conj().T
+        ham = herm(2**n, rng)
         circuit = qiskit.QuantumCircuit(n)
         for qubit in range(n):
             circuit.ry(0.37 * (qubit + 1), qubit)

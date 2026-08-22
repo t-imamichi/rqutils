@@ -207,6 +207,19 @@ LOG = logging.getLogger(__name__)
 _MAX_STATES = 2**31 - 1
 
 
+def _default_states_size(num_states: int) -> int:
+    """Return the default ``states_size`` for a subspace of ``num_states`` rows.
+
+    The next power of two at or above ``num_states``, floored at 2. Named rather than inlined so the
+    tests that assert what the default *is* pin this rule instead of restating it -- a restatement
+    would keep passing against a changed rule, silently turning those comparisons into tautologies.
+
+    The floor matters only for degenerate input (0, 1 or 2 rows all give 2); it exists so a subspace
+    can never be bucketed to a single slot, where the filler machinery has no room to work.
+    """
+    return 1 << max((num_states - 1).bit_length(), 1)
+
+
 type HamiltonianInput = PauliSumXZ | tuple[Sequence[str], Sequence[Number]]
 try:
     from qiskit.quantum_info import SparsePauliOp
@@ -299,7 +312,7 @@ def sqd(
         #
         # Purely a shape knob: the padding is not observable, since filler slots are excluded from the
         # projection and trimmed off the returned basis below. Pass an explicit value to override.
-        states_size = 1 << max((states.shape[0] - 1).bit_length(), 1)
+        states_size = _default_states_size(states.shape[0])
     if states_size < states.shape[0]:
         raise ValueError("states_size smaller than the states array length")
     # The 2^31 ceiling the module docstring calls a hard limit, actually enforced. Subspace positions
@@ -410,15 +423,10 @@ def hproj(
         # non-symmetric matrix. Validated rather than documented away, and only on this opt-in path --
         # the branch above is sorted by construction and pays nothing.
         #
-        # Cost re-confirmed by A/B against 2a89f94~1 (the revision before this guard), per the
-        # whole-call rule: 1.052 -> 1.239 ms at N=1580 and 1.131 -> 1.276 ms at N=2545, i.e. 17.8% and
-        # 12.8%. Timing _is_lex_sorted alone instead reads 4.8-6.6% -- the same predicate-only
-        # underestimate CLAUDE.md warns about, so do not "correct" this figure downward from it.
-        #
-        # Worth it regardless, because the guard displaces np.unique's O(N log N) sort with an O(N)
-        # adjacent-row comparison: passing already-unique states makes hproj 1.4x faster at N=466,
-        # rising to 2.6x at N=2545. This path is the faster one, not merely a way to skip work you
-        # have already done.
+        # Cost provenance, which the docstring above does not carry: A/B'd against 2a89f94~1 (the
+        # revision before this guard) per the whole-call rule -- 1.052 -> 1.239 ms at N=1580 and
+        # 1.131 -> 1.276 ms at N=2545. See the `unique_states` docstring for what those percentages
+        # mean and for the two ways of mis-measuring them.
         if not _is_lex_sorted(states):
             raise ValueError(
                 "unique_states=True requires `states` to be uniquified and lex-sorted, but the "
@@ -595,22 +603,27 @@ def run_sqd(
     # differentiability -- a caller who does passes nterms to apply_h directly -- so here the only
     # question is speed, and below the crossover the while_loop is the faster kernel.
     #
-    # _apply_h_resolved, not the public apply_h: the tuple is assembled above under a static
-    # cache_level precisely so the packing stays static, which is the resolved kernel's contract. The
-    # public entry point exists to stop *callers* mispairing the two; here they are built together.
+    # _apply_h_resolved, not the public apply_h, for a mechanical reason and not merely because the
+    # pairing is safe here: this code already holds an assembled `scanned` tuple and must bind the
+    # statics via functools.partial for ground_locg's positional splat. Routing through the public
+    # wrapper would mean unpacking that tuple back into six keywords so the wrapper could reassemble
+    # it -- pure churn on the matvec path. So don't "simplify" by deleting the private kernel and
+    # jitting apply_h; tests would still pass and the solver would pay for it.
     solver_nterms = max(hamiltonian.nzterms)
-    matvec = functools.partial(
-        _apply_h_resolved,
-        cache_level=cache_level,
-        nterms=solver_nterms if solver_nterms >= _NTERMS_MIN_K else None,
-    )
+    matvec_nterms = solver_nterms if solver_nterms >= _NTERMS_MIN_K else None
+    matvec = functools.partial(_apply_h_resolved, cache_level=cache_level, nterms=matvec_nterms)
     args = (scanned, states_u if needs_states else None)
 
     def vinit_from_min_diag():
         if cache_level[1] == 2:
             diagonal = diagonals[0]
         else:
-            diagonal = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u).real
+            # Same nterms the matvec uses: this computes the same diagonal by the same kernel, so
+            # leaving it ungated would trace the accumulator a second time under a different static
+            # key within this one trace, and would let the two drift if the accumulator changed.
+            diagonal = get_diagonal(
+                hamiltonian.z[0], hamiltonian.c[0], states_u, matvec_nterms
+            ).real
         # Set the fill-in components to the maximum value so that argmin only sees the valid entries
         diagonal = jnp.where(_is_filler(states_u) == 1, jnp.max(diagonal), diagonal)
         imin = jnp.argmin(diagonal)
@@ -715,7 +728,7 @@ def _is_lex_sorted(states: NDArray[np.uint8]) -> bool:
     first differing byte -- equal rows count as *unsorted*, since `get_xsource`'s precondition is
     uniquified-and-sorted and a duplicate row makes the projection ambiguous either way.
 
-    One vectorized pass, no early exit, so unsorted input costs the same as sorted. Measured at 12-14%
+    One vectorized pass, no early exit, so unsorted input costs the same as sorted. Measured at 12-18%
     of `hproj` (A/B'd end-to-end; both are `O(N)`, so the ratio is flat in N) and ~20 ms standalone at
     N=1M, flat in `B`. Cheap enough to be unconditional on a debug/reference path, in exchange for
     turning a silent wrong answer into a raise. :func:`sqd` never reaches `hproj`, so it is unaffected.
@@ -924,14 +937,12 @@ def _accumulate_diagonal(
     the last bit either way (``maxdiff`` exactly 0.0, measured at 8k, 64k and 400k states).
 
     **It is not uniformly faster, and the crossover is a property of the kernel rather than of the
-    padding.** A ``lax.scan`` carries a fixed per-call cost the ``while_loop`` does not, so with a
-    *tight* count -- no padding scanned at all -- the ratio ``while``/``scan`` measures 0.62x at
-    ``K=2``, 0.80x at 4, 0.88x at 6, 1.03x at 8, then stays above 1 through ``K=32``. At ``K=29``
-    with 3 real terms it is 1.09x, and at 400k states 0.279 ms against 0.382 ms. Padding moves the
-    magnitude, not the crossover. The noise band on this arm is 12%, so a ratio within that of 1.0 is
-    unresolved. :data:`_NTERMS_MIN_K` is where :func:`run_sqd` draws the line for its own use; a
-    caller who needs the gradient passes ``nterms`` regardless of ``K``, since correctness of the
-    derivative is not a speed question.
+    padding.** A ``lax.scan`` carries a fixed per-call cost the ``while_loop`` does not, so below
+    roughly 8 terms the ``while_loop`` wins even with no padding to skip. :data:`_NTERMS_MIN_K`
+    carries the measured series and is where :func:`run_sqd` draws the line for its own use. What is
+    specific to this function: at ``K=29`` with 3 real terms the scan is 1.09x, and at 400k states
+    0.279 ms against 0.382 ms. A caller who needs the gradient passes ``nterms`` regardless of
+    ``K``, since correctness of the derivative is not a speed question.
 
     **Verified negative result: do not unroll the X-group loop to give each group its own count.**
     ``apply_h`` scans over X groups, so one trip count must serve all of them and skewed
@@ -1187,8 +1198,12 @@ def apply_h(
 
     Args:
         vec: Vector to multiply.
-        scanned: Deprecated. The positional tuple form, paired with ``cache_level``; see
-            :func:`_apply_h_resolved` for its layouts. Emits a :exc:`DeprecationWarning`.
+        scanned: Deprecated. The positional tuple form, whose members are interpreted by position
+            according to ``cache_level``: ``(0, 0)`` ``(xsignatures, zsignatures, coeffs)``;
+            ``(0, 1)`` ``(xsignatures, diag_signs, coeffs)``; ``(0, 2)``
+            ``(xsignatures, diagonals)``; ``(1, 0)`` ``(xsources, zsignatures, coeffs)``;
+            ``(1, 1)`` ``(xsources, diag_signs, coeffs)``; ``(1, 2)`` ``(xsources, diagonals)``.
+            Emits a :exc:`DeprecationWarning` -- pass the arrays by name instead.
         states: Uniquified state list. Required whenever the X signatures or the Z signatures are
             supplied, i.e. for every combination except ``xsources`` with ``diag_signs`` and
             ``xsources`` with ``diagonals`` -- those two read neither, so they need no states at all.
@@ -1244,9 +1259,11 @@ def apply_h(
             DeprecationWarning,
             stacklevel=2,
         )
-        return _apply_h_resolved(
-            vec, scanned, states, (1, 2) if cache_level is None else cache_level, nterms
-        )
+        # cache_level omitted with a tuple is legal in the old API; let the kernel's own default
+        # apply rather than restating it here, where it could drift from the signature.
+        if cache_level is None:
+            return _apply_h_resolved(vec, scanned, states, nterms=nterms)
+        return _apply_h_resolved(vec, scanned, states, cache_level, nterms)
 
     # Each axis is (name, cache_level digit, array). Pairing the three here means the axis is
     # resolved, validated and unpacked from one list, with no lookup table to keep in step.

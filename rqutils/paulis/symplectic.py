@@ -295,7 +295,7 @@ class PauliSumXZ:
         # counts is the per-group real-term count; keep it rather than letting it fall out of scope.
         # Nothing downstream can rederive it (see the nzterms docstring), and a static trip count over
         # the real terms is what makes the diagonal accumulation differentiable.
-        return cls(xsignatures, zsignatures, phcoeffs, num_qubits, tuple(int(n) for n in counts))
+        return cls(xsignatures, zsignatures, phcoeffs, num_qubits, tuple(counts.tolist()))
 
     @property
     def arrays(self) -> tuple[jax.Array, jax.Array, jax.Array]:
