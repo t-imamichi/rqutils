@@ -134,7 +134,7 @@ class PauliSumXZ:
         return np.unpackbits(states_p, axis=-1)[:, 1 : 1 + num_qubits]
 
     @classmethod
-    def from_paulisum(cls, paulisum: Any) -> "PauliSumXZ":
+    def from_paulisum(cls, paulisum: Any, atol: float = 1e-12) -> "PauliSumXZ":
         """Build the packed representation from a Pauli sum.
 
         The only constructor, and the signature half of the bit-alignment contract: it inserts the
@@ -150,6 +150,11 @@ class PauliSumXZ:
             paulisum: Either a ``(paulis, coeffs)`` tuple of a Pauli-string sequence and a matching
                 coefficient sequence, or a qiskit ``SparsePauliOp``. Qiskit's ``.x``/``.z`` are
                 reversed on ingest, since this class is little-endian in qubit order.
+            atol: Absolute tolerance on the imaginary part of each coefficient. A coefficient whose
+                ``|imag|`` exceeds this raises; anything at or below it is treated as rounding and
+                discarded. The default admits operators that are Hermitian to float64 rounding --
+                which is what decomposing a numerically-conjugated Hermitian matrix produces -- while
+                still rejecting genuinely complex coefficients. Pass ``0.0`` for an exact test.
 
         Returns:
             The packed representation.
@@ -157,9 +162,10 @@ class PauliSumXZ:
         Raises:
             ValueError: If the Pauli and coefficient sequences differ in length; if the Pauli strings
                 are not all the same length; if ``paulisum`` is neither a tuple nor a
-                ``SparsePauliOp``; or if any coefficient has a nonzero imaginary part, since a
-                complex coefficient makes the operator non-Hermitian and every consumer of this class
-                assumes Hermiticity. There is no flag to bypass the last check.
+                ``SparsePauliOp``; or if any coefficient's imaginary part exceeds ``atol`` in absolute
+                value, since a complex coefficient makes the operator non-Hermitian and every consumer
+                of this class assumes Hermiticity. There is no flag to bypass the last check --
+                ``atol`` sets where rounding ends, not whether the check runs.
         """
         if isinstance(paulisum, tuple):  # ([paulis], [coeffs])
             paulis, coeffs = paulisum
@@ -204,10 +210,28 @@ class PauliSumXZ:
         # agree: the Qiskit branch always raised, while the tuple branch used to warn and silently
         # take .real under force_real=True -- discarding the imaginary part of a non-Hermitian
         # operator rather than rejecting it.
-        if np.any(coeffs.imag != 0.0):
+        #
+        # The comparison is against `atol`, not exact zero. A mathematically Hermitian operator whose
+        # Pauli coefficients were obtained *numerically* carries rounding at the 1e-16 level, and an
+        # exact test refuses it: conjugating a Hermitian matrix by a non-Clifford circuit and
+        # decomposing the result -- the standard way to build a rotated Hamiltonian -- was measured to
+        # be rejected 18 times out of 18 (n = 3, 4, 5 x 6 seeds) at a largest coefficient |imag| of
+        # 3.3e-16, while those same operators' own hermiticity error reached 2.7e-15. The residue
+        # being rejected was an order of magnitude *smaller* than the property it was testing for.
+        #
+        # This is NOT a return to force_real. That took .real on operators with genuinely nonzero
+        # imaginary parts, discarding real signal; the tolerance still rejects those loudly and only
+        # accepts values indistinguishable from zero at float64. The default sits ~4 orders above the
+        # observed rounding and many orders below any physical coefficient, so the two cases stay
+        # cleanly separated; pass a smaller `atol` to tighten it, or 0.0 to restore the exact test.
+        if np.any(np.abs(coeffs.imag) > atol):
+            worst = np.abs(coeffs.imag).max()
             raise ValueError(
-                "Coefficients of Paulis must be real for the Hamiltonian to be Hermitian."
+                "Coefficients of Paulis must be real for the Hamiltonian to be Hermitian; "
+                f"largest |imag| is {worst:.3e}, above atol={atol:.3e}."
             )
+        # Discard the sub-atol rounding rather than carrying it: every downstream consumer indexes
+        # `.c` expecting a real dtype where the folded phase permits one.
         coeffs = coeffs.real
 
         # Find unique X signatures together with correspondence pointers

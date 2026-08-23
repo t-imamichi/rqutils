@@ -229,6 +229,139 @@ class TestCoefficientDtype:
             PauliSumXZ.from_paulisum(qiskit.quantum_info.SparsePauliOp(["XX"], [1.0 + 1.0j]))
 
 
+class TestHermiticityTolerance:
+    """The imaginary-part check is against ``atol``, not exact zero.
+
+    The exact test refused operators that are Hermitian *to float64 rounding*, which is what you get
+    whenever the Pauli coefficients were obtained numerically rather than written down. Measured on
+    the standard construction -- conjugate a Hermitian matrix by a non-Clifford circuit, decompose the
+    result -- **18 of 18** operators (n = 3, 4, 5 x 6 seeds) were rejected at a largest coefficient
+    ``|imag|`` of **3.3e-16**, while those same operators' own hermiticity error reached **2.7e-15**.
+    The residue being rejected was an order of magnitude smaller than the property under test.
+
+    The defect these tests lock down is the *pair*: widening must not become the ``force_real``
+    behaviour deleted before it (see :class:`TestCoefficientDtype`), which discarded genuine signal.
+    So every test below comes with its opposite -- rounding is accepted, and real signal still raises.
+    """
+
+    # 1e-11 is one order above the 1e-12 default, 1e-6 is far above, 0.5j is unmistakable.
+    @pytest.mark.parametrize("imag", [0.5, 1e-6, 1e-11])
+    def test_genuine_complex_signal_still_raises(self, imag):
+        """A tolerance must not silently truncate real signal -- that was ``force_real``'s defect.
+
+        The 1e-11 case is the tight one: it is only 10x the default ``atol`` and would be invisible in
+        any eyeball check of the coefficients, but it is 5 orders above the 3.3e-16 rounding this
+        tolerance exists to admit, so the two regimes do not overlap.
+        """
+        with pytest.raises(ValueError, match="must be real for the Hamiltonian to be Hermitian"):
+            PauliSumXZ.from_paulisum((["ZI", "IZ"], [1.0, 1.0 + imag * 1.0j]))
+
+    def test_error_message_reports_the_offending_magnitude(self):
+        """The raise names the largest ``|imag|`` and the ``atol`` it exceeded.
+
+        Without both numbers a caller hitting this cannot tell "my operator is not Hermitian" from
+        "my ``atol`` is too tight", which are opposite fixes.
+        """
+        with pytest.raises(
+            ValueError, match=r"largest \|imag\| is 1\.000e-06, above atol=1\.000e-12"
+        ):
+            PauliSumXZ.from_paulisum((["ZI", "IZ"], [1.0, 1.0 + 1e-6j]))
+
+    @pytest.mark.parametrize("imag", [1e-16, 3.3e-16])
+    def test_float64_rounding_is_accepted_and_discarded(self, imag):
+        """Rounding at the float64 level is admitted, and the residue does not survive into ``.c``.
+
+        3.3e-16 is the measured worst case from the 18-operator sweep, not a round number.
+        """
+        hamiltonian = PauliSumXZ.from_paulisum((["ZI", "IZ"], [1.0, 1.0 + imag * 1.0j]))
+        assert hamiltonian.c.dtype == np.float64, "sub-atol residue must not keep .c complex"
+        assert np.allclose(np.sort(hamiltonian.c.ravel()), [1.0, 1.0])
+
+    def test_atol_zero_restores_the_exact_check(self):
+        """``atol=0.0`` is the old behaviour, so the strictness is recoverable rather than lost."""
+        with pytest.raises(ValueError, match="must be real for the Hamiltonian to be Hermitian"):
+            PauliSumXZ.from_paulisum((["ZI", "IZ"], [1.0, 1.0 + 1e-16j]), atol=0.0)
+
+    def test_atol_zero_still_accepts_exactly_real_coefficients(self):
+        """The comparison is strict ``>``, so ``atol=0.0`` rejects only a *nonzero* residue.
+
+        Mutation-tested: relaxing the check to ``>=`` leaves the rest of this suite green while making
+        ``atol=0.0`` refuse every ordinary hand-written Hamiltonian, since ``0.0 >= 0.0``. Nothing else
+        here passes ``atol=0.0`` together with a genuinely real coefficient, so this is the only arm
+        that separates "exact test" from "impossible test".
+        """
+        hamiltonian = PauliSumXZ.from_paulisum((["ZI", "IZ"], [1.0, -0.5]), atol=0.0)
+        assert hamiltonian.c.dtype == np.float64
+
+    @pytest.mark.parametrize("imag", [-0.5, -1e-6, -1e-11])
+    def test_negative_imaginary_parts_are_rejected_too(self, imag):
+        """The check takes ``abs()``; without it, half the complex plane walks straight through.
+
+        Mutation-tested and this is a *correctness* gap rather than only a coverage one: dropping the
+        ``abs()`` to ``coeffs.imag > atol`` keeps the whole suite green while a coefficient of
+        ``-0.5j`` is accepted and then silently truncated by the ``.real`` below -- reinstating exactly
+        the ``force_real`` defect this tolerance was written not to reintroduce, for every coefficient
+        whose imaginary part happens to be negative. Qiskit's ``SparsePauliOp`` routinely produces
+        both signs (the 18-operator sweep saw ``-2.1e-17`` alongside ``+1.1e-16``), so this is a
+        reachable input and not a contrived one.
+        """
+        with pytest.raises(ValueError, match="must be real for the Hamiltonian to be Hermitian"):
+            PauliSumXZ.from_paulisum((["ZI", "IZ"], [1.0, 1.0 + imag * 1.0j]))
+
+    def test_atol_can_be_tightened_below_the_default(self):
+        """The keyword tightens as well as documents: 1e-13 passes by default but not at 1e-15."""
+        PauliSumXZ.from_paulisum((["ZI", "IZ"], [1.0, 1.0 + 1e-13j]))  # default 1e-12: fine
+        with pytest.raises(ValueError, match="must be real for the Hamiltonian to be Hermitian"):
+            PauliSumXZ.from_paulisum((["ZI", "IZ"], [1.0, 1.0 + 1e-13j]), atol=1e-15)
+
+    def test_tolerance_applies_to_the_qiskit_branch_too(self):
+        """Both ingest paths share one check, so neither can drift -- the reason it is hoisted.
+
+        This is the branch that actually motivated the request: ``SparsePauliOp.from_operator`` on a
+        numerically-conjugated Hermitian matrix is where the 1e-16 residue comes from in practice.
+        """
+        qiskit = pytest.importorskip("qiskit")
+        op = qiskit.quantum_info.SparsePauliOp(["ZI", "IZ"], [1.0, 1.0 + 3.3e-16j])
+        assert PauliSumXZ.from_paulisum(op).c.dtype == np.float64
+        with pytest.raises(ValueError, match="must be real for the Hamiltonian to be Hermitian"):
+            PauliSumXZ.from_paulisum(op, atol=0.0)
+
+    def test_rotated_hermitian_operator_is_accepted_end_to_end(self):
+        """The originating use case: conjugate by a non-Clifford circuit, decompose, ingest.
+
+        Measured before the tolerance: this raised for every one of 18 such operators. The assertion
+        is on the *residue* as well as on acceptance, so the test would notice if a future qiskit
+        version started returning exactly-real coefficients here and made the case vacuous.
+        """
+        qiskit = pytest.importorskip("qiskit")
+        from qiskit.quantum_info import Operator, SparsePauliOp
+
+        n, rng = 4, np.random.default_rng(1)
+        A = rng.normal(size=(2**n, 2**n)) + 1j * rng.normal(size=(2**n, 2**n))
+        H = A + A.conj().T
+        qc = qiskit.QuantumCircuit(n)
+        for q in range(n):
+            qc.ry(0.37 * (q + 1), q)
+        for q in range(n - 1):
+            qc.cx(q, q + 1)
+        U = Operator(qc).to_matrix()
+        op = SparsePauliOp.from_operator(U @ H @ U.conj().T)
+
+        residue = np.abs(np.asarray(op.coeffs).imag).max()
+        assert 0.0 < residue < 1e-12, (
+            f"fixture must carry sub-atol rounding to be meaningful; got {residue:.3e}"
+        )
+        # Acceptance is the whole assertion, and deliberately not a dtype check. A dense random
+        # Hermitian matrix spans all 4^n strings, so odd-Y terms are present and ``.c`` is complex128
+        # *by construction* (the folded ``(-i)^{x.z}`` phase -- see TestCoefficientDtype). Asserting
+        # float64 here would conflate two independent properties and fail for the documented reason.
+        PauliSumXZ.from_paulisum(op)
+        # ...and the same operator is still refused under the exact test, which is what shows the
+        # acceptance came from the tolerance rather than from the residue having vanished somewhere.
+        with pytest.raises(ValueError, match="must be real for the Hamiltonian to be Hermitian"):
+            PauliSumXZ.from_paulisum(op, atol=0.0)
+
+
 class TestPadding:
     """The pad bit at position 0 is intrinsic: every signature is shifted right by one bit.
 
