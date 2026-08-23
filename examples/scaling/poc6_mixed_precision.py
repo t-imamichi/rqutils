@@ -37,7 +37,6 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 
-import functools
 
 import jax.numpy as jnp
 import numpy as np
@@ -71,15 +70,14 @@ def make_matvecs(xsources, diagonals):
     its convergence tolerance -- at f64; without it the tolerance loosens by ~1e9 and the solver
     stops early while reporting success.
     """
-    base = functools.partial(apply_h, cache_level=(1, 2))
     diag32 = diagonals.astype(jnp.complex64 if jnp.iscomplexobj(diagonals) else jnp.float32)
 
     def mv64(v, *args):
-        return base(v, (xsources, diagonals), None)
+        return apply_h(v, xsources=xsources, diagonals=diagonals)
 
     def mv_mixed(v, *args):
         v32 = v.astype(diag32.dtype)
-        out32 = base(v32, (xsources, diag32), None)
+        out32 = apply_h(v32, xsources=xsources, diagonals=diag32)
         return out32.astype(v.dtype)
 
     return mv64, mv_mixed
@@ -175,14 +173,15 @@ def main():
     print("ground_locg's work_dtype becomes f32 and tol = finfo(f32).eps -- ~1e9 looser.")
     p = make_problem(24, 50_000, num_terms=200, num_xgroups=50, real_only=True, seed=64)
     _, xs, dg, vec, size = setup(p)
-    base = functools.partial(apply_h, cache_level=(1, 2))
     dg32 = dg.astype(jnp.float32)
 
     def mv_naive(v, *a):
         # No cast back: work_dtype collapses to f32 and the tolerance loosens with it.
-        return base(v.astype(jnp.float32), (xs, dg32), None)
+        return apply_h(v.astype(jnp.float32), xsources=xs, diagonals=dg32)
 
-    e_ref = float(ground_locg(lambda v, *a: base(v, (xs, dg), None), vec, maxiter=300)[0])
+    e_ref = float(
+        ground_locg(lambda v, *a: apply_h(v, xsources=xs, diagonals=dg), vec, maxiter=300)[0]
+    )
     en, _, nn, cn = ground_locg(mv_naive, vec.astype(jnp.float32), maxiter=300)
     print(f"  f64 reference : eigval={e_ref:.10f}")
     print(f"  naive f32     : eigval={float(en):.10f}  iters={int(nn)}  converged={bool(cn)}")

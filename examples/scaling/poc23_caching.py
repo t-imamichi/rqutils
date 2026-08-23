@@ -96,21 +96,17 @@ def poc3_signbits_vs_diagonals():
         c = build_caches(p, states_u)
         vec = jnp.asarray(np.random.default_rng(0).normal(size=size).astype(p.hamiltonian.c.dtype))
 
-        mv11 = functools.partial(apply_h, cache_level=(1, 1))
-        mv12 = functools.partial(apply_h, cache_level=(1, 2))
-        args11 = ((c["xsources"], c["diag_signs"], p.hamiltonian.c), None)
-        args12 = ((c["xsources"], c["diagonals"]), None)
+        mv11 = functools.partial(
+            apply_h, xsources=c["xsources"], diag_signs=c["diag_signs"], coeffs=p.hamiltonian.c
+        )
+        mv12 = functools.partial(apply_h, xsources=c["xsources"], diagonals=c["diagonals"])
 
-        r11 = jax.block_until_ready(mv11(vec, *args11))
-        r12 = jax.block_until_ready(mv12(vec, *args12))
+        r11 = jax.block_until_ready(mv11(vec))
+        r12 = jax.block_until_ready(mv12(vec))
         diff = max_abs_diff(r11, r12)
 
-        t11 = timeit(
-            lambda mv11=mv11, vec=vec, args11=args11: mv11(vec, *args11), "(1,1)", trials=5
-        )
-        t12 = timeit(
-            lambda mv12=mv12, vec=vec, args12=args12: mv12(vec, *args12), "(1,2)", trials=5
-        )
+        t11 = timeit(lambda mv11=mv11, vec=vec: mv11(vec), "(1,1)", trials=5)
+        t12 = timeit(lambda mv12=mv12, vec=vec: mv12(vec), "(1,2)", trials=5)
 
         b_signs, b_diags = nbytes(c["diag_signs"]), nbytes(c["diagonals"])
         # (1,1) additionally needs the coefficient array; (1,2) does not. Both keep xsources.

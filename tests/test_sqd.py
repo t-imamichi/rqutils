@@ -20,7 +20,6 @@ initial-vector bugs affected all six kernels identically, so a consistency-only 
 passed while every kernel returned the same wrong number.
 """
 
-import itertools
 import os
 import subprocess
 import sys
@@ -36,8 +35,6 @@ from conftest import (
 )
 
 from rqutils.sqd import (
-    _DIAGONAL_KEYS,
-    _XSOURCE_KEYS,
     _is_lex_sorted,
     _pack_scanned,
     apply_h,
@@ -51,13 +48,11 @@ from rqutils.sqd import (
     uniquify_states,
 )
 
-# Every (source_indices, diagonals) combination, i.e. all six matvec kernels. Derived from the
-# library's own dispatch dicts rather than written out, so a seventh strategy cannot be added to
-# `apply_h` without the parametrized suites here picking it up.
-CACHE_LEVELS = sorted(itertools.product(_XSOURCE_KEYS.values(), _DIAGONAL_KEYS.values()))
-assert CACHE_LEVELS == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)], (
-    "the 2x3 grid changed shape; the suites below assume six levels"
-)
+# Every (source_indices, diagonals) combination, i.e. all six matvec kernels. Written out rather than
+# derived from `apply_h`'s dispatch: the axis options now live inline in the function (they pair each
+# keyword with its array, which only exists at call time), so there is no module table to read. The
+# grid is small, fixed by the kernel's 2x3 shape, and a seventh strategy would need new tests anyway.
+CACHE_LEVELS = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
 
 
 def pack_padded(states):
@@ -787,9 +782,10 @@ class TestMatvecKernels:
         got = np.asarray(
             apply_h(
                 p["vector"],
-                (p["xsignatures"], p["zsignatures"], p["coeffs"]),
-                p["states_u"],
-                (0, 0),
+                xsignatures=p["xsignatures"],
+                zsignatures=p["zsignatures"],
+                coeffs=p["coeffs"],
+                states=p["states_u"],
             )
         ).real
         assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
@@ -806,17 +802,18 @@ class TestMatvecKernels:
         pass if the collapse broke all six identically.
         """
         p = apply_h_inputs(np.random.default_rng(20260805))
-        xgroup = p["xsources"] if cache_level[0] == 1 else p["xsignatures"]
-        diagonal_arg = {
-            0: p["zsignatures"],
-            1: p["diag_signs"],
-            2: p["diagonals"],
-        }[cache_level[1]]
-        scanned = _pack_scanned(cache_level, xgroup, diagonal_arg, p["coeffs"])
-
+        # Map the cache_level under test back to the keywords that select it. The positional form is
+        # gone, so a level is now requested by *naming* the arrays it implies -- which is the point of
+        # the change: this mapping is written once here, in the test, rather than being a thing every
+        # caller had to get right.
+        xname = "xsources" if cache_level[0] == 1 else "xsignatures"
+        dname = {0: "zsignatures", 1: "diag_signs", 2: "diagonals"}[cache_level[1]]
+        kwargs = {xname: p[xname], dname: p[dname]}
+        if cache_level[1] != 2:
+            kwargs["coeffs"] = p["coeffs"]
         needs_states = cache_level[0] == 0 or cache_level[1] == 0
         got = np.asarray(
-            apply_h(p["vector"], scanned, p["states_u"] if needs_states else None, cache_level)
+            apply_h(p["vector"], states=p["states_u"] if needs_states else None, **kwargs)
         ).real
         assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
 
@@ -835,7 +832,7 @@ class TestMatvecKernels:
         """The keyword form covers all six strategies and each still matches a dense reference.
 
         The keyword names are the only thing selecting the strategy here, so this is what pins the
-        ``_XSOURCE_KEYS``/``_DIAGONAL_KEYS`` mapping. A transposed entry in either dict would route a
+        keyword-to-digit pairing inside ``apply_h``. A transposed digit there would route a
         call to the wrong branch and produce a plausible finite vector, exactly the failure mode
         :meth:`test_every_cache_level_matches_dense` exists for -- so the reference is dense here too,
         not the positional form (agreeing with a sibling that is wrong the same way proves nothing).
@@ -845,26 +842,15 @@ class TestMatvecKernels:
         got = np.asarray(apply_h(p["vector"], states=p["states_u"], **kwargs)).real
         assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
 
-    def test_keyword_and_positional_forms_agree(self):
-        """The wrapper must not change the numbers -- it only resolves names to a ``cache_level``.
-
-        Bit-identical rather than approximate: both routes reach the same jitted kernel with the same
-        tuple, so any difference at all would mean the resolution built a different ``scanned``.
-        """
-        p = apply_h_inputs(np.random.default_rng(20260805))
-        kw = np.asarray(apply_h(p["vector"], xsources=p["xsources"], diagonals=p["diagonals"]))
-        pos = np.asarray(apply_h(p["vector"], (p["xsources"], p["diagonals"]), None, (1, 2)))
-        assert np.array_equal(kw, pos)
-
     @pytest.mark.parametrize(
         ("names", "match"),
         [
-            (("diag_signs", "coeffs"), "exactly one of"),
-            (("xsignatures", "xsources", "diagonals"), "exactly one of"),
-            (("xsources", "coeffs"), "exactly one of"),
-            (("xsources", "diag_signs", "diagonals", "coeffs"), "exactly one of"),
-            (("xsources", "diag_signs"), "coeffs is required"),
-            (("xsources", "diagonals", "coeffs"), "coeffs must not be given"),
+            (("diag_signs", "coeffs"), "exactly one of xsources="),
+            (("xsignatures", "xsources", "diagonals"), "exactly one of xsources="),
+            (("xsources", "coeffs"), "exactly one of diagonals="),
+            (("xsources", "diag_signs", "diagonals", "coeffs"), "exactly one of diagonals="),
+            (("xsources", "diag_signs"), "requires coeffs="),
+            (("xsources", "diagonals", "coeffs"), "already folds in coeffs="),
         ],
     )
     def test_underspecified_or_overspecified_keyword_calls_raise(self, names, match):
@@ -880,25 +866,9 @@ class TestMatvecKernels:
             apply_h(p["vector"], states=p["states_u"], **kwargs)
 
     def test_no_arrays_at_all_raises(self):
-        """Calling with neither convention names what is missing rather than failing on a None tuple."""
-        with pytest.raises(ValueError, match="needs per-X-group arrays"):
+        """Naming nothing names what is missing, rather than failing somewhere downstream."""
+        with pytest.raises(ValueError, match="exactly one of xsources= or xsignatures="):
             apply_h(np.zeros(4))
-
-    @pytest.mark.parametrize("positional_arg", ["scanned", "cache_level"])
-    def test_mixing_the_two_conventions_raises(self, positional_arg):
-        """Mixing forms would give two answers to "what strategy is this?", so it is refused.
-
-        Silently preferring one would recreate the original hazard in a new place: the caller would
-        have written a ``cache_level`` that the call then ignored. Both members of the positional
-        convention are covered, since either alone is enough to make the request ambiguous.
-        """
-        p = apply_h_inputs(np.random.default_rng(20260805))
-        kwargs = {"xsources": p["xsources"], "diagonals": p["diagonals"]}
-        kwargs[positional_arg] = (
-            (p["xsources"], p["diagonals"]) if positional_arg == "scanned" else (1, 2)
-        )
-        with pytest.raises(TypeError, match="not both"):
-            apply_h(p["vector"], **kwargs)
 
     @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
     def test_pack_scanned_arity_matches_what_the_kernel_unpacks(self, cache_level):
@@ -956,8 +926,14 @@ class TestMatvecKernels:
         after caching. For the other four, a missing S would otherwise surface as an opaque failure
         deep inside ``get_xsource``/``get_diagonal``.
         """
+        dummy = np.zeros((1, 1), dtype=np.uint8)
+        xname = "xsources" if cache_level[0] == 1 else "xsignatures"
+        dname = {0: "zsignatures", 1: "diag_signs", 2: "diagonals"}[cache_level[1]]
+        kwargs = {xname: dummy, dname: dummy}
+        if cache_level[1] != 2:
+            kwargs["coeffs"] = np.zeros(1)
         with pytest.raises(ValueError, match="states is required"):
-            apply_h(np.zeros(4), (np.zeros((1, 1), dtype=np.uint8),) * 3, None, cache_level)
+            apply_h(np.zeros(4), states=None, **kwargs)
 
     def test_fully_cached_level_matches_dense(self):
         """``cache_level=(1, 2)``, the fully-precomputed level, against a dense reference.
@@ -971,7 +947,9 @@ class TestMatvecKernels:
         parametrization changes.
         """
         p = apply_h_inputs(np.random.default_rng(20260804), num_terms=5)
-        got = np.asarray(apply_h(p["vector"], (p["xsources"], p["diagonals"]), None, (1, 2))).real
+        got = np.asarray(
+            apply_h(p["vector"], xsources=p["xsources"], diagonals=p["diagonals"], states=None)
+        ).real
         assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
 
 

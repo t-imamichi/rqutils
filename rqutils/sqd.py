@@ -922,10 +922,6 @@ def apply_xgrp(
 # implies. This is the single source of truth for `apply_h`'s dispatch: a caller names what it has and
 # the strategy follows, rather than declaring a strategy and being trusted to have packed a tuple to
 # match. See `apply_h`'s docstring for why that distinction is a correctness matter and not ergonomics.
-_XSOURCE_KEYS = {"xsignatures": 0, "xsources": 1}
-_DIAGONAL_KEYS = {"zsignatures": 0, "diag_signs": 1, "diagonals": 2}
-
-
 def _pack_scanned(
     cache_level: tuple[int, int], xgroup: NDArray, diagonal_arg: NDArray, coeffs: NDArray | None
 ) -> tuple[NDArray, ...]:
@@ -944,10 +940,8 @@ def _pack_scanned(
 
 def apply_h(
     vec: NDArray[np.inexact],
-    scanned: tuple[NDArray, ...] | None = None,
-    states: StateList | None = None,
-    cache_level: tuple[int, int] | None = None,
     *,
+    states: StateList | None = None,
     xsignatures: NDArray | None = None,
     xsources: NDArray | None = None,
     zsignatures: NDArray | None = None,
@@ -957,39 +951,39 @@ def apply_h(
 ) -> jax.Array:
     r"""Return :math:`Hv`, naming the per-X-group inputs so a mispairing cannot be expressed.
 
-    Two calling conventions. The **keyword** form names each array, and the supplied set *determines*
-    the caching strategy:
+    Name the per-X-group arrays you have and the caching strategy follows from them:
 
     .. code-block:: python
 
         apply_h(vec, xsources=..., diag_signs=..., coeffs=..., states=states)   # was (1, 1)
         apply_h(vec, xsignatures=..., diagonals=..., states=states)             # was (0, 2)
 
-    The **positional** form takes a ``scanned`` tuple plus an explicit ``cache_level``, which is what
-    :func:`sqd` and :mod:`ground_locg` use internally (the solver splats ``matvec(vec, *args)``, so the
-    tuple has to stay positional there). It is fully supported and not deprecated.
+    Every array parameter is keyword-only, so the six valid input sets are the only constructible
+    ones. **This replaced a positional ``(scanned, cache_level)`` form, which is gone** -- a breaking
+    change, and the reason it went: ``cache_level`` selected *positionally* how the members of
+    ``scanned`` were interpreted, and nothing could check that the tuple matched the strategy
+    declared. Passing raw X signatures while claiming ``cache_level[0] == 1`` -- which promises
+    precomputed X *sources* -- raised nothing and silently computed a different operator (measured
+    max abs error 0.44 on a 5-state n=4 subspace). Both are integer arrays, so the boundary could not
+    tell an index array from a signature array.
 
-    Prefer the keyword form at any hand-written call site. ``cache_level`` selects, **positionally**,
-    how the members of ``scanned`` are interpreted, and nothing can check that the tuple matches the
-    strategy declared: passing raw X signatures while claiming ``cache_level[0] == 1`` -- which
-    promises precomputed X *sources* -- raises nothing and silently computes a different operator
-    (measured max abs error 0.44 on a 5-state n=4 subspace). Both are integer arrays, so the boundary
-    cannot tell an index array from a signature array.
+    :func:`sqd` and :mod:`ground_locg` do not go through here: they call the private
+    ``_apply_h_kernel`` with an assembled tuple and a static ``cache_level`` bound via
+    ``functools.partial``, because the solver splats ``matvec(vec, *args)`` positionally.
 
-    A shape or dtype assertion per branch does **not** close this, which is worth recording because it
-    is the obvious cheap fix. X sources are ``(n_groups, n_states)`` and X signatures are
-    ``(n_groups, n_bytes)``, so the trailing dimension usually separates them -- but at ``n = 15``
-    (2 bytes) with a 2-state subspace both are exactly ``(2, 2)``, and the mispairing sails through the
-    assertion it was supposed to trip. Only naming the inputs makes the six valid combinations the
-    only constructible ones.
+    Naming was the only fix available, which is worth recording because a per-branch shape or dtype
+    assertion is the obvious cheap alternative. X sources are ``(n_groups, n_states)`` and X signatures
+    are ``(n_groups, n_bytes)``, so the trailing dimension usually separates them -- but at ``n = 15``
+    (2 bytes) with a 2-state subspace both are exactly ``(2, 2)``, and a mispairing would sail through
+    the assertion meant to trip it.
 
-    What this closes, stated exactly: the keyword form removes *mispairing* -- declaring one strategy
-    while having packed the arrays for another -- because the strategy is no longer declared separately
-    from the arrays. It does **not** detect an array passed under the wrong name (``xsources=x`` is
-    still accepted, since a signature array and an index array remain indistinguishable at the
-    boundary). That residue is much smaller: the name sits at the call site immediately beside the
-    array it labels, rather than in a positional tuple whose meaning is fixed by a separate argument
-    several lines away.
+    What naming closes, stated exactly: it removes *mispairing* -- declaring one strategy while having
+    packed the arrays for another -- because the strategy is no longer declared separately from the
+    arrays. It does **not** detect an array passed under the wrong name (``xsources=x`` is still
+    accepted, since a signature array and an index array remain indistinguishable at the boundary).
+    That residue is much smaller: the name sits at the call site immediately beside the array it
+    labels, rather than in a positional tuple whose meaning is fixed by a separate argument several
+    lines away.
 
     All six strategies are one ``jax.lax.scan`` over the X groups accumulating
     ``out + apply_xgrp(xsource, diagonal, vec)``; they differ only in where the two inputs come
@@ -1000,10 +994,10 @@ def apply_h(
     cache_level    ``xsource``                 ``diagonal``
     =============  ==========================  =====================================
     ``(0, *)``     ``get_xsource(x, states)``  --
-    ``(1, *)``     scanned (precomputed)       --
+    ``(1, *)``     ``xsources`` as given       --
     ``(*, 0)``     --                          ``get_diagonal(z, c, states)``
     ``(*, 1)``     --                          ``compute_diagonal(signs, c)``
-    ``(*, 2)``     --                          scanned (precomputed)
+    ``(*, 2)``     --                          ``diagonals`` as given
     =============  ==========================  =====================================
 
     The keyword names correspond one-to-one: ``xsignatures``/``xsources`` select the first index,
@@ -1012,18 +1006,9 @@ def apply_h(
 
     Args:
         vec: Vector to multiply.
-        scanned: Positional form only -- per-X-group arrays to scan over, in the order the
-            ``cache_level`` grid implies. ``(0, 0)``: ``(xsignatures, zsignatures, coeffs)``.
-            ``(0, 1)``: ``(xsignatures, diag_signs, coeffs)``. ``(0, 2)``:
-            ``(xsignatures, diagonals)``. ``(1, 0)``: ``(xsources, zsignatures, coeffs)``.
-            ``(1, 1)``: ``(xsources, diag_signs, coeffs)``. ``(1, 2)``: ``(xsources, diagonals)``.
-            Mutually exclusive with the keyword form.
         states: Uniquified state list. Required whenever either element of the resolved
             ``cache_level`` is 0, i.e. for every combination except ``(1, 1)`` and ``(1, 2)`` -- those
             two read neither the X signatures nor the Z signatures, so they need no states at all.
-        cache_level: Caching strategy, as documented on :func:`sqd`. Positional form only; defaults to
-            ``(1, 2)`` when ``scanned`` is given without it. Passing it alongside keyword arrays is an
-            error, since the keywords already determine it.
         xsignatures: Packed X signatures per group; selects ``cache_level[0] == 0``.
         xsources: Precomputed X source indices per group; selects ``cache_level[0] == 1``.
         zsignatures: Packed Z signatures per group; selects ``cache_level[1] == 0``. Needs ``coeffs``.
@@ -1037,61 +1022,51 @@ def apply_h(
         :math:`Hv`.
 
     Raises:
-        TypeError: If the two calling conventions are mixed (``scanned`` or ``cache_level`` together
-            with any named array).
-        ValueError: If no per-group arrays are given at all; if the named arrays do not select exactly
-            one X source and one diagonal strategy; if ``coeffs`` is missing where required or supplied
+        ValueError: If the named arrays do not select exactly one X source and one diagonal strategy
+            (including naming none at all); if ``coeffs`` is missing where required or supplied
             alongside ``diagonals``; or if ``states`` is None while the resolved ``cache_level`` has a
             0 in either position.
     """
-    # Keyed by name so the resolved key can index straight back to its array; the whole point of the
-    # dispatch is a lookup *by name*, which named locals cannot express without `locals()`.
-    named = {
-        "xsignatures": xsignatures,
-        "xsources": xsources,
-        "zsignatures": zsignatures,
-        "diag_signs": diag_signs,
-        "diagonals": diagonals,
-        "coeffs": coeffs,
-    }
-    supplied = {k for k, v in named.items() if v is not None}
-
-    if not supplied:
-        if scanned is None:
-            raise ValueError(
-                "apply_h needs per-X-group arrays: either the positional `scanned` tuple or the "
-                f"keyword form naming one of {sorted(_XSOURCE_KEYS)} and one of "
-                f"{sorted(_DIAGONAL_KEYS)}."
-            )
-        return _apply_h_kernel(vec, scanned, states, cache_level or (1, 2))
-
-    # Mixing the conventions would mean two answers to "what strategy is this?", which is the
-    # ambiguity the keyword form exists to remove -- so it is refused rather than prioritized.
-    if scanned is not None or cache_level is not None:
-        raise TypeError(
-            "apply_h takes either the positional (scanned, cache_level) form or the keyword "
-            f"form naming individual arrays, not both; got {sorted(supplied)} alongside "
-            f"{'scanned' if scanned is not None else 'cache_level'}."
+    # Each axis is one list of (keyword name, cache_level digit, array). Pairing the three together
+    # means an axis is filtered, validated and unpacked from a single place -- no name-to-digit table
+    # to keep in step with a separate name-to-array lookup, and no dict built only to be read back.
+    xgiven = [
+        opt
+        for opt in (("xsources", 1, xsources), ("xsignatures", 0, xsignatures))
+        if opt[2] is not None
+    ]
+    dgiven = [
+        opt
+        for opt in (
+            ("diagonals", 2, diagonals),
+            ("diag_signs", 1, diag_signs),
+            ("zsignatures", 0, zsignatures),
         )
+        if opt[2] is not None
+    ]
+    if len(xgiven) != 1:
+        raise ValueError(
+            "apply_h: pass exactly one of xsources= or xsignatures= "
+            f"(got {sorted(name for name, _, _ in xgiven) or 'neither'})"
+        )
+    if len(dgiven) != 1:
+        raise ValueError(
+            "apply_h: pass exactly one of diagonals=, diag_signs= or zsignatures= "
+            f"(got {sorted(name for name, _, _ in dgiven) or 'none'})"
+        )
+    (_, xaxis, xarray), (dname, daxis, darray) = xgiven[0], dgiven[0]
 
-    def pick(keys: dict[str, int]) -> str:
-        got = sorted(supplied & set(keys))
-        if len(got) != 1:
-            raise ValueError(f"exactly one of {sorted(keys)} is required; got {got}.")
-        return got[0]
+    # coeffs is not optional-with-a-default: it is required by exactly two of the three diagonal forms
+    # and meaningless in the third, so silently ignoring a stray one would hide a mistake.
+    if daxis == 2 and coeffs is not None:
+        raise ValueError("apply_h: diagonals= already folds in coeffs=; do not pass both")
+    if daxis != 2 and coeffs is None:
+        raise ValueError(f"apply_h: {dname}= requires coeffs=")
 
-    xkey, dkey = pick(_XSOURCE_KEYS), pick(_DIAGONAL_KEYS)
-    cache_level = (_XSOURCE_KEYS[xkey], _DIAGONAL_KEYS[dkey])
-    # coeffs is not optional-with-a-default here: the two computing strategies cannot produce a
-    # diagonal without it, and `diagonals` has already absorbed it. Requiring it explicitly is what
-    # keeps "I forgot coeffs" from becoming a wrong number instead of a raise.
-    if cache_level[1] == 2 and coeffs is not None:
-        raise ValueError("coeffs must not be given with diagonals, which already folds it in.")
-    if cache_level[1] != 2 and coeffs is None:
-        raise ValueError(f"coeffs is required with {dkey}.")
-
-    scanned = _pack_scanned(cache_level, named[xkey], named[dkey], coeffs)
-    return _apply_h_kernel(vec, scanned, states, cache_level)
+    cache_level = (xaxis, daxis)
+    return _apply_h_kernel(
+        vec, _pack_scanned(cache_level, xarray, darray, coeffs), states, cache_level
+    )
 
 
 @jax.jit(static_argnames=["cache_level"])

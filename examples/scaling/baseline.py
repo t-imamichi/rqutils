@@ -68,10 +68,8 @@ def component_costs(problem, cache_level=(1, 2)):
         ]
     )
     vec = jnp.asarray(np.random.default_rng(0).normal(size=size).astype(ham.c.dtype))
-    mv = functools.partial(apply_h, cache_level=(1, 2))
-    out["matvec"] = timeit(
-        lambda: mv(vec, (xsources, diagonals), None), "apply_h (1,2) matvec", trials=5
-    )
+    mv = functools.partial(apply_h, xsources=xsources, diagonals=diagonals)
+    out["matvec"] = timeit(lambda: mv(vec), "apply_h (1,2) matvec", trials=5)
     return out
 
 
