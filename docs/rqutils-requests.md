@@ -7,6 +7,41 @@
 > 9.7x slower at n=100, because `apply_h` takes one static `nterms` for all X groups while a rotated
 > operator has median 2 terms per group and a max of 197 (1.4% of slots real). Per-group `nterms`, or
 > a segment-sum layout, would be needed to close that. See the note at the end of A1.
+>
+> ### ⚠️ Follow-up: A1's ragged-operator gap is now closed
+>
+> **The segment-sum layout that last paragraph asks for was built** (`rqutils.sqd.all_diagonals`,
+> fed by `PauliSumXZ.flat_terms`), so the "would be needed" above is no longer the current state.
+> It reduces per-term contributions to per-group rows in one pass over the *real* terms, so the work
+> is proportional to `sum(nzterms)` rather than `J * max(nzterms)`.
+>
+> Measured against the rectangular scan at N=4096, **bit-identical** (`maxdiff` exactly 0.0) at every
+> size, on local two-body operators with long-range Z strings added:
+>
+> | J | skew | real slots | speedup |
+> | --- | --- | --- | --- |
+> | 10 | 4.2x | 23.8% | 2.0x |
+> | 40 | 17.1x | 5.9% | 47-49x |
+> | 100 | 42.8x | 2.3% | **150-160x** |
+>
+> (Ranges, not point values: two runs of the same sweep gave 49.3x/156.9x and 47.0x/153.0x, so the
+> last few percent is run-to-run variance rather than signal.)
+>
+> Compile time is *lower* than the scan's at every size (52 ms against 282 ms at J=100) and nearly
+> flat in J, which is what makes this the right structure where unrolling the group loop was not --
+> that unroll bought a similar speedup but paid compile growing linearly in J and only broke even
+> after thousands of calls. Differentiable w.r.t. coefficients with no special handling; a full
+> `expval` gradient matches central finite differences to 1.2e-10. Sharding-transparent, verified on
+> a 4-device mesh across every residue of `N mod mesh.size` to 2.2e-15.
+>
+> So the `spinchain` measurement above stands as a correct verdict on the *scalar* `nterms` API, and
+> is worth re-running against `all_diagonals`. Note the shipped default for `apply_h` is still the
+> single `max(nzterms)` -- ordinary Hamiltonians sit at low skew, where the two are within noise --
+> so the flat layout is opt-in via `cache_level[1] == 2`.
+>
+> Everything below this banner is the **original request**, preserved as written. Its line numbers
+> refer to `rqutils` 0.2.0 and have drifted; cite it for the measurements and the reasoning, not for
+> locations.
 
 Four requests against `rqutils` 0.2.0 (`github.com/t-imamichi/rqutils`, branch `metal`), written from
 the `spinchain` side. Every claim below was measured on that version; each item states the exact call
