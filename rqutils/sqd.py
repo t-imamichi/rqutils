@@ -193,6 +193,10 @@ from rqutils.ground_locg import ground_locg
 from rqutils.paulis.symplectic import PauliSumXZ
 
 LOG = logging.getLogger(__name__)
+# Largest subspace size representable in the int32 indices used throughout (uniquify_states' iota,
+# get_xsource's output). Documented in the module docstring as the hard scaling limit; enforced in
+# sqd() and hproj() so an overflow raises instead of silently permuting the subspace.
+_MAX_STATES = 2**31 - 1
 
 type HamiltonianInput = PauliSumXZ | tuple[Sequence[str], Sequence[Number]]
 try:
@@ -259,7 +263,9 @@ def sqd(
         only, never the filler slots, so their count can be below ``states_size``.
 
     Raises:
-        ValueError: If ``states_size`` is smaller than ``states.shape[0]``.
+        ValueError: If ``states_size`` is smaller than ``states.shape[0]``, or if it exceeds
+            :math:`2^{31} - 1`, the ceiling imposed by the int32 indices used for subspace positions
+            (beyond it an index wraps negative and the subspace is silently permuted).
     """
     if states_size is None:
         # Default to the next power of two at or above the input length. states_size exists to stop
@@ -277,6 +283,18 @@ def sqd(
         states_size = 1 << max((states.shape[0] - 1).bit_length(), 1)
     if states_size < states.shape[0]:
         raise ValueError("states_size smaller than the states array length")
+    # The 2^31 ceiling the module docstring calls a hard limit, actually enforced. Subspace positions
+    # are int32 throughout -- uniquify_states' iota, and get_xsource's returned indices with -1 as the
+    # absent marker -- so a size at or above 2^31 wraps to a negative index and yields a corrupted
+    # permutation rather than an error: a plausible finite answer, the failure mode this module keeps
+    # guarding against. Note a wrapped index is -2147483648, not -1, so the absent-marker test cannot
+    # even catch it. Unreachable on current hardware (2^31 states is already 4.3 GB of packed states
+    # before any vector), which is exactly why the check is cheap insurance rather than a cost.
+    if states_size > _MAX_STATES:
+        raise ValueError(
+            f"states_size {states_size} exceeds the {_MAX_STATES} limit imposed by int32 subspace "
+            "indexing; see the scaling-limits section of the module documentation"
+        )
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
 
@@ -343,17 +361,29 @@ def hproj(
 
     Raises:
         ValueError: If ``unique_states=True`` and ``states`` is not strictly increasing in
-            lexicographic order (unsorted, or containing duplicate rows).
+            lexicographic order (unsorted, or containing duplicate rows); or if the subspace exceeds
+            :math:`2^{31} - 1` states, the ceiling imposed by the int32 indices
+            :func:`get_xsource` returns.
     """
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
+    # Same int32 ceiling sqd() enforces, since hproj reaches get_xsource too and its returned
+    # positions are int32 with -1 as the absent marker. Checked here, before the O(N) sortedness scan
+    # and the np.unique below: it is an O(1) look at a shape, so it costs nothing to do first and
+    # reports the real problem rather than letting a doomed call spend time first (measured on the
+    # test that reaches it: 0.23 s with the check first, 23 s when it sits after the scan).
+    states = np.asarray(states)
+    if states.shape[0] > _MAX_STATES:
+        raise ValueError(
+            f"subspace of {states.shape[0]} states exceeds the {_MAX_STATES} limit imposed by int32 "
+            "subspace indexing; see the scaling-limits section of the module documentation"
+        )
     if not unique_states:
         states = np.unique(states, axis=0)
     else:
         # get_xsource binary-searches into `states`, so unsorted rows silently produced a wrong,
         # non-symmetric matrix. Validated rather than documented away, at 12-14% of hproj and only on
         # this opt-in path -- the branch above is sorted by construction and pays nothing.
-        states = np.asarray(states)
         if not _is_lex_sorted(states):
             raise ValueError(
                 "unique_states=True requires `states` to be uniquified and lex-sorted, but the "

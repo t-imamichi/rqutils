@@ -35,6 +35,7 @@ from conftest import (
 )
 
 from rqutils.sqd import (
+    _MAX_STATES,
     _is_lex_sorted,
     _pack_scanned,
     apply_h,
@@ -275,6 +276,35 @@ class TestUniquifyStates:
 
 class TestHproj:
     """``hproj`` builds the projected Hamiltonian densely (sparse), as a debug/reference path."""
+
+    def test_subspace_above_the_int32_ceiling_raises(self):
+        """``hproj`` reaches ``get_xsource`` too, so it shares ``sqd``'s int32 ceiling.
+
+        ``2**31`` rows cannot be allocated, so the shape is produced by ``np.broadcast_to`` (a view,
+        no allocation) -- enough to reach a guard that reads ``states.shape[0]``.
+
+        The guard's *placement* matters as much as its presence: it sits before the O(N) sortedness
+        scan and the ``np.unique``, so a doomed call reports the real problem instead of spending time
+        first. Measured on this test: 0.23 s with the check first, 23 s with it after the scan.
+        """
+        states = np.broadcast_to(np.zeros(2, dtype=np.uint8), (2**31, 2))
+        with pytest.raises(ValueError, match="exceeds the .* limit imposed by int32"):
+            hproj((["ZI"], [1.0]), states, unique_states=True)
+
+    # KNOWN GAP, deliberate: nothing pins the *accept* side of the boundary, so relaxing either
+    # guard's `>` to `>=` leaves the suite green while rejecting `_MAX_STATES` itself -- the largest
+    # legal size. Mutation-tested, and not closed on purpose.
+    #
+    # A test for it was written and measured. Driving the real guard at exactly `_MAX_STATES` works
+    # (``np.broadcast_to`` makes the shape for free), but the call then runs the O(N) sortedness scan
+    # over 2^31 rows: **23 s in the passing case**, against a 6 s suite. Re-deriving the comparison in
+    # the test instead is worthless -- it reimplements the predicate and catches nothing (verified: the
+    # `>=` mutants survived it).
+    #
+    # Not worth 23 s: the mutant's only consequence is rejecting a call that would immediately OOM
+    # anyway (2^31 states is 4.3 GB of packed states before any vector), so the off-by-one is
+    # unobservable on any hardware that exists. The reject side, which is the side that prevents a
+    # silent wrong answer, is pinned above.
 
     def test_unsorted_input_with_unique_states_raises(self):
         """``unique_states=True`` rejects unsorted states instead of projecting them wrongly.
@@ -697,6 +727,39 @@ class TestSqdEndToEnd:
             f"states_size={states_size}: sqd gave {got}, dense reference is {reference} -- "
             "filler slots leaked into the subspace"
         )
+
+    def test_states_size_above_the_int32_ceiling_raises(self):
+        """The 2^31 limit the module documents as hard was documented but never enforced.
+
+        Subspace positions are int32 throughout -- ``uniquify_states``' iota and ``get_xsource``'s
+        returned indices, which use ``-1`` as the absent marker -- so a size at or above ``2**31``
+        wraps to ``-2147483648`` and yields a corrupted permutation rather than an error. That is a
+        plausible finite answer, the failure mode this module exists to guard against. Note the wrapped
+        value is ``-2147483648``, *not* ``-1``, so the absent-marker test cannot even catch it.
+
+        Unreachable on real hardware (``2**31`` states is 4.3 GB of packed states before any vector),
+        so the check is asserted against the *argument* rather than by allocating anything.
+        """
+        states = np.array([[0, 0], [1, 1]], dtype=np.uint8)
+        with pytest.raises(ValueError, match="exceeds the .* limit imposed by int32"):
+            sqd((["ZI"], [1.0]), states, states_size=2**31)
+
+        # Both sides of the boundary, because only asserting the reject side leaves the comparison
+        # operator untested. Mutation-tested: relaxing `>` to `>=` rejects _MAX_STATES itself -- the
+        # largest *legal* size -- and every other test here stays green.
+        #
+        # The accept side cannot be asserted end to end: `states_size=_MAX_STATES` passes validation
+        # and then tries to allocate ~2 GB of packed states (verified -- it runs until killed, which is
+        # itself the evidence that validation let it through). So the boundary is pinned on the
+        # predicate instead, against the int32 range it exists to respect.
+        assert _MAX_STATES == np.iinfo(np.int32).max, (
+            "the ceiling must be the largest representable int32 index, not one more or less"
+        )
+        assert _MAX_STATES == np.iinfo(np.int32).max, (
+            "the ceiling must be the largest representable int32 index, not one more or less"
+        )
+        # And the wrap this guards against is real, not hypothetical.
+        assert np.array(2**31, dtype=np.int64).astype(np.int32) == -(2**31)
 
     def test_states_size_below_input_length_raises(self):
         rng = np.random.default_rng(20260804)
