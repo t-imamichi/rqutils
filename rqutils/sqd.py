@@ -238,7 +238,11 @@ def sqd(
             (subspace_dim, num_qubits).
         states_size: Fix the size of the states array used in computation to the specified value so
             that compilation is not triggered at each call with slightly different array sizes. Must
-            be at least ``states.shape[0]``. On a non-empty mesh this is rounded **up** to the next
+            be at least ``states.shape[0]``. Defaults to the next power of two at or above
+            ``states.shape[0]``, which is the rule a caller feeding growing, all-distinct subspace
+            dimensions needs (the normal SQD access pattern -- one dimension per Krylov rung plus one
+            per configuration-recovery round, so no two calls share a size). Pass
+            ``states.shape[0]`` for no padding at all. On a non-empty mesh this is rounded **up** to the next
             multiple of ``mesh.size``, so the value used internally may exceed the one passed; that
             widens the coalescing this argument exists for rather than defeating it (measured on a
             4-device mesh, ``states_size`` 33 through 36 all share one compiled kernel -- 707 ms to
@@ -258,7 +262,19 @@ def sqd(
         ValueError: If ``states_size`` is smaller than ``states.shape[0]``.
     """
     if states_size is None:
-        states_size = states.shape[0]
+        # Default to the next power of two at or above the input length. states_size exists to stop
+        # each distinct subspace dimension retracing the solver, and growing all-distinct dimensions
+        # are the *normal* SQD access pattern rather than an edge case: an SKQD run walks one
+        # dimension per Krylov rung plus one per configuration-recovery round, so every call sees a
+        # dimension it has not seen before and a default of states.shape[0] pins nothing. Bucketing
+        # to powers of two collapses that to O(log N) traces (measured 1.25x over five growing
+        # dimensions 60..260 at n=10, and 1.43x over the first five rungs of an n=13 job, energies
+        # bit-identical in both -- it is purely a compilation-coalescing knob).
+        #
+        # Padding is not observable: filler slots are excluded from the projection and trimmed from
+        # the returned basis, so this is transparent to callers that never passed a value. Callers
+        # that want the old behaviour pass states.shape[0] explicitly.
+        states_size = 1 << max((states.shape[0] - 1).bit_length(), 1)
     if states_size < states.shape[0]:
         raise ValueError("states_size smaller than the states array length")
     if not isinstance(hamiltonian, PauliSumXZ):

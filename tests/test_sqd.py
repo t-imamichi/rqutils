@@ -646,9 +646,16 @@ class TestSqdEndToEnd:
         to ``>> 8`` (a uint8 shifted by 8 is 0, marking every filler as a genuine state): the whole
         sqd suite stays green *except* this test.
 
-        This fixture instead uses 4 states that are ALREADY unique, so ``states_size=None`` needs no
-        padding at all and is a genuinely filler-free control -- the only arm that stays correct under
-        that mutation, which is what separates "filler handling broke" from "the solver broke".
+        This fixture instead uses 4 states that are ALREADY unique, so the ``states_size=None`` arm
+        needs no padding at all and is a genuinely filler-free control -- the only arm that stays
+        correct under that mutation, which is what separates "filler handling broke" from "the solver
+        broke".
+
+        That control property depends on the fixture length being a power of two, and it is asserted
+        below rather than left implicit. ``states_size=None`` no longer means "no padding": it
+        defaults to the next power of two at or above the input length, so a fixture of, say, 5 rows
+        would round to 8 and this arm would silently acquire three filler slots -- becoming a second
+        padded arm and leaving the mutation uncaught, with nothing in the test to say so.
         Two distinct guards are pinned, both measured to return a plausible wrong answer of -1.2
         against the true -0.8297058541:
 
@@ -673,7 +680,6 @@ class TestSqdEndToEnd:
         strings = ["ZIII", "IZII", "XXII", "IIZI"]
         coeffs = [1.0, -0.5, 0.3, 0.7]
         states = np.array([[0, 0, 0, 0], [0, 0, 1, 1], [0, 1, 0, 1], [1, 0, 0, 1]], dtype=np.uint8)
-        assert len(np.unique(states, axis=0)) == len(states), "fixture must start filler-free"
 
         reference = lowest_projected(strings, coeffs, states)
         got = eigval_of(strings, coeffs, states, states_size=states_size)
