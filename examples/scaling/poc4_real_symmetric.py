@@ -66,11 +66,9 @@ def main():
     for real in [False, True]:
         p = make_problem(18, 8_000, num_terms=60, num_xgroups=30, real_only=real, seed=41)
         _states_u, xs, dg, vec, size = setup(p)
-        mv = functools.partial(apply_h, cache_level=(1, 2))
-        hv = jax.block_until_ready(mv(vec, (xs, dg), None))
-        eigval, eigvec, niter, conv = ground_locg(
-            lambda v, *a, mv=mv: mv(v, *a), vec, args=((xs, dg), None), maxiter=60
-        )
+        mv = functools.partial(apply_h, xsources=xs, diagonals=dg)
+        hv = jax.block_until_ready(mv(vec))
+        eigval, eigvec, niter, conv = ground_locg(lambda v, mv=mv: mv(v), vec, maxiter=60)
         print(
             f"  real_only={real!s:<5s}  c={p.hamiltonian.c.dtype!s:<10s} "
             f"Hv={hv.dtype!s:<10s} eigvec={eigvec.dtype!s:<10s} "
@@ -88,12 +86,8 @@ def main():
         for real in [False, True]:
             p = make_problem(24, num_states, num_terms=200, num_xgroups=50, real_only=real, seed=42)
             _states_u, xs, dg, vec, size = setup(p)
-            mv = functools.partial(apply_h, cache_level=(1, 2))
-            ts[real] = timeit(
-                lambda mv=mv, vec=vec, xs=xs, dg=dg: mv(vec, (xs, dg), None),
-                f"real={real}",
-                trials=5,
-            )
+            mv = functools.partial(apply_h, xsources=xs, diagonals=dg)
+            ts[real] = timeit(lambda mv=mv, vec=vec: mv(vec), f"real={real}", trials=5)
             info[real] = (p.num_xgroups, size, nbytes_of(dg))
         assert info[False][0] == info[True][0], "J mismatch: comparison is not controlled"
         print(
@@ -116,13 +110,12 @@ def main():
         for real in [False, True]:
             p = make_problem(24, num_states, num_terms=200, num_xgroups=50, real_only=real, seed=43)
             _states_u, xs, dg, vec, size = setup(p)
-            mv = functools.partial(apply_h, cache_level=(1, 2))
+            mv = functools.partial(apply_h, xsources=xs, diagonals=dg)
 
-            def solve(mv=mv, vec=vec, xs=xs, dg=dg):
+            def solve(mv=mv, vec=vec):
                 return ground_locg(
-                    lambda v, *a, mv=mv: mv(v, *a),
+                    lambda v, mv=mv: mv(v),
                     vec,
-                    args=((xs, dg), None),
                     maxiter=maxiter,
                     tol=0.0,
                 )

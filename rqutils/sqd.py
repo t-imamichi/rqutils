@@ -146,11 +146,12 @@ returning the same energy. Prefer ``cache_level[0] = 1`` unless the memory genui
 diagonal axis is where the real memory-versus-speed judgement lies.
 
 **Selecting a strategy at the** :func:`apply_h` **boundary.** Name the arrays you have and the
-strategy follows from them. The tuple form that took its meaning from ``cache_level`` positionally is
-deprecated: nothing verified that the tuple matched the level declared, and supplying X signatures
-while declaring precomputed sources silently computed a different operator (measured 0.44 max abs
-error, no exception). A dtype or shape assertion cannot close that gap -- stacked Z signatures and
-sign bits are both uint8 of rank 3 -- so the representations are distinguished by name instead.
+strategy follows from them. An earlier tuple form took its meaning from ``cache_level`` positionally
+and has been removed: nothing verified that the tuple matched the level declared, and supplying X
+signatures while declaring precomputed sources silently computed a different operator (measured 0.44
+max abs error, no exception). A dtype or shape assertion could not have closed that gap -- stacked Z
+signatures and sign bits are both uint8 of rank 3 -- so the representations are distinguished by name
+instead.
 
 Distributed arrays and scaling limits
 =====================================
@@ -190,7 +191,6 @@ pad bit that aligns them with the Hamiltonian's signatures, and recovered with
 import functools
 import logging
 import time
-import warnings
 from collections.abc import Callable, Sequence
 from numbers import Number
 
@@ -263,10 +263,10 @@ def sqd(
     caching, 1=cache sign bits, 2=cache diagonals).
 
     On :func:`sqd` this tuple is the supported spelling -- the arrays are assembled internally, so
-    there is nothing for a caller to mispair. A caller invoking :func:`apply_h` directly should name
-    the arrays instead (``xsources=``/``xsignatures=``, ``diagonals=``/``diag_signs=``/
-    ``zsignatures=``); the equivalent positional tuple is deprecated there because nothing could check
-    it against the level declared.
+    there is nothing for a caller to mispair. A caller invoking :func:`apply_h` directly names the
+    arrays instead (``xsources=``/``xsignatures=``, ``diagonals=``/``diag_signs=``/``zsignatures=``);
+    the equivalent positional tuple was removed because nothing could check it against the level
+    declared.
 
     Args:
         hamiltonian: Hamiltonian to be projected and diagonalized.
@@ -1412,11 +1412,9 @@ def _apply_h_resolved(
 
 def apply_h(
     vec: NDArray[np.inexact],
-    scanned: tuple[NDArray, ...] | None = None,
-    states: StateList | None = None,
-    cache_level: tuple[int, int] | None = None,
-    nterms: int | None = None,
     *,
+    states: StateList | None = None,
+    nterms: int | None = None,
     xsources: NDArray[np.int32] | None = None,
     xsignatures: NDArray[np.uint8] | None = None,
     zsignatures: NDArray[np.uint8] | None = None,
@@ -1433,15 +1431,15 @@ def apply_h(
         apply_h(vec, xsources=xsrc, diag_signs=signs, coeffs=c, states=states)   # was (1, 1)
         apply_h(vec, xsignatures=x, diagonals=diags, states=states)              # was (0, 2)
 
-    **Why this replaces the positional form.** ``cache_level`` selected, *positionally*, how the
-    members of a ``scanned`` tuple were interpreted, and nothing checked that the tuple matched the
-    level declared. Passing raw X signatures while claiming ``cache_level[0] == 1`` -- which promises
-    precomputed X *sources* -- raised nothing and silently computed a different operator (measured
-    0.44 max abs error on a 5-state subspace). An index array and a signature array are
-    indistinguishable at that boundary: both are integer-typed with compatible shapes. Worse, the
-    obvious cheap mitigation does not work -- a dtype or rank assertion cannot separate
-    ``zsignatures`` from ``diag_signs``, since stacked they are *both* uint8 of rank 3, and shapes
-    collide outright when the subspace size equals the packed byte width.
+    **Why this replaced the positional form.** The positional form's ``cache_level`` selected,
+    positionally, how the members of a ``scanned`` tuple were interpreted, and nothing checked that
+    the tuple matched the level declared. Passing raw X signatures while claiming
+    ``cache_level[0] == 1`` -- which promises precomputed X *sources* -- raised nothing and silently
+    computed a different operator (measured 0.44 max abs error on a 5-state subspace). An index array
+    and a signature array are indistinguishable at that boundary: both are integer-typed with
+    compatible shapes. Worse, the obvious cheap mitigation does not work -- a dtype or rank assertion
+    cannot separate ``zsignatures`` from ``diag_signs``, since stacked they are *both* uint8 of rank
+    3, and shapes collide outright when the subspace size equals the packed byte width.
 
     Naming each representation makes the six valid combinations the only constructible ones, so a
     mispairing is a :exc:`TypeError` here instead of a wrong number later. Note the honest limit: this
@@ -1449,16 +1447,9 @@ def apply_h(
 
     Args:
         vec: Vector to multiply.
-        scanned: Deprecated. The positional tuple form, whose members are interpreted by position
-            according to ``cache_level``: ``(0, 0)`` ``(xsignatures, zsignatures, coeffs)``;
-            ``(0, 1)`` ``(xsignatures, diag_signs, coeffs)``; ``(0, 2)``
-            ``(xsignatures, diagonals)``; ``(1, 0)`` ``(xsources, zsignatures, coeffs)``;
-            ``(1, 1)`` ``(xsources, diag_signs, coeffs)``; ``(1, 2)`` ``(xsources, diagonals)``.
-            Emits a :exc:`DeprecationWarning` -- pass the arrays by name instead.
         states: Uniquified state list. Required whenever the X signatures or the Z signatures are
             supplied, i.e. for every combination except ``xsources`` with ``diag_signs`` and
             ``xsources`` with ``diagonals`` -- those two read neither, so they need no states at all.
-        cache_level: Deprecated, and only meaningful with ``scanned``.
         nterms: Static number of Z terms to sum per X group. Pass it to make this differentiable with
             respect to the coefficients; use ``max(hamiltonian.nzterms)``. Ignored when ``diagonals``
             is given, since no accumulation happens then. See :func:`_accumulate_diagonal`.
@@ -1477,45 +1468,10 @@ def apply_h(
 
     Raises:
         TypeError: If the named arrays do not form exactly one of the six valid combinations -- none
-            or both of the X-axis arrays, none or several of the diagonal-axis arrays, ``coeffs``
-            missing where it is needed or supplied where it is not, or the named form mixed with
-            ``scanned``/``cache_level``.
+            or both of the X-axis arrays, none or several of the diagonal-axis arrays, or ``coeffs``
+            missing where it is needed or supplied where it is not.
         ValueError: If ``states`` is needed but None.
     """
-    if scanned is not None or cache_level is not None:
-        named = {
-            name: value
-            for name, value in (
-                ("xsources", xsources),
-                ("xsignatures", xsignatures),
-                ("zsignatures", zsignatures),
-                ("diag_signs", diag_signs),
-                ("diagonals", diagonals),
-                ("coeffs", coeffs),
-            )
-            if value is not None
-        }
-        if named:
-            raise TypeError(
-                "apply_h: the deprecated scanned/cache_level form cannot be mixed with the named "
-                f"arrays {sorted(named)}; pass only one form"
-            )
-        if scanned is None:
-            raise TypeError("apply_h: cache_level requires scanned")
-        warnings.warn(
-            "apply_h's positional (scanned, cache_level) form is deprecated: the pairing is "
-            "unchecked, and mispairing it silently computes a different operator. Pass the arrays "
-            "by name instead (xsources=/xsignatures=, diagonals=/diag_signs=/zsignatures=, "
-            "coeffs=).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        # cache_level omitted with a tuple is legal in the old API; let the kernel's own default
-        # apply rather than restating it here, where it could drift from the signature.
-        if cache_level is None:
-            return _apply_h_resolved(vec, scanned, states, nterms=nterms)
-        return _apply_h_resolved(vec, scanned, states, cache_level, nterms)
-
     # Each axis is (name, cache_level digit, array). Pairing the three here means the axis is
     # resolved, validated and unpacked from one list, with no lookup table to keep in step.
     xaxis_options = [("xsources", 1, xsources), ("xsignatures", 0, xsignatures)]

@@ -1372,14 +1372,15 @@ class TestMatvecKernels:
             apply_h(np.zeros(4), **kwargs)
 
     def test_mispairing_is_now_unconstructible(self):
-        """The silent-wrong-answer path: an X signature passed where an X *source* was promised.
+        """The silent-wrong-answer path the named API forecloses: an X signature passed where an
+        X *source* was promised.
 
-        The defect, measured on this exact fixture before the fix: ``cache_level=(1, 1)`` with
-        ``hamiltonian.x`` in slot 0 instead of the precomputed sources returned
-        ``[-0.02, 0.02, 0.02, -0.02, 0.02]`` against the correct
-        ``[0.2, -0.1, 0.46, 0.22, 0.2]`` -- **max abs error 0.44, no exception**. An index array and a
-        signature array are both integer-typed with compatible shapes, so the boundary could not tell
-        them apart.
+        History: the deprecated positional ``(scanned, cache_level)`` form (removed) let this
+        mispairing through. On this exact fixture, ``cache_level=(1, 1)`` with ``hamiltonian.x`` in
+        slot 0 instead of the precomputed sources returned ``[-0.02, 0.02, 0.02, -0.02, 0.02]``
+        against the correct ``[0.2, -0.1, 0.46, 0.22, 0.2]`` -- a measured 0.44 max abs error, no
+        exception. An index array and a signature array are both integer-typed with compatible
+        shapes, so the old boundary could not tell them apart.
 
         Note what is *not* fixable by a cheaper dtype or rank assertion, which is why the API changed
         rather than gaining a check: stacked ``diag_signs`` and ``zsignatures`` are **both uint8 of
@@ -1403,11 +1404,9 @@ class TestMatvecKernels:
         assert signs.dtype == hamiltonian.z.dtype == np.uint8
         assert signs.ndim == hamiltonian.z.ndim == 3
 
-        correct = np.asarray(
-            apply_h(
-                vector, xsources=xsources, diag_signs=signs, coeffs=hamiltonian.c, states=states_u
-            )
-        )
+        # The correctly-named call still constructs and runs; only the mispairings below are
+        # rejected.
+        apply_h(vector, xsources=xsources, diag_signs=signs, coeffs=hamiltonian.c, states=states_u)
         # Naming the X axis twice is a TypeError, not a silent reinterpretation.
         with pytest.raises(TypeError, match="exactly one of xsources= or xsignatures="):
             apply_h(
@@ -1430,21 +1429,6 @@ class TestMatvecKernels:
                 coeffs=hamiltonian.c,
                 states=states_u,
             )
-        # The legacy tuple form still lets the mispairing through -- pinned so the deprecation
-        # message keeps being justified by a real defect rather than by taste.
-        with pytest.warns(DeprecationWarning):
-            mispaired = np.asarray(
-                apply_h(
-                    vector,
-                    (hamiltonian.x, signs, hamiltonian.c),
-                    states_u,
-                    (1, 1),
-                )
-            )
-        assert np.abs(mispaired - correct).max() > 0.1, (
-            "the legacy path is expected to still produce a wrong answer; if it now raises or agrees, "
-            "this test's premise has changed"
-        )
 
     def test_coeffs_requirement_is_enforced_per_diagonal_form(self):
         """``coeffs`` is required by two of the three diagonal forms and meaningless in the third."""
@@ -1458,32 +1442,6 @@ class TestMatvecKernels:
             apply_h(vector, xsources=xsources, zsignatures=hamiltonian.z, states=states_u)
         with pytest.raises(TypeError, match="coeffs= is not used with diagonals="):
             apply_h(vector, xsources=xsources, diagonals=diagonals, coeffs=hamiltonian.c)
-
-    def test_legacy_tuple_form_still_works_but_warns(self):
-        """Deprecated, not removed: an existing caller keeps working until it migrates."""
-        rng = np.random.default_rng(9)
-        states = unique_states(7, 4, rng)
-        strings = real_pauli_strings(4, 5, rng)
-        coeffs = rng.normal(size=len(strings))
-        _, _, vector, xsources, diagonals = matvec_fixture(rng, strings, coeffs, states)
-
-        want = np.asarray(apply_h(vector, xsources=xsources, diagonals=diagonals))
-        with pytest.warns(DeprecationWarning, match="deprecated"):
-            got = np.asarray(apply_h(vector, (xsources, diagonals), None, (1, 2)))
-        np.testing.assert_array_equal(got, want)
-
-    def test_mixing_the_two_forms_raises(self):
-        """A half-migrated call site is a mistake, not a merge of the two conventions."""
-        rng = np.random.default_rng(10)
-        states = unique_states(5, 4, rng)
-        _, _, vector, xsources, diagonals = matvec_fixture(
-            rng, ["ZIII", "XXII"], [1.0, 0.4], states
-        )
-
-        with pytest.raises(TypeError, match="cannot be mixed with the named arrays"):
-            apply_h(vector, (xsources, diagonals), None, (1, 2), xsources=xsources)
-        with pytest.raises(TypeError, match="cache_level requires scanned"):
-            apply_h(vector, cache_level=(1, 2))
 
     def test_fully_cached_level_matches_dense(self):
         """``cache_level=(1, 2)``, the fully-precomputed level, against a dense reference.
