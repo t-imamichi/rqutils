@@ -2,7 +2,7 @@
 
 The premise needed checking before building anything, and it changed the question. ``apply_h``
 already propagates float64 correctly when ``PauliSumXZ.c`` narrows to float64 -- the dtype flows from
-``.c`` through ``_diag_from_z`` to the output, verified directly. So there is no promotion bug to fix
+``.c`` through ``diagonals`` to the output, verified directly. So there is no promotion bug to fix
 and nothing to implement.
 
 What is left is a measurement worth having: **how much does realness actually buy**, across the
@@ -39,7 +39,7 @@ import numpy as np
 from _scaling_common import fmt_ratio, header, make_problem, timeit
 
 from rqutils.ground_locg import ground_locg
-from rqutils.sqd import _diag_from_z, apply_h, uniquify_states, xsource
+from rqutils.sqd import apply_h, diagonals, uniquify_states, xsource
 
 
 def setup(problem):
@@ -49,13 +49,15 @@ def setup(problem):
     xsources = jax.block_until_ready(
         jax.lax.scan(lambda _, x: (None, xsource(x, states_u)), None, ham.x)[1]
     )
-    diagonals = jax.block_until_ready(
-        jax.lax.scan(lambda _, v: (None, _diag_from_z(v[0], v[1], states_u)), None, (ham.z, ham.c))[
-            1
-        ]
+    diags = jax.block_until_ready(
+        jax.lax.scan(
+            lambda _, v: (None, diagonals(v[1], zsignatures=v[0], states=states_u)),
+            None,
+            (ham.z, ham.c),
+        )[1]
     )
     vec = jnp.asarray(np.random.default_rng(0).normal(size=size).astype(ham.c.dtype))
-    return states_u, xsources, diagonals, vec, size
+    return states_u, xsources, diags, vec, size
 
 
 def main():

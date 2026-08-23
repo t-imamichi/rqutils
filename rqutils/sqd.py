@@ -206,6 +206,10 @@ together, but **without a stability promise** -- prefer the kernel API above whe
 .. autofunction:: diagonals
 .. autofunction:: apply_xgroup
 
+``CACHE_LEVELS`` is the convenience constant enumerating all six ``(source_indices, diagonals)``
+pairs :func:`apply_h` resolves to; it is data rather than a function, so it carries no autodoc
+directive.
+
 States are packed with :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states`, which inserts the
 pad bit that aligns them with the Hamiltonian's signatures, and recovered with
 :meth:`~rqutils.paulis.symplectic.PauliSumXZ.unpack_states`.

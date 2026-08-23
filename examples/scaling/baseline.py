@@ -31,7 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 from _scaling_common import header, make_problem, timeit
 
-from rqutils.sqd import _diag_from_z, apply_h, uniquify_states, xsource
+from rqutils.sqd import apply_h, diagonals, uniquify_states, xsource
 
 
 def component_costs(problem, cache_level=(1, 2)):
@@ -51,7 +51,9 @@ def component_costs(problem, cache_level=(1, 2)):
         lambda: xsource(ham.x[0], states_u), "xsource (1 signature)", trials=5
     )
     out["diagonal_1"] = timeit(
-        lambda: _diag_from_z(ham.z[0], ham.c[0], states_u), "_diag_from_z (1 group)", trials=5
+        lambda: diagonals(ham.c[0], zsignatures=ham.z[0], states=states_u),
+        "diagonals (1 group)",
+        trials=5,
     )
 
     # Full precomputation of all J source indices, as _run_sqd does under cache_level[0]==1.
@@ -62,13 +64,15 @@ def component_costs(problem, cache_level=(1, 2)):
 
     # One matvec under the fully-cached strategy, which is the steady-state solver cost.
     xsources = jax.block_until_ready(all_xsources())
-    diagonals = jax.block_until_ready(
-        jax.lax.scan(lambda _, v: (None, _diag_from_z(v[0], v[1], states_u)), None, (ham.z, ham.c))[
-            1
-        ]
+    diags = jax.block_until_ready(
+        jax.lax.scan(
+            lambda _, v: (None, diagonals(v[1], zsignatures=v[0], states=states_u)),
+            None,
+            (ham.z, ham.c),
+        )[1]
     )
     vec = jnp.asarray(np.random.default_rng(0).normal(size=size).astype(ham.c.dtype))
-    mv = functools.partial(apply_h, xsources=xsources, diagonals=diagonals)
+    mv = functools.partial(apply_h, xsources=xsources, diagonals=diags)
     out["matvec"] = timeit(lambda: mv(vec), "apply_h (1,2) matvec", trials=5)
     return out
 

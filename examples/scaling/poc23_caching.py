@@ -39,10 +39,10 @@ from _scaling_common import header, make_problem, max_abs_diff, timeit
 from poc1_searchsorted import xsource_searchsorted_u64
 
 from rqutils.sqd import (
-    _diag_from_z,
     apply_h,
     apply_xgroup,
     diag_signs,
+    diagonals,
     uniquify_states,
     xsource,
 )
@@ -57,15 +57,17 @@ def build_caches(problem, states_u):
     signs = jax.block_until_ready(
         jax.lax.scan(lambda _, z: (None, diag_signs(z, states_u)), None, ham.z)[1]
     )
-    diagonals = jax.block_until_ready(
-        jax.lax.scan(lambda _, v: (None, _diag_from_z(v[0], v[1], states_u)), None, (ham.z, ham.c))[
-            1
-        ]
+    diags = jax.block_until_ready(
+        jax.lax.scan(
+            lambda _, v: (None, diagonals(v[1], zsignatures=v[0], states=states_u)),
+            None,
+            (ham.z, ham.c),
+        )[1]
     )
     return {
         "xsources": xsources,
         "diag_signs": signs,
-        "diagonals": diagonals,
+        "diagonals": diags,
         "states_u": states_u,
     }
 
