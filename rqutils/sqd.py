@@ -169,14 +169,18 @@ comes from :func:`uniquify_states` alone -- see :func:`get_xsource` for that cha
 measured to be worth. A comparable limit is set by the GPU memory, which is at most O(100)GB per
 device as of mid-2026.
 
-When the source indices are cached but neither the sign bits nor the diagonals are, the state list
-:math:`S` will also be sharded after the computation of the source indices are done.
+When the source indices are cached -- ``cache_level[0] == 1``, whatever the diagonal setting -- the
+state list :math:`S` is also sharded once the source indices are computed, since nothing sorts or
+binary-searches it afterwards. At ``cache_level[0] == 0`` it stays replicated, because
+:func:`get_xsource` runs inside the matvec and its binary search needs the whole sorted array; the
+consumers that need a sharded view of it derive one themselves (see :func:`_spread_seed`).
 
 SQD API
 =======
 
 .. autofunction:: sqd
 .. autofunction:: hproj
+.. autofunction:: all_diagonals
 
 States are packed with :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states`, which inserts the
 pad bit that aligns them with the Hamiltonian's signatures, and recovered with
@@ -351,10 +355,6 @@ def sqd(
 
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
-    # Built here rather than inside run_sqd: dropping the padding is a boolean-mask index, which
-    # needs concrete shapes, and run_sqd sees `hamiltonian` as a pytree of tracers. Only the
-    # cache_level[1] == 2 path reads it, so it is skipped otherwise -- the reshape is host-side work
-    # proportional to the rectangle.
     # Built here rather than inside run_sqd: dropping the padding is a boolean-mask index, which
     # needs concrete shapes, and run_sqd sees `hamiltonian` as a pytree of tracers. Only the
     # cache_level[1] == 2 path reads it, so it is skipped otherwise -- the reshape is host-side work
@@ -663,21 +663,21 @@ def run_sqd(
 
     def vinit_from_min_diag():
         if cache_level[1] == 2:
-            # .real for the same reason the else-branch takes it: the diagonal of a Hermitian operator
-            # is real, but `.c` is complex128 whenever any Pauli string has an odd number of Ys, so the
-            # composed diagonal carries a zero imaginary part along. argmin below cannot order complex
-            # values -- "lt does not accept dtype complex128" -- and this branch was missing the
-            # narrowing the other one had, so cache_level=(1, 2) raised on any odd-Y operator with an
-            # all-identity X group (the group that makes this branch reachable). Pre-existing; found by
-            # sweeping cache_level in poc7_sharding.py, which previously only ran the default.
-            diagonal = diagonals[0].real
+            diagonal = diagonals[0]
         else:
             # Same nterms the matvec uses: this computes the same diagonal by the same kernel, so
             # leaving it ungated would trace the accumulator a second time under a different static
             # key within this one trace, and would let the two drift if the accumulator changed.
-            diagonal = get_diagonal(
-                hamiltonian.z[0], hamiltonian.c[0], states_u, matvec_nterms
-            ).real
+            diagonal = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u, matvec_nterms)
+        # Narrow AFTER the join, not in each branch. The diagonal of a Hermitian operator is real, but
+        # `.c` is complex128 whenever any Pauli string has an odd number of Ys, so the composed
+        # diagonal carries a zero imaginary part along and the argmin below cannot order it ("lt does
+        # not accept dtype complex128"). Both branches used to narrow independently, and that is
+        # exactly how the bug shipped: the cache_level[1] == 2 branch was added without copying the
+        # other's `.real`, so that level raised on any odd-Y operator with an all-identity X group --
+        # the group that makes this function reachable at all. One narrowing on the joined value means
+        # a third diagonal source cannot reintroduce it.
+        diagonal = diagonal.real
         # Set the fill-in components to the maximum value so that argmin only sees the valid entries
         diagonal = jnp.where(_is_filler(states_u) == 1, jnp.max(diagonal), diagonal)
         imin = jnp.argmin(diagonal)
@@ -960,6 +960,12 @@ def get_diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Arr
 #
 # This gates speed only. Differentiability always requires nterms, so apply_h honours whatever a
 # caller passes; this constant only decides what run_sqd binds for itself.
+# Every (source_indices, diagonals) combination, i.e. all six matvec kernels apply_h resolves to.
+# Lives here rather than in the tests because the POCs need it too and cannot import from tests/;
+# two independent copies of this list is how a sharding failure on the (0, *) levels went unnoticed
+# while poc7_sharding.py swept only a subset.
+CACHE_LEVELS = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+
 _NTERMS_MIN_K = 8
 
 
@@ -1158,9 +1164,9 @@ def all_diagonals(
     The rectangular alternative to :func:`get_diagonal`. That one is called per X group under a
     ``lax.scan``, so a single trip count serves every group and each pays the widest group's extent.
     This one takes the *flat* layout -- :attr:`~rqutils.paulis.symplectic.PauliSumXZ.flat_terms`,
-    which drops the padding -- computes every term's contribution at once, and reduces them back to
-    per-group rows with a segment sum. The work is proportional to the number of real terms rather
-    than to :math:`J 	imes \max_j K^{(j)}`.
+    which drops the padding -- computes every term's contribution at once, and scatter-adds them back
+    to per-group rows. The work is proportional to the number of real terms rather
+    than to :math:`J \times \max_j K^{(j)}`.
 
     **This is strictly better than a static ``nterms`` when the groups are ragged, and never worse.**
     Measured against the ``lax.scan`` form at :math:`N = 4096`, on local two-body operators with
@@ -1182,7 +1188,7 @@ def all_diagonals(
     linearly with :math:`J` (4233 ms at :math:`J=257`) and only breaks even after thousands of calls.
 
     Output is **bit-identical** to the scan form (``maxdiff`` exactly 0.0 at every size above), because
-    the segment sum accumulates in the same term order. Differentiable w.r.t. ``coeffs`` with no
+    the scatter accumulates in the same term order. Differentiable w.r.t. ``coeffs`` with no
     special handling -- there is no data-dependent termination to begin with -- and verified against a
     closed-form gradient to 1.8e-15.
 

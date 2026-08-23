@@ -36,6 +36,7 @@ from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import (
     _MAX_STATES,
     _NTERMS_MIN_K,
+    CACHE_LEVELS,
     _default_states_size,
     _is_lex_sorted,
     _z_parity,
@@ -50,9 +51,6 @@ from rqutils.sqd import (
     sqd,
     uniquify_states,
 )
-
-# Every (source_indices, diagonals) combination, i.e. all six matvec kernels.
-CACHE_LEVELS = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
 
 
 def pack_padded(states):
@@ -361,7 +359,10 @@ class TestAllDiagonals:
         assert np.all(np.isfinite(np.asarray(got)))
 
         diagonals = np.asarray(all_diagonals(flat_z, flat_c, group_ids, states_u, num_groups))
-        signs = 1.0 - 2.0 * np.stack([np.asarray(_z_parity(states_u, z)) for z in flat_z])
+        # vmap, not a per-term Python loop: one eager dispatch and device transfer per term measured
+        # 46x slower at (T=206, N=4096), and this mirrors all_diagonals' own structure rather than
+        # restating it in a slower idiom.
+        signs = 1.0 - 2.0 * np.asarray(jax.vmap(lambda z: _z_parity(states_u, z))(flat_z))
         expected = np.array(
             [2.0 * np.sum(signs[t] * diagonals[group_ids[t]]) for t in range(flat_c.shape[0])]
         )
@@ -432,7 +433,7 @@ class TestFlatTerms:
         flat_z, flat_c, group_ids = hamiltonian.flat_terms
         nzterms = np.asarray(hamiltonian.nzterms)
         assert flat_z.shape[0] == flat_c.shape[0] == group_ids.shape[0] == nzterms.sum()
-        # Non-decreasing, which is what lets all_diagonals pass indices_are_sorted=True.
+        # Non-decreasing, which is what makes all_diagonals' scatter contiguous.
         assert np.all(np.diff(group_ids) >= 0)
         assert np.array_equal(np.bincount(group_ids, minlength=len(nzterms)), nzterms)
 

@@ -31,7 +31,7 @@ import numpy as np
 from _scaling_common import header, make_problem
 from jax.sharding import AxisType
 
-from rqutils.sqd import hproj, sqd
+from rqutils.sqd import CACHE_LEVELS, hproj, sqd
 
 
 def check_single_vs_sharded():
@@ -64,7 +64,7 @@ def check_single_vs_sharded():
                 cache_level: float(
                     sqd(p.hamiltonian, p.states, return_eigvec=False, cache_level=cache_level)
                 )
-                for cache_level in [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+                for cache_level in CACHE_LEVELS
             }
         eig_precomputed = eig_levels[(1, 2)]
         worst_level = max(abs(e - eig_single) for e in eig_levels.values())
@@ -77,7 +77,8 @@ def check_single_vs_sharded():
         d_ss = abs(eig_sharded - eig_single)
         d_ref = abs(eig_single - eig_dense)
         d_pc = abs(eig_precomputed - eig_single)
-        results[num_qubits] = (d_ss, d_ref, max(d_pc, worst_level))
+        # worst_level already maximises over all six levels, so d_pc is one of its terms.
+        results[num_qubits] = (d_ss, d_ref, worst_level)
         print(
             f"  n={num_qubits:<3d} N={num_states:<6d}  single={eig_single:+.10f}  "
             f"sharded={eig_sharded:+.10f}  dense={eig_dense:+.10f}"
