@@ -21,6 +21,10 @@ phase error was hiding in plain sight. The one exception is ``cz``, whose decomp
 irreducible ``exp(i*pi/4)`` -- see :meth:`TestCz.test_cz_matches_up_to_global_phase`.
 """
 
+import os
+import subprocess
+import sys
+
 import numpy as np
 import pytest
 from conftest import gate_unitary, phaseless_distance, simulate_dense
@@ -428,3 +432,90 @@ def test_gate_unitary_reference_matches_dense_simulation():
         name, qubits, *rest = spec
         by_hand = gate_unitary(name, qubits, 2, *rest) @ by_hand
     assert np.allclose(simulate_dense(specs, 2), by_hand, atol=1e-15)
+
+
+class TestShardedOutput:
+    """``svsim``'s ``out_sharding`` must not change the answer, at any spec or gate.
+
+    This path was exercised by **nothing** -- CLAUDE.md recorded it as the one remaining
+    ``out_sharding`` contract with no test. It is checked here because the same axis in
+    :mod:`rqutils.sqd` hid three defects, two of which masked the next: a rank-2 ``PartitionSpec`` on
+    a rank-1 accumulator, a ``jnp.where`` mixing a replicated predicate with a partitioned operand,
+    and a complex diagonal reaching ``argmin``. Measured, ``svsim`` has none of them -- every case
+    below agrees with the single-device answer to exactly 0.0, and the returned specs confirm the
+    output is genuinely distributed (4 shards of 16 amplitudes at n=6) rather than replicated and
+    coincidentally right.
+
+    ``svsim`` is structurally safer than ``sqd`` here: it takes ``out_sharding`` as an explicit
+    parameter and threads it through every op that creates an array, rather than resharding
+    conditionally partway through. The ``array_initial_state`` case is the one that mirrors ``sqd``'s
+    ``_spread_seed`` defect -- a replicated caller-supplied vector meeting a partitioned scan body --
+    and it passes.
+
+    **Not covered, deliberately:** a mesh size that does not divide ``2**num_qubits``. That raises
+    from jax, and it is a documented hard constraint rather than a defect -- a state vector cannot be
+    padded the way ``sqd``'s state list can, because its indices *are* the basis states. Note the
+    constraint bites harder than "small circuits": a 3- or 6-device mesh never divides a power of two,
+    so it fails at *every* qubit count. See ``svsim``'s docstring.
+
+    Runs as a subprocess because the virtual device count has to be set before jax initializes, and
+    ``conftest`` has already imported it by collection time.
+    """
+
+    # frozenset, not set: a mutable class attribute is shared across every test instance, so an
+    # accidental mutation in one test would silently change what the others assert.
+    EXPECTED_CASES = frozenset(
+        {
+            "implicit",
+            "explicit_partitioned",
+            "explicit_replicated",
+            "array_initial_state",
+            "sharded_initial_state",
+        }
+    )
+
+    def test_sharding_does_not_change_the_state_vector(self):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_sharded_svsim.py")
+        assert os.path.exists(script), f"missing sharding harness at {script}"
+        env = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=4"}
+        # check=False deliberately: the assertion below reports the child's stderr, which is far more
+        # useful than CalledProcessError's bare exit code for a jax sharding raise.
+        proc = subprocess.run(
+            [sys.executable, script],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        assert proc.returncode == 0, f"sharded svsim raised:\n{proc.stderr[-3000:]}"
+
+        seen = {}
+        for line in proc.stdout.strip().splitlines():
+            parts = line.split(maxsplit=2)
+            if len(parts) != 3:
+                continue
+            seen[parts[0]] = (float(parts[1]), parts[2])
+
+        # Completeness before values: a child dying after two cases would otherwise pass on those two.
+        assert set(seen) == self.EXPECTED_CASES, (
+            f"expected {sorted(self.EXPECTED_CASES)}, got {sorted(seen)} -- the child did not run "
+            f"every case:\n{proc.stdout[-2000:]}"
+        )
+        for label, (diff, spec) in sorted(seen.items()):
+            assert diff == pytest.approx(0.0, abs=1e-13), (
+                f"{label}: sharded state vector differs from single-device by {diff}"
+            )
+        # The partitioned arms must actually be partitioned. This is not redundant with the value
+        # checks above: an explicitly *replicated* run agrees with the single-device reference to
+        # exactly 0.0 (measured), so "correct but silently unsharded" is invisible to any value
+        # comparison. Only the spec distinguishes them.
+        #
+        # Mutation-tested. Neutering the mesh lookup or discarding a caller-supplied `out_sharding`
+        # is caught, though via the child's exit code rather than here -- the `sharded_initial_state`
+        # case then feeds a partitioned input into a replicated body and jax raises. These assertions
+        # are what would catch a subtler regression that kept every op self-consistent while dropping
+        # the partitioning.
+        assert seen["explicit_replicated"][1] == "P(None,)", seen["explicit_replicated"]
+        for label in self.EXPECTED_CASES - {"explicit_replicated"}:
+            assert seen[label][1] == "P('x',)", f"{label} was not partitioned: {seen[label][1]}"

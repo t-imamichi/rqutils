@@ -104,7 +104,16 @@ def svsim(
     Args:
         circuit: Quantum circuit to simulate.
         initial_state: Initial state vector or the one-hot index.
-        out_sharding: Manual specification of the sharding of the final state vector.
+        out_sharding: Manual specification of the sharding of the final state vector. Defaults to
+            ``PartitionSpec(mesh.axis_names)`` when a mesh is active, i.e. the state vector is
+            partitioned over every mesh axis. **The mesh size must divide** ``2**num_qubits``, which
+            is a hard requirement rather than a tuning choice: a state vector cannot be padded the way
+            :func:`rqutils.sqd.sqd`'s state list can, because its indices *are* the basis states and a
+            filler amplitude would change the operator. Since the dimension is a power of two, this
+            holds automatically for a power-of-two mesh with ``2**num_qubits >= mesh.size``, and never
+            holds for a mesh of, say, 3 or 6 devices -- there it fails at *every* qubit count, not just
+            small ones. The raise comes from jax and names both shapes. Pass
+            ``PartitionSpec(None)`` to replicate instead, at the cost of a full copy per device.
 
     Returns:
         Final state vector as a (sharded) JAX Array.

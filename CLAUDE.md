@@ -73,11 +73,27 @@ uv run --extra dev pytest -v -x        # verbose, stop at first failure
 ```
 
 One `tests/test_<module>.py` per module. All seven are covered — `ground_locg`, `sqd`, `svsim`,
-`paulis/general`, `paulis/symplectic`, `qprint`, `math` — but **only single-device**: no *test*
-exercises a multi-device mesh. `sqd`'s mesh-size padding and, through it, `ground_locg`'s
-`out_sharding` contract are now covered by `examples/scaling/poc7_sharding.py` (see below) rather than
-by pytest — run it after any change to `ground_locg`'s reductions or helper signatures, not just
-after touching `sqd`; **`svsim`'s `out_sharding` is still exercised by nothing.** `tests/` also
+`paulis/general`, `paulis/symplectic`, `qprint`, `math`. Most of it is single-device; the multi-device
+paths are covered by two subprocess tests plus a POC, since virtual devices must be requested before
+jax initializes (see below). `sqd`'s mesh-size padding and, through it, `ground_locg`'s `out_sharding`
+contract are covered by `test_sqd.py::TestShardedCacheLevels` and, more thoroughly, by
+`examples/scaling/poc7_sharding.py` — run the POC after any change to `ground_locg`'s reductions or
+helper signatures, not just after touching `sqd`. **`svsim`'s `out_sharding` is now covered** by
+`test_svsim.py::TestShardedOutput` (subprocessing `tests/_sharded_svsim.py`), which was the last
+untested sharding contract — checked because the same axis in `sqd` hid three defects. `svsim` had
+none: it takes `out_sharding` as an explicit parameter and threads it through every array-creating op,
+rather than resharding conditionally partway through as `run_sqd` does. Its one limit is documented
+rather than fixed: **`mesh.size` must divide `2^num_qubits`**, so a 3- or 6-device mesh fails at
+*every* qubit count, not just small ones. A state vector cannot be padded the way `sqd`'s state list
+can — its indices *are* the basis states — so there is nothing to pad and the jax raise (which names
+both shapes) stands. `PartitionSpec(None)` replicates instead.
+
+**Assert the sharding *spec*, not just the values.** An explicitly replicated `svsim` run agrees with
+the single-device answer to exactly 0.0, so "correct but silently unsharded" is invisible to any value
+comparison — the regression a dropped `out_sharding` would actually cause. `TestShardedOutput` asserts
+both.
+
+`tests/` also
 contains three Jupyter notebooks used as interactive scratchpads; pytest does not collect them.
 
 `tests/_sharded_cache_levels.py` is a script, not a test module (the leading underscore keeps it
