@@ -43,6 +43,7 @@ from rqutils.sqd import (
     all_diagonals,
     apply_h,
     compute_diagonal,
+    diagonals,
     get_diag_signs,
     get_diagonal,
     get_xsource,
@@ -407,6 +408,73 @@ class TestAllDiagonals:
         for cache_level in ((0, 2), (1, 2)):
             got = eigval_of(strings, coeffs, states, cache_level=cache_level)
             assert got == pytest.approx(reference, rel=1e-10), f"cache_level={cache_level}"
+
+
+class TestDiagonalsDispatch:
+    """``diagonals`` is one entry point over three sign sources, named the way ``apply_h`` names its.
+
+    The three predecessors (``compute_diagonal`` from cached bits, ``get_diagonal`` from Z signatures,
+    ``all_diagonals`` over the flat layout) took the same ``(coeffs, ...)`` and differed only in what
+    identified the sign source -- so which one to call was a fact the caller had to know rather than
+    state. Equality with each predecessor is asserted **bitwise**: this is a dispatch change, not a
+    numerical one, so anything else would signal a re-associated sum.
+    """
+
+    def test_diag_signs_path_matches_compute_diagonal(self):
+        rng = np.random.default_rng(41)
+        num_terms = 9
+        diag_signs = rng.integers(0, 256, size=(24, 2), dtype=np.uint8)
+        coeffs = np.zeros(num_terms)
+        coeffs[:4] = rng.normal(size=4)
+        want = compute_diagonal(diag_signs, coeffs, num_terms)
+        got = diagonals(coeffs, diag_signs=diag_signs, nterms=num_terms)
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    def test_zsignatures_path_matches_get_diagonal(self):
+        rng = np.random.default_rng(42)
+        states = unique_states(9, 5, rng)
+        hamiltonian = PauliSumXZ.from_paulisum((["ZIIII", "IZZII", "IIIZZ"], [1.0, -0.5, 0.25]))
+        states_u = uniquify_states(pack_padded(states), states.shape[0])
+        nterms = hamiltonian.nzterms[0]
+        want = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u, nterms)
+        got = diagonals(
+            hamiltonian.c[0], zsignatures=hamiltonian.z[0], states=states_u, nterms=nterms
+        )
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    def test_flat_path_matches_all_diagonals(self):
+        rng = np.random.default_rng(43)
+        strings = real_pauli_strings(5, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(12, 5, rng)
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_u = uniquify_states(pack_padded(states), states.shape[0])
+        flat_z, flat_c, group_ids = hamiltonian.flat_terms
+        num_groups = hamiltonian.x.shape[0]
+        want = all_diagonals(flat_z, flat_c, group_ids, states_u, num_groups)
+        got = diagonals(
+            flat_c,
+            zsignatures=flat_z,
+            group_ids=group_ids,
+            states=states_u,
+            num_groups=num_groups,
+        )
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    def test_invalid_combinations_raise(self):
+        """Each invalid keyword set names the axis that is wrong, before any array is read."""
+        coeffs = np.zeros((1, 1))
+        dummy = np.zeros((1, 1), dtype=np.uint8)
+        with pytest.raises(TypeError, match="exactly one of diag_signs= or zsignatures="):
+            diagonals(coeffs)
+        with pytest.raises(TypeError, match="exactly one of diag_signs= or zsignatures="):
+            diagonals(coeffs, diag_signs=dummy, zsignatures=dummy)
+        with pytest.raises(TypeError, match="zsignatures= requires states="):
+            diagonals(coeffs, zsignatures=dummy)
+        with pytest.raises(TypeError, match="diag_signs= is used without states="):
+            diagonals(coeffs, diag_signs=dummy, states=dummy)
+        with pytest.raises(TypeError, match="group_ids= requires num_groups="):
+            diagonals(coeffs, zsignatures=dummy, states=dummy, group_ids=np.zeros(1, dtype=int))
 
 
 class TestFlatTerms:

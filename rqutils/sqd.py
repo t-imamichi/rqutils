@@ -1244,6 +1244,89 @@ def all_diagonals(
     return accumulator.at[group_ids].add(contributions, out_sharding=out_sharding)
 
 
+# Renamed in the next commit; aliased here so this commit is independently testable.
+_diag_from_signs = compute_diagonal
+_diag_from_z = get_diagonal
+_diag_all_groups = all_diagonals
+
+
+def diagonals(
+    coeffs: NDArray[np.inexact],
+    *,
+    diag_signs: NDArray[np.uint8] | None = None,
+    zsignatures: NDArray[np.uint8] | None = None,
+    group_ids: NDArray[np.integer] | None = None,
+    states: StateList | None = None,
+    num_groups: int | None = None,
+    nterms: int | None = None,
+) -> jax.Array:
+    r"""Compose the diagonal of one X group, or of every X group at once.
+
+    One entry point over three sign sources, named the way :func:`apply_h` names its inputs. Which
+    source you have is a fact about your data, so it is stated rather than encoded in a choice of
+    function:
+
+    .. code-block:: python
+
+        diagonals(coeffs, diag_signs=signs)                       # from cached packed sign bits
+        diagonals(coeffs, zsignatures=z, states=states)           # recomputed for one X group
+        diagonals(flat_coeffs, zsignatures=flat_z, group_ids=ids,  # every group, padding-free
+                  states=states, num_groups=J)
+
+    The first two return one group's diagonal, shape ``(num_states,)``. The third returns every
+    group's, shape ``(num_groups, num_states)``, and is the form to prefer for ragged operators --
+    see :attr:`~rqutils.paulis.symplectic.PauliSumXZ.flat_terms` for the layout and
+    :func:`_diag_all_groups` for the measured speedups.
+
+    This function itself is not jitted: it is a host-side keyword dispatch over three kernels that
+    are each already ``@jax.jit``-decorated, exactly as :func:`apply_h` dispatches over its own named
+    forms. Jitting it would gain nothing and would force ``nterms``/``num_groups`` to be threaded
+    through as static arguments of *this* function too, when they only need to be static on the
+    inner kernels that actually trace on them.
+
+    Args:
+        coeffs: Phase-folded coefficients. Shape ``(num_terms,)`` for one group, or the flat
+            ``(sum(nzterms),)`` for the all-groups form.
+        diag_signs: Precomputed packed sign bits for this group, from :func:`get_diag_signs`. Mutually
+            exclusive with ``zsignatures``, and needs no ``states``.
+        zsignatures: Packed Z signatures. Requires ``states``, since the sign bits are recomputed.
+        group_ids: The X group each flat term belongs to. Selects the all-groups form and requires
+            ``num_groups``.
+        states: Uniquified state list. Required with ``zsignatures``, rejected with ``diag_signs``.
+        num_groups: Number of X groups. **Must be static.** Required with ``group_ids``.
+        nterms: Static term count for the per-group forms; see :func:`_accumulate_diagonal` for why
+            it matters and when it pays. Ignored by the all-groups form, which has no padding to skip.
+
+    Returns:
+        The composed diagonal(s).
+
+    Raises:
+        TypeError: If the keywords do not form one of the three valid sets -- neither or both sign
+            sources, ``zsignatures`` without ``states``, ``diag_signs`` with ``states``, or
+            ``group_ids`` without ``num_groups``.
+    """
+    given = [
+        name
+        for name, value in (("diag_signs", diag_signs), ("zsignatures", zsignatures))
+        if value is not None
+    ]
+    if len(given) != 1:
+        raise TypeError(
+            f"diagonals: pass exactly one of diag_signs= or zsignatures= (got {given or 'neither'})"
+        )
+    if diag_signs is not None:
+        if states is not None:
+            raise TypeError("diagonals: diag_signs= is used without states=; the bits are cached")
+        return _diag_from_signs(diag_signs, coeffs, nterms)
+    if states is None:
+        raise TypeError("diagonals: zsignatures= requires states= to recompute the sign bits")
+    if group_ids is None:
+        return _diag_from_z(zsignatures, coeffs, states, nterms)
+    if num_groups is None:
+        raise TypeError("diagonals: group_ids= requires num_groups=, which must be static")
+    return _diag_all_groups(zsignatures, coeffs, group_ids, states, num_groups)
+
+
 @jax.jit
 def apply_xgrp(
     xsource: NDArray[np.int32], diagonal: NDArray[np.inexact], vec: NDArray[np.inexact]
