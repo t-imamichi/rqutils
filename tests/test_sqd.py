@@ -680,6 +680,13 @@ class TestSqdEndToEnd:
         strings = ["ZIII", "IZII", "XXII", "IIZI"]
         coeffs = [1.0, -0.5, 0.3, 0.7]
         states = np.array([[0, 0, 0, 0], [0, 0, 1, 1], [0, 1, 0, 1], [1, 0, 0, 1]], dtype=np.uint8)
+        assert len(np.unique(states, axis=0)) == len(states), "fixture must start filler-free"
+        # Uniqueness alone is not enough for the states_size=None arm to be filler-free -- the
+        # default rounds up to a power of two, so the row count must already be one.
+        assert len(states) & (len(states) - 1) == 0, (
+            f"fixture length {len(states)} is not a power of two, so the states_size=None arm "
+            "would be padded and would stop being a filler-free control"
+        )
 
         reference = lowest_projected(strings, coeffs, states)
         got = eigval_of(strings, coeffs, states, states_size=states_size)
@@ -720,6 +727,43 @@ class TestSqdEndToEnd:
         assert run_sqd._cache_size() == before, (
             "run_sqd retraced for a shorter input despite states_size being pinned"
         )
+
+
+def apply_h_inputs(rng, num_qubits=4, num_terms=6, num_states=12):
+    """Build every per-X-group representation ``apply_h`` accepts, plus a dense reference.
+
+    A plain function taking ``rng`` rather than a ``@pytest.fixture``, per the suite convention in
+    ``conftest``: a fixture drawing from an RNG makes stream position depend on fixture resolution
+    order, which is invisible at the call site. Callers pass their own seeded ``rng``, so the six
+    keyword combinations below all see byte-identical inputs and differ only in which names are used.
+
+    Returns a dict of every representation of the same operator, so a test can select one pairing
+    without rebuilding the others.
+    """
+    from rqutils.paulis.symplectic import PauliSumXZ
+
+    strings = real_pauli_strings(num_qubits, num_terms, rng)
+    coeffs = rng.normal(size=len(strings))
+    states = unique_states(num_states, num_qubits, rng)
+
+    hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+    states_u = uniquify_states(pack_padded(states), states.shape[0])
+    return {
+        "states_u": states_u,
+        "vector": rng.normal(size=states.shape[0]),
+        "matrix": project_dense(strings, coeffs, states).real,
+        "x": hamiltonian.x,
+        "z": hamiltonian.z,
+        "c": hamiltonian.c,
+        "xsources": np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x]),
+        "signs": np.stack([np.asarray(get_diag_signs(z, states_u)) for z in hamiltonian.z]),
+        "diagonals": np.stack(
+            [
+                np.asarray(get_diagonal(z, c, states_u).real)
+                for z, c in zip(hamiltonian.z, hamiltonian.c)
+            ]
+        ),
+    }
 
 
 class TestMatvecKernels:
@@ -792,6 +836,142 @@ class TestMatvecKernels:
             apply_h(vector, scanned, states_u if needs_states else None, cache_level)
         ).real
         assert np.abs(got - matrix @ vector).max() < 1e-12
+
+    @pytest.mark.parametrize(
+        "kwargs_for",
+        [
+            lambda p: {"xsignatures": p["x"], "zsignatures": p["z"], "coeffs": p["c"]},
+            lambda p: {"xsignatures": p["x"], "diag_signs": p["signs"], "coeffs": p["c"]},
+            lambda p: {"xsignatures": p["x"], "diagonals": p["diagonals"]},
+            lambda p: {"xsources": p["xsources"], "zsignatures": p["z"], "coeffs": p["c"]},
+            lambda p: {"xsources": p["xsources"], "diag_signs": p["signs"], "coeffs": p["c"]},
+            lambda p: {"xsources": p["xsources"], "diagonals": p["diagonals"]},
+        ],
+        ids=["x+z", "x+signs", "x+diags", "xsrc+z", "xsrc+signs", "xsrc+diags"],
+    )
+    def test_keyword_form_matches_dense_for_every_combination(self, kwargs_for):
+        """The keyword form covers all six strategies and each still matches a dense reference.
+
+        The keyword names are the only thing selecting the strategy here, so this is what pins the
+        ``_XSOURCE_KEYS``/``_DIAGONAL_KEYS`` mapping. A transposed entry in either dict would route a
+        call to the wrong branch and produce a plausible finite vector, exactly the failure mode
+        :meth:`test_every_cache_level_matches_dense` exists for -- so the reference is dense here too,
+        not the positional form (agreeing with a sibling that is wrong the same way proves nothing).
+        """
+        p = apply_h_inputs(np.random.default_rng(20260805))
+        got = np.asarray(apply_h(p["vector"], states=p["states_u"], **kwargs_for(p))).real
+        assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
+
+    def test_keyword_and_positional_forms_agree(self):
+        """The wrapper must not change the numbers -- it only resolves names to a ``cache_level``.
+
+        Bit-identical rather than approximate: both routes reach the same jitted kernel with the same
+        tuple, so any difference at all would mean the resolution built a different ``scanned``.
+        """
+        p = apply_h_inputs(np.random.default_rng(20260805))
+        kw = np.asarray(apply_h(p["vector"], xsources=p["xsources"], diagonals=p["diagonals"]))
+        pos = np.asarray(apply_h(p["vector"], (p["xsources"], p["diagonals"]), None, (1, 2)))
+        assert np.array_equal(kw, pos)
+
+    @pytest.mark.parametrize(
+        ("kwargs_for", "match"),
+        [
+            (lambda p: {"diag_signs": p["signs"], "coeffs": p["c"]}, "exactly one of"),
+            (
+                lambda p: {
+                    "xsignatures": p["x"],
+                    "xsources": p["xsources"],
+                    "diagonals": p["diagonals"],
+                },
+                "exactly one of",
+            ),
+            (lambda p: {"xsources": p["xsources"], "coeffs": p["c"]}, "exactly one of"),
+            (
+                lambda p: {
+                    "xsources": p["xsources"],
+                    "diag_signs": p["signs"],
+                    "diagonals": p["diagonals"],
+                    "coeffs": p["c"],
+                },
+                "exactly one of",
+            ),
+            (lambda p: {"xsources": p["xsources"], "diag_signs": p["signs"]}, "coeffs is required"),
+            (
+                lambda p: {
+                    "xsources": p["xsources"],
+                    "diagonals": p["diagonals"],
+                    "coeffs": p["c"],
+                },
+                "coeffs must not be given",
+            ),
+        ],
+        ids=[
+            "no-xsource",
+            "two-xsources",
+            "no-diagonal",
+            "two-diagonals",
+            "missing-coeffs",
+            "redundant-coeffs",
+        ],
+    )
+    def test_underspecified_or_overspecified_keyword_calls_raise(self, kwargs_for, match):
+        """Every way of not naming exactly one X source and one diagonal strategy must raise.
+
+        This is the substance of the change: the six valid combinations become the only *constructible*
+        ones. Under the positional form each of these was either a silent wrong answer or an opaque
+        failure deep inside the scan; here they fail at the call site before any array is read.
+        """
+        p = apply_h_inputs(np.random.default_rng(20260805))
+        with pytest.raises(ValueError, match=match):
+            apply_h(p["vector"], states=p["states_u"], **kwargs_for(p))
+
+    def test_no_arrays_at_all_raises(self):
+        """Calling with neither convention names what is missing rather than failing on a None tuple."""
+        with pytest.raises(ValueError, match="needs per-X-group arrays"):
+            apply_h(np.zeros(4))
+
+    @pytest.mark.parametrize("extra", [{"scanned": True}, {"cache_level": True}])
+    def test_mixing_the_two_conventions_raises(self, extra):
+        """Mixing forms would give two answers to "what strategy is this?", so it is refused.
+
+        Silently preferring one would recreate the original hazard in a new place: the caller would
+        have written a ``cache_level`` that the call then ignored.
+        """
+        p = apply_h_inputs(np.random.default_rng(20260805))
+        kwargs = {"xsources": p["xsources"], "diagonals": p["diagonals"]}
+        if "scanned" in extra:
+            args = (p["vector"], (p["xsources"], p["diagonals"]))
+        else:
+            args = (p["vector"],)
+            kwargs["cache_level"] = (1, 2)
+        with pytest.raises(TypeError, match="not both"):
+            apply_h(*args, **kwargs)
+
+    def test_shape_assertion_would_not_have_closed_this(self):
+        """Records *why* the fix is naming rather than a per-branch shape check.
+
+        A shape assertion is the obvious cheap mitigation and was proposed as one: X sources are
+        ``(n_groups, n_states)`` while X signatures are ``(n_groups, n_bytes)``, so the trailing
+        dimension "already distinguishes them". It does not, and this test pins the counterexample so
+        nobody re-derives the shortcut: at ``n = 15`` the signatures are 2 bytes wide, so a 2-state
+        subspace makes both arrays exactly ``(2, 2)``. Only the dtype differs, which is an
+        implementation detail of ``get_xsource`` rather than a contract.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        num_qubits = 15
+        strings = ["X" * 3 + "I" * 12, "I" * 4 + "ZZ" + "I" * 9]
+        hamiltonian = PauliSumXZ.from_paulisum((strings, [0.5, -0.3]))
+        states = np.array(
+            [[int(b) for b in format(c, f"0{num_qubits}b")] for c in (0, 7)], dtype=np.uint8
+        )
+        states_u = uniquify_states(pack_padded(states), states.shape[0])
+        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
+
+        assert hamiltonian.x.shape == xsources.shape == (2, 2), (
+            "the counterexample requires the signature and index arrays to collide in shape; "
+            f"got {hamiltonian.x.shape} and {xsources.shape}"
+        )
 
     @pytest.mark.parametrize("cache_level", [(0, 0), (0, 1), (0, 2), (1, 0)])
     def test_omitting_states_raises(self, cache_level):

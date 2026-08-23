@@ -169,9 +169,10 @@ def poc2_partial_j():
     j_actual = p.num_xgroups
     print(f"  {p.describe()}")
 
-    ref = jax.block_until_ready(
-        functools.partial(apply_h, cache_level=(1, 2))(vec, (c["xsources"], c["diagonals"]), None)
-    )
+    # Keyword form: this is a one-shot call, so naming the arrays is both clearer and unmispairable.
+    # The benchmark thunks above stay on the positional form deliberately -- they are measuring the
+    # shape the solver actually calls, which splats a tuple.
+    ref = jax.block_until_ready(apply_h(vec, xsources=c["xsources"], diagonals=c["diagonals"]))
 
     for use_ss in [False, True]:
         label = "searchsorted (POC 1)" if use_ss else "library sort"
