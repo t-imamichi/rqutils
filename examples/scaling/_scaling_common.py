@@ -1,9 +1,8 @@
 """Shared problem generation and timing for the scaling POCs.
 
 Every script in this directory reaches this module through
-``sys.path.insert(0, dirname(__file__))``, the same pattern ``examples/mlx/`` uses for
-``_bench_common.py``. Names here are unqualified by design: the directory already says
-``scaling``.
+``sys.path.insert(0, dirname(__file__))``, so they run as scripts rather than being imported. Names
+here are unqualified by design: the directory already says ``scaling``.
 
 Two things live here because getting either wrong silently invalidates a comparison.
 
@@ -15,9 +14,11 @@ because ``J`` (distinct X signatures) is what the matvec cost is linear in, and 
 gives ``J == num_terms`` almost surely -- which makes the ``K^{(j)}`` axis unmeasurable.
 
 **Timing** reports the min of repeated trials and, separately, the spread. The spread is not
-decoration: ``CLAUDE.md`` records a 3.9% noise floor on this machine for the MLX arm and a case
-where two runs of identical code looked like a valid comparison. Any difference under the measured
-spread is unresolved, and ``fmt_ratio`` refuses to call such a pair a win.
+decoration: a **3.9%** noise floor was measured on this machine, and two runs of identical code once
+looked like a valid comparison. Any difference under the measured spread is unresolved, and
+``fmt_ratio`` refuses to call such a pair a win. (The 3.9% figure came from the since-deleted MLX
+benchmark arm; treat it as the order of magnitude to expect, not a constant for these POCs, and rely
+on the per-run spread that ``timeit`` actually reports.)
 """
 
 import statistics
@@ -199,8 +200,8 @@ def fmt_ratio(baseline: Timing, candidate: Timing, noise_floor: float | None = N
     """Describe candidate-vs-baseline, refusing to claim a win inside the noise.
 
     ``noise_floor`` defaults to the larger of the two measured spreads. A speedup smaller than that
-    is reported as UNRESOLVED rather than as a number, which is the discipline ``CLAUDE.md`` records
-    for the MLX arms after two runs of identical code looked like a valid comparison.
+    is reported as UNRESOLVED rather than as a number -- the discipline adopted after two runs of
+    identical code once looked like a valid comparison.
     """
     if noise_floor is None:
         noise_floor = max(baseline.spread_frac, candidate.spread_frac)

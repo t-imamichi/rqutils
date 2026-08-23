@@ -65,7 +65,8 @@ unsupported-operator = "ignore"
 # `type X = A | B` followed by `X |= C` under a HAS_* guard is the library's documented pattern for
 # optional dependencies (see CLAUDE.md); ty reads the augmented assignment as rebinding the alias.
 invalid-assignment = "ignore"
-# mlx (darwin-only extra) and mpi4py (declared nowhere, installed manually) are optional at runtime.
+# mpi4py is imported by examples/ but declared nowhere -- install it manually for the
+# multi-process path. Optional at runtime, so an unresolved import here is expected.
 unresolved-import = "ignore"
 # Unpacking a value whose declared type is a union of scalar and sequence (qprint's terms list,
 # sqd's variable-length return tuple). The runtime shapes are correct; the annotations are looser
