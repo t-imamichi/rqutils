@@ -180,6 +180,18 @@ reuses the compiled kernel and both arms return bit-identical numbers (`test_gro
 is untested: some survive because the fixture never exercises them, which is a fixture finding, not a
 missing test.
 
+**Three benchmarking lessons that outlived the code that taught them.** Each was measured on a port
+that has since been deleted, but none depends on it:
+
+- **When you delete a comparison arm, check what it was incidentally covering.** A guard was covered
+  *only* as a side effect of comparing two implementations of an eigensolve; deleting one arm silently
+  took the guard's only test with it. Applies to any A/B you remove.
+- **Expect a ~3.9% noise floor when benchmarking a before/after on this machine.** Treat any
+  difference under ~4% as unresolved, not as a result.
+- **fp32 in an eigensolve is a dynamic-range trap**, not merely a precision one: a large shift
+  destroys the small eigenvalue you are solving for. `examples/scaling/poc6_mixed_precision.py`
+  measures it.
+
 **A green suite after reverting a fix means the test is missing, not that the guard is dead.** Some
 guards are only reachable when *other* defects compound with them, so the end-to-end assertion
 (theta matches `eigvalsh`) stays green while the invariant the guard protects is already destroyed.
