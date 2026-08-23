@@ -18,6 +18,7 @@ Run (the flag is mandatory -- without it this reports a single device and skips)
         uv run --extra qiskit python examples/scaling/poc7_sharding.py
 """
 
+import itertools
 import os
 import sys
 
@@ -67,6 +68,45 @@ def check_single_vs_sharded():
         )
         print(f"          |sharded-single|={d_ss:.3e}   |single-dense|={d_ref:.3e}")
     return results
+
+
+def check_all_cache_levels():
+    header("POC 7d: every cache_level, sharded vs single-device vs dense")
+    print("Two sharding bugs lived in the three cache_level[0] == 0 cells, uncovered because this")
+    print("script and the pytest arm both ran only sqd's default (1, 0):")
+    print("  * _accumulate_diagonal put a rank-2 PartitionSpec on a rank-1 accumulator (all six).")
+    print("  * _spread_seed's jnp.where mixed a replicated predicate with a partitioned vec, since")
+    print("    run_sqd reshards states_u only inside `if cache_level[0] == 1` ((0,*) only).")
+    print(
+        "The FIRST masked the SECOND -- fixing it turned 6 failures into 3, not 0. So the grid is"
+    )
+    print(
+        "swept rather than sampled: one representative cell reported success at three broken ones."
+    )
+    print()
+    p = make_problem(14, 600, num_terms=40, seed=71)
+    hp = hproj(p.hamiltonian, np.unique(p.states, axis=0), unique_states=True)
+    eig_dense = float(np.min(np.linalg.eigvalsh(hp.toarray())))
+    mesh = jax.make_mesh((jax.device_count(),), ("x",), (AxisType.Explicit,))
+
+    worst = 0.0
+    print(
+        f"  {'cache_level':>12s}  {'single':>16s}  {'sharded':>16s}  {'|s-1dev|':>10s}  {'|s-dense|':>10s}"
+    )
+    for cache_level in sorted(itertools.product((0, 1), (0, 1, 2))):
+        single = float(sqd(p.hamiltonian, p.states, return_eigvec=False, cache_level=cache_level))
+        with jax.set_mesh(mesh):
+            sharded = float(
+                sqd(p.hamiltonian, p.states, return_eigvec=False, cache_level=cache_level)
+            )
+        d_ss, d_ref = abs(sharded - single), abs(sharded - eig_dense)
+        worst = max(worst, d_ss)
+        print(
+            f"  {cache_level!s:>12s}  {single:+16.10f}  {sharded:+16.10f}  "
+            f"{d_ss:10.3e}  {d_ref:10.3e}"
+        )
+    print(f"\n  dense reference: {eig_dense:+.10f}")
+    return worst
 
 
 def check_mesh_padding():
@@ -131,15 +171,16 @@ def main():
     print("No timings are reported here -- they would be meaningless. Correctness only.")
 
     res = check_single_vs_sharded()
+    worst_cache = check_all_cache_levels()
     check_mesh_padding()
     check_eigvec_path()
 
     header("VERDICT")
-    worst = max(d for d, _ in res.values())
+    worst = max(max(d for d, _ in res.values()), worst_cache)
     print(f"  worst |sharded - single| across sizes: {worst:.3e}")
     if worst < 1e-8:
-        print("  Sharded and single-device agree. The out_sharding contract and mesh padding")
-        print(f"  hold on {ndev} devices -- previously untested per CLAUDE.md.")
+        print("  Sharded and single-device agree at ALL SIX cache levels. The out_sharding")
+        print(f"  contract and mesh padding hold on {ndev} devices.")
     else:
         print("  DIVERGENCE: the sharded path does not reproduce the single-device answer.")
     print()

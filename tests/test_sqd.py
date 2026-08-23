@@ -975,30 +975,77 @@ class TestMatvecKernels:
         assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
 
 
-class TestShardedDiagonalRank:
-    """``_accumulate_diagonal`` must carry only the *leading* axis of its template's sharding.
+class TestComplexCoefficientsAcrossCacheLevels:
+    """Every ``cache_level`` must handle a complex-coefficient Hamiltonian.
 
-    The accumulator is 1-D of length ``template.shape[0]``, but ``get_diagonal`` passes the 2-D
-    ``(N, nbytes)`` state list as the template. Taking the template's full spec therefore handed a
-    rank-2 ``PartitionSpec`` to a rank-1 ``jnp.zeros``, which raises "Length of sharding.spec (2) must
-    be equal to aval's ndim (1)" -- on **every** sharded ``sqd`` call at **every** ``cache_level``,
-    since ``run_sqd``'s ``vinit_from_min_diag`` reaches ``get_diagonal`` unconditionally.
+    ``.c`` is complex128 whenever any Pauli string has an **odd Y count** -- the folded
+    ``(-i)^{x.z}`` phase makes it so by construction, not by mistake (see
+    ``paulis/symplectic.py``). ``run_sqd``'s ``vinit_from_min_diag`` took ``.real`` on the uncached
+    diagonal branch but used ``diagonals[0]`` raw on the cached one, and the ``jnp.max``/``argmin``
+    below reject complex input outright. So ``cache_level[1] == 2`` raised
+    ``TypeError: lt does not accept dtype complex128`` for every odd-Y Hamiltonian -- **single
+    device, no mesh involved**.
 
-    This ran as a subprocess because the virtual device count has to be set before jax initializes,
-    which an in-process test cannot do after ``conftest`` has imported it. Measured: reverting the fix
-    leaves this entire suite green while the mesh path raises -- pytest is single-device only, so
-    ``examples/scaling/poc7_sharding.py`` was the sole coverage and a regression here is invisible to
-    ``pytest`` without this test.
-
-    The complementary trap is also pinned: rebuilding the sharding as a bare ``PartitionSpec`` fixes
-    the mesh path and breaks the single-device one, where a spec with no active mesh context is
-    rejected outright. Both arms have to pass, which is why this asserts the sharded *and*
-    single-device answers agree rather than only that the sharded call succeeds.
+    Uncovered because the whole suite's fixtures draw from ``real_pauli_strings``, which keeps the Y
+    count even so ``.c`` stays float64. A grid sweep over ``cache_level`` with a real fixture reports
+    six passes; the defect needs the *fixture* varied, not the parameter. That is the lesson worth
+    keeping: parametrizing over a strategy axis proves nothing about dtype axes the fixture pins.
     """
 
-    def test_sharded_and_single_device_agree_on_four_virtual_devices(self):
+    def test_odd_y_hamiltonian_works_at_every_cache_level(self):
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        # "YZII" and "IIYY": the first has an odd Y count, so the folded phase leaves .c complex.
+        strings = ["YZII", "XXII", "IZZI", "IIYY"]
+        coeffs = [0.5, -0.3, 0.7, 0.2]
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs))
+        assert hamiltonian.c.dtype == np.complex128, (
+            "fixture must carry complex coefficients or this test is vacuous"
+        )
+
+        rng = np.random.default_rng(3)
+        states = np.unique(rng.integers(0, 2, size=(12, 4)).astype(np.uint8), axis=0)
+        reference = float(
+            np.min(np.linalg.eigvalsh(hproj(hamiltonian, states, unique_states=True).toarray()))
+        )
+
+        for cache_level in CACHE_LEVELS:
+            got = float(sqd(hamiltonian, states, return_eigvec=False, cache_level=cache_level))
+            assert got == pytest.approx(reference, abs=1e-9), (
+                f"cache_level={cache_level}: sqd gave {got}, dense reference is {reference}"
+            )
+
+
+class TestShardedCacheLevels:
+    """Every ``cache_level`` must give the same answer sharded as single-device.
+
+    Two distinct sharding defects lived in the three ``cache_level[0] == 0`` cells, and **nothing
+    covered them**: ``examples/scaling/poc7_sharding.py`` and the first version of this test both ran
+    only ``sqd``'s default ``(1, 0)``. Measured on a 4-device mesh:
+
+    * ``_accumulate_diagonal`` carried its template's *full* sharding spec onto a 1-D accumulator,
+      while ``get_diagonal`` passes the 2-D ``(N, nbytes)`` state list -- so a rank-2
+      ``PartitionSpec`` met a rank-1 ``jnp.zeros`` ("Length of sharding.spec (2) must be equal to
+      aval's ndim (1)"). This failed **all six** levels.
+    * ``_spread_seed``'s ``jnp.where`` mixed a replicated predicate with a partitioned ``vec``:
+      ``vec`` is built sharded unconditionally, but ``run_sqd`` reshards ``states_u`` only inside
+      ``if cache_level[0] == 1`` (the uncached branch still needs the replicated array for
+      ``get_xsource``). Raised ``ShardingTypeError`` on ``(0, 0)``, ``(0, 1)`` and ``(0, 2)``.
+
+    **The first bug masked the second** -- it raised earlier in the call, so fixing it turned six
+    failures into three rather than none. That is why this sweeps the whole grid instead of sampling
+    a representative cell: one cell reported success while three were broken.
+
+    Runs as a subprocess because the virtual device count has to be set before jax initializes, and
+    ``conftest`` has already imported it by collection time. The child script lives in
+    ``tests/_sharded_cache_levels.py`` rather than an inline string so ruff and ty check it -- as a
+    blob, an ``ImportError`` there would surface as a nonzero exit, indistinguishable from the
+    regression this exists to catch, under an assertion message blaming the sharding.
+    """
+
+    def test_every_cache_level_agrees_sharded_and_single_device(self):
         script = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "_sharded_diagonal_rank.py"
+            os.path.dirname(os.path.abspath(__file__)), "_sharded_cache_levels.py"
         )
         assert os.path.exists(script), f"missing sharding harness at {script}"
         env = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=4"}
@@ -1013,7 +1060,22 @@ class TestShardedDiagonalRank:
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         )
         assert proc.returncode == 0, f"sharded sqd raised:\n{proc.stderr[-3000:]}"
-        single, sharded = (float(v) for v in proc.stdout.split()[-2:])
-        assert single == pytest.approx(sharded, abs=1e-12), (
-            f"sharded {sharded} disagrees with single-device {single}"
+
+        seen = {}
+        for line in proc.stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) != 4:
+                continue
+            i, j, single, sharded = int(parts[0]), int(parts[1]), float(parts[2]), float(parts[3])
+            seen[(i, j)] = (single, sharded)
+
+        # Assert the grid is complete before checking values: a child that died after two levels
+        # would otherwise pass on the two it managed to print.
+        assert sorted(seen) == CACHE_LEVELS, (
+            f"expected all of {CACHE_LEVELS}, got {sorted(seen)} -- the child did not run the full "
+            f"grid:\n{proc.stdout[-2000:]}"
         )
+        for cache_level, (single, sharded) in sorted(seen.items()):
+            assert single == pytest.approx(sharded, abs=1e-12), (
+                f"cache_level={cache_level}: sharded {sharded} disagrees with single-device {single}"
+            )

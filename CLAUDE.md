@@ -80,8 +80,8 @@ by pytest — run it after any change to `ground_locg`'s reductions or helper si
 after touching `sqd`; **`svsim`'s `out_sharding` is still exercised by nothing.** `tests/` also
 contains three Jupyter notebooks used as interactive scratchpads; pytest does not collect them.
 
-`tests/_sharded_diagonal_rank.py` is a script, not a test module (the leading underscore keeps it
-uncollected): `test_sqd.py::TestShardedDiagonalRank` subprocesses it under
+`tests/_sharded_cache_levels.py` is a script, not a test module (the leading underscore keeps it
+uncollected): `test_sqd.py::TestShardedCacheLevels` subprocesses it under
 `XLA_FLAGS=--xla_force_host_platform_device_count=4`, because the virtual device count has to be set
 before jax initializes and `conftest.py` has already imported it by collection time. It lives in a
 file rather than an inline string so ruff and ty check it — as a `textwrap.dedent` blob an
@@ -165,7 +165,19 @@ sharding code path (mesh detection, `PartitionSpec` propagation, `jax.reshard`, 
 padding) with no GPU. This is not hypothetical: the first run found `sqd` raising `ShardingTypeError`
 on *any* mesh, because one scatter omitted `out_sharding` while every neighbouring op passed it.
 `examples/scaling/poc7_sharding.py` is the harness — sharded against single-device against a dense
-`eigvalsh` reference, plus every residue of `N mod mesh.size`. Timings under virtual devices are
+`eigvalsh` reference, plus every residue of `N mod mesh.size` **and all six `cache_level`s**.
+
+**Sweep `cache_level`, don't sample it.** Three bugs hid behind a single-cell check, and each was
+masked by the one before it — every existing sharding check ran only `sqd`'s default `(1, 0)`:
+`_accumulate_diagonal`'s rank-2 spec on a rank-1 accumulator (failed all six); then, once fixed,
+`_spread_seed`'s `jnp.where` mixing a replicated predicate with a partitioned `vec`, because
+`run_sqd` reshards `states_u` only inside `if cache_level[0] == 1` (failed `(0, *)`); then, once the
+sweep reached a *complex* fixture, `vinit_from_min_diag` using `diagonals[0]` raw where the uncached
+branch took `.real` (failed `(*, 2)` on any odd-Y Hamiltonian, **single-device, no mesh**). Fixing
+each one only revealed the next, so "the mesh test passes" meant very little until the grid was
+complete. Note the last needed the *fixture* varied, not the parameter: the suite's
+`real_pauli_strings` keeps the Y count even, so `.c` stays float64 and a six-cell sweep still
+reported six passes. Timings under virtual devices are
 meaningless (they share one CPU), so use this for correctness only.
 
 ## Architecture

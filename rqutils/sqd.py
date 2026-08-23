@@ -451,7 +451,20 @@ def _spread_seed(
     mixed = mixed ^ (mixed >> 16)
     # Map to [-1, 1). The distribution does not matter, only that no entry is systematically zero.
     vec = mixed.astype(dtype) * (2.0 / float(2**32)) - 1.0
-    return jnp.where(_is_filler(states_u) == 1, jnp.zeros_like(vec), vec)
+    # Reshard the predicate to match `vec` rather than assuming it already does. `vec` is built
+    # sharded unconditionally (the iota above takes `out_sharding`), but `states_u`'s sharding depends
+    # on the caller: `run_sqd` reshards it only inside `if cache_level[0] == 1`, because the
+    # uncached branch still needs the replicated array for the `get_xsource` searches. So at
+    # cache_level[0] == 0 the predicate arrives replicated while `vec` is partitioned, and
+    # `jnp.where` rejects the pair -- "select `which` must be scalar or have the same sharding as
+    # cases". That raised on every mesh for (0, 0), (0, 1) and (0, 2), the three levels no sharding
+    # test covered; it was previously masked by _accumulate_diagonal's rank bug, which failed all six
+    # earlier in the call. Fixed here rather than by resharding states_u in the caller: this function
+    # is what decides `vec`'s sharding, so it owns the requirement that the mask agree with it.
+    filler = _is_filler(states_u) == 1
+    if sharding is not None:
+        filler = jax.reshard(filler, sharding)
+    return jnp.where(filler, jnp.zeros_like(vec), vec)
 
 
 @jax.jit(static_argnames=["states_size", "return_eigvec", "cache_level", "log_level"])
@@ -534,7 +547,15 @@ def run_sqd(
         if cache_level[1] == 2:
             diagonal = diagonals[0]
         else:
-            diagonal = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u).real
+            diagonal = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u)
+        # `.real` on both branches, not just the uncached one. A Hermitian operator's projected
+        # diagonal is real by construction, but `diagonals` carries `hamiltonian.c`'s dtype, which is
+        # complex128 whenever any Pauli string has an odd Y count (the folded `(-i)^{x.z}` phase makes
+        # it so -- see PauliSumXZ). The `jnp.max`/`argmin` below reject complex input outright, so
+        # cache_level[1] == 2 raised `TypeError: lt does not accept dtype complex128` for every such
+        # Hamiltonian -- on a single device, with no mesh involved. The uncached branch took `.real`
+        # and worked, which is what made the asymmetry easy to miss.
+        diagonal = diagonal.real
         # Set the fill-in components to the maximum value so that argmin only sees the valid entries
         diagonal = jnp.where(_is_filler(states_u) == 1, jnp.max(diagonal), diagonal)
         imin = jnp.argmin(diagonal)
