@@ -53,17 +53,21 @@ def check_single_vs_sharded():
         with jax.set_mesh(mesh):
             eig_sharded = float(sqd(p.hamiltonian, p.states, return_eigvec=False))
 
-        # cache_level=(1, 2) as well as the default (1, 0), because the two take DIFFERENT diagonal
-        # code paths: (1, 0) recomputes per group via get_diagonal, while (1, 2) precomputes through
-        # all_diagonals' sharded scatter-add. Sweeping only the default is how all_diagonals shipped
-        # with unsolved sharding while this POC stayed green -- a passing run said nothing about a path
-        # it never selected. The cache_level[0] == 0 levels are deliberately not swept: they have
-        # raised ShardingTypeError on any mesh since before all_diagonals existed, for unrelated
-        # reasons in get_xsource.
+        # ALL SIX cache levels, not just the default. They take different code paths -- (*, 0)
+        # recomputes diagonals per group, (*, 1) reads cached sign bits, (*, 2) precomputes through
+        # all_diagonals' sharded scatter-add, and (0, *) defers get_xsource into the matvec, which is
+        # what delays run_sqd's reshard of the state list. Sweeping only the default is how two
+        # separate sharding bugs stayed hidden while this POC ran green: a passing sharding run says
+        # nothing about a path it never selects.
         with jax.set_mesh(mesh):
-            eig_precomputed = float(
-                sqd(p.hamiltonian, p.states, return_eigvec=False, cache_level=(1, 2))
-            )
+            eig_levels = {
+                cache_level: float(
+                    sqd(p.hamiltonian, p.states, return_eigvec=False, cache_level=cache_level)
+                )
+                for cache_level in [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+            }
+        eig_precomputed = eig_levels[(1, 2)]
+        worst_level = max(abs(e - eig_single) for e in eig_levels.values())
 
         # Independent reference: dense projection + scipy, so this is not self-consistency.
         hp = hproj(p.hamiltonian, np.unique(p.states, axis=0), unique_states=True)
@@ -73,14 +77,14 @@ def check_single_vs_sharded():
         d_ss = abs(eig_sharded - eig_single)
         d_ref = abs(eig_single - eig_dense)
         d_pc = abs(eig_precomputed - eig_single)
-        results[num_qubits] = (d_ss, d_ref, d_pc)
+        results[num_qubits] = (d_ss, d_ref, max(d_pc, worst_level))
         print(
             f"  n={num_qubits:<3d} N={num_states:<6d}  single={eig_single:+.10f}  "
             f"sharded={eig_sharded:+.10f}  dense={eig_dense:+.10f}"
         )
         print(
             f"          |sharded-single|={d_ss:.3e}   |single-dense|={d_ref:.3e}   "
-            f"|(1,2)-single|={d_pc:.3e}"
+            f"|(1,2)-single|={d_pc:.3e}   worst over all 6 levels={worst_level:.3e}"
         )
     return results
 
@@ -154,10 +158,11 @@ def main():
     worst = max(d for d, _, _ in res.values())
     worst_pc = max(d for _, _, d in res.values())
     print(f"  worst |sharded - single| across sizes: {worst:.3e}")
-    print(f"  worst |cache_level=(1,2) - single|  : {worst_pc:.3e}")
+    print(f"  worst over all six cache levels     : {worst_pc:.3e}")
     if worst < 1e-8 and worst_pc < 1e-8:
-        print("  Sharded and single-device agree, on the default (1, 0) diagonal path AND on the")
-        print("  (1, 2) precompute, which routes through all_diagonals' sharded scatter-add.")
+        print("  Sharded and single-device agree on ALL SIX cache levels, including the three")
+        print("  cache_level[0] == 0 levels that raised ShardingTypeError until _spread_seed")
+        print("  resharded its filler predicate, and the (1, 2) precompute through all_diagonals.")
         print(f"  The out_sharding contract and mesh padding hold on {ndev} devices.")
     else:
         print("  DIVERGENCE: the sharded path does not reproduce the single-device answer.")

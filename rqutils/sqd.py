@@ -523,6 +523,17 @@ def _spread_seed(
 
     Fill-in slots produced by uniquification (marked by the high bit of byte 0) are zeroed: they
     carry no basis state, so weight there would place the iterate partly outside the subspace.
+
+    Args:
+        states_size: Length of the vector to build, i.e. the padded subspace size.
+        states_u: Uniquified state list, read only for its fill-in markers.
+        dtype: Output dtype, normally ``hamiltonian.c.dtype``.
+        sharding: Partition spec for the result, or ``None`` on an empty mesh. The fill-in predicate
+            is resharded to match -- see the comment at the ``jnp.where`` for why that is not
+            automatic.
+
+    Returns:
+        The seed vector, shape ``(states_size,)``.
     """
     index = jax.lax.broadcasted_iota(jnp.uint32, (states_size,), 0, out_sharding=sharding)
     # Two xorshift-multiply rounds (the constants are Murmur-style mixers): enough that consecutive
@@ -535,7 +546,17 @@ def _spread_seed(
     mixed = mixed ^ (mixed >> 16)
     # Map to [-1, 1). The distribution does not matter, only that no entry is systematically zero.
     vec = mixed.astype(dtype) * (2.0 / float(2**32)) - 1.0
-    return jnp.where(_is_filler(states_u) == 1, jnp.zeros_like(vec), vec)
+    # Match the predicate's sharding to `vec`'s rather than assuming they agree. They do not at
+    # cache_level[0] == 0: `vec` follows the `sharding` argument, while `states_u` is still unsharded
+    # there because run_sqd defers its reshard until after the last get_xsource -- which on that level
+    # happens inside the matvec, so it never runs before this point. jnp.where then raises
+    # "select `which` must be scalar or have the same sharding as cases", which is why all three
+    # cache_level[0] == 0 kernels failed on any non-empty mesh. Resharding the small 0/1 predicate is
+    # cheaper than resharding the state list, and leaves the binary search's precondition untouched.
+    is_filler = _is_filler(states_u)
+    if sharding is not None:
+        is_filler = jax.reshard(is_filler, sharding)
+    return jnp.where(is_filler == 1, jnp.zeros_like(vec), vec)
 
 
 @jax.jit(static_argnames=["states_size", "return_eigvec", "cache_level", "log_level"])

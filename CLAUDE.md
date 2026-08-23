@@ -106,8 +106,16 @@ stayed green — **a passing sharding POC is not evidence for a path it does not
 spot also hid a second, older bug: `vinit_from_min_diag` narrowed its diagonal to `.real` on one
 branch and not the other, so `cache_level=(1, 2)` raised `TypeError: lt does not accept dtype
 complex128` for any odd-Y operator with an all-identity X group (reproduced at `ac15362`). Both are
-fixed and pinned. Still true: the three `cache_level[0] == 0` levels raise `ShardingTypeError` on any
-mesh, for reasons unrelated to the diagonal path and predating this work. The deprecated MLX
+fixed and pinned. The POC now sweeps **all six** levels, and the three
+`cache_level[0] == 0` ones — which raised `ShardingTypeError` on any mesh, at `e5703ac` and every
+revision since — are fixed too. Root cause was **`_spread_seed`, not `get_xsource`** (an earlier note
+here guessed wrong): `run_sqd` defers `jax.reshard(states_u, sharding)` until after the last
+`get_xsource`, which on `cache_level[0] == 0` happens *inside the matvec*, so the reshard never runs
+before `_spread_seed` — leaving its `jnp.where` predicate unsharded against a sharded `vec`
+("select `which` must be scalar or have the same sharding as cases"). `_spread_seed` now reshards the
+small 0/1 predicate itself, which is cheaper than resharding the state list and leaves the binary
+search's sortedness precondition untouched. **pytest is single-device, so `poc7_sharding.py` is the
+only coverage** — run it after touching `_spread_seed`, the reshard placement, or any diagonal path. The deprecated MLX
 port at `examples/mlx/solver.py` needs MLX to import, so pytest never touches it; it is checked by
 `examples/mlx/check_solver_headless.py` (numpy shim, runs anywhere) and
 `examples/mlx/check_solver_device.py` (real device) instead. `tests/` also contains three Jupyter
