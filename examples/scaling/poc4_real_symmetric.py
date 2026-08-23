@@ -16,7 +16,7 @@ conflates "complex arithmetic is slower" with "this problem needed more iteratio
 
 - **Fixed iteration count** (``maxiter`` pinned, ``tol=0``) isolates per-iteration cost. This is the
   number to quote, and it mirrors why ``CLAUDE.md`` says to read ``per_it_ms`` from ``fixed_s``
-  rather than ``solve_s`` for the MLX arms.
+  rather than ``solve_s``.
 - **Same X/Z structure**: the real and complex problems are generated from the same seed and the same
   ``num_xgroups``, so J, N, and maxK match. Only the Y parity differs.
 

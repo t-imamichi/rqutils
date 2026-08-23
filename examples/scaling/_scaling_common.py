@@ -1,9 +1,8 @@
 """Shared problem generation and timing for the scaling POCs.
 
 Every script in this directory reaches this module through
-``sys.path.insert(0, dirname(__file__))``, the same pattern ``examples/mlx/`` uses for
-``_bench_common.py``. Names here are unqualified by design: the directory already says
-``scaling``.
+``sys.path.insert(0, dirname(__file__))``. Names here are unqualified by design: the directory
+already says ``scaling``.
 
 Two things live here because getting either wrong silently invalidates a comparison.
 
@@ -15,7 +14,7 @@ because ``J`` (distinct X signatures) is what the matvec cost is linear in, and 
 gives ``J == num_terms`` almost surely -- which makes the ``K^{(j)}`` axis unmeasurable.
 
 **Timing** reports the min of repeated trials and, separately, the spread. The spread is not
-decoration: ``CLAUDE.md`` records a 3.9% noise floor on this machine for the MLX arm and a case
+decoration: ``CLAUDE.md`` records a 3.9% noise floor on this machine and a case
 where two runs of identical code looked like a valid comparison. Any difference under the measured
 spread is unresolved, and ``fmt_ratio`` refuses to call such a pair a win.
 """
@@ -200,7 +199,7 @@ def fmt_ratio(baseline: Timing, candidate: Timing, noise_floor: float | None = N
 
     ``noise_floor`` defaults to the larger of the two measured spreads. A speedup smaller than that
     is reported as UNRESOLVED rather than as a number, which is the discipline ``CLAUDE.md`` records
-    for the MLX arms after two runs of identical code looked like a valid comparison.
+    after two runs of identical code looked like a valid comparison.
     """
     if noise_floor is None:
         noise_floor = max(baseline.spread_frac, candidate.spread_frac)

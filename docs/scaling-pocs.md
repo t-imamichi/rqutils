@@ -6,7 +6,7 @@ the library.
 
 **Machine and its limits.** Apple M1, 16 GB, `jax.default_backend() == "cpu"`, one device, x64
 enabled. Every number below is CPU unless a section says otherwise. Quoting a CPU ratio as a GPU ratio
-is the error `CLAUDE.md` warns about for the MLX arms, so it is not done here.
+is the error `CLAUDE.md` warns about, so it is not done here.
 
 **GPU status (NVIDIA GH200 120GB, single device, 2026-08-06).** Two of the three GPU-specific claims
 in `poc8_gpu_unverified.py` are now settled and one remains unrun:

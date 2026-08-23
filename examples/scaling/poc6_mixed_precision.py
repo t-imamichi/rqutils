@@ -20,7 +20,7 @@ Two obstacles, both real and both measured rather than asserted:
    unsatisfiable -- the solver would run to ``maxiter`` and report not-converged. Measured below as
    the achieved residual, not assumed.
 
-The fp32 trap ``CLAUDE.md`` records for the MLX eigensolve is relevant here too: a large dynamic
+The fp32 trap ``CLAUDE.md`` records for an eigensolve is relevant here too: a large dynamic
 range makes balancing destroy small eigenvalues outright. That is why accuracy is reported as the
 eigenvalue error against a full-f64 reference on the *same* operator, with the residual normalized by
 the operator norm rather than by |theta|.

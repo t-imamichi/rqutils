@@ -25,7 +25,7 @@ that never decreases), so neither number it printed could move regardless of the
 direction should hold on GPU, since a binary-search gather is strictly less work than a sort, but the
 magnitude will differ: a GPU sort is far better optimized relative to its gather than a CPU one, so
 **expect the GPU speedup to be smaller**. Quoting the CPU number as a GPU number would be exactly the
-error ``CLAUDE.md`` warns about for the MLX arms ("a flat CPU result does not mean a change is
+error ``CLAUDE.md`` warns about ("a flat CPU result does not mean a change is
 worthless" -- and its converse). The sort arm is asserted to grow with ``N``; if it goes flat the
 measurement is not kernel-dominated and the ratio is suppressed rather than printed.
 
