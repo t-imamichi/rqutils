@@ -306,7 +306,7 @@ class PauliSumXZ:
         size and the wrong one when they are not: a rotated operator can be 782x197 with a median of
         2 terms per group, so 98.6% of the slots are padding and every group pays the widest group's
         extent. This property is the alternative layout for that case -- see
-        :func:`rqutils.sqd.all_diagonals`, which consumes it.
+        :func:`rqutils.sqd._diag_all_groups`, which consumes it.
 
         Derived from :attr:`nzterms`, which is the only record of where each group's real terms end
         (a pad slot's Z signature is byte-identical to a genuine all-identity one, so the arrays alone

@@ -44,7 +44,7 @@ import numpy as np
 from _scaling_common import fmt_ratio, header, make_problem, timeit
 
 from rqutils.ground_locg import ground_locg
-from rqutils.sqd import apply_h, get_diagonal, get_xsource, uniquify_states
+from rqutils.sqd import _diag_from_z, apply_h, uniquify_states, xsource
 
 
 def setup(problem):
@@ -52,10 +52,10 @@ def setup(problem):
     states_u = jax.block_until_ready(uniquify_states(problem.states_p, size))
     ham = problem.hamiltonian
     xsources = jax.block_until_ready(
-        jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, ham.x)[1]
+        jax.lax.scan(lambda _, x: (None, xsource(x, states_u)), None, ham.x)[1]
     )
     diagonals = jax.block_until_ready(
-        jax.lax.scan(lambda _, v: (None, get_diagonal(v[0], v[1], states_u)), None, (ham.z, ham.c))[
+        jax.lax.scan(lambda _, v: (None, _diag_from_z(v[0], v[1], states_u)), None, (ham.z, ham.c))[
             1
         ]
     )

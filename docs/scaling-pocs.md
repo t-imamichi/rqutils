@@ -19,7 +19,7 @@ in `poc8_gpu_unverified.py` are now settled and one remains unrun:
   *correctness* on virtual CPU devices, so only speed is missing.
 
 **A POC's baseline must be pinned, not read from the library.** POC 1's proposal was adopted in
-commit 23fb226, which made `get_xsource` *be* the searchsorted — and silently turned both POC 1's and
+commit 23fb226, which made `xsource` *be* the searchsorted — and silently turned both POC 1's and
 POC 8's timing arms into searchsorted-versus-searchsorted comparisons. The first GPU run of POC 8
 duly reported 1.002×/1.000×/1.000× and a flat memory profile, and produced no information about
 either claim; POC 1e read 0.26× "SLOWER" for the same reason. `fmt_ratio` was right every time, which
@@ -49,10 +49,10 @@ matvec — and the question is which one is in front. It is not the one the modu
 | component | runs | cost at N=200k, J=50 | scaling |
 |---|---|---|---|
 | `uniquify_states` | once | 48.6 ms | N^1.15 |
-| `get_xsource` × J | once (cached) | **3064 ms** | N^0.88 |
+| `xsource` × J | once (cached) | **3064 ms** | N^0.88 |
 | `apply_h` matvec | per iteration | 8.35 ms | N^1.03 |
 
-Weighted by call count, `get_xsource` setup is **66–97 %** of a whole solve (97.5 % at 10 iterations,
+Weighted by call count, `xsource` setup is **66–97 %** of a whole solve (97.5 % at 10 iterations,
 66.4 % at 200). `matvec/J` is flat at ~0.16 ms across J ∈ {10, 25, 50, 100}, confirming the `O(J·N)`
 model exactly. So the sort is not merely a ceiling on N — it is the dominant cost at every size
 measured, which reorders the priorities.
@@ -61,7 +61,7 @@ measured, which reorders the priorities.
 
 | # | idea | verdict | measured |
 |---|---|---|---|
-| 1 | `searchsorted` replaces the 2N sort | **ADOPTED — now in `get_xsource`** | CPU 12–25× per signature; **GPU 5.15× at N=64M**, rising |
+| 1 | `searchsorted` replaces the 2N sort | **ADOPTED — now in `xsource`** | CPU 12–25× per signature; **GPU 5.15× at N=64M**, rising |
 | 3 | `cache_level=(1,1)` vs `(1,2)` | **know about it** | 16× less memory, 2.4–2.6× slower matvec |
 | 4 | real-symmetric f64 path | **already works** | 1.47–1.80× per solve; nothing to implement |
 | 2 | partial-J caching dial | **marginal** | curve is linear, but endpoints dominate |
@@ -71,7 +71,7 @@ measured, which reorders the priorities.
 
 ### 1. searchsorted instead of the sort — ADOPTED
 
-**This is now what `get_xsource` does**; `poc1_searchsorted.py` remains as the exploratory record. The
+**This is now what `xsource` does**; `poc1_searchsorted.py` remains as the exploratory record. The
 integrated version re-measured **12.1×, 18.7×, 16.9×** on the J-fold precompute at N = 100k/200k/500k,
 consistent with the POC.
 
@@ -114,7 +114,7 @@ the script's own instruction.
 Note this is now a claim about `lax.sort` itself: the sort left the library in 23fb226, so it is
 answerable only against the pinned legacy arm, and a flat result there is a finding about JAX rather
 than about `sqd`. The removal still stands on the other three grounds (speed, the `2N` allocation
-behind the `N ≤ 2**31` ceiling, and shardability). Tests are in `tests/test_sqd.py::TestGetXsource`, verified to fail against
+behind the `N ≤ 2**31` ceiling, and shardability). Tests are in `tests/test_sqd.py::TestXsource`, verified to fail against
 three injected defects: reversed byte significance (7 failures), the `uint64` path used beyond 8 bytes
 (3 failures, exactly the `B > 8` cases), and a non-negative absent-source sentinel (13 failures).
 
@@ -146,7 +146,7 @@ same reason). Sizing it up the way `--sweep-to` does for POC 1b would fix that; 
 **The correctness gate had to be rewritten, and the reason is the interesting part.** "Bit-identical"
 rejected a correct implementation: on a fill-in row the library's `idx_sorted[1:] - size` lands on
 assorted negatives (−12, −11, −10…) where a searchsorted returns −1. Both are consumed identically,
-since `apply_xgrp` gathers with `mode="fill", wrap_negative_indices=False`. The gate is now: valid-row
+since `apply_xgroup` gathers with `mode="fill", wrap_negative_indices=False`. The gate is now: valid-row
 indices bit-identical **and** the gathered result bit-identical — the latter being the only property a
 consumer can observe.
 

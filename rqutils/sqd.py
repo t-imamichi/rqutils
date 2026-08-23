@@ -136,7 +136,7 @@ bits / coefficient sums. Since :math:`S` occupies :math:`\lceil n/8 \rceil N` by
 caching setting should be adjusted according to the values of :math:`n` and :math:`\{K^{(j)}\}_j`.
 
 **How expensive, concretely: the source-index setup dominates the solve, so this is not a symmetric
-memory-for-speed dial.** Weighted by call count, the :math:`J`-fold :func:`get_xsource` precompute
+memory-for-speed dial.** Weighted by call count, the :math:`J`-fold :func:`xsource` precompute
 measured **66-97%** of an entire solve -- 97.5% at 10 iterations, 66.4% at 200 (3064 ms of setup
 against 8.35 ms per matvec iteration, N=200k, J=50; see ``docs/scaling-pocs.md``). Turning source-index
 caching *off* therefore pays that cost once per matvec rather than once per solve, which is a far
@@ -165,14 +165,14 @@ sort the states list during the initial uniquification. That sort must take plac
 device, with at most :math:`2^{32}` elements involved, so it caps the achievable :math:`N` at
 :math:`2^{31}`. Source index identification no longer contributes: it is a binary search into the
 already-sorted state list rather than a sort of a stacked :math:`2N` array, which is why the cap
-comes from :func:`uniquify_states` alone -- see :func:`get_xsource` for that change and what it was
+comes from :func:`uniquify_states` alone -- see :func:`xsource` for that change and what it was
 measured to be worth. A comparable limit is set by the GPU memory, which is at most O(100)GB per
 device as of mid-2026.
 
 When the source indices are cached -- ``cache_level[0] == 1``, whatever the diagonal setting -- the
 state list :math:`S` is also sharded once the source indices are computed, since nothing sorts or
 binary-searches it afterwards. At ``cache_level[0] == 0`` it stays replicated, because
-:func:`get_xsource` runs inside the matvec and its binary search needs the whole sorted array; the
+:func:`xsource` runs inside the matvec and its binary search needs the whole sorted array; the
 consumers that need a sharded view of it derive one themselves (see :func:`_spread_seed`).
 
 SQD API
@@ -180,7 +180,7 @@ SQD API
 
 .. autofunction:: sqd
 .. autofunction:: hproj
-.. autofunction:: all_diagonals
+.. autofunction:: _diag_all_groups
 
 States are packed with :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states`, which inserts the
 pad bit that aligns them with the Hamiltonian's signatures, and recovered with
@@ -206,7 +206,7 @@ from rqutils.paulis.symplectic import PauliSumXZ
 
 LOG = logging.getLogger(__name__)
 # Largest subspace size representable in the int32 indices used throughout (uniquify_states' iota,
-# get_xsource's output). Documented in the module docstring as the hard scaling limit; enforced in
+# xsource's output). Documented in the module docstring as the hard scaling limit; enforced in
 # sqd() and hproj() so an overflow raises instead of silently permuting the subspace.
 _MAX_STATES = 2**31 - 1
 
@@ -320,7 +320,7 @@ def sqd(
     if states_size < states.shape[0]:
         raise ValueError("states_size smaller than the states array length")
     # The 2^31 ceiling the module docstring calls a hard limit, actually enforced. Subspace positions
-    # are int32 throughout -- uniquify_states' iota, and get_xsource's returned indices with -1 as the
+    # are int32 throughout -- uniquify_states' iota, and xsource's returned indices with -1 as the
     # absent marker -- so a size at or above 2^31 wraps to a negative index and yields a corrupted
     # permutation rather than an error: a plausible finite answer, the failure mode this module keeps
     # guarding against. Unreachable on current hardware (2^31 states is already 4.3 GB of packed
@@ -339,7 +339,7 @@ def sqd(
 
     states_p = PauliSumXZ.pack_states(states)
     # Pad the *input* up to states_size too, not just the internal arrays. states_p is a traced
-    # argument of run_sqd, so its leading dimension is part of the jit cache key: leaving it at the
+    # argument of _run_sqd, so its leading dimension is part of the jit cache key: leaving it at the
     # raw input length retraces the whole solver on every distinct len(states), which is precisely
     # what states_size exists to prevent (measured 0.44 s per call versus 0.064 s once the shape
     # repeats). uniquify_states already pins every array it derives, so this was the one shape that
@@ -355,12 +355,12 @@ def sqd(
 
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
-    # Built here rather than inside run_sqd: dropping the padding is a boolean-mask index, which
-    # needs concrete shapes, and run_sqd sees `hamiltonian` as a pytree of tracers. Only the
+    # Built here rather than inside _run_sqd: dropping the padding is a boolean-mask index, which
+    # needs concrete shapes, and _run_sqd sees `hamiltonian` as a pytree of tracers. Only the
     # cache_level[1] == 2 path reads it, so it is skipped otherwise -- the reshape is host-side work
     # proportional to the rectangle.
     flat_terms = hamiltonian.flat_terms if cache_level[1] == 2 else None
-    result = run_sqd(
+    result = _run_sqd(
         hamiltonian, states_p, states_size, return_eigvec, cache_level, flat_terms=flat_terms
     )
     LOG.info("Found ground eigenpair in %f seconds.", time.time() - start)
@@ -392,7 +392,7 @@ def hproj(
             (subspace_dim, num_qubits).
         unique_states: Whether ``states`` can be assumed to be already uniquified **and
             lex-sorted**, skipping the internal ``np.unique(..., axis=0)``. Both halves are
-            required, because :func:`get_xsource` binary-searches into ``states``; violating either
+            required, because :func:`xsource` binary-searches into ``states``; violating either
             raises :class:`ValueError`. Sortedness is validated on this path (host-side numpy,
             measured 12-18% of the call), so an unsorted subspace is rejected rather than silently
             projected into a wrong, non-symmetric matrix as it was before. Leave this ``False`` to
@@ -413,11 +413,11 @@ def hproj(
         ValueError: If ``unique_states=True`` and ``states`` is not strictly increasing in
             lexicographic order (unsorted, or containing duplicate rows); or if the subspace exceeds
             :math:`2^{31} - 1` states, the ceiling imposed by the int32 indices
-            :func:`get_xsource` returns.
+            :func:`xsource` returns.
     """
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
-    # Same int32 ceiling sqd() enforces, since hproj reaches get_xsource too and its returned
+    # Same int32 ceiling sqd() enforces, since hproj reaches xsource too and its returned
     # positions are int32 with -1 as the absent marker. Checked here, before the O(N) sortedness scan
     # and the np.unique below: it is an O(1) look at a shape, so it costs nothing to do first and
     # reports the real problem rather than letting a doomed call spend time first.
@@ -430,7 +430,7 @@ def hproj(
     if not unique_states:
         states = np.unique(states, axis=0)
     else:
-        # get_xsource binary-searches into `states`, so unsorted rows silently produced a wrong,
+        # xsource binary-searches into `states`, so unsorted rows silently produced a wrong,
         # non-symmetric matrix. Validated rather than documented away, and only on this opt-in path --
         # the branch above is sorted by construction and pays nothing.
         #
@@ -441,7 +441,7 @@ def hproj(
         if not _is_lex_sorted(states):
             raise ValueError(
                 "unique_states=True requires `states` to be uniquified and lex-sorted, but the "
-                "rows given are not strictly increasing. get_xsource binary-searches into this "
+                "rows given are not strictly increasing. xsource binary-searches into this "
                 "array, so an unsorted subspace yields a wrong (non-symmetric) projection rather "
                 "than an error deeper in. Pass np.unique(states, axis=0), or leave "
                 "unique_states=False to have hproj do it."
@@ -483,8 +483,8 @@ def _hproj_cols_elems(hamiltonian: PauliSumXZ, states_p: StateList) -> tuple[jax
     """
 
     def get_from_one(_, ham):
-        columns = get_xsource(ham[0], states_p)
-        diagonals = get_diagonal(ham[1], ham[2], states_p)
+        columns = xsource(ham[0], states_p)
+        diagonals = _diag_from_z(ham[1], ham[2], states_p)
         return None, (columns, diagonals)
 
     return jax.lax.scan(get_from_one, None, hamiltonian.arrays)[1]
@@ -499,7 +499,7 @@ def _is_filler(states_u: StateList) -> jax.Array:
     consumers, rather than two that a reader has to re-derive as equal.
 
     Returned as the bit itself, not a bool, because the fillers sort to the end: the result is a
-    non-decreasing 0/1 array, which is what lets ``run_sqd`` locate the subspace boundary with a
+    non-decreasing 0/1 array, which is what lets ``_run_sqd`` locate the subspace boundary with a
     ``searchsorted`` instead of a count.
     """
     return states_u[:, 0] >> 7
@@ -510,7 +510,7 @@ def _spread_seed(
 ) -> jax.Array:
     """Return a deterministic pseudo-random unit-scale vector over the subspace.
 
-    Used as (part of) ``run_sqd``'s initial vector. The point is coverage, not quality: LOBPCG
+    Used as (part of) ``_run_sqd``'s initial vector. The point is coverage, not quality: LOBPCG
     requires a non-vanishing overlap with the ground state, and a one-hot seed can fail that
     outright -- it cannot leave the connected component of the projected Hamiltonian that contains
     it, so a subspace whose Hamiltonian splits into disconnected blocks yields that block's
@@ -548,7 +548,7 @@ def _spread_seed(
     vec = mixed.astype(dtype) * (2.0 / float(2**32)) - 1.0
     # Match the predicate's sharding to `vec`'s rather than assuming they agree. They do not at
     # cache_level[0] == 0: `vec` follows the `sharding` argument, while `states_u` is still unsharded
-    # there because run_sqd defers its reshard until after the last get_xsource -- which on that level
+    # there because _run_sqd defers its reshard until after the last xsource -- which on that level
     # happens inside the matvec, so it never runs before this point. jnp.where then raises
     # "select `which` must be scalar or have the same sharding as cases", which is why all three
     # cache_level[0] == 0 kernels failed on any non-empty mesh. Resharding the small 0/1 predicate is
@@ -560,7 +560,7 @@ def _spread_seed(
 
 
 @jax.jit(static_argnames=["states_size", "return_eigvec", "cache_level", "log_level"])
-def run_sqd(
+def _run_sqd(
     hamiltonian: PauliSumXZ,
     states_p: StateList,
     states_size: int,
@@ -591,9 +591,7 @@ def run_sqd(
         if log_level <= logging.DEBUG:
             jax.debug.print("Precomputing xsources")
 
-        xsources = jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, hamiltonian.x)[
-            1
-        ]
+        xsources = jax.lax.scan(lambda _, x: (None, xsource(x, states_u)), None, hamiltonian.x)[1]
         if sharding:
             # We will not be performing sorts on states any more - shard the array
             if log_level <= logging.DEBUG:
@@ -605,24 +603,24 @@ def run_sqd(
         if log_level <= logging.DEBUG:
             jax.debug.print("Precomputing sign bits of diagonals")
 
-        diag_signs = jax.lax.scan(
-            lambda _, z: (None, get_diag_signs(z, states_u)), None, hamiltonian.z
-        )[1]
+        signs = jax.lax.scan(lambda _, z: (None, diag_signs(z, states_u)), None, hamiltonian.z)[1]
     elif cache_level[1] == 2:
         if log_level <= logging.DEBUG:
             jax.debug.print("Precomputing diagonals")
 
         if flat_terms is None:
             diagonals = jax.lax.scan(
-                lambda _, v: (None, get_diagonal(v[0], v[1], states_u)),
+                lambda _, v: (None, _diag_from_z(v[0], v[1], states_u)),
                 None,
                 (hamiltonian.z, hamiltonian.c),
             )[1]
         else:
             # One pass over the real terms instead of J passes over the padded rectangle. Identical
-            # to the last bit, and faster at every raggedness measured -- see all_diagonals.
+            # to the last bit, and faster at every raggedness measured -- see _diag_all_groups.
             flat_z, flat_c, group_ids = flat_terms
-            diagonals = all_diagonals(flat_z, flat_c, group_ids, states_u, hamiltonian.x.shape[0])
+            diagonals = _diag_all_groups(
+                flat_z, flat_c, group_ids, states_u, hamiltonian.x.shape[0]
+            )
 
     # Assemble the per-X-group arrays apply_h scans over. This stays a Python-level match on the
     # static cache_level: the *packing* must be static too, or the tuple structure would become part
@@ -632,7 +630,7 @@ def run_sqd(
         case 0:
             scanned = (xgroup, hamiltonian.z, hamiltonian.c)
         case 1:
-            scanned = (xgroup, diag_signs, hamiltonian.c)
+            scanned = (xgroup, signs, hamiltonian.c)
         case 2:
             scanned = (xgroup, diagonals)
     # (1, 2) reads neither signature array, so it needs no states at all -- which is what lets the
@@ -668,7 +666,7 @@ def run_sqd(
             # Same nterms the matvec uses: this computes the same diagonal by the same kernel, so
             # leaving it ungated would trace the accumulator a second time under a different static
             # key within this one trace, and would let the two drift if the accumulator changed.
-            diagonal = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u, matvec_nterms)
+            diagonal = _diag_from_z(hamiltonian.z[0], hamiltonian.c[0], states_u, matvec_nterms)
         # Narrow AFTER the join, not in each branch. The diagonal of a Hermitian operator is real, but
         # `.c` is complex128 whenever any Pauli string has an odd number of Ys, so the composed
         # diagonal carries a zero imaginary part along and the argmin below cannot order it ("lt does
@@ -767,7 +765,7 @@ def _pack_state_keys(states: StateList) -> jax.Array:
 
     Byte 0 becomes the most significant, so integer order on the keys is identical to row lex order.
     That equivalence is the whole point: it lets a scalar binary search stand in for a lexicographic
-    one. Only valid while `B <= 8`; :func:`get_xsource` checks that before calling.
+    one. Only valid while `B <= 8`; :func:`xsource` checks that before calling.
     """
     nbytes = states.shape[1]
     shifts = jnp.asarray([8 * (nbytes - 1 - i) for i in range(nbytes)], dtype=jnp.uint64)
@@ -779,7 +777,7 @@ def _is_lex_sorted(states: NDArray[np.uint8]) -> bool:
 
     Host-side numpy, deliberately: the one caller (:func:`hproj`) is eager, and the point is to
     ``raise`` before any tracing, which a traced predicate cannot do. Compares adjacent rows at their
-    first differing byte -- equal rows count as *unsorted*, since `get_xsource`'s precondition is
+    first differing byte -- equal rows count as *unsorted*, since `xsource`'s precondition is
     uniquified-and-sorted and a duplicate row makes the projection ambiguous either way.
 
     One vectorized pass, no early exit, so unsorted input costs the same as sorted. Measured at 12-18%
@@ -832,7 +830,7 @@ def _row_less_than(rows: jax.Array, targets: jax.Array) -> jax.Array:
 
 
 @jax.jit
-def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
+def xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
     """Return an index array into the source of an X operation.
 
     Let `V` be a vector of complex or float values with shape `[N]`, `S` be a lex-sorted 2-d array
@@ -851,7 +849,7 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
 
     **`states` must be lex-sorted.** This has always been required -- the previous sort-based
     implementation also silently returned a wrong answer otherwise -- but was never stated. Both
-    in-tree callers satisfy it: `run_sqd` passes `uniquify_states`' output, and `hproj` passes
+    in-tree callers satisfy it: `_run_sqd` passes `uniquify_states`' output, and `hproj` passes
     `np.unique(..., axis=0)`'s. Note `hproj`'s `unique_states=True` shortcut skips that `np.unique`,
     so a caller passing unsorted-but-unique states gets a wrong (and non-symmetric) matrix; that
     predates this implementation and is pinned by
@@ -881,7 +879,7 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
 
     Returns `-1` at every position whose source is absent. Note the previous implementation returned
     *assorted* negative values there (it computed `I[k+1] - N` unconditionally) rather than exactly
-    `-1`; consumers cannot tell, because `apply_xgrp` gathers with
+    `-1`; consumers cannot tell, because `apply_xgroup` gathers with
     `mode="fill", wrap_negative_indices=False` and any negative index yields 0.0. Tests comparing
     against a stored index array must therefore compare only valid rows, or compare the gathered
     result.
@@ -933,7 +931,7 @@ def _z_parity(states: StateList, zsignature: jax.Array) -> jax.Array:
 
 
 @jax.jit
-def get_diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Array:
+def diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Array:
     """Return the packed sign bits."""
 
     def get_signs(carry, zsignature):
@@ -959,7 +957,7 @@ def get_diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Arr
 # arm is 12%, so treat a ratio within that of 1.0 as unresolved and prefer the while_loop.
 #
 # This gates speed only. Differentiability always requires nterms, so apply_h honours whatever a
-# caller passes; this constant only decides what run_sqd binds for itself.
+# caller passes; this constant only decides what _run_sqd binds for itself.
 # Every (source_indices, diagonals) combination, i.e. all six matvec kernels apply_h resolves to.
 # Lives here rather than in the tests because the POCs need it too and cannot import from tests/;
 # two independent copies of this list is how a sharding failure on the (0, *) levels went unnoticed
@@ -999,7 +997,7 @@ def _accumulate_diagonal(
     **It is not uniformly faster, and the crossover is a property of the kernel rather than of the
     padding.** A ``lax.scan`` carries a fixed per-call cost the ``while_loop`` does not, so below
     roughly 8 terms the ``while_loop`` wins even with no padding to skip. :data:`_NTERMS_MIN_K`
-    carries the measured series and is where :func:`run_sqd` draws the line for its own use. What is
+    carries the measured series and is where :func:`_run_sqd` draws the line for its own use. What is
     specific to this function: at ``K=29`` with 3 real terms the scan is 1.09x, and at 400k states
     0.279 ms against 0.382 ms. A caller who needs the gradient passes ``nterms`` regardless of
     ``K``, since correctness of the derivative is not a speed question.
@@ -1100,7 +1098,7 @@ def _accumulate_diagonal(
 
 
 @jax.jit(static_argnames=["nterms"])
-def compute_diagonal(
+def _diag_from_signs(
     diag_signs: NDArray[np.uint8], coeffs: NDArray[np.inexact], nterms: int | None = None
 ) -> jax.Array:
     """Compute the diagonals from the sign bits and coefficients.
@@ -1126,7 +1124,7 @@ def compute_diagonal(
 
 
 @jax.jit(static_argnames=["nterms"])
-def get_diagonal(
+def _diag_from_z(
     zsignatures: NDArray[np.uint8],
     coeffs: NDArray[np.inexact],
     states: StateList,
@@ -1152,7 +1150,7 @@ def get_diagonal(
 
 
 @jax.jit(static_argnames=["num_groups"])
-def all_diagonals(
+def _diag_all_groups(
     zsignatures: NDArray[np.uint8],
     coeffs: NDArray[np.inexact],
     group_ids: NDArray[np.integer],
@@ -1161,7 +1159,7 @@ def all_diagonals(
 ) -> jax.Array:
     r"""Return every X group's diagonal in one pass over the real Z terms only.
 
-    The rectangular alternative to :func:`get_diagonal`. That one is called per X group under a
+    The rectangular alternative to :func:`_diag_from_z`. That one is called per X group under a
     ``lax.scan``, so a single trip count serves every group and each pays the widest group's extent.
     This one takes the *flat* layout -- :attr:`~rqutils.paulis.symplectic.PauliSumXZ.flat_terms`,
     which drops the padding -- computes every term's contribution at once, and scatter-adds them back
@@ -1232,7 +1230,7 @@ def all_diagonals(
     # internally with no way to constrain them, so on a non-empty mesh it drops the sharding and
     # raises "Incompatible types for broadcasting: float64[5,32@x] vs float64[5,32]" -- measured, with
     # `contributions` already correctly P(None, 'x') at that point, so the loss was entirely inside
-    # the helper. This is the same `.at[...].add(..., out_sharding=...)` form get_diag_signs uses, and
+    # the helper. This is the same `.at[...].add(..., out_sharding=...)` form diag_signs uses, and
     # it is what makes these diagonals safe to feed ground_locg, which is sharding-transparent only if
     # the matvec preserves output sharding.
     #
@@ -1242,12 +1240,6 @@ def all_diagonals(
         (num_groups, contributions.shape[1]), dtype=contributions.dtype, out_sharding=out_sharding
     )
     return accumulator.at[group_ids].add(contributions, out_sharding=out_sharding)
-
-
-# Renamed in the next commit; aliased here so this commit is independently testable.
-_diag_from_signs = compute_diagonal
-_diag_from_z = get_diagonal
-_diag_all_groups = all_diagonals
 
 
 def diagonals(
@@ -1287,7 +1279,7 @@ def diagonals(
     Args:
         coeffs: Phase-folded coefficients. Shape ``(num_terms,)`` for one group, or the flat
             ``(sum(nzterms),)`` for the all-groups form.
-        diag_signs: Precomputed packed sign bits for this group, from :func:`get_diag_signs`. Mutually
+        diag_signs: Precomputed packed sign bits for this group, from :func:`diag_signs`. Mutually
             exclusive with ``zsignatures``, and needs no ``states``.
         zsignatures: Packed Z signatures. Requires ``states``, since the sign bits are recomputed.
         group_ids: The X group each flat term belongs to. Selects the all-groups form and requires
@@ -1328,7 +1320,7 @@ def diagonals(
 
 
 @jax.jit
-def apply_xgrp(
+def apply_xgroup(
     xsource: NDArray[np.int32], diagonal: NDArray[np.inexact], vec: NDArray[np.inexact]
 ) -> jax.Array:
     """Gather vector entries from the source indices and multiply them with diagonals."""
@@ -1352,17 +1344,17 @@ def _apply_h_resolved(
     r"""Return :math:`Hv`, resolving the per-X-group inputs according to ``cache_level``.
 
     All six caching strategies are one ``jax.lax.scan`` over the X groups accumulating
-    ``out + apply_xgrp(xsource, diagonal, vec)``; they differ only in where the two inputs come
+    ``out + apply_xgroup(xsource, diagonal, vec)``; they differ only in where the two inputs come
     from. That is exactly the 2x3 grid ``cache_level`` already names, so it is expressed as a grid
     rather than as six near-identical functions:
 
     =============  ==========================  =====================================
     cache_level    ``xsource``                 ``diagonal``
     =============  ==========================  =====================================
-    ``(0, *)``     ``get_xsource(x, states)``  --
+    ``(0, *)``     ``xsource(x, states)``      --
     ``(1, *)``     scanned (precomputed)       --
-    ``(*, 0)``     --                          ``get_diagonal(z, c, states)``
-    ``(*, 1)``     --                          ``compute_diagonal(signs, c)``
+    ``(*, 0)``     --                          ``_diag_from_z(z, c, states)``
+    ``(*, 1)``     --                          ``_diag_from_signs(signs, c)``
     ``(*, 2)``     --                          scanned (precomputed)
     =============  ==========================  =====================================
 
@@ -1406,14 +1398,14 @@ def _apply_h_resolved(
     def fn(out, val):
         # val[0] is the X source for this group: either the precomputed index array or the X
         # signature it is derived from.
-        xsource = val[0] if cache_level[0] == 1 else get_xsource(val[0], states)
+        xsrc = val[0] if cache_level[0] == 1 else xsource(val[0], states)
         if cache_level[1] == 0:
-            diagonal = get_diagonal(val[1], val[2], states, nterms)
+            diagonal = _diag_from_z(val[1], val[2], states, nterms)
         elif cache_level[1] == 1:
-            diagonal = compute_diagonal(val[1], val[2], nterms)
+            diagonal = _diag_from_signs(val[1], val[2], nterms)
         else:
             diagonal = val[1]
-        return out + apply_xgrp(xsource, diagonal, vec), None
+        return out + apply_xgroup(xsrc, diagonal, vec), None
 
     return jax.lax.scan(fn, jnp.zeros_like(vec), scanned)[0]
 

@@ -6,7 +6,7 @@ per-device memory for the caches, and the ``O(J*N)`` per-matvec cost. They scale
 components against N and against J independently:
 
 - ``uniquify_states`` -- runs **once** per solve.
-- ``get_xsource`` -- runs J times, and holds the ``2N`` sort that sets the hard ceiling.
+- ``xsource`` -- runs J times, and holds the ``2N`` sort that sets the hard ceiling.
 - ``apply_h`` -- runs once per solver iteration, tens to hundreds of times.
 
 The per-call costs are then weighted by call count, which is the only comparison that matters: a
@@ -31,7 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 from _scaling_common import header, make_problem, timeit
 
-from rqutils.sqd import apply_h, get_diagonal, get_xsource, uniquify_states
+from rqutils.sqd import _diag_from_z, apply_h, uniquify_states, xsource
 
 
 def component_costs(problem, cache_level=(1, 2)):
@@ -48,22 +48,22 @@ def component_costs(problem, cache_level=(1, 2)):
     # One X signature only: the J-fold cost is this times J, and timing all J at once would hide
     # whether the per-signature cost itself scales.
     out["xsource_1"] = timeit(
-        lambda: get_xsource(ham.x[0], states_u), "get_xsource (1 signature)", trials=5
+        lambda: xsource(ham.x[0], states_u), "xsource (1 signature)", trials=5
     )
     out["diagonal_1"] = timeit(
-        lambda: get_diagonal(ham.z[0], ham.c[0], states_u), "get_diagonal (1 group)", trials=5
+        lambda: _diag_from_z(ham.z[0], ham.c[0], states_u), "_diag_from_z (1 group)", trials=5
     )
 
-    # Full precomputation of all J source indices, as run_sqd does under cache_level[0]==1.
+    # Full precomputation of all J source indices, as _run_sqd does under cache_level[0]==1.
     def all_xsources():
-        return jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, ham.x)[1]
+        return jax.lax.scan(lambda _, x: (None, xsource(x, states_u)), None, ham.x)[1]
 
     out["xsource_all"] = timeit(all_xsources, f"all {problem.num_xgroups} xsources", trials=3)
 
     # One matvec under the fully-cached strategy, which is the steady-state solver cost.
     xsources = jax.block_until_ready(all_xsources())
     diagonals = jax.block_until_ready(
-        jax.lax.scan(lambda _, v: (None, get_diagonal(v[0], v[1], states_u)), None, (ham.z, ham.c))[
+        jax.lax.scan(lambda _, v: (None, _diag_from_z(v[0], v[1], states_u)), None, (ham.z, ham.c))[
             1
         ]
     )

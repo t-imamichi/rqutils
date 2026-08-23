@@ -1,6 +1,6 @@
-"""POC 1: replace ``get_xsource``'s 2N sort with a searchsorted into the already-sorted S.
+"""POC 1: replace ``xsource``'s 2N sort with a searchsorted into the already-sorted S.
 
-**This POC's proposal was adopted in commit 23fb226, so ``rqutils.sqd.get_xsource`` IS the
+**This POC's proposal was adopted in commit 23fb226, so ``rqutils.sqd.xsource`` IS the
 searchsorted now.** The sort baseline therefore lives here, as ``xsource_sort_legacy`` -- a verbatim
 copy of the pre-23fb226 implementation -- and every *timing* arm compares against that, not against
 the library. Timing against the library would compare two binary searches and report 1.00x, which is
@@ -8,7 +8,7 @@ exactly what happened on the first GPU run of ``poc8_gpu_unverified.py``. The *c
 reference the library on purpose: agreeing with what ``sqd`` actually ships is the property that
 matters, and it is now a regression test rather than a proposal.
 
-``get_xsource`` finds, for each ``i``, the index ``A[i]`` with ``S[A[i]] == S[i] ^ x``, or -1 when no
+``xsource`` finds, for each ``i``, the index ``A[i]`` with ``S[A[i]] == S[i] ^ x``, or -1 when no
 such state is in the subspace. The former implementation did this by concatenating ``S`` and
 ``S ^ x`` into a ``2N`` array, sorting it, and reading off adjacent equal pairs. That sort is why
 ``N <= 2**31``, is noted in-tree as leaking up to 5 GB of GPU memory, and -- per ``baseline.py`` --
@@ -36,7 +36,7 @@ reason is worth recording.
 On a **fill-in row** (all-255, produced by uniquification) the target ``255 ^ x`` is never in ``S``,
 so the answer is "no source". The legacy sort reaches that verdict through
 ``idx_sorted[1:] - size`` and lands on assorted negative values (-12, -11, -10, ...) rather than
-exactly -1; a searchsorted returns -1. Both are consumed identically, because ``apply_xgrp`` gathers
+exactly -1; a searchsorted returns -1. Both are consumed identically, because ``apply_xgroup`` gathers
 with ``mode="fill", wrap_negative_indices=False``, so *any* negative index yields 0.0. Demanding
 equality here would reject a correct implementation over an unobservable difference.
 
@@ -65,7 +65,7 @@ import jax.numpy as jnp
 import numpy as np
 from _scaling_common import fmt_ratio, header, make_problem, timeit
 
-from rqutils.sqd import get_xsource, uniquify_states
+from rqutils.sqd import uniquify_states, xsource
 
 # Fill-in rows from uniquification are all-255. They must never match a real source: a genuine
 # packed state always has byte 0 < 128 because of the pad bit, so 255 is unreachable by construction.
@@ -74,11 +74,11 @@ FILL_BYTE = 255
 
 @jax.jit
 def xsource_sort_legacy(xsignature, states):
-    """The pre-23fb226 ``get_xsource``: concatenate ``S`` and ``S ^ X`` into ``2N`` rows and sort.
+    """The pre-23fb226 ``xsource``: concatenate ``S`` and ``S ^ X`` into ``2N`` rows and sort.
 
     **This is the baseline arm, and it lives here because the library no longer provides one.**
-    Commit 23fb226 replaced ``rqutils.sqd.get_xsource`` with the searchsorted below, so timing
-    ``get_xsource`` against ``xsource_searchsorted_u64`` now compares two binary searches and
+    Commit 23fb226 replaced ``rqutils.sqd.xsource`` with the searchsorted below, so timing
+    ``xsource`` against ``xsource_searchsorted_u64`` now compares two binary searches and
     measures 1.00x. That is exactly what happened on the first GPU run of ``poc8``: both arms were
     the same algorithm, ``fmt_ratio`` correctly refused to call a winner, and the run produced no
     information about the 12-25x claim it existed to check. A POC whose baseline is whatever the
@@ -89,7 +89,7 @@ def xsource_sort_legacy(xsignature, states):
     ``jax.reshard`` tail is dropped because these POCs time a single device; the sort is the subject.
 
     Returns assorted negative values (not exactly -1) on fill-in rows, since it computes
-    ``I[k+1] - N`` unconditionally. Consumers cannot tell, because ``apply_xgrp`` gathers with
+    ``I[k+1] - N`` unconditionally. Consumers cannot tell, because ``apply_xgroup`` gathers with
     ``wrap_negative_indices=False`` and any negative index yields 0.0 -- which is why the
     correctness gate here compares valid-row indices and gathered results, not raw index arrays.
     """
@@ -191,7 +191,7 @@ def _equivalent(ref, got, states_u, rng):
     nbad = int(np.sum(ref[valid] != got[valid]))
 
     # The observable property: gather a probe vector through both index arrays exactly as
-    # apply_xgrp does, and require the results to agree everywhere including the fill rows.
+    # apply_xgroup does, and require the results to agree everywhere including the fill rows.
     probe = jnp.asarray(rng.normal(size=states_u.shape[0]))
 
     def gather(idx):
@@ -228,7 +228,7 @@ def check_correctness():
         case_ok = True
         for isig in range(min(4, p.num_xgroups)):
             xsig = p.hamiltonian.x[isig]
-            ref = np.asarray(get_xsource(xsig, states_u))
+            ref = np.asarray(xsource(xsig, states_u))
             for name, got in [
                 ("u64", np.asarray(xsource_searchsorted_u64(xsig, states_u))),
                 ("lex", np.asarray(xsource_searchsorted_lex(xsig, states_u))),
@@ -409,7 +409,7 @@ def check_lex_variant():
         size = p.states_p.shape[0]
         states_u = jax.block_until_ready(uniquify_states(p.states_p, size))
         xsig = p.hamiltonian.x[0]
-        ref = np.asarray(get_xsource(xsig, states_u))
+        ref = np.asarray(xsource(xsig, states_u))
         got = np.asarray(xsource_searchsorted_lex(xsig, states_u))
         i_same, g_same, nbad = _equivalent(ref, got, states_u, np.random.default_rng(8))
         assert i_same and g_same, f"lex mismatch at n={num_qubits}: nbad={nbad}"

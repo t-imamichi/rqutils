@@ -56,7 +56,7 @@ import numpy as np
 from _scaling_common import fmt_ratio, header, make_problem, timeit
 from poc1_searchsorted import FILL_BYTE, xsource_searchsorted_u64
 
-from rqutils.sqd import get_xsource, uniquify_states
+from rqutils.sqd import uniquify_states, xsource
 
 
 def hamming_order(xsigs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -150,7 +150,7 @@ def main():
         delta = np.bitwise_xor(xsigs[i_prev], xsigs[i_curr])
         a_delta = xsource_searchsorted_u64(delta, states_u)
         a_curr = compose_sources(a_curr, a_delta)
-        ref = get_xsource(xsigs[i_curr], states_u)
+        ref = xsource(xsigs[i_curr], states_u)
         i_same, g_same = gather_equiv(ref, a_curr, states_u, rng)
         all_ok = all_ok and i_same and g_same
         vf = float(np.mean(np.asarray(a_curr) >= 0))
@@ -166,7 +166,7 @@ def main():
     a0 = np.asarray(xsource_searchsorted_u64(xsigs[i0], states_u))
     ad = np.asarray(xsource_searchsorted_u64(delta, states_u))
     comp = np.asarray(compose_sources(jnp.asarray(a0), jnp.asarray(ad)))
-    ref1 = np.asarray(get_xsource(xsigs[i1], states_u))
+    ref1 = np.asarray(xsource(xsigs[i1], states_u))
     only_ref = np.logical_and(ref1 >= 0, comp < 0)
     print()
     print("  ROOT CAUSE (depth 1, the shallowest possible chain):")

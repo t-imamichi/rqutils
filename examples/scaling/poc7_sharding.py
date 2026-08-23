@@ -55,8 +55,8 @@ def check_single_vs_sharded():
 
         # ALL SIX cache levels, not just the default. They take different code paths -- (*, 0)
         # recomputes diagonals per group, (*, 1) reads cached sign bits, (*, 2) precomputes through
-        # all_diagonals' sharded scatter-add, and (0, *) defers get_xsource into the matvec, which is
-        # what delays run_sqd's reshard of the state list. Sweeping only the default is how two
+        # _diag_all_groups' sharded scatter-add, and (0, *) defers xsource into the matvec, which is
+        # what delays _run_sqd's reshard of the state list. Sweeping only the default is how two
         # separate sharding bugs stayed hidden while this POC ran green: a passing sharding run says
         # nothing about a path it never selects.
         with jax.set_mesh(mesh):
@@ -114,7 +114,7 @@ def check_mesh_padding():
 
 def check_eigvec_path():
     header("POC 7c: return_eigvec=True under sharding -- reshard round-trip")
-    print("run_sqd reshards eigvec and states_u back to PartitionSpec(None) before returning")
+    print("_run_sqd reshards eigvec and states_u back to PartitionSpec(None) before returning")
     print("(sqd.py:497-499). Check the returned vector is a genuine eigenvector, not just that the")
     print("call succeeds: ||Hv - ev|| / ||v|| against the dense projection.")
     print()
@@ -163,7 +163,9 @@ def main():
     if worst < 1e-8 and worst_pc < 1e-8:
         print("  Sharded and single-device agree on ALL SIX cache levels, including the three")
         print("  cache_level[0] == 0 levels that raised ShardingTypeError until _spread_seed")
-        print("  resharded its filler predicate, and the (1, 2) precompute through all_diagonals.")
+        print(
+            "  resharded its filler predicate, and the (1, 2) precompute through _diag_all_groups."
+        )
         print(f"  The out_sharding contract and mesh padding hold on {ndev} devices.")
     else:
         print("  DIVERGENCE: the sharded path does not reproduce the single-device answer.")

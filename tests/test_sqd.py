@@ -4,12 +4,12 @@ Organized by defect, like ``test_ground_locg.py``. Three bugs were found while w
 and fixed alongside it; each has a test named for it that reproduces the exact input and records the
 measured wrong value, so a regression names itself:
 
-- ``compute_diagonal``'s ``ibit = iterm & 255`` (should be ``& 7``), which made the
+- ``_diag_from_signs``'s ``ibit = iterm & 255`` (should be ``& 7``), which made the
   ``cache_level[1] == 1`` kernels wrong once an X group held more than 8 Z terms.
 - ``hproj`` building the Hamiltonian *with* the signature pad bit while packing states *without* it,
   so its bit alignment disagreed with the ``sqd`` path. The padding was an opt-in ``add_padding``
   flag then; it is now intrinsic to ``PauliSumXZ``, so the two sides cannot disagree.
-- ``run_sqd``'s one-hot initial vectors, which cannot leave the connected component of the
+- ``_run_sqd``'s one-hot initial vectors, which cannot leave the connected component of the
   projected Hamiltonian that contains the seed, and which violate ``ground_locg``'s
   non-vanishing-overlap precondition outright when the seed state is decoupled.
 
@@ -38,19 +38,19 @@ from rqutils.sqd import (
     _NTERMS_MIN_K,
     CACHE_LEVELS,
     _default_states_size,
+    _diag_all_groups,
+    _diag_from_signs,
+    _diag_from_z,
     _is_lex_sorted,
+    _run_sqd,
     _z_parity,
-    all_diagonals,
     apply_h,
-    compute_diagonal,
+    diag_signs,
     diagonals,
-    get_diag_signs,
-    get_diagonal,
-    get_xsource,
     hproj,
-    run_sqd,
     sqd,
     uniquify_states,
+    xsource,
 )
 
 
@@ -73,7 +73,7 @@ def matvec_fixture(rng, strings, coeffs, states):
     validation tests care about *which* arrays they pass, not how they were built -- inlining the
     build made each of them ~12 lines of identical setup around two assertions.
 
-    The two precomputes use ``jax.lax.scan`` over the X groups, the same idiom ``run_sqd`` uses,
+    The two precomputes use ``jax.lax.scan`` over the X groups, the same idiom ``_run_sqd`` uses,
     rather than a Python loop with one jitted dispatch per group (measured 4-6x slower). The tests
     then demonstrate the vectorized form the library documents instead of a slower alternative.
 
@@ -83,9 +83,9 @@ def matvec_fixture(rng, strings, coeffs, states):
     hamiltonian = PauliSumXZ.from_paulisum((strings, list(coeffs)))
     states_u = uniquify_states(pack_padded(states), states.shape[0])
     vector = rng.normal(size=states.shape[0])
-    xsources = jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, hamiltonian.x)[1]
+    xsources = jax.lax.scan(lambda _, x: (None, xsource(x, states_u)), None, hamiltonian.x)[1]
     diagonals = jax.lax.scan(
-        lambda _, v: (None, get_diagonal(v[0], v[1], states_u).real),
+        lambda _, v: (None, _diag_from_z(v[0], v[1], states_u).real),
         None,
         (hamiltonian.z, hamiltonian.c),
     )[1]
@@ -98,8 +98,8 @@ def eigval_of(pauli_strings, coeffs, states, **kwargs):
     return float(np.asarray(result).ravel()[0])
 
 
-class TestComputeDiagonal:
-    """``compute_diagonal`` composes a diagonal from packed sign bits and coefficients."""
+class TestDiagFromSigns:
+    """``_diag_from_signs`` composes a diagonal from packed sign bits and coefficients."""
 
     @pytest.mark.parametrize("num_terms", [1, 7, 8, 9, 17])
     def test_matches_direct_sum(self, num_terms):
@@ -118,14 +118,14 @@ class TestComputeDiagonal:
             packed[:, term // 8] |= (negative[:, term] << (7 - (term % 8))).astype(np.uint8)
         coeffs = rng.normal(size=num_terms)
 
-        got = np.asarray(compute_diagonal(packed, coeffs))
+        got = np.asarray(_diag_from_signs(packed, coeffs))
         expected = ((1.0 - 2.0 * negative) * coeffs).sum(axis=1)
         assert np.abs(got - expected).max() < 1e-13
 
-    def test_agrees_with_get_diagonal(self):
+    def test_agrees_with_diag_from_z(self):
         """The two diagonal paths (``cache_level[1]`` 1 vs 2) must produce the same numbers.
 
-        ``get_diagonal`` recomputes signs from the Z signatures; ``compute_diagonal`` reads them
+        ``_diag_from_z`` recomputes signs from the Z signatures; ``_diag_from_signs`` reads them
         from precomputed packed bits. They are the same quantity by two routes, so this pins the
         pair together independently of any end-to-end solve.
         """
@@ -146,9 +146,9 @@ class TestComputeDiagonal:
         states_u = uniquify_states(states_p, states_p.shape[0])
         assert hamiltonian.z.shape[0] == 1, "expected a single X group for pure-Z input"
 
-        signs = get_diag_signs(hamiltonian.z[0], states_u)
-        from_signs = np.asarray(compute_diagonal(signs, hamiltonian.c[0]))
-        direct = np.asarray(get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u).real)
+        signs = diag_signs(hamiltonian.z[0], states_u)
+        from_signs = np.asarray(_diag_from_signs(signs, hamiltonian.c[0]))
+        direct = np.asarray(_diag_from_z(hamiltonian.z[0], hamiltonian.c[0], states_u).real)
         assert np.abs(from_signs - direct).max() < 1e-13
 
 
@@ -182,7 +182,7 @@ class TestStaticNterms:
     def test_static_nterms_is_bit_identical_to_the_while_loop(self, num_terms):
         """Same sum in the same order, so equality is exact -- ``pytest.approx`` would be too weak.
 
-        Parametrized on the same counts as :meth:`TestComputeDiagonal.test_matches_direct_sum`, which
+        Parametrized on the same counts as :meth:`TestDiagFromSigns.test_matches_direct_sum`, which
         pins the ``& 7`` byte-offset bug: a term count crossing a byte boundary is where an indexing
         change would show up.
         """
@@ -192,8 +192,8 @@ class TestStaticNterms:
         coeffs = np.zeros(num_terms + 3)
         coeffs[:num_terms] = rng.normal(size=num_terms)
 
-        want = compute_diagonal(diag_signs, coeffs)
-        got = compute_diagonal(diag_signs, coeffs, num_terms)
+        want = _diag_from_signs(diag_signs, coeffs)
+        got = _diag_from_signs(diag_signs, coeffs, num_terms)
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
     def test_grad_wrt_coeffs_works_with_nterms_and_raises_without(self):
@@ -211,7 +211,7 @@ class TestStaticNterms:
         coeffs[:4] = [0.5, -0.3, 0.7, 0.2]
 
         def loss(cc, nterms):
-            return jnp.sum(compute_diagonal(diag_signs, cc, nterms) ** 2)
+            return jnp.sum(_diag_from_signs(diag_signs, cc, nterms) ** 2)
 
         signs = self._sign_matrix(diag_signs, num_terms)
         expected = 2.0 * (signs.T @ (signs @ coeffs))
@@ -228,9 +228,9 @@ class TestStaticNterms:
         rng = np.random.default_rng(5)
         states = pack_padded(np.unique(rng.integers(0, 2, size=(6, 4), dtype=np.uint8), axis=0))
         hamiltonian = PauliSumXZ.from_paulisum((["ZIII", "XXII"], [1.0, 0.4]))
-        xsources = jax.lax.scan(lambda _, x: (None, get_xsource(x, states)), None, hamiltonian.x)[1]
+        xsources = jax.lax.scan(lambda _, x: (None, xsource(x, states)), None, hamiltonian.x)[1]
         diagonals = jax.lax.scan(
-            lambda _, v: (None, get_diagonal(v[0], v[1], states)),
+            lambda _, v: (None, _diag_from_z(v[0], v[1], states)),
             None,
             (hamiltonian.z, hamiltonian.c),
         )[1]
@@ -250,24 +250,24 @@ class TestStaticNterms:
         diag_signs = rng.integers(0, 256, size=(16, 2), dtype=np.uint8)
         coeffs = np.zeros(12)
         coeffs[:5] = rng.normal(size=5)
-        tight = compute_diagonal(diag_signs, coeffs, 5)
-        overlong = compute_diagonal(diag_signs, coeffs, 12)
+        tight = _diag_from_signs(diag_signs, coeffs, 5)
+        overlong = _diag_from_signs(diag_signs, coeffs, 12)
         np.testing.assert_array_equal(np.asarray(overlong), np.asarray(tight))
 
-    def test_get_diagonal_accepts_nterms_too(self):
+    def test_diag_from_z_accepts_nterms_too(self):
         """Both diagonal builders share the accumulator, so both must thread the count."""
         rng = np.random.default_rng(7)
         states = pack_padded(np.unique(rng.integers(0, 2, size=(9, 5), dtype=np.uint8), axis=0))
         hamiltonian = PauliSumXZ.from_paulisum((["ZIIII", "IZZII", "IIIZZ"], [1.0, -0.5, 0.25]))
-        want = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states)
-        got = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states, hamiltonian.nzterms[0])
+        want = _diag_from_z(hamiltonian.z[0], hamiltonian.c[0], states)
+        got = _diag_from_z(hamiltonian.z[0], hamiltonian.c[0], states, hamiltonian.nzterms[0])
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
-class TestAllDiagonals:
-    """``all_diagonals`` builds every group's diagonal from the padding-free flat layout.
+class TestDiagAllGroups:
+    """``_diag_all_groups`` builds every group's diagonal from the padding-free flat layout.
 
-    The problem it solves: ``get_diagonal`` runs per X group under a ``lax.scan``, so one static trip
+    The problem it solves: ``_diag_from_z`` runs per X group under a ``lax.scan``, so one static trip
     count serves every group and each pays the widest group's extent. For ragged operators that is
     almost all padding -- a caller reported a 782x197 rectangle with median 2 terms per group, 1.4% of
     slots real, and measured routing a cost function through the rectangular path at 2x slower (n=20)
@@ -287,7 +287,7 @@ class TestAllDiagonals:
     def _scan_reference(hamiltonian, states_u):
         """The rectangular path this replaces: one static nterms for every group."""
         return jax.lax.scan(
-            lambda _, v: (None, get_diagonal(v[0], v[1], states_u, max(hamiltonian.nzterms))),
+            lambda _, v: (None, _diag_from_z(v[0], v[1], states_u, max(hamiltonian.nzterms))),
             None,
             (hamiltonian.z, hamiltonian.c),
         )[1]
@@ -303,7 +303,7 @@ class TestAllDiagonals:
         states_u = uniquify_states(pack_padded(states), states.shape[0])
 
         flat_z, flat_c, group_ids = hamiltonian.flat_terms
-        got = all_diagonals(flat_z, flat_c, group_ids, states_u, hamiltonian.x.shape[0])
+        got = _diag_all_groups(flat_z, flat_c, group_ids, states_u, hamiltonian.x.shape[0])
         want = self._scan_reference(hamiltonian, states_u)
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
@@ -332,7 +332,7 @@ class TestAllDiagonals:
 
         states_u = uniquify_states(pack_padded(states), states.shape[0])
         flat_z, flat_c, group_ids = hamiltonian.flat_terms
-        got = all_diagonals(flat_z, flat_c, group_ids, states_u, hamiltonian.x.shape[0])
+        got = _diag_all_groups(flat_z, flat_c, group_ids, states_u, hamiltonian.x.shape[0])
         np.testing.assert_array_equal(
             np.asarray(got), np.asarray(self._scan_reference(hamiltonian, states_u))
         )
@@ -354,14 +354,14 @@ class TestAllDiagonals:
         num_groups = hamiltonian.x.shape[0]
 
         def loss(cc):
-            return jnp.sum(all_diagonals(flat_z, cc, group_ids, states_u, num_groups) ** 2)
+            return jnp.sum(_diag_all_groups(flat_z, cc, group_ids, states_u, num_groups) ** 2)
 
         got = jax.grad(loss)(flat_c)
         assert np.all(np.isfinite(np.asarray(got)))
 
-        diagonals = np.asarray(all_diagonals(flat_z, flat_c, group_ids, states_u, num_groups))
+        diagonals = np.asarray(_diag_all_groups(flat_z, flat_c, group_ids, states_u, num_groups))
         # vmap, not a per-term Python loop: one eager dispatch and device transfer per term measured
-        # 46x slower at (T=206, N=4096), and this mirrors all_diagonals' own structure rather than
+        # 46x slower at (T=206, N=4096), and this mirrors _diag_all_groups' own structure rather than
         # restating it in a slower idiom.
         signs = 1.0 - 2.0 * np.asarray(jax.vmap(lambda z: _z_parity(states_u, z))(flat_z))
         expected = np.array(
@@ -377,7 +377,7 @@ class TestAllDiagonals:
         ``segment_sum`` allocates its accumulator internally with no way to constrain it, so on a mesh
         it dropped the sharding and raised (``Incompatible types for broadcasting: float64[5,32@x] vs
         float64[5,32]``) even though the contributions were already correctly ``P(None, 'x')``. The
-        explicit ``.at[ids].add(..., out_sharding=...)`` form -- the same one ``get_diag_signs`` uses --
+        explicit ``.at[ids].add(..., out_sharding=...)`` form -- the same one ``diag_signs`` uses --
         keeps it. This pins that the swap was value-preserving; the mesh behaviour itself is checked by
         ``examples/scaling/poc7_sharding.py``, which now sweeps ``cache_level`` for exactly that reason.
         """
@@ -413,36 +413,36 @@ class TestAllDiagonals:
 class TestDiagonalsDispatch:
     """``diagonals`` is one entry point over three sign sources, named the way ``apply_h`` names its.
 
-    The three predecessors (``compute_diagonal`` from cached bits, ``get_diagonal`` from Z signatures,
-    ``all_diagonals`` over the flat layout) took the same ``(coeffs, ...)`` and differed only in what
+    The three predecessors (``_diag_from_signs`` from cached bits, ``_diag_from_z`` from Z signatures,
+    ``_diag_all_groups`` over the flat layout) took the same ``(coeffs, ...)`` and differed only in what
     identified the sign source -- so which one to call was a fact the caller had to know rather than
     state. Equality with each predecessor is asserted **bitwise**: this is a dispatch change, not a
     numerical one, so anything else would signal a re-associated sum.
     """
 
-    def test_diag_signs_path_matches_compute_diagonal(self):
+    def test_diag_signs_path_matches_diag_from_signs(self):
         rng = np.random.default_rng(41)
         num_terms = 9
         diag_signs = rng.integers(0, 256, size=(24, 2), dtype=np.uint8)
         coeffs = np.zeros(num_terms)
         coeffs[:4] = rng.normal(size=4)
-        want = compute_diagonal(diag_signs, coeffs, num_terms)
+        want = _diag_from_signs(diag_signs, coeffs, num_terms)
         got = diagonals(coeffs, diag_signs=diag_signs, nterms=num_terms)
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
-    def test_zsignatures_path_matches_get_diagonal(self):
+    def test_zsignatures_path_matches_diag_from_z(self):
         rng = np.random.default_rng(42)
         states = unique_states(9, 5, rng)
         hamiltonian = PauliSumXZ.from_paulisum((["ZIIII", "IZZII", "IIIZZ"], [1.0, -0.5, 0.25]))
         states_u = uniquify_states(pack_padded(states), states.shape[0])
         nterms = hamiltonian.nzterms[0]
-        want = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u, nterms)
+        want = _diag_from_z(hamiltonian.z[0], hamiltonian.c[0], states_u, nterms)
         got = diagonals(
             hamiltonian.c[0], zsignatures=hamiltonian.z[0], states=states_u, nterms=nterms
         )
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
-    def test_flat_path_matches_all_diagonals(self):
+    def test_flat_path_matches_diag_all_groups(self):
         rng = np.random.default_rng(43)
         strings = real_pauli_strings(5, 8, rng)
         coeffs = rng.normal(size=len(strings))
@@ -451,7 +451,7 @@ class TestDiagonalsDispatch:
         states_u = uniquify_states(pack_padded(states), states.shape[0])
         flat_z, flat_c, group_ids = hamiltonian.flat_terms
         num_groups = hamiltonian.x.shape[0]
-        want = all_diagonals(flat_z, flat_c, group_ids, states_u, num_groups)
+        want = _diag_all_groups(flat_z, flat_c, group_ids, states_u, num_groups)
         got = diagonals(
             flat_c,
             zsignatures=flat_z,
@@ -501,7 +501,7 @@ class TestFlatTerms:
         flat_z, flat_c, group_ids = hamiltonian.flat_terms
         nzterms = np.asarray(hamiltonian.nzterms)
         assert flat_z.shape[0] == flat_c.shape[0] == group_ids.shape[0] == nzterms.sum()
-        # Non-decreasing, which is what makes all_diagonals' scatter contiguous.
+        # Non-decreasing, which is what makes _diag_all_groups' scatter contiguous.
         assert np.all(np.diff(group_ids) >= 0)
         assert np.array_equal(np.bincount(group_ids, minlength=len(nzterms)), nzterms)
 
@@ -517,7 +517,7 @@ class TestFlatTerms:
 
 
 class TestNtermsGate:
-    """``run_sqd`` binds ``nterms`` only where the fixed-length scan is actually faster.
+    """``_run_sqd`` binds ``nterms`` only where the fixed-length scan is actually faster.
 
     The defect this locks down was self-inflicted: binding ``nterms`` unconditionally made every
     small-``K`` Hamiltonian slower, because a ``lax.scan`` carries a fixed per-call cost the
@@ -601,8 +601,8 @@ class TestNzterms:
         assert len(hamiltonian.nzterms) == hamiltonian.x.shape[0]
 
 
-class TestGetXsource:
-    """``get_xsource`` finds, for each state, the index of ``state ^ xsignature``."""
+class TestXsource:
+    """``xsource`` finds, for each state, the index of ``state ^ xsignature``."""
 
     def test_partner_indices_and_absent_marker(self):
         """A partner outside the subspace must be ``-1``, which the matvec turns into a zero.
@@ -615,16 +615,16 @@ class TestGetXsource:
         states_u = uniquify_states(pack_padded(states), 3)
         # IIIX flips the last qubit: state 0 <-> state 1, and state 2's partner is absent.
         hamiltonian = PauliSumXZ.from_paulisum((["IIIX"], [1.0]))
-        assert np.array_equal(np.asarray(get_xsource(hamiltonian.x[0], states_u)), [1, 0, -1])
+        assert np.array_equal(np.asarray(xsource(hamiltonian.x[0], states_u)), [1, 0, -1])
         # XIII flips the first qubit: state 0 <-> state 2, and state 1's partner is absent.
         hamiltonian = PauliSumXZ.from_paulisum((["XIII"], [1.0]))
-        assert np.array_equal(np.asarray(get_xsource(hamiltonian.x[0], states_u)), [2, -1, 0])
+        assert np.array_equal(np.asarray(xsource(hamiltonian.x[0], states_u)), [2, -1, 0])
 
     @pytest.mark.parametrize("num_qubits", [6, 7, 8, 15, 16, 23, 24, 55, 63, 64, 71, 80])
     def test_matches_dense_partner_map_across_byte_widths(self, num_qubits):
         """Defect: a source-index array that is a *permutation* of the right answer.
 
-        ``get_xsource`` is a binary search into a lex-sorted ``S``, with a ``uint64``-key fast path
+        ``xsource`` is a binary search into a lex-sorted ``S``, with a ``uint64``-key fast path
         for ``B <= 8`` bytes and a lexicographic fallback beyond. Two ways that goes wrong silently:
 
         - Packing bytes in the wrong significance order makes integer order disagree with row lex
@@ -678,8 +678,7 @@ class TestGetXsource:
         hamiltonian = PauliSumXZ.from_paulisum((labels, [1.0] * len(labels)))
         # Guard the guard: if no signature couples anything, this test proves nothing.
         n_present = max(
-            int(np.sum(np.asarray(get_xsource(np.asarray(xs), states_u)) >= 0))
-            for xs in hamiltonian.x
+            int(np.sum(np.asarray(xsource(np.asarray(xs), states_u)) >= 0)) for xs in hamiltonian.x
         )
         assert n_present > 0, (
             f"n={num_qubits}: no signature has any partner in the subspace, so the expected "
@@ -687,13 +686,13 @@ class TestGetXsource:
         )
 
         for xsig in hamiltonian.x:
-            got = np.asarray(get_xsource(np.asarray(xsig), states_u))
+            got = np.asarray(xsource(np.asarray(xsig), states_u))
             expected = np.array(
                 [row_of.get(np.bitwise_xor(row, xsig).tobytes(), -1) for row in states_u],
                 dtype=np.int32,
             )
             # Fill-in rows (all-255) have no source; both sides agree they are absent, but only the
-            # sign is contractual there -- see the note in get_xsource's docstring.
+            # sign is contractual there -- see the note in xsource's docstring.
             is_fill = states_u[:, 0] == 255
             assert np.array_equal(got[~is_fill], expected[~is_fill]), (
                 f"n={num_qubits} B={states_u.shape[1]}: index array disagrees with the dense "
@@ -705,7 +704,7 @@ class TestGetXsource:
         """Defect: an absent source that indexes a real vector entry instead of gathering zero.
 
         The contract consumers rely on is only that an absent source is *negative*, since
-        ``apply_xgrp`` gathers with ``wrap_negative_indices=False``. A non-negative sentinel (0, or
+        ``apply_xgroup`` gathers with ``wrap_negative_indices=False``. A non-negative sentinel (0, or
         ``N``) would silently add a spurious matrix element. Pinned here because the sort-based
         implementation returned assorted negatives while the search returns exactly -1, so the
         *sign* is the invariant, not the value.
@@ -713,7 +712,7 @@ class TestGetXsource:
         # Single state whose IIIX partner (0001) is not in the subspace.
         states_u = uniquify_states(pack_padded(np.array([[0, 0, 0, 0]], dtype=np.uint8)), 1)
         hamiltonian = PauliSumXZ.from_paulisum((["IIIX"], [1.0]))
-        got = np.asarray(get_xsource(hamiltonian.x[0], states_u))
+        got = np.asarray(xsource(hamiltonian.x[0], states_u))
         assert got[0] < 0, f"absent source must be negative, got {got[0]}"
 
 
@@ -723,7 +722,7 @@ class TestUniquifyStates:
     def test_dedupes_and_marks_fillers(self):
         """Filler slots must be detectable via ``states_u[:, 0] >> 7``.
 
-        That marker is what lets ``run_sqd`` keep fillers out of the argmin and out of the initial
+        That marker is what lets ``_run_sqd`` keep fillers out of the argmin and out of the initial
         vector; if fillers were indistinguishable from real states the solver could place weight
         outside the subspace.
         """
@@ -743,7 +742,7 @@ class TestHproj:
     """``hproj`` builds the projected Hamiltonian densely (sparse), as a debug/reference path."""
 
     def test_subspace_above_the_int32_ceiling_raises(self):
-        """``hproj`` reaches ``get_xsource`` too, so it shares ``sqd``'s int32 ceiling.
+        """``hproj`` reaches ``xsource`` too, so it shares ``sqd``'s int32 ceiling.
 
         ``2**31`` rows cannot be allocated, so the shape is produced by ``np.broadcast_to`` (a view,
         no allocation) -- enough to reach a guard that reads ``states.shape[0]``.
@@ -755,7 +754,7 @@ class TestHproj:
     def test_unsorted_input_with_unique_states_raises(self):
         """``unique_states=True`` rejects unsorted states instead of projecting them wrongly.
 
-        ``get_xsource`` requires a lex-sorted ``S``. Both production callers satisfy it -- ``run_sqd``
+        ``xsource`` requires a lex-sorted ``S``. Both production callers satisfy it -- ``_run_sqd``
         via ``uniquify_states``, ``hproj`` via ``np.unique(..., axis=0)`` -- but ``hproj``'s
         ``unique_states=True`` shortcut skips that ``np.unique``, so a caller who has already
         deduplicated *without* sorting violates the precondition.
@@ -815,7 +814,7 @@ class TestHproj:
 
         Filler slots are all-``255`` rows, so two or more are duplicates and fail the strictness test.
         This is the one way the sortedness guard could surprise a caller -- ``uniquify_states`` output
-        is otherwise exactly what ``get_xsource`` wants -- so it is pinned rather than left to be
+        is otherwise exactly what ``xsource`` wants -- so it is pinned rather than left to be
         rediscovered. ``sqd`` trims fillers before returning its basis, which is why
         ``examples/scaling/poc7_sharding.py`` can hand that basis straight to ``hproj``.
         """
@@ -939,7 +938,7 @@ class TestHproj:
 
 
 class TestSqdInitialVector:
-    """``run_sqd``'s initial vector must have a non-vanishing overlap with the ground state.
+    """``_run_sqd``'s initial vector must have a non-vanishing overlap with the ground state.
 
     A one-hot seed cannot leave the connected component of the projected Hamiltonian that contains
     it: Krylov iteration only reaches states linked by a nonzero matrix element. Both of the
@@ -1151,7 +1150,7 @@ class TestSqdEndToEnd:
         against the true -0.8297058541:
 
         * ``_is_filler``'s high-bit test (``states_u[:, 0] >> 7``) -- three call sites depend on it.
-        * ``run_sqd``'s filler-diagonal masking (``jnp.where(_is_filler(...) == 1, max, diagonal)``),
+        * ``_run_sqd``'s filler-diagonal masking (``jnp.where(_is_filler(...) == 1, max, diagonal)``),
           which keeps a filler's zero diagonal from being selected as the minimum eigenvalue.
 
         A filler slot is all-ones (255) and ``pack_states`` reserves a leading zero pad bit, so a
@@ -1216,7 +1215,7 @@ class TestSqdEndToEnd:
     def test_states_size_above_the_int32_ceiling_raises(self):
         """The 2^31 limit the module documents as hard was documented but never enforced.
 
-        Subspace positions are int32 throughout -- ``uniquify_states``' iota and ``get_xsource``'s
+        Subspace positions are int32 throughout -- ``uniquify_states``' iota and ``xsource``'s
         returned indices, which use ``-1`` as the absent marker -- so a size at or above ``2**31``
         wraps to ``-2147483648`` and yields a corrupted permutation rather than an error. That is a
         plausible finite answer, the failure mode this module exists to guard against.
@@ -1239,7 +1238,7 @@ class TestSqdEndToEnd:
     def test_states_size_actually_prevents_recompilation(self):
         """``states_size`` pinned the internal arrays but not the input, so it never worked.
 
-        ``sqd`` packed ``states`` to its raw length and handed that to ``run_sqd``, where
+        ``sqd`` packed ``states`` to its raw length and handed that to ``_run_sqd``, where
         ``states_p`` is a *traced* argument -- so its leading dimension entered the jit cache key and
         every distinct ``len(states)`` retraced the whole solver despite the pin. That is the exact
         thing the parameter is documented to prevent, and it failed silently: results stayed correct,
@@ -1256,11 +1255,11 @@ class TestSqdEndToEnd:
 
         # Warm the cache at the pinned shape, then count misses across shorter inputs.
         eigval_of(strings, coeffs, states, states_size=states_size)
-        before = run_sqd._cache_size()
+        before = _run_sqd._cache_size()
         for length in (11, 10, 9):
             eigval_of(strings, coeffs, states[:length], states_size=states_size)
-        assert run_sqd._cache_size() == before, (
-            "run_sqd retraced for a shorter input despite states_size being pinned"
+        assert _run_sqd._cache_size() == before, (
+            "_run_sqd retraced for a shorter input despite states_size being pinned"
         )
 
 
@@ -1320,7 +1319,7 @@ class TestMatvecKernels:
         if cache_level[0] == 1:
             kwargs = {
                 "xsources": jax.lax.scan(
-                    lambda _, x: (None, get_xsource(x, states_u)), None, hamiltonian.x
+                    lambda _, x: (None, xsource(x, states_u)), None, hamiltonian.x
                 )[1]
             }
         else:
@@ -1331,14 +1330,14 @@ class TestMatvecKernels:
             case 1:
                 kwargs |= {
                     "diag_signs": jax.lax.scan(
-                        lambda _, z: (None, get_diag_signs(z, states_u)), None, hamiltonian.z
+                        lambda _, z: (None, diag_signs(z, states_u)), None, hamiltonian.z
                     )[1],
                     "coeffs": hamiltonian.c,
                 }
             case 2:
                 kwargs |= {
                     "diagonals": jax.lax.scan(
-                        lambda _, v: (None, get_diagonal(v[0], v[1], states_u).real),
+                        lambda _, v: (None, _diag_from_z(v[0], v[1], states_u).real),
                         None,
                         (hamiltonian.z, hamiltonian.c),
                     )[1]
@@ -1356,7 +1355,7 @@ class TestMatvecKernels:
 
         ``(1, 1)`` and ``(1, 2)`` read neither signature array, which is what lets a caller drop S
         after caching. For the other four, a missing S would otherwise surface as an opaque failure
-        deep inside ``get_xsource``/``get_diagonal``.
+        deep inside ``xsource``/``_diag_from_z``.
         """
         dummy = np.zeros((1, 1), dtype=np.uint8)
         kwargs = {"xsources" if cache_level[0] == 1 else "xsignatures": dummy}
@@ -1395,7 +1394,7 @@ class TestMatvecKernels:
         states = unique_states(6, num_qubits, rng)
         hamiltonian, states_u, vector, xsources, _ = matvec_fixture(rng, strings, coeffs, states)
         signs = np.asarray(
-            jax.lax.scan(lambda _, z: (None, get_diag_signs(z, states_u)), None, hamiltonian.z)[1]
+            jax.lax.scan(lambda _, z: (None, diag_signs(z, states_u)), None, hamiltonian.z)[1]
         )
 
         # The two representations really are interchangeable at the old boundary...

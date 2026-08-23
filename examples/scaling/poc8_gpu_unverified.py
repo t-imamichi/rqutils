@@ -5,7 +5,7 @@ one device. Three claims cannot be reached from there, and this script exists so
 in one run on a CUDA box rather than re-derived.
 
 **Both sort-related claims below are measured against ``poc1.xsource_sort_legacy``, a pinned copy of
-the pre-23fb226 implementation -- not against ``rqutils.sqd.get_xsource``.** The library *is* the
+the pre-23fb226 implementation -- not against ``rqutils.sqd.xsource``.** The library *is* the
 searchsorted now, so it can no longer serve as its own baseline. The first GPU run of this script
 predated that swap and compared the library against POC 1: two binary searches, reported as
 1.002x/1.000x/1.000x, and a memory claim aimed at a ``lax.sort`` that had already been deleted. The
@@ -114,9 +114,7 @@ def bytes_in_use():
 
 def claim1_sort_leak():
     header("CLAIM 1: does lax.sort leak GPU memory, and does searchsorted avoid it?")
-    print(
-        "Reproduces the note now recorded in get_xsource's docstring, as closely as shape allows:"
-    )
+    print("Reproduces the note now recorded in xsource's docstring, as closely as shape allows:")
     print(f"  n={options.num_qubits}, N={options.num_states} (note cites (5M, 9))")
     print()
     if jax.default_backend() == "cpu":
@@ -135,7 +133,7 @@ def claim1_sort_leak():
     print(f"  post-uniquification N={size}, B={states_u.shape[1]}, J={p.num_xgroups}")
     print()
 
-    # The subject of this claim is lax.sort, which commit 23fb226 REMOVED from get_xsource. Timing
+    # The subject of this claim is lax.sort, which commit 23fb226 REMOVED from xsource. Timing
     # or profiling the library here would exercise a binary search and find no leak by construction,
     # so the arm under test is poc1's pinned legacy sort.
     def sweep(fn):
@@ -181,9 +179,7 @@ def claim2_speedup_on_gpu():
     print("to its gather, so the ratio should compress. The direction should still favour")
     print("searchsorted, since it is strictly less work.")
     print()
-    print(
-        "Baseline is poc1's xsource_sort_legacy, NOT rqutils.sqd.get_xsource. Commit 23fb226 made"
-    )
+    print("Baseline is poc1's xsource_sort_legacy, NOT rqutils.sqd.xsource. Commit 23fb226 made")
     print("the library BE the searchsorted, so timing against it compares two binary searches: the")
     print("first GPU run of this script reported 1.002x/1.000x/1.000x for exactly that reason.")
     print()
