@@ -53,6 +53,18 @@ def check_single_vs_sharded():
         with jax.set_mesh(mesh):
             eig_sharded = float(sqd(p.hamiltonian, p.states, return_eigvec=False))
 
+        # cache_level=(1, 2) as well as the default (1, 0), because the two take DIFFERENT diagonal
+        # code paths: (1, 0) recomputes per group via get_diagonal, while (1, 2) precomputes through
+        # all_diagonals' sharded scatter-add. Sweeping only the default is how all_diagonals shipped
+        # with unsolved sharding while this POC stayed green -- a passing run said nothing about a path
+        # it never selected. The cache_level[0] == 0 levels are deliberately not swept: they have
+        # raised ShardingTypeError on any mesh since before all_diagonals existed, for unrelated
+        # reasons in get_xsource.
+        with jax.set_mesh(mesh):
+            eig_precomputed = float(
+                sqd(p.hamiltonian, p.states, return_eigvec=False, cache_level=(1, 2))
+            )
+
         # Independent reference: dense projection + scipy, so this is not self-consistency.
         hp = hproj(p.hamiltonian, np.unique(p.states, axis=0), unique_states=True)
         dense = hp.toarray()
@@ -60,12 +72,16 @@ def check_single_vs_sharded():
 
         d_ss = abs(eig_sharded - eig_single)
         d_ref = abs(eig_single - eig_dense)
-        results[num_qubits] = (d_ss, d_ref)
+        d_pc = abs(eig_precomputed - eig_single)
+        results[num_qubits] = (d_ss, d_ref, d_pc)
         print(
             f"  n={num_qubits:<3d} N={num_states:<6d}  single={eig_single:+.10f}  "
             f"sharded={eig_sharded:+.10f}  dense={eig_dense:+.10f}"
         )
-        print(f"          |sharded-single|={d_ss:.3e}   |single-dense|={d_ref:.3e}")
+        print(
+            f"          |sharded-single|={d_ss:.3e}   |single-dense|={d_ref:.3e}   "
+            f"|(1,2)-single|={d_pc:.3e}"
+        )
     return results
 
 
@@ -135,11 +151,14 @@ def main():
     check_eigvec_path()
 
     header("VERDICT")
-    worst = max(d for d, _ in res.values())
+    worst = max(d for d, _, _ in res.values())
+    worst_pc = max(d for _, _, d in res.values())
     print(f"  worst |sharded - single| across sizes: {worst:.3e}")
-    if worst < 1e-8:
-        print("  Sharded and single-device agree. The out_sharding contract and mesh padding")
-        print(f"  hold on {ndev} devices -- previously untested per CLAUDE.md.")
+    print(f"  worst |cache_level=(1,2) - single|  : {worst_pc:.3e}")
+    if worst < 1e-8 and worst_pc < 1e-8:
+        print("  Sharded and single-device agree, on the default (1, 0) diagonal path AND on the")
+        print("  (1, 2) precompute, which routes through all_diagonals' sharded scatter-add.")
+        print(f"  The out_sharding contract and mesh padding hold on {ndev} devices.")
     else:
         print("  DIVERGENCE: the sharded path does not reproduce the single-device answer.")
     print()

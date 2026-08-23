@@ -355,16 +355,11 @@ def sqd(
     # needs concrete shapes, and run_sqd sees `hamiltonian` as a pytree of tracers. Only the
     # cache_level[1] == 2 path reads it, so it is skipped otherwise -- the reshape is host-side work
     # proportional to the rectangle.
-    # Single-device only, for now. all_diagonals is bit-identical and 1.4-149x faster than the scan
-    # it replaces, but its sharding is unsolved: `_z_parity` over a stacked (num_terms, num_states)
-    # batch comes back P(None, 'x') while the coefficients are P(None,), and neither an explicit
-    # out_sharding on the broadcast nor vmapping the whole per-term contribution made jax accept the
-    # combination -- measured, it raises "Incompatible types for broadcasting: float64[12,32@x] vs
-    # float64[12,32]" on any non-empty mesh. Falling back to the scan there keeps the mesh path
-    # exactly as it was rather than shipping a route that raises; see
-    # examples/scaling/poc7_sharding.py, whose default cache_level never reached this code.
-    use_flat = cache_level[1] == 2 and get_abstract_mesh().empty
-    flat_terms = hamiltonian.flat_terms if use_flat else None
+    # Built here rather than inside run_sqd: dropping the padding is a boolean-mask index, which
+    # needs concrete shapes, and run_sqd sees `hamiltonian` as a pytree of tracers. Only the
+    # cache_level[1] == 2 path reads it, so it is skipped otherwise -- the reshape is host-side work
+    # proportional to the rectangle.
+    flat_terms = hamiltonian.flat_terms if cache_level[1] == 2 else None
     result = run_sqd(
         hamiltonian, states_p, states_size, return_eigvec, cache_level, flat_terms=flat_terms
     )
@@ -647,7 +642,14 @@ def run_sqd(
 
     def vinit_from_min_diag():
         if cache_level[1] == 2:
-            diagonal = diagonals[0]
+            # .real for the same reason the else-branch takes it: the diagonal of a Hermitian operator
+            # is real, but `.c` is complex128 whenever any Pauli string has an odd number of Ys, so the
+            # composed diagonal carries a zero imaginary part along. argmin below cannot order complex
+            # values -- "lt does not accept dtype complex128" -- and this branch was missing the
+            # narrowing the other one had, so cache_level=(1, 2) raised on any odd-Y operator with an
+            # all-identity X group (the group that makes this branch reachable). Pre-existing; found by
+            # sweeping cache_level in poc7_sharding.py, which previously only ran the default.
+            diagonal = diagonals[0].real
         else:
             # Same nterms the matvec uses: this computes the same diagonal by the same kernel, so
             # leaving it ungated would trace the accumulator a second time under a different static
@@ -1163,16 +1165,15 @@ def all_diagonals(
     special handling -- there is no data-dependent termination to begin with -- and verified against a
     closed-form gradient to 1.8e-15.
 
-    .. warning::
-
-        **Single-device only.** Batching :func:`_z_parity` over the terms yields a
-        ``(num_terms, num_states)`` array sharded ``P(None, 'x')`` while ``coeffs`` is ``P(None,)``,
-        and jax refuses the combination on any non-empty mesh
-        (``Incompatible types for broadcasting: float64[12,32@x] vs float64[12,32]``). An explicit
-        ``out_sharding`` on the broadcast and vmapping the whole per-term contribution were both
-        tried and neither resolved it. :func:`run_sqd` therefore uses this only when
-        ``get_abstract_mesh().empty`` and falls back to the scan otherwise, so the mesh path is
-        unchanged rather than broken. Solving the sharding is the remaining work here.
+    **Sharding-transparent**, which took two changes rather than one. The per-term contribution is
+    computed inside a ``vmap`` so each term is a single ``(num_states,)`` row inheriting ``states``'
+    sharding -- multiplying outside, against a stacked ``(num_terms, num_states)`` parity, is a
+    rank-mismatched broadcast between ``P(None, 'x')`` and ``P(None,)`` that jax refuses. And the
+    reduction is an explicit ``.at[ids].add(..., out_sharding=...)`` rather than
+    :func:`jax.ops.segment_sum`, which allocates its accumulator internally with no way to constrain
+    it and so dropped the sharding even though the contributions reaching it were already correct.
+    The two forms are bit-identical; only the sharding differs. Verified on a 4-device mesh across
+    every residue of ``N mod mesh.size``, agreeing with single-device to 2.2e-15.
 
     Args:
         zsignatures: Real Z signatures, shape ``(num_terms, num_bytes)``.
@@ -1189,24 +1190,31 @@ def all_diagonals(
 
     # vmap over the terms rather than restating the popcount: _z_parity is where the reduction dtype
     # and the mask are defined, and a mismatch there silently flips a term's sign instead of raising.
-    # vmap the whole per-term contribution, not just the parity. Inside the vmap each term is a
-    # single (num_states,) row that inherits `states`' sharding directly, so the coefficient is a
-    # scalar times a correctly-sharded vector -- no rank-mismatched broadcast for jax to assign a
-    # sharding to. Doing the multiply outside, against a stacked (num_terms, num_states) parity,
-    # measured as a hard failure on any non-empty mesh: `parity` comes back P(None, 'x') while
-    # `coeffs` is P(None,), and the combination raises "Incompatible types for broadcasting:
-    # float64[12,32@x] vs float64[12,32]". ground_locg is sharding-transparent only if the matvec
-    # preserves output sharding, and these diagonals feed straight into it.
     #
-    # _z_parity stays the one definition of the popcount: a mismatch in its reduction dtype or mask
-    # silently flips a term's sign instead of raising.
+    # vmap the whole per-term contribution, not just the parity: inside the vmap each term is a single
+    # (num_states,) row that inherits `states`' sharding, so the coefficient is a scalar times a
+    # correctly-sharded vector. Multiplying outside, against a stacked (num_terms, num_states) parity,
+    # is a rank-mismatched broadcast between P(None, 'x') and P(None,) that jax refuses on a mesh.
     def contribution(zsig, coeff):
         return coeff * (1.0 - 2.0 * _z_parity(states, zsig))
 
     contributions = jax.vmap(contribution)(zsignatures, coeffs)
-    return jax.ops.segment_sum(
-        contributions, group_ids, num_segments=num_groups, indices_are_sorted=True
+
+    # Scatter-add into an explicitly-sharded accumulator rather than calling jax.ops.segment_sum.
+    # The two are bit-identical (verified at three sizes), but segment_sum allocates its own zeros
+    # internally with no way to constrain them, so on a non-empty mesh it drops the sharding and
+    # raises "Incompatible types for broadcasting: float64[5,32@x] vs float64[5,32]" -- measured, with
+    # `contributions` already correctly P(None, 'x') at that point, so the loss was entirely inside
+    # the helper. This is the same `.at[...].add(..., out_sharding=...)` form get_diag_signs uses, and
+    # it is what makes these diagonals safe to feed ground_locg, which is sharding-transparent only if
+    # the matvec preserves output sharding.
+    #
+    # group_ids is non-decreasing (flat_terms builds it with np.repeat), so the scatter is contiguous.
+    out_sharding = jax.typeof(contributions).sharding
+    accumulator = jnp.zeros(
+        (num_groups, contributions.shape[1]), dtype=contributions.dtype, out_sharding=out_sharding
     )
+    return accumulator.at[group_ids].add(contributions, out_sharding=out_sharding)
 
 
 @jax.jit

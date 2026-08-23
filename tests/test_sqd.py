@@ -31,7 +31,6 @@ from conftest import (
     real_pauli_strings,
     unique_states,
 )
-from jax.sharding import get_abstract_mesh
 
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import (
@@ -370,21 +369,31 @@ class TestAllDiagonals:
             f"gradient {np.asarray(got)} does not match closed form {expected}"
         )
 
-    def test_is_gated_to_single_device(self):
-        """The segment-sum path is skipped on a mesh, because its sharding is unsolved.
+    def test_scatter_add_matches_segment_sum(self):
+        """The scatter-add must be exactly ``jax.ops.segment_sum``, which it replaced for sharding.
 
-        Not a preference: batching ``_z_parity`` over the terms gives ``P(None, 'x')`` against
-        ``P(None,)`` coefficients and jax rejects the broadcast. ``run_sqd`` checks
-        ``get_abstract_mesh().empty``, so a mesh falls back to the scan and the mesh path is exactly
-        what it was. Verified against ``fc1a661``: the three ``cache_level[0] == 0`` levels already
-        raised ``ShardingTypeError`` there for unrelated reasons, and this change does not move that.
-
-        Asserted through the gate expression rather than by building a mesh, so the test says what it
-        depends on without needing ``XLA_FLAGS``; ``examples/scaling/poc7_sharding.py`` is where the
-        real mesh runs -- note its default ``cache_level`` never reaches this code, which is why the
-        sharding failure went unnoticed until it was exercised directly.
+        ``segment_sum`` allocates its accumulator internally with no way to constrain it, so on a mesh
+        it dropped the sharding and raised (``Incompatible types for broadcasting: float64[5,32@x] vs
+        float64[5,32]``) even though the contributions were already correctly ``P(None, 'x')``. The
+        explicit ``.at[ids].add(..., out_sharding=...)`` form -- the same one ``get_diag_signs`` uses --
+        keeps it. This pins that the swap was value-preserving; the mesh behaviour itself is checked by
+        ``examples/scaling/poc7_sharding.py``, which now sweeps ``cache_level`` for exactly that reason.
         """
-        assert get_abstract_mesh().empty, "test suite is expected to run single-device"
+        rng = np.random.default_rng(31)
+        for num_terms, num_states, num_groups in [(5, 32, 2), (38, 512, 12)]:
+            contributions = jnp.asarray(rng.normal(size=(num_terms, num_states)))
+            counts = np.ones(num_groups, dtype=int)
+            counts[-1] += num_terms - num_groups
+            group_ids = jnp.asarray(np.repeat(np.arange(num_groups), counts))
+            want = jax.ops.segment_sum(
+                contributions, group_ids, num_segments=num_groups, indices_are_sorted=True
+            )
+            got = (
+                jnp.zeros((num_groups, num_states), dtype=contributions.dtype)
+                .at[group_ids]
+                .add(contributions)
+            )
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
     def test_sqd_agrees_with_dense_through_the_segment_sum_path(self):
         """End-to-end: ``cache_level[1] == 2`` now routes through this, and must not move the answer."""
@@ -1107,6 +1116,33 @@ class TestSqdEndToEnd:
             f"states_size={states_size}: sqd gave {got}, dense reference is {reference} -- "
             "filler slots leaked into the subspace"
         )
+
+    def test_complex_coefficients_work_at_every_cache_level(self):
+        """``vinit_from_min_diag`` narrowed the diagonal to real on one branch but not the other.
+
+        ``.c`` is complex128 whenever any Pauli string has an odd number of Ys, so the composed
+        diagonal carries a zero imaginary part. ``argmin`` cannot order complex values, and the
+        ``cache_level[1] == 2`` branch read ``diagonals[0]`` without the ``.real`` its sibling took --
+        so that level raised ``TypeError: lt does not accept dtype complex128`` on any odd-Y operator
+        whose X groups include the all-identity one, which is what makes the branch reachable.
+
+        Pre-existing (reproduced at ``ac15362``), and found only by sweeping ``cache_level`` in
+        ``poc7_sharding.py``; every fixture in this suite either had real coefficients or no identity
+        X group, so all six levels stayed green.
+        """
+        strings = ["IIII", "XYII", "ZIZI", "IIZZ"]
+        coeffs = [0.5, 0.3, -0.4, 0.7]
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs))
+        assert hamiltonian.c.dtype == np.complex128, "fixture must have complex coefficients"
+        assert not np.any(np.asarray(hamiltonian.x[0])), "fixture needs an all-identity X group"
+
+        states = np.unique(
+            np.random.default_rng(0).integers(0, 2, size=(12, 4), dtype=np.uint8), axis=0
+        )
+        reference = lowest_projected(strings, coeffs, states)
+        for cache_level in CACHE_LEVELS:
+            got = eigval_of(strings, coeffs, states, cache_level=cache_level)
+            assert got == pytest.approx(reference, abs=1e-9), f"cache_level={cache_level}"
 
     def test_states_size_above_the_int32_ceiling_raises(self):
         """The 2^31 limit the module documents as hard was documented but never enforced.
