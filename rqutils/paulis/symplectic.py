@@ -224,11 +224,11 @@ class PauliSumXZ:
         # accepts values indistinguishable from zero at float64. The default sits ~4 orders above the
         # observed rounding and many orders below any physical coefficient, so the two cases stay
         # cleanly separated; pass a smaller `atol` to tighten it, or 0.0 to restore the exact test.
-        if np.any(np.abs(coeffs.imag) > atol):
-            worst = np.abs(coeffs.imag).max()
+        imag = np.abs(coeffs.imag)
+        if np.any(imag > atol):
             raise ValueError(
                 "Coefficients of Paulis must be real for the Hamiltonian to be Hermitian; "
-                f"largest |imag| is {worst:.3e}, above atol={atol:.3e}."
+                f"largest |imag| is {imag.max():.3e}, above atol={atol:.3e}."
             )
         # Discard the sub-atol rounding rather than carrying it: every downstream consumer indexes
         # `.c` expecting a real dtype where the folded phase permits one.

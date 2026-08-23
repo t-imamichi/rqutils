@@ -240,15 +240,15 @@ def sqd(
             that compilation is not triggered at each call with slightly different array sizes. Must
             be at least ``states.shape[0]``. Defaults to the next power of two at or above
             ``states.shape[0]``, which is the rule a caller feeding growing, all-distinct subspace
-            dimensions needs (the normal SQD access pattern -- one dimension per Krylov rung plus one
-            per configuration-recovery round, so no two calls share a size). Pass
-            ``states.shape[0]`` for no padding at all. On a non-empty mesh this is rounded **up** to the next
-            multiple of ``mesh.size``, so the value used internally may exceed the one passed; that
-            widens the coalescing this argument exists for rather than defeating it (measured on a
-            4-device mesh, ``states_size`` 33 through 36 all share one compiled kernel -- 707 ms to
-            compile, then ~16 ms -- while 37 rounds to 40 and compiles afresh). The padding is not
-            observable in the result: filler slots are excluded from the projection and trimmed from
-            the returned basis.
+            dimensions needs (the normal SQD access pattern -- one dimension per Krylov rung plus
+            one per configuration-recovery round, so no two calls share a size). Pass
+            ``states.shape[0]`` for no padding at all. On a non-empty mesh this is rounded **up**
+            to the next multiple of ``mesh.size``, so the value used internally may exceed the one
+            passed; that widens the coalescing this argument exists for rather than defeating it
+            (measured on a 4-device mesh, ``states_size`` 33 through 36 all share one compiled
+            kernel -- 707 ms to compile, then ~16 ms -- while 37 rounds to 40 and compiles afresh).
+            The padding is not observable in the result: filler slots are excluded from the
+            projection and trimmed from the returned basis.
         return_eigvec: Whether to return the eigenvector (coefficients and unique state bitstrings).
         cache_level: Switches for caching the results of source indices and sign bits / diagonals.
             See the module documentation for the detailed discussion of the resource tradeoff involved.
@@ -504,17 +504,23 @@ def run_sqd(
             (hamiltonian.z, hamiltonian.c),
         )[1]
 
-    # Assemble the per-X-group arrays apply_h scans over. This stays a Python-level match on the
+    # Assemble the per-X-group arrays apply_h scans over. This stays a Python-level branch on the
     # static cache_level: the *packing* must be static too, or the tuple structure would become part
     # of the traced arguments and retrace on every call.
+    #
+    # Selected with if/elif rather than a dict literal keyed on cache_level[1]: `diag_signs` and
+    # `diagonals` are assigned only inside their own branches above, so a dict literal -- which
+    # evaluates every value before indexing -- raises UnboundLocalError on the levels that skipped
+    # them. The layout itself is shared with apply_h through _pack_scanned; only the choice of which
+    # array to hand it is local.
     xgroup = xsources if cache_level[0] == 1 else hamiltonian.x
-    match cache_level[1]:
-        case 0:
-            scanned = (xgroup, hamiltonian.z, hamiltonian.c)
-        case 1:
-            scanned = (xgroup, diag_signs, hamiltonian.c)
-        case 2:
-            scanned = (xgroup, diagonals)
+    if cache_level[1] == 0:
+        diagonal_arg = hamiltonian.z
+    elif cache_level[1] == 1:
+        diagonal_arg = diag_signs
+    else:
+        diagonal_arg = diagonals
+    scanned = _pack_scanned(cache_level, xgroup, diagonal_arg, hamiltonian.c)
     # (1, 2) reads neither signature array, so it needs no states at all -- which is what lets the
     # caller drop S entirely under the most aggressive caching (see the module docstring).
     needs_states = cache_level[0] == 0 or cache_level[1] == 0
@@ -899,6 +905,22 @@ _XSOURCE_KEYS = {"xsignatures": 0, "xsources": 1}
 _DIAGONAL_KEYS = {"zsignatures": 0, "diag_signs": 1, "diagonals": 2}
 
 
+def _pack_scanned(
+    cache_level: tuple[int, int], xgroup: NDArray, diagonal_arg: NDArray, coeffs: NDArray | None
+) -> tuple[NDArray, ...]:
+    """Lay out the tuple ``_apply_h_kernel`` scans over, for one resolved ``cache_level``.
+
+    The kernel unpacks positionally (``val[0]``, ``val[1]``, and ``val[2]`` only when
+    ``cache_level[1] == 0``), so the arity rule is a contract between packer and kernel: a 3-tuple
+    carrying the coefficients for the two strategies that *compute* a diagonal, a 2-tuple for the one
+    that reads a precomputed one. Both callers -- ``run_sqd`` and ``apply_h``'s keyword resolution --
+    go through here so that rule is stated once rather than once per caller.
+    """
+    if cache_level[1] == 2:
+        return (xgroup, diagonal_arg)
+    return (xgroup, diagonal_arg, coeffs)
+
+
 def apply_h(
     vec: NDArray[np.inexact],
     scanned: tuple[NDArray, ...] | None = None,
@@ -1001,6 +1023,8 @@ def apply_h(
             alongside ``diagonals``; or if ``states`` is None while the resolved ``cache_level`` has a
             0 in either position.
     """
+    # Keyed by name so the resolved key can index straight back to its array; the whole point of the
+    # dispatch is a lookup *by name*, which named locals cannot express without `locals()`.
     named = {
         "xsignatures": xsignatures,
         "xsources": xsources,
@@ -1011,50 +1035,41 @@ def apply_h(
     }
     supplied = {k for k, v in named.items() if v is not None}
 
-    if supplied:
-        # Mixing the conventions would mean two answers to "what strategy is this?", which is the
-        # ambiguity the keyword form exists to remove -- so it is refused rather than prioritized.
-        if scanned is not None or cache_level is not None:
-            raise TypeError(
-                "apply_h takes either the positional (scanned, cache_level) form or the keyword "
-                f"form naming individual arrays, not both; got {sorted(supplied)} alongside "
-                f"{'scanned' if scanned is not None else 'cache_level'}."
-            )
-        xkeys = supplied & set(_XSOURCE_KEYS)
-        dkeys = supplied & set(_DIAGONAL_KEYS)
-        if len(xkeys) != 1:
-            raise ValueError(
-                f"exactly one of {sorted(_XSOURCE_KEYS)} is required; got {sorted(xkeys)}."
-            )
-        if len(dkeys) != 1:
-            raise ValueError(
-                f"exactly one of {sorted(_DIAGONAL_KEYS)} is required; got {sorted(dkeys)}."
-            )
-        xkey, dkey = xkeys.pop(), dkeys.pop()
-        cache_level = (_XSOURCE_KEYS[xkey], _DIAGONAL_KEYS[dkey])
-        # coeffs is not optional-with-a-default here: the two computing strategies cannot produce a
-        # diagonal without it, and `diagonals` has already absorbed it. Requiring it explicitly is
-        # what keeps "I forgot coeffs" from becoming a wrong number instead of a raise.
-        if cache_level[1] == 2:
-            if coeffs is not None:
-                raise ValueError(
-                    "coeffs must not be given with diagonals, which already folds it in."
-                )
-            scanned = (named[xkey], diagonals)
-        else:
-            if coeffs is None:
-                raise ValueError(f"coeffs is required with {dkey}.")
-            scanned = (named[xkey], named[dkey], coeffs)
-    else:
+    if not supplied:
         if scanned is None:
             raise ValueError(
                 "apply_h needs per-X-group arrays: either the positional `scanned` tuple or the "
                 f"keyword form naming one of {sorted(_XSOURCE_KEYS)} and one of "
                 f"{sorted(_DIAGONAL_KEYS)}."
             )
-        if cache_level is None:
-            cache_level = (1, 2)
+        return _apply_h_kernel(vec, scanned, states, cache_level or (1, 2))
 
+    # Mixing the conventions would mean two answers to "what strategy is this?", which is the
+    # ambiguity the keyword form exists to remove -- so it is refused rather than prioritized.
+    if scanned is not None or cache_level is not None:
+        raise TypeError(
+            "apply_h takes either the positional (scanned, cache_level) form or the keyword "
+            f"form naming individual arrays, not both; got {sorted(supplied)} alongside "
+            f"{'scanned' if scanned is not None else 'cache_level'}."
+        )
+
+    def pick(keys: dict[str, int]) -> str:
+        got = sorted(supplied & set(keys))
+        if len(got) != 1:
+            raise ValueError(f"exactly one of {sorted(keys)} is required; got {got}.")
+        return got[0]
+
+    xkey, dkey = pick(_XSOURCE_KEYS), pick(_DIAGONAL_KEYS)
+    cache_level = (_XSOURCE_KEYS[xkey], _DIAGONAL_KEYS[dkey])
+    # coeffs is not optional-with-a-default here: the two computing strategies cannot produce a
+    # diagonal without it, and `diagonals` has already absorbed it. Requiring it explicitly is what
+    # keeps "I forgot coeffs" from becoming a wrong number instead of a raise.
+    if cache_level[1] == 2 and coeffs is not None:
+        raise ValueError("coeffs must not be given with diagonals, which already folds it in.")
+    if cache_level[1] != 2 and coeffs is None:
+        raise ValueError(f"coeffs is required with {dkey}.")
+
+    scanned = _pack_scanned(cache_level, named[xkey], named[dkey], coeffs)
     return _apply_h_kernel(vec, scanned, states, cache_level)
 
 

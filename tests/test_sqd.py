@@ -20,10 +20,10 @@ initial-vector bugs affected all six kernels identically, so a consistency-only 
 passed while every kernel returned the same wrong number.
 """
 
+import itertools
 import os
 import subprocess
 import sys
-import textwrap
 
 import numpy as np
 import pytest
@@ -36,7 +36,10 @@ from conftest import (
 )
 
 from rqutils.sqd import (
+    _DIAGONAL_KEYS,
+    _XSOURCE_KEYS,
     _is_lex_sorted,
+    _pack_scanned,
     apply_h,
     compute_diagonal,
     get_diag_signs,
@@ -48,8 +51,13 @@ from rqutils.sqd import (
     uniquify_states,
 )
 
-# Every (source_indices, diagonals) combination, i.e. all six matvec kernels.
-CACHE_LEVELS = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+# Every (source_indices, diagonals) combination, i.e. all six matvec kernels. Derived from the
+# library's own dispatch dicts rather than written out, so a seventh strategy cannot be added to
+# `apply_h` without the parametrized suites here picking it up.
+CACHE_LEVELS = sorted(itertools.product(_XSOURCE_KEYS.values(), _DIAGONAL_KEYS.values()))
+assert CACHE_LEVELS == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)], (
+    "the 2x3 grid changed shape; the suites below assume six levels"
+)
 
 
 def pack_padded(states):
@@ -738,7 +746,11 @@ def apply_h_inputs(rng, num_qubits=4, num_terms=6, num_states=12):
     keyword combinations below all see byte-identical inputs and differ only in which names are used.
 
     Returns a dict of every representation of the same operator, so a test can select one pairing
-    without rebuilding the others.
+    without rebuilding the others. The keys are spelled exactly as ``apply_h``'s keyword parameters
+    (``xsignatures``, ``zsignatures``, ``diag_signs``, ``coeffs``, ...), so a caller can splat a
+    selection straight in -- ``**{k: p[k] for k in names}`` -- rather than writing a dict literal that
+    re-pairs name to array by hand. That hand-pairing is itself a place a typo silently swaps two
+    arrays, which is precisely the hazard ``apply_h``'s keyword form exists to remove.
     """
     from rqutils.paulis.symplectic import PauliSumXZ
 
@@ -752,11 +764,11 @@ def apply_h_inputs(rng, num_qubits=4, num_terms=6, num_states=12):
         "states_u": states_u,
         "vector": rng.normal(size=states.shape[0]),
         "matrix": project_dense(strings, coeffs, states).real,
-        "x": hamiltonian.x,
-        "z": hamiltonian.z,
-        "c": hamiltonian.c,
+        "xsignatures": hamiltonian.x,
+        "zsignatures": hamiltonian.z,
+        "coeffs": hamiltonian.c,
         "xsources": np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x]),
-        "signs": np.stack([np.asarray(get_diag_signs(z, states_u)) for z in hamiltonian.z]),
+        "diag_signs": np.stack([np.asarray(get_diag_signs(z, states_u)) for z in hamiltonian.z]),
         "diagonals": np.stack(
             [
                 np.asarray(get_diagonal(z, c, states_u).real)
@@ -771,23 +783,16 @@ class TestMatvecKernels:
 
     def test_apply_h_matches_dense(self):
         """``apply_h`` (no caching) is the reference kernel the cached ones must match."""
-        from rqutils.paulis.symplectic import PauliSumXZ
-
-        rng = np.random.default_rng(20260804)
-        num_qubits = 4
-        strings = real_pauli_strings(num_qubits, 5, rng)
-        coeffs = rng.normal(size=len(strings))
-        states = unique_states(12, num_qubits, rng)
-
-        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        states_u = uniquify_states(pack_padded(states), states.shape[0])
-        matrix = project_dense(strings, coeffs, states).real
-        vector = rng.normal(size=states.shape[0])
-
+        p = apply_h_inputs(np.random.default_rng(20260804), num_terms=5)
         got = np.asarray(
-            apply_h(vector, (hamiltonian.x, hamiltonian.z, hamiltonian.c), states_u, (0, 0))
+            apply_h(
+                p["vector"],
+                (p["xsignatures"], p["zsignatures"], p["coeffs"]),
+                p["states_u"],
+                (0, 0),
+            )
         ).real
-        assert np.abs(got - matrix @ vector).max() < 1e-12
+        assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
 
     @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
     def test_every_cache_level_matches_dense(self, cache_level):
@@ -800,56 +805,33 @@ class TestMatvecKernels:
         rather than against the other kernels is what catches it: cross-kernel agreement alone would
         pass if the collapse broke all six identically.
         """
-        from rqutils.paulis.symplectic import PauliSumXZ
-
-        rng = np.random.default_rng(20260805)
-        num_qubits = 4
-        strings = real_pauli_strings(num_qubits, 6, rng)
-        coeffs = rng.normal(size=len(strings))
-        states = unique_states(12, num_qubits, rng)
-
-        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        states_u = uniquify_states(pack_padded(states), states.shape[0])
-        vector = rng.normal(size=states.shape[0])
-        matrix = project_dense(strings, coeffs, states).real
-
-        xgroup = hamiltonian.x
-        if cache_level[0] == 1:
-            xgroup = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
-        match cache_level[1]:
-            case 0:
-                scanned = (xgroup, hamiltonian.z, hamiltonian.c)
-            case 1:
-                signs = np.stack([np.asarray(get_diag_signs(z, states_u)) for z in hamiltonian.z])
-                scanned = (xgroup, signs, hamiltonian.c)
-            case 2:
-                diagonals = np.stack(
-                    [
-                        np.asarray(get_diagonal(z, c, states_u).real)
-                        for z, c in zip(hamiltonian.z, hamiltonian.c)
-                    ]
-                )
-                scanned = (xgroup, diagonals)
+        p = apply_h_inputs(np.random.default_rng(20260805))
+        xgroup = p["xsources"] if cache_level[0] == 1 else p["xsignatures"]
+        diagonal_arg = {
+            0: p["zsignatures"],
+            1: p["diag_signs"],
+            2: p["diagonals"],
+        }[cache_level[1]]
+        scanned = _pack_scanned(cache_level, xgroup, diagonal_arg, p["coeffs"])
 
         needs_states = cache_level[0] == 0 or cache_level[1] == 0
         got = np.asarray(
-            apply_h(vector, scanned, states_u if needs_states else None, cache_level)
+            apply_h(p["vector"], scanned, p["states_u"] if needs_states else None, cache_level)
         ).real
-        assert np.abs(got - matrix @ vector).max() < 1e-12
+        assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
 
     @pytest.mark.parametrize(
-        "kwargs_for",
+        "names",
         [
-            lambda p: {"xsignatures": p["x"], "zsignatures": p["z"], "coeffs": p["c"]},
-            lambda p: {"xsignatures": p["x"], "diag_signs": p["signs"], "coeffs": p["c"]},
-            lambda p: {"xsignatures": p["x"], "diagonals": p["diagonals"]},
-            lambda p: {"xsources": p["xsources"], "zsignatures": p["z"], "coeffs": p["c"]},
-            lambda p: {"xsources": p["xsources"], "diag_signs": p["signs"], "coeffs": p["c"]},
-            lambda p: {"xsources": p["xsources"], "diagonals": p["diagonals"]},
+            ("xsignatures", "zsignatures", "coeffs"),
+            ("xsignatures", "diag_signs", "coeffs"),
+            ("xsignatures", "diagonals"),
+            ("xsources", "zsignatures", "coeffs"),
+            ("xsources", "diag_signs", "coeffs"),
+            ("xsources", "diagonals"),
         ],
-        ids=["x+z", "x+signs", "x+diags", "xsrc+z", "xsrc+signs", "xsrc+diags"],
     )
-    def test_keyword_form_matches_dense_for_every_combination(self, kwargs_for):
+    def test_keyword_form_matches_dense_for_every_combination(self, names):
         """The keyword form covers all six strategies and each still matches a dense reference.
 
         The keyword names are the only thing selecting the strategy here, so this is what pins the
@@ -859,7 +841,8 @@ class TestMatvecKernels:
         not the positional form (agreeing with a sibling that is wrong the same way proves nothing).
         """
         p = apply_h_inputs(np.random.default_rng(20260805))
-        got = np.asarray(apply_h(p["vector"], states=p["states_u"], **kwargs_for(p))).real
+        kwargs = {name: p[name] for name in names}
+        got = np.asarray(apply_h(p["vector"], states=p["states_u"], **kwargs)).real
         assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
 
     def test_keyword_and_positional_forms_agree(self):
@@ -874,47 +857,17 @@ class TestMatvecKernels:
         assert np.array_equal(kw, pos)
 
     @pytest.mark.parametrize(
-        ("kwargs_for", "match"),
+        ("names", "match"),
         [
-            (lambda p: {"diag_signs": p["signs"], "coeffs": p["c"]}, "exactly one of"),
-            (
-                lambda p: {
-                    "xsignatures": p["x"],
-                    "xsources": p["xsources"],
-                    "diagonals": p["diagonals"],
-                },
-                "exactly one of",
-            ),
-            (lambda p: {"xsources": p["xsources"], "coeffs": p["c"]}, "exactly one of"),
-            (
-                lambda p: {
-                    "xsources": p["xsources"],
-                    "diag_signs": p["signs"],
-                    "diagonals": p["diagonals"],
-                    "coeffs": p["c"],
-                },
-                "exactly one of",
-            ),
-            (lambda p: {"xsources": p["xsources"], "diag_signs": p["signs"]}, "coeffs is required"),
-            (
-                lambda p: {
-                    "xsources": p["xsources"],
-                    "diagonals": p["diagonals"],
-                    "coeffs": p["c"],
-                },
-                "coeffs must not be given",
-            ),
-        ],
-        ids=[
-            "no-xsource",
-            "two-xsources",
-            "no-diagonal",
-            "two-diagonals",
-            "missing-coeffs",
-            "redundant-coeffs",
+            (("diag_signs", "coeffs"), "exactly one of"),
+            (("xsignatures", "xsources", "diagonals"), "exactly one of"),
+            (("xsources", "coeffs"), "exactly one of"),
+            (("xsources", "diag_signs", "diagonals", "coeffs"), "exactly one of"),
+            (("xsources", "diag_signs"), "coeffs is required"),
+            (("xsources", "diagonals", "coeffs"), "coeffs must not be given"),
         ],
     )
-    def test_underspecified_or_overspecified_keyword_calls_raise(self, kwargs_for, match):
+    def test_underspecified_or_overspecified_keyword_calls_raise(self, names, match):
         """Every way of not naming exactly one X source and one diagonal strategy must raise.
 
         This is the substance of the change: the six valid combinations become the only *constructible*
@@ -922,30 +875,52 @@ class TestMatvecKernels:
         failure deep inside the scan; here they fail at the call site before any array is read.
         """
         p = apply_h_inputs(np.random.default_rng(20260805))
+        kwargs = {name: p[name] for name in names}
         with pytest.raises(ValueError, match=match):
-            apply_h(p["vector"], states=p["states_u"], **kwargs_for(p))
+            apply_h(p["vector"], states=p["states_u"], **kwargs)
 
     def test_no_arrays_at_all_raises(self):
         """Calling with neither convention names what is missing rather than failing on a None tuple."""
         with pytest.raises(ValueError, match="needs per-X-group arrays"):
             apply_h(np.zeros(4))
 
-    @pytest.mark.parametrize("extra", [{"scanned": True}, {"cache_level": True}])
-    def test_mixing_the_two_conventions_raises(self, extra):
+    @pytest.mark.parametrize("positional_arg", ["scanned", "cache_level"])
+    def test_mixing_the_two_conventions_raises(self, positional_arg):
         """Mixing forms would give two answers to "what strategy is this?", so it is refused.
 
         Silently preferring one would recreate the original hazard in a new place: the caller would
-        have written a ``cache_level`` that the call then ignored.
+        have written a ``cache_level`` that the call then ignored. Both members of the positional
+        convention are covered, since either alone is enough to make the request ambiguous.
         """
         p = apply_h_inputs(np.random.default_rng(20260805))
         kwargs = {"xsources": p["xsources"], "diagonals": p["diagonals"]}
-        if "scanned" in extra:
-            args = (p["vector"], (p["xsources"], p["diagonals"]))
-        else:
-            args = (p["vector"],)
-            kwargs["cache_level"] = (1, 2)
+        kwargs[positional_arg] = (
+            (p["xsources"], p["diagonals"]) if positional_arg == "scanned" else (1, 2)
+        )
         with pytest.raises(TypeError, match="not both"):
-            apply_h(*args, **kwargs)
+            apply_h(p["vector"], **kwargs)
+
+    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
+    def test_pack_scanned_arity_matches_what_the_kernel_unpacks(self, cache_level):
+        """The packer's arity is a contract with the kernel, and it is shared by two callers.
+
+        ``_apply_h_kernel``'s scan body reads ``val[2]`` only when ``cache_level[1] == 0``, so the
+        3-tuple/2-tuple split is a real contract: the two strategies that *compute* a diagonal need
+        the coefficients, the one that reads a precomputed diagonal must not carry them.
+
+        Asserted directly because the end-to-end tests do **not** catch a violation. Mutation-tested:
+        forcing the 3-tuple for every level leaves all of `test_sqd.py` green, because the extra
+        element is scanned and then ignored -- wasted work per group rather than a wrong number. That
+        makes it invisible to any value assertion, and it is exactly the kind of silent drift the
+        shared packer exists to prevent now that ``run_sqd`` and ``apply_h`` both depend on it.
+        """
+        marker = np.zeros(1)
+        packed = _pack_scanned(cache_level, marker, marker, marker)
+        expected = 2 if cache_level[1] == 2 else 3
+        assert len(packed) == expected, (
+            f"cache_level={cache_level} packed a {len(packed)}-tuple; the kernel expects {expected} "
+            "(coeffs are carried only by the levels that compute a diagonal)"
+        )
 
     def test_shape_assertion_would_not_have_closed_this(self):
         """Records *why* the fix is naming rather than a per-branch shape check.
@@ -995,28 +970,9 @@ class TestMatvecKernels:
         Fixing the input rather than parametrizing keeps that pin stable as the grid test's
         parametrization changes.
         """
-        from rqutils.paulis.symplectic import PauliSumXZ
-
-        rng = np.random.default_rng(20260804)
-        num_qubits = 4
-        strings = real_pauli_strings(num_qubits, 5, rng)
-        coeffs = rng.normal(size=len(strings))
-        states = unique_states(12, num_qubits, rng)
-
-        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        states_u = uniquify_states(pack_padded(states), states.shape[0])
-        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x])
-        diagonals = np.stack(
-            [
-                np.asarray(get_diagonal(z, c, states_u).real)
-                for z, c in zip(hamiltonian.z, hamiltonian.c)
-            ]
-        )
-        matrix = project_dense(strings, coeffs, states).real
-        vector = rng.normal(size=states.shape[0])
-
-        got = np.asarray(apply_h(vector, (xsources, diagonals), None, (1, 2))).real
-        assert np.abs(got - matrix @ vector).max() < 1e-12
+        p = apply_h_inputs(np.random.default_rng(20260804), num_terms=5)
+        got = np.asarray(apply_h(p["vector"], (p["xsources"], p["diagonals"]), None, (1, 2))).real
+        assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
 
 
 class TestShardedDiagonalRank:
@@ -1041,32 +997,15 @@ class TestShardedDiagonalRank:
     """
 
     def test_sharded_and_single_device_agree_on_four_virtual_devices(self):
-        script = textwrap.dedent(
-            """
-            import jax
-            jax.config.update("jax_enable_x64", True)
-            import numpy as np
-            from jax.sharding import AxisType
-            from rqutils.sqd import sqd
-
-            n, N = 8, 37          # N mod 4 != 0, so mesh-size rounding is exercised too
-            rng = np.random.default_rng(11)
-            strings = ["".join(rng.choice(list("IXZ"), size=n)) for _ in range(5)]
-            coeffs = rng.normal(size=5).tolist()
-            states = rng.integers(0, 2, size=(N, n)).astype(np.uint8)
-
-            single = float(sqd((strings, coeffs), states, return_eigvec=False))
-            mesh = jax.make_mesh((4,), ("x",), (AxisType.Explicit,))
-            with jax.set_mesh(mesh):
-                sharded = float(sqd((strings, coeffs), states, return_eigvec=False))
-            print(f"{single!r} {sharded!r}")
-            """
+        script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "_sharded_diagonal_rank.py"
         )
+        assert os.path.exists(script), f"missing sharding harness at {script}"
         env = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=4"}
-        # check=False deliberately: the assertion below reports the child's stderr, which is far
-        # more useful than CalledProcessError's bare exit code for a jax sharding raise.
+        # check=False deliberately: the assertion below reports the child's stderr, which is far more
+        # useful than CalledProcessError's bare exit code for a jax sharding raise.
         proc = subprocess.run(
-            [sys.executable, "-c", script],
+            [sys.executable, script],
             capture_output=True,
             text=True,
             check=False,
