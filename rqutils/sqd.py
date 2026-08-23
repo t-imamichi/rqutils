@@ -586,7 +586,14 @@ def run_sqd(
         # Hamiltonian -- on a single device, with no mesh involved. The uncached branch took `.real`
         # and worked, which is what made the asymmetry easy to miss.
         diagonal = diagonal.real
-        # Set the fill-in components to the maximum value so that argmin only sees the valid entries
+        # Set the fill-in components to the maximum value so that argmin only sees the valid entries.
+        #
+        # This looks like `_spread_seed`'s sharding bug and is not: there the predicate and the operand
+        # had *independent* provenance (`vec` came from an iota with an explicit `out_sharding` while
+        # `states_u` might still be replicated), so their specs could disagree. Here `diagonal` derives
+        # from `states_u` too, so the two track together by construction -- verified P(None)/P(None)
+        # unresharded and P('x')/P('x') after the reshard. No reshard is needed, and adding one would
+        # imply a hazard that cannot arise on this line.
         diagonal = jnp.where(_is_filler(states_u) == 1, jnp.max(diagonal), diagonal)
         imin = jnp.argmin(diagonal)
         # Weight the minimum-diagonal state heavily -- it is the best single guess available, and
@@ -649,7 +656,24 @@ def uniquify_states(states_p: StateList, states_size: int) -> StateList:
 
     The returned array will have shape (states_size, states_p.shape[1]). If states_size is greater
     than the number of unique states, the residual entries at the end are filled with 255.
+
+    Raises:
+        ValueError: If ``states_size`` exceeds :data:`_MAX_STATES`, the ceiling imposed by the int32
+            iota below.
     """
+    # The int32 ceiling checked where the int32 index is actually created, not only in the public
+    # entry points. `sqd()` and `hproj()` check it too -- earlier, with better messages, and before
+    # their own O(N) work -- but this function and `get_xsource` are un-underscored and are called
+    # directly by six scripts under examples/scaling/, which is exactly the code that pushes N. Those
+    # call sites reach the iota with neither entry-point guard in the chain.
+    #
+    # Free: `states_size` is static (see the decorator), so this fires at trace time and costs nothing
+    # per call. A traced value could not be compared at all.
+    if states_size > _MAX_STATES:
+        raise ValueError(
+            f"states_size {states_size} exceeds the {_MAX_STATES} limit imposed by the int32 index "
+            "below; beyond it the iota wraps negative and the subspace is silently permuted"
+        )
     # Perform a lexsort
     iota = jax.lax.broadcasted_iota(np.int32, (states_p.shape[0],), 0)
     perm = jax.lax.sort((*states_p.T, iota), dimension=0, num_keys=states_p.shape[1])[-1]
@@ -948,10 +972,6 @@ def apply_xgrp(
     return xvec * diagonal
 
 
-# The six valid keyword combinations, mapping the name of each supplied array to the cache_level it
-# implies. This is the single source of truth for `apply_h`'s dispatch: a caller names what it has and
-# the strategy follows, rather than declaring a strategy and being trusted to have packed a tuple to
-# match. See `apply_h`'s docstring for why that distinction is a correctness matter and not ergonomics.
 def _pack_scanned(
     cache_level: tuple[int, int], xgroup: NDArray, diagonal_arg: NDArray, coeffs: NDArray | None
 ) -> tuple[NDArray, ...]:
@@ -1103,8 +1123,8 @@ def apply_h(
 def _apply_h_kernel(
     vec: NDArray[np.inexact],
     scanned: tuple[NDArray, ...],
-    states: StateList | None = None,
-    cache_level: tuple[int, int] = (1, 2),
+    states: StateList | None,
+    cache_level: tuple[int, int],
 ) -> jax.Array:
     r"""Return :math:`Hv`, resolving the per-X-group inputs according to ``cache_level``.
 

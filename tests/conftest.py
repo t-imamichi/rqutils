@@ -21,6 +21,8 @@ Please keep new fixtures as plain functions taking ``rng``.
 """
 
 import os
+import subprocess
+import sys
 import tempfile
 
 # Both of the following must be set BEFORE jax/matplotlib are imported, which is what puts them
@@ -243,3 +245,44 @@ def collapsing_states(num_draws, num_qubits, rng):
         "raise num_draws or lower num_qubits"
     )
     return draws
+
+
+def run_sharded_child(script_name, subject, num_devices=4):
+    """Run a ``tests/_sharded_*.py`` script under virtual devices and return its stdout.
+
+    Multi-device coverage has to go through a subprocess: the virtual device count comes from
+    ``XLA_FLAGS=--xla_force_host_platform_device_count``, which XLA reads at backend initialization,
+    and this module has already imported jax by collection time. The child scripts live in files
+    rather than ``textwrap.dedent`` blobs so ruff and ty check them -- as a blob, an ``ImportError``
+    from a rename would surface as a nonzero exit, indistinguishable from the regression under test.
+
+    A plain function, not a ``@pytest.fixture``: the prohibition at the top of this module is about
+    RNG stream position depending on fixture ordering, and this draws no RNG in the parent (each
+    child seeds itself).
+
+    ``check=False`` is deliberate -- the caller-facing assertion here reports the child's stderr,
+    which is far more useful than ``CalledProcessError``'s bare exit code for a jax sharding raise.
+
+    Args:
+        script_name: Basename of the script in this directory, e.g. ``"_sharded_svsim.py"``.
+        subject: Named in the failure message, e.g. ``"svsim"``.
+        num_devices: Virtual device count to request.
+
+    Returns:
+        The child's stdout. Callers parse their own line protocol and **must** assert their case set
+        is complete before checking values, or a child that dies partway passes on what it printed.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, script_name)
+    assert os.path.exists(script), f"missing sharding harness at {script}"
+    env = {**os.environ, "XLA_FLAGS": f"--xla_force_host_platform_device_count={num_devices}"}
+    proc = subprocess.run(
+        [sys.executable, script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        cwd=os.path.dirname(here),
+    )
+    assert proc.returncode == 0, f"sharded {subject} raised:\n{proc.stderr[-3000:]}"
+    return proc.stdout

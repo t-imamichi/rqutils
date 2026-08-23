@@ -20,10 +20,7 @@ initial-vector bugs affected all six kernels identically, so a consistency-only 
 passed while every kernel returned the same wrong number.
 """
 
-import os
-import subprocess
-import sys
-
+import jax
 import numpy as np
 import pytest
 from conftest import (
@@ -31,6 +28,7 @@ from conftest import (
     lowest_projected,
     project_dense,
     real_pauli_strings,
+    run_sharded_child,
     unique_states,
 )
 
@@ -274,6 +272,38 @@ class TestUniquifyStates:
         assert np.all(out[(out[:, 0] >> 7) == 1] == 255)
 
 
+class TestInt32Ceiling:
+    """``_MAX_STATES`` is enforced where the int32 index is created, not only in the entry points.
+
+    ``uniquify_states`` and ``get_xsource`` are un-underscored and are called directly by six scripts
+    under ``examples/scaling/`` -- exactly the code that pushes N -- so those call sites reached the
+    int32 iota with neither ``sqd()``'s nor ``hproj()``'s guard in the chain. The guard now also sits
+    on ``uniquify_states``' static ``states_size``, which fires at trace time and costs nothing.
+
+    Putting it there is also what makes **both** sides of the boundary cheap to test. Reaching the
+    guard through ``hproj`` cost 23 s (the passing case runs the O(N) sortedness scan over 2^31 rows),
+    which is why the accept side was previously left unpinned and recorded as a known gap. Through
+    ``jax.eval_shape`` the guard traces without allocating: measured ~5 ms per side.
+    """
+
+    def test_oversized_states_size_raises_at_the_source(self):
+        """The bypass path: ``uniquify_states`` called directly, as the scaling POCs do."""
+        packed = np.zeros((4, 2), dtype=np.uint8)
+        with pytest.raises(ValueError, match="exceeds the .* limit imposed by the int32 index"):
+            jax.eval_shape(lambda s: uniquify_states(s, 2**31), packed)
+
+    def test_the_largest_legal_size_is_accepted(self):
+        """The accept side, which pins the comparison operator rather than just the constant.
+
+        Mutation-tested: relaxing either ``>`` to ``>=`` rejects ``_MAX_STATES`` itself -- the largest
+        representable int32 index -- and without this arm every other test stays green. Asserting the
+        arithmetic instead would only reimplement the predicate; the guard has to run.
+        """
+        packed = np.zeros((4, 2), dtype=np.uint8)
+        jax.eval_shape(lambda s: uniquify_states(s, _MAX_STATES), packed)
+        assert _MAX_STATES == np.iinfo(np.int32).max
+
+
 class TestHproj:
     """``hproj`` builds the projected Hamiltonian densely (sparse), as a debug/reference path."""
 
@@ -290,21 +320,6 @@ class TestHproj:
         states = np.broadcast_to(np.zeros(2, dtype=np.uint8), (2**31, 2))
         with pytest.raises(ValueError, match="exceeds the .* limit imposed by int32"):
             hproj((["ZI"], [1.0]), states, unique_states=True)
-
-    # KNOWN GAP, deliberate: nothing pins the *accept* side of the boundary, so relaxing either
-    # guard's `>` to `>=` leaves the suite green while rejecting `_MAX_STATES` itself -- the largest
-    # legal size. Mutation-tested, and not closed on purpose.
-    #
-    # A test for it was written and measured. Driving the real guard at exactly `_MAX_STATES` works
-    # (``np.broadcast_to`` makes the shape for free), but the call then runs the O(N) sortedness scan
-    # over 2^31 rows: **23 s in the passing case**, against a 6 s suite. Re-deriving the comparison in
-    # the test instead is worthless -- it reimplements the predicate and catches nothing (verified: the
-    # `>=` mutants survived it).
-    #
-    # Not worth 23 s: the mutant's only consequence is rejecting a call that would immediately OOM
-    # anyway (2^31 states is 4.3 GB of packed states before any vector), so the off-by-one is
-    # unobservable on any hardware that exists. The reject side, which is the side that prevents a
-    # silent wrong answer, is pinned above.
 
     def test_unsorted_input_with_unique_states_raises(self):
         """``unique_states=True`` rejects unsorted states instead of projecting them wrongly.
@@ -755,9 +770,6 @@ class TestSqdEndToEnd:
         assert _MAX_STATES == np.iinfo(np.int32).max, (
             "the ceiling must be the largest representable int32 index, not one more or less"
         )
-        assert _MAX_STATES == np.iinfo(np.int32).max, (
-            "the ceiling must be the largest representable int32 index, not one more or less"
-        )
         # And the wrap this guards against is real, not hypothetical.
         assert np.array(2**31, dtype=np.int64).astype(np.int32) == -(2**31)
 
@@ -793,6 +805,40 @@ class TestSqdEndToEnd:
         assert run_sqd._cache_size() == before, (
             "run_sqd retraced for a shorter input despite states_size being pinned"
         )
+
+
+# Every keyword `apply_h_kwargs` may ask for, so a caller with no real arrays can fill them all.
+_APPLY_H_ARRAY_KEYS = (
+    "xsources",
+    "xsignatures",
+    "zsignatures",
+    "diag_signs",
+    "diagonals",
+    "coeffs",
+)
+
+
+def apply_h_kwargs(cache_level, arrays):
+    """Map a ``cache_level`` back to the ``apply_h`` keywords that select it.
+
+    The positional form is gone, so a level is requested by *naming* the arrays it implies. That
+    mapping is the thing under test in several places here, so it lives in one function: written out
+    per test it was copy-paste-with-variation, which is the hazard the keyword API exists to reduce.
+
+    Args:
+        cache_level: The ``(source_indices, diagonals)`` pair to express.
+        arrays: Anything indexable by keyword name -- :func:`apply_h_inputs`' dict keys are already
+            spelled as the keywords, so it can be passed directly.
+
+    Returns:
+        The keyword dict, including ``coeffs`` for the two strategies that compute a diagonal.
+    """
+    xname = "xsources" if cache_level[0] == 1 else "xsignatures"
+    dname = {0: "zsignatures", 1: "diag_signs", 2: "diagonals"}[cache_level[1]]
+    kwargs = {xname: arrays[xname], dname: arrays[dname]}
+    if cache_level[1] != 2:
+        kwargs["coeffs"] = arrays["coeffs"]
+    return kwargs
 
 
 def apply_h_inputs(rng, num_qubits=4, num_terms=6, num_states=12):
@@ -865,15 +911,7 @@ class TestMatvecKernels:
         pass if the collapse broke all six identically.
         """
         p = apply_h_inputs(np.random.default_rng(20260805))
-        # Map the cache_level under test back to the keywords that select it. The positional form is
-        # gone, so a level is now requested by *naming* the arrays it implies -- which is the point of
-        # the change: this mapping is written once here, in the test, rather than being a thing every
-        # caller had to get right.
-        xname = "xsources" if cache_level[0] == 1 else "xsignatures"
-        dname = {0: "zsignatures", 1: "diag_signs", 2: "diagonals"}[cache_level[1]]
-        kwargs = {xname: p[xname], dname: p[dname]}
-        if cache_level[1] != 2:
-            kwargs["coeffs"] = p["coeffs"]
+        kwargs = apply_h_kwargs(cache_level, p)
         needs_states = cache_level[0] == 0 or cache_level[1] == 0
         got = np.asarray(
             apply_h(p["vector"], states=p["states_u"] if needs_states else None, **kwargs)
@@ -989,12 +1027,10 @@ class TestMatvecKernels:
         after caching. For the other four, a missing S would otherwise surface as an opaque failure
         deep inside ``get_xsource``/``get_diagonal``.
         """
+        # Shapes are irrelevant here -- the guard fires before any array is read -- so one dummy
+        # stands in for every name the level asks for.
         dummy = np.zeros((1, 1), dtype=np.uint8)
-        xname = "xsources" if cache_level[0] == 1 else "xsignatures"
-        dname = {0: "zsignatures", 1: "diag_signs", 2: "diagonals"}[cache_level[1]]
-        kwargs = {xname: dummy, dname: dummy}
-        if cache_level[1] != 2:
-            kwargs["coeffs"] = np.zeros(1)
+        kwargs = apply_h_kwargs(cache_level, dict.fromkeys(_APPLY_H_ARRAY_KEYS, dummy))
         with pytest.raises(ValueError, match="states is required"):
             apply_h(np.zeros(4), states=None, **kwargs)
 
@@ -1045,10 +1081,11 @@ class TestComplexCoefficientsAcrossCacheLevels:
         )
 
         rng = np.random.default_rng(3)
-        states = np.unique(rng.integers(0, 2, size=(12, 4)).astype(np.uint8), axis=0)
-        reference = float(
-            np.min(np.linalg.eigvalsh(hproj(hamiltonian, states, unique_states=True).toarray()))
-        )
+        states = unique_states(12, 4, rng)
+        # lowest_projected, not hproj: an independent Kronecker construction rather than library code
+        # that shares get_xsource with sqd. Verified identical here (-0.7976882234986247), but
+        # agreeing with a sibling that could be wrong the same way proves nothing.
+        reference = lowest_projected(strings, coeffs, states)
 
         for cache_level in CACHE_LEVELS:
             got = float(sqd(hamiltonian, states, return_eigvec=False, cache_level=cache_level))
@@ -1085,25 +1122,10 @@ class TestShardedCacheLevels:
     """
 
     def test_every_cache_level_agrees_sharded_and_single_device(self):
-        script = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "_sharded_cache_levels.py"
-        )
-        assert os.path.exists(script), f"missing sharding harness at {script}"
-        env = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=4"}
-        # check=False deliberately: the assertion below reports the child's stderr, which is far more
-        # useful than CalledProcessError's bare exit code for a jax sharding raise.
-        proc = subprocess.run(
-            [sys.executable, script],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        )
-        assert proc.returncode == 0, f"sharded sqd raised:\n{proc.stderr[-3000:]}"
+        stdout = run_sharded_child("_sharded_cache_levels.py", "sqd")
 
         seen = {}
-        for line in proc.stdout.strip().splitlines():
+        for line in stdout.strip().splitlines():
             parts = line.split()
             if len(parts) != 4:
                 continue
@@ -1114,7 +1136,7 @@ class TestShardedCacheLevels:
         # would otherwise pass on the two it managed to print.
         assert sorted(seen) == CACHE_LEVELS, (
             f"expected all of {CACHE_LEVELS}, got {sorted(seen)} -- the child did not run the full "
-            f"grid:\n{proc.stdout[-2000:]}"
+            f"grid:\n{stdout[-2000:]}"
         )
         for cache_level, (single, sharded) in sorted(seen.items()):
             assert single == pytest.approx(sharded, abs=1e-12), (

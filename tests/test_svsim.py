@@ -21,13 +21,9 @@ phase error was hiding in plain sight. The one exception is ``cz``, whose decomp
 irreducible ``exp(i*pi/4)`` -- see :meth:`TestCz.test_cz_matches_up_to_global_phase`.
 """
 
-import os
-import subprocess
-import sys
-
 import numpy as np
 import pytest
-from conftest import gate_unitary, phaseless_distance, simulate_dense
+from conftest import gate_unitary, phaseless_distance, run_sharded_child, simulate_dense
 
 from rqutils.svsim import CircuitXZ, svsim, to_circuitxz
 
@@ -475,23 +471,10 @@ class TestShardedOutput:
     )
 
     def test_sharding_does_not_change_the_state_vector(self):
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_sharded_svsim.py")
-        assert os.path.exists(script), f"missing sharding harness at {script}"
-        env = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=4"}
-        # check=False deliberately: the assertion below reports the child's stderr, which is far more
-        # useful than CalledProcessError's bare exit code for a jax sharding raise.
-        proc = subprocess.run(
-            [sys.executable, script],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        )
-        assert proc.returncode == 0, f"sharded svsim raised:\n{proc.stderr[-3000:]}"
+        stdout = run_sharded_child("_sharded_svsim.py", "svsim")
 
         seen = {}
-        for line in proc.stdout.strip().splitlines():
+        for line in stdout.strip().splitlines():
             parts = line.split(maxsplit=2)
             if len(parts) != 3:
                 continue
@@ -500,7 +483,7 @@ class TestShardedOutput:
         # Completeness before values: a child dying after two cases would otherwise pass on those two.
         assert set(seen) == self.EXPECTED_CASES, (
             f"expected {sorted(self.EXPECTED_CASES)}, got {sorted(seen)} -- the child did not run "
-            f"every case:\n{proc.stdout[-2000:]}"
+            f"every case:\n{stdout[-2000:]}"
         )
         for label, (diff, spec) in sorted(seen.items()):
             assert diff == pytest.approx(0.0, abs=1e-13), (

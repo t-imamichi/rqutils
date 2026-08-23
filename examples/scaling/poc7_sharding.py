@@ -62,15 +62,19 @@ def check_single_vs_sharded():
         d_ss = abs(eig_sharded - eig_single)
         d_ref = abs(eig_single - eig_dense)
         results[num_qubits] = (d_ss, d_ref)
+        if num_qubits == 14:
+            # Hand the n=14 fixture and its dense reference to POC 7d rather than have it rebuild
+            # both: same make_problem arguments, same hproj, same eigvalsh (~310 ms).
+            reused = (p, eig_dense)
         print(
             f"  n={num_qubits:<3d} N={num_states:<6d}  single={eig_single:+.10f}  "
             f"sharded={eig_sharded:+.10f}  dense={eig_dense:+.10f}"
         )
         print(f"          |sharded-single|={d_ss:.3e}   |single-dense|={d_ref:.3e}")
-    return results
+    return results, reused
 
 
-def check_all_cache_levels():
+def check_all_cache_levels(problem, eig_dense):
     header("POC 7d: every cache_level, sharded vs single-device vs dense")
     print("Two sharding bugs lived in the three cache_level[0] == 0 cells, uncovered because this")
     print("script and the pytest arm both ran only sqd's default (1, 0):")
@@ -84,9 +88,7 @@ def check_all_cache_levels():
         "swept rather than sampled: one representative cell reported success at three broken ones."
     )
     print()
-    p = make_problem(14, 600, num_terms=40, seed=71)
-    hp = hproj(p.hamiltonian, np.unique(p.states, axis=0), unique_states=True)
-    eig_dense = float(np.min(np.linalg.eigvalsh(hp.toarray())))
+    p = problem
     mesh = jax.make_mesh((jax.device_count(),), ("x",), (AxisType.Explicit,))
 
     worst = 0.0
@@ -170,8 +172,8 @@ def main():
     print("NOTE: virtual CPU devices exercise the sharding CODE PATHS but share one physical CPU.")
     print("No timings are reported here -- they would be meaningless. Correctness only.")
 
-    res = check_single_vs_sharded()
-    worst_cache = check_all_cache_levels()
+    res, (problem, eig_dense) = check_single_vs_sharded()
+    worst_cache = check_all_cache_levels(problem, eig_dense)
     check_mesh_padding()
     check_eigvec_path()
 
