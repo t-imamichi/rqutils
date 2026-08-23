@@ -8,6 +8,15 @@
 > operator has median 2 terms per group and a max of 197 (1.4% of slots real). Per-group `nterms`, or
 > a segment-sum layout, would be needed to close that. See the note at the end of A1.
 >
+> ### ⚠️ The symbol names below are pre-0.3 and no longer import
+>
+> Everything under this banner is the **original request, preserved as written**, so its code blocks
+> reference names that have since been renamed. Pasting one raises `ImportError`. The mapping:
+> `get_xsource` -> `xsource`, `get_diag_signs` -> `diag_signs`, `apply_xgrp` -> `apply_xgroup`,
+> `run_sqd` -> `_run_sqd` (now private), and `compute_diagonal`/`get_diagonal`/`all_diagonals` ->
+> the single `diagonals()` with a named sign source. Its line-number references (`sqd.py:789`,
+> `:827`, `:841`, `:867`, `:208`, `:442`) are against 0.2.0 and have drifted too. See `CHANGELOG.md`.
+>
 > ### ⚠️ Follow-up: A1's ragged-operator gap is now closed
 >
 > **The segment-sum layout that last paragraph asks for was built** (`rqutils.sqd.all_diagonals`,

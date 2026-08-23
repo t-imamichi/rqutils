@@ -24,10 +24,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 from qiskit.quantum_info import SparsePauliOp
 
 from rqutils.paulis.symplectic import PauliSumXZ
+from rqutils.sqd import diagonals, uniquify_states, xsource
 
 
 @dataclass
@@ -210,6 +213,39 @@ def fmt_ratio(baseline: Timing, candidate: Timing, noise_floor: float | None = N
     if verdict.startswith("UNRESOLVED"):
         return f"{ratio:.3f}x -> {verdict}; noise floor {noise_floor * 100:.1f}%"
     return f"{verdict} {direction}; noise floor {noise_floor * 100:.1f}%"
+
+
+def precompute(problem):
+    """Uniquify the states and precompute the per-X-group source indices and diagonals.
+
+    The four-step preamble every POC that times a matvec needs, and which two of them had verbatim
+    copies of. Kept here for the reason this module's docstring already gives: a POC that
+    reconstructs the library's own setup by hand is measuring its own reconstruction. Each step is
+    ``block_until_ready``-ed so a caller timing what follows is not also timing this.
+
+    Args:
+        problem: A :class:`Problem` from :func:`make_problem`.
+
+    Returns:
+        ``(states_u, xsources, diags, vec, size)`` -- the uniquified states, the stacked source
+        indices, the stacked diagonals, a deterministic random vector in the Hamiltonian's dtype,
+        and the padded subspace size.
+    """
+    size = problem.states_p.shape[0]
+    states_u = jax.block_until_ready(uniquify_states(problem.states_p, size))
+    ham = problem.hamiltonian
+    xsources = jax.block_until_ready(
+        jax.lax.scan(lambda _, x: (None, xsource(x, states_u)), None, ham.x)[1]
+    )
+    diags = jax.block_until_ready(
+        jax.lax.scan(
+            lambda _, v: (None, diagonals(v[1], zsignatures=v[0], states=states_u)),
+            None,
+            (ham.z, ham.c),
+        )[1]
+    )
+    vec = jnp.asarray(np.random.default_rng(0).normal(size=size).astype(ham.c.dtype))
+    return states_u, xsources, diags, vec, size
 
 
 def max_abs_diff(a, b) -> float:

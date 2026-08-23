@@ -34,30 +34,11 @@ jax.config.update("jax_enable_x64", True)
 
 import functools
 
-import jax.numpy as jnp
 import numpy as np
-from _scaling_common import fmt_ratio, header, make_problem, timeit
+from _scaling_common import fmt_ratio, header, make_problem, precompute, timeit
 
 from rqutils.ground_locg import ground_locg
-from rqutils.sqd import apply_h, diagonals, uniquify_states, xsource
-
-
-def setup(problem):
-    size = problem.states_p.shape[0]
-    states_u = jax.block_until_ready(uniquify_states(problem.states_p, size))
-    ham = problem.hamiltonian
-    xsources = jax.block_until_ready(
-        jax.lax.scan(lambda _, x: (None, xsource(x, states_u)), None, ham.x)[1]
-    )
-    diags = jax.block_until_ready(
-        jax.lax.scan(
-            lambda _, v: (None, diagonals(v[1], zsignatures=v[0], states=states_u)),
-            None,
-            (ham.z, ham.c),
-        )[1]
-    )
-    vec = jnp.asarray(np.random.default_rng(0).normal(size=size).astype(ham.c.dtype))
-    return states_u, xsources, diags, vec, size
+from rqutils.sqd import apply_h
 
 
 def main():
@@ -67,7 +48,7 @@ def main():
     print()
     for real in [False, True]:
         p = make_problem(18, 8_000, num_terms=60, num_xgroups=30, real_only=real, seed=41)
-        _states_u, xs, dg, vec, size = setup(p)
+        _states_u, xs, dg, vec, size = precompute(p)
         mv = functools.partial(apply_h, xsources=xs, diagonals=dg)
         hv = jax.block_until_ready(mv(vec))
         eigval, eigvec, niter, conv = ground_locg(lambda v, mv=mv: mv(v), vec, maxiter=60)
@@ -87,7 +68,7 @@ def main():
         info = {}
         for real in [False, True]:
             p = make_problem(24, num_states, num_terms=200, num_xgroups=50, real_only=real, seed=42)
-            _states_u, xs, dg, vec, size = setup(p)
+            _states_u, xs, dg, vec, size = precompute(p)
             mv = functools.partial(apply_h, xsources=xs, diagonals=dg)
             ts[real] = timeit(lambda mv=mv, vec=vec: mv(vec), f"real={real}", trials=5)
             info[real] = (p.num_xgroups, size, nbytes_of(dg))
@@ -111,7 +92,7 @@ def main():
         ts = {}
         for real in [False, True]:
             p = make_problem(24, num_states, num_terms=200, num_xgroups=50, real_only=real, seed=43)
-            _states_u, xs, dg, vec, size = setup(p)
+            _states_u, xs, dg, vec, size = precompute(p)
             mv = functools.partial(apply_h, xsources=xs, diagonals=dg)
 
             def solve(mv=mv, vec=vec):

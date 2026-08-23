@@ -126,7 +126,7 @@ def poc3_signbits_vs_diagonals():
         print()
 
 
-def _partial_matvec_factory(xsources_cached, xsigs_uncached, diagonals, states_u, use_searchsorted):
+def _partial_matvec_factory(xsources_cached, xsigs_uncached, diags, states_u, use_searchsorted):
     """Matvec caching the first J' source-index arrays and recomputing the rest.
 
     Two scans rather than one: the cached and uncached halves carry different leading-axis types
@@ -143,14 +143,14 @@ def _partial_matvec_factory(xsources_cached, xsigs_uncached, diagonals, states_u
             def cached_step(acc, val):
                 return acc + apply_xgroup(val[0], val[1], vec), None
 
-            out = jax.lax.scan(cached_step, out, (xsources_cached, diagonals[:ncached]))[0]
+            out = jax.lax.scan(cached_step, out, (xsources_cached, diags[:ncached]))[0]
         if xsigs_uncached is not None and xsigs_uncached.shape[0]:
 
             def uncached_step(acc, val):
                 xsrc = xsource_fn(val[0], states_u)
                 return acc + apply_xgroup(xsrc, val[1], vec), None
 
-            out = jax.lax.scan(uncached_step, out, (xsigs_uncached, diagonals[ncached:]))[0]
+            out = jax.lax.scan(uncached_step, out, (xsigs_uncached, diags[ncached:]))[0]
         return out
 
     return matvec

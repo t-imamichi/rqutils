@@ -38,32 +38,13 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
-import numpy as np
-from _scaling_common import fmt_ratio, header, make_problem, timeit
+from _scaling_common import fmt_ratio, header, make_problem, precompute, timeit
 
 from rqutils.ground_locg import ground_locg
-from rqutils.sqd import apply_h, diagonals, uniquify_states, xsource
+from rqutils.sqd import apply_h
 
 
-def setup(problem):
-    size = problem.states_p.shape[0]
-    states_u = jax.block_until_ready(uniquify_states(problem.states_p, size))
-    ham = problem.hamiltonian
-    xsources = jax.block_until_ready(
-        jax.lax.scan(lambda _, x: (None, xsource(x, states_u)), None, ham.x)[1]
-    )
-    diags = jax.block_until_ready(
-        jax.lax.scan(
-            lambda _, v: (None, diagonals(v[1], zsignatures=v[0], states=states_u)),
-            None,
-            (ham.z, ham.c),
-        )[1]
-    )
-    vec = jnp.asarray(np.random.default_rng(0).normal(size=size).astype(ham.c.dtype))
-    return states_u, xsources, diags, vec, size
-
-
-def make_matvecs(xsources, diagonals):
+def make_matvecs(xsources, diags):
     """Return (f64 matvec, mixed-precision matvec).
 
     The mixed version casts inputs down to f32, does the gather-and-multiply there, and casts the
@@ -71,10 +52,10 @@ def make_matvecs(xsources, diagonals):
     its convergence tolerance -- at f64; without it the tolerance loosens by ~1e9 and the solver
     stops early while reporting success.
     """
-    diag32 = diagonals.astype(jnp.complex64 if jnp.iscomplexobj(diagonals) else jnp.float32)
+    diag32 = diags.astype(jnp.complex64 if jnp.iscomplexobj(diags) else jnp.float32)
 
     def mv64(v, *args):
-        return apply_h(v, xsources=xsources, diagonals=diagonals)
+        return apply_h(v, xsources=xsources, diagonals=diags)
 
     def mv_mixed(v, *args):
         v32 = v.astype(diag32.dtype)
@@ -92,7 +73,7 @@ def main():
     for real in [True, False]:
         for num_states in [200_000, 500_000]:
             p = make_problem(24, num_states, num_terms=200, num_xgroups=50, real_only=real, seed=61)
-            _, xs, dg, vec, size = setup(p)
+            _, xs, dg, vec, size = precompute(p)
             mv64, mvmx = make_matvecs(xs, dg)
             _ = jax.block_until_ready(mv64(vec))
             _ = jax.block_until_ready(mvmx(vec))
@@ -116,7 +97,7 @@ def main():
     for real in [True, False]:
         for num_states in [50_000, 200_000]:
             p = make_problem(24, num_states, num_terms=200, num_xgroups=50, real_only=real, seed=62)
-            _, xs, dg, vec, size = setup(p)
+            _, xs, dg, vec, size = precompute(p)
             mv64, mvmx = make_matvecs(xs, dg)
 
             e64, _v64, n64, c64 = ground_locg(lambda v, *a, mv64=mv64: mv64(v), vec, maxiter=300)
@@ -143,7 +124,7 @@ def main():
     for real in [True, False]:
         num_states = 200_000
         p = make_problem(24, num_states, num_terms=200, num_xgroups=50, real_only=real, seed=63)
-        _, xs, dg, vec, size = setup(p)
+        _, xs, dg, vec, size = precompute(p)
         mv64, mvmx = make_matvecs(xs, dg)
 
         for mode, kw in [
@@ -173,7 +154,7 @@ def main():
     )
     print("ground_locg's work_dtype becomes f32 and tol = finfo(f32).eps -- ~1e9 looser.")
     p = make_problem(24, 50_000, num_terms=200, num_xgroups=50, real_only=True, seed=64)
-    _, xs, dg, vec, size = setup(p)
+    _, xs, dg, vec, size = precompute(p)
     dg32 = dg.astype(jnp.float32)
 
     def mv_naive(v, *a):

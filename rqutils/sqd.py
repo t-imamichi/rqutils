@@ -215,8 +215,11 @@ pad bit that aligns them with the Hamiltonian's signatures, and recovered with
 :meth:`~rqutils.paulis.symplectic.PauliSumXZ.unpack_states`.
 """
 
-# Grouped by tier (solvers / kernel API / building blocks), matching the module docstring's API
-# section -- not alphabetical, so the isort-style ordering RUF022 would apply is the wrong order.
+# Grouped by tier (solvers / kernel API / building blocks) to match the module docstring's API
+# section, so RUF022's alphabetical ordering is deliberately not followed. The `noqa` is load-bearing
+# rather than decorative: RUF022 does fire here (verified -- ruff's default rule set includes it).
+# Building __all__ from three sorted per-tier lists was tried instead and rejected: PLE0605 requires
+# __all__ to be a literal, not a computed expression, so the concatenation trades one lint for another.
 __all__ = [  # noqa: RUF022
     # Solvers.
     "sqd",
@@ -227,9 +230,12 @@ __all__ = [  # noqa: RUF022
     "xsource",
     "diag_signs",
     "apply_h",
-    # Lower-level building blocks: documented, but with no stability promise.
+    # Lower-level building blocks: documented, but with no stability promise. CACHE_LEVELS is data
+    # rather than a function, so it carries no autodoc directive -- but the tier prose above
+    # advertises it, so `from rqutils.sqd import *` must actually provide it.
     "diagonals",
     "apply_xgroup",
+    "CACHE_LEVELS",
 ]
 
 import functools
@@ -1006,7 +1012,7 @@ def diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Array:
 # Lives here rather than in the tests because the POCs need it too and cannot import from tests/;
 # two independent copies of this list is how a sharding failure on the (0, *) levels went unnoticed
 # while poc7_sharding.py swept only a subset.
-CACHE_LEVELS = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+CACHE_LEVELS = ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2))
 
 _NTERMS_MIN_K = 8
 

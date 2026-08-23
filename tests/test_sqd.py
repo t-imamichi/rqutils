@@ -1494,6 +1494,7 @@ class TestPublicSurface:
             "apply_h",
             "diagonals",
             "apply_xgroup",
+            "CACHE_LEVELS",
         ]
 
     def test_third_party_names_are_not_exported(self):
@@ -1509,13 +1510,25 @@ class TestPublicSurface:
 
         import rqutils.sqd as module
 
-        defined_here = {
+        # Functions defined here, PLUS public non-callables that are not imported symbols. The
+        # filter used to be functions-only, which is how CACHE_LEVELS -- documented as public in the
+        # module docstring -- sat outside __all__ with this test still green. `LOG` is excluded by
+        # name: it is a logger the module configures for itself, not part of the surface.
+        functions = {
             name
             for name, obj in vars(module).items()
             if not name.startswith("_")
             and (inspect.isfunction(obj) or hasattr(obj, "__wrapped__"))
             and getattr(obj, "__module__", None) == "rqutils.sqd"
         }
+        constants = {
+            name
+            for name, obj in vars(module).items()
+            if not name.startswith("_")
+            and name not in {"LOG"}
+            and isinstance(obj, (tuple, frozenset))
+        }
+        defined_here = functions | constants
         assert defined_here == set(module.__all__), (
             f"mismatch: {defined_here ^ set(module.__all__)}"
         )
