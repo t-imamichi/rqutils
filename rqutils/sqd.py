@@ -179,14 +179,54 @@ consumers that need a sharded view of it derive one themselves (see :func:`_spre
 SQD API
 =======
 
+Solvers
+-------
+
 .. autofunction:: sqd
 .. autofunction:: hproj
-.. autofunction:: _diag_all_groups
+
+Kernel API
+----------
+
+Enough to assemble a matrix-vector product by hand, which is what a caller with its own solver or
+its own cost function needs. These four plus :class:`~rqutils.paulis.symplectic.PauliSumXZ` are
+self-sufficient: ``diag_signs`` feeds ``apply_h`` directly, so no diagonal builder is required.
+
+.. autofunction:: uniquify_states
+.. autofunction:: xsource
+.. autofunction:: diag_signs
+.. autofunction:: apply_h
+
+Lower-level building blocks
+----------------------------
+
+Documented because the in-tree POCs use them and because they explain how the kernel API is put
+together, but **without a stability promise** -- prefer the kernel API above where it suffices.
+
+.. autofunction:: diagonals
+.. autofunction:: apply_xgroup
 
 States are packed with :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states`, which inserts the
 pad bit that aligns them with the Hamiltonian's signatures, and recovered with
 :meth:`~rqutils.paulis.symplectic.PauliSumXZ.unpack_states`.
 """
+
+# Grouped by tier (solvers / kernel API / building blocks), matching the module docstring's API
+# section -- not alphabetical, so the isort-style ordering RUF022 would apply is the wrong order.
+__all__ = [  # noqa: RUF022
+    # Solvers.
+    "sqd",
+    "hproj",
+    # Kernel API: enough to build a matvec by hand. Verified self-sufficient -- these four plus
+    # PauliSumXZ compose a full Hv with no diagonal builder needed, since diag_signs feeds apply_h.
+    "uniquify_states",
+    "xsource",
+    "diag_signs",
+    "apply_h",
+    # Lower-level building blocks: documented, but with no stability promise.
+    "diagonals",
+    "apply_xgroup",
+]
 
 import functools
 import logging

@@ -1465,3 +1465,57 @@ class TestMatvecKernels:
 
         got = np.asarray(apply_h(vector, xsources=xsources, diagonals=diagonals)).real
         assert np.abs(got - matrix @ vector).max() < 1e-12
+
+
+class TestPublicSurface:
+    """``__all__`` is the promise, and it must match what the module actually exports.
+
+    Without it, ``from rqutils.sqd import *`` pulled in eight third-party names -- ``coo_array``,
+    ``csr_array``, ``SparsePauliOp``, ``PartitionSpec``, ``get_abstract_mesh``, ``Callable``,
+    ``Sequence``, ``Number`` -- because a module with no ``__all__`` exports every global that does
+    not start with an underscore. ``rqutils/__init__.py`` already declares one; this module did not.
+    """
+
+    def test_all_names_exist(self):
+        import rqutils.sqd as module
+
+        for name in module.__all__:
+            assert hasattr(module, name), f"__all__ names {name}, which does not exist"
+
+    def test_all_matches_the_documented_tiers(self):
+        import rqutils.sqd as module
+
+        assert module.__all__ == [
+            "sqd",
+            "hproj",
+            "uniquify_states",
+            "xsource",
+            "diag_signs",
+            "apply_h",
+            "diagonals",
+            "apply_xgroup",
+        ]
+
+    def test_third_party_names_are_not_exported(self):
+        """The leak this fixes: scipy and qiskit names were reachable as rqutils.sqd.X."""
+        import rqutils.sqd as module
+
+        for leaked in ("coo_array", "csr_array", "SparsePauliOp", "PartitionSpec", "Callable"):
+            assert leaked not in module.__all__, f"{leaked} must not be part of the public surface"
+
+    def test_every_public_name_is_in_all(self):
+        """A public name absent from __all__ is either an oversight or should be private."""
+        import inspect
+
+        import rqutils.sqd as module
+
+        defined_here = {
+            name
+            for name, obj in vars(module).items()
+            if not name.startswith("_")
+            and (inspect.isfunction(obj) or hasattr(obj, "__wrapped__"))
+            and getattr(obj, "__module__", None) == "rqutils.sqd"
+        }
+        assert defined_here == set(module.__all__), (
+            f"mismatch: {defined_here ^ set(module.__all__)}"
+        )
