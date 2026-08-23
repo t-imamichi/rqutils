@@ -801,7 +801,8 @@ def _accumulate_diagonal(
 
     Args:
         coeffs: Phased coefficients for this X group, shape ``(K,)``.
-        template: Array whose leading axis length and sharding the output follows.
+        template: Array whose leading axis length and sharding the output follows. May be of any
+            rank -- only the leading axis's partitioning is carried over, since the output is 1-D.
         sign_bit: Maps a term index to that term's per-state sign bit (0 or 1).
 
     Returns:
@@ -817,8 +818,19 @@ def _accumulate_diagonal(
         signs = 1.0 - 2.0 * sign_bit(iterm)
         return diagonal + coeffs[iterm] * signs, iterm + 1
 
+    # Carry over only the *leading* axis of the template's sharding. The output is 1-D of length
+    # template.shape[0] while the template may be 2-D -- `get_diagonal` passes the (N, nbytes) state
+    # list -- and jnp.zeros rejects a rank-2 spec on a rank-1 aval ("Length of sharding.spec (2) must
+    # be equal to aval's ndim (1)"). That raise fired on *every* sharded sqd call, at *every*
+    # cache_level, because run_sqd's vinit_from_min_diag reaches get_diagonal unconditionally.
+    #
+    # Rebuilt as a NamedSharding rather than a bare PartitionSpec: the spec alone is rejected when no
+    # mesh context is active, which is the ordinary single-device path.
+    sharding = jax.typeof(template).sharding
     init = jnp.zeros(
-        template.shape[0], dtype=coeffs.dtype, out_sharding=jax.typeof(template).sharding
+        template.shape[0],
+        dtype=coeffs.dtype,
+        out_sharding=jax.sharding.NamedSharding(sharding.mesh, PartitionSpec(sharding.spec[0])),
     )
     return jax.lax.while_loop(cond_fn, add_diag, (init, 0))[0]
 

@@ -20,6 +20,11 @@ initial-vector bugs affected all six kernels identically, so a consistency-only 
 passed while every kernel returned the same wrong number.
 """
 
+import os
+import subprocess
+import sys
+import textwrap
+
 import numpy as np
 import pytest
 from conftest import (
@@ -826,3 +831,64 @@ class TestMatvecKernels:
 
         got = np.asarray(apply_h(vector, (xsources, diagonals), None, (1, 2))).real
         assert np.abs(got - matrix @ vector).max() < 1e-12
+
+
+class TestShardedDiagonalRank:
+    """``_accumulate_diagonal`` must carry only the *leading* axis of its template's sharding.
+
+    The accumulator is 1-D of length ``template.shape[0]``, but ``get_diagonal`` passes the 2-D
+    ``(N, nbytes)`` state list as the template. Taking the template's full spec therefore handed a
+    rank-2 ``PartitionSpec`` to a rank-1 ``jnp.zeros``, which raises "Length of sharding.spec (2) must
+    be equal to aval's ndim (1)" -- on **every** sharded ``sqd`` call at **every** ``cache_level``,
+    since ``run_sqd``'s ``vinit_from_min_diag`` reaches ``get_diagonal`` unconditionally.
+
+    This ran as a subprocess because the virtual device count has to be set before jax initializes,
+    which an in-process test cannot do after ``conftest`` has imported it. Measured: reverting the fix
+    leaves this entire suite green while the mesh path raises -- pytest is single-device only, so
+    ``examples/scaling/poc7_sharding.py`` was the sole coverage and a regression here is invisible to
+    ``pytest`` without this test.
+
+    The complementary trap is also pinned: rebuilding the sharding as a bare ``PartitionSpec`` fixes
+    the mesh path and breaks the single-device one, where a spec with no active mesh context is
+    rejected outright. Both arms have to pass, which is why this asserts the sharded *and*
+    single-device answers agree rather than only that the sharded call succeeds.
+    """
+
+    def test_sharded_and_single_device_agree_on_four_virtual_devices(self):
+        script = textwrap.dedent(
+            """
+            import jax
+            jax.config.update("jax_enable_x64", True)
+            import numpy as np
+            from jax.sharding import AxisType
+            from rqutils.sqd import sqd
+
+            n, N = 8, 37          # N mod 4 != 0, so mesh-size rounding is exercised too
+            rng = np.random.default_rng(11)
+            strings = ["".join(rng.choice(list("IXZ"), size=n)) for _ in range(5)]
+            coeffs = rng.normal(size=5).tolist()
+            states = rng.integers(0, 2, size=(N, n)).astype(np.uint8)
+
+            single = float(sqd((strings, coeffs), states, return_eigvec=False))
+            mesh = jax.make_mesh((4,), ("x",), (AxisType.Explicit,))
+            with jax.set_mesh(mesh):
+                sharded = float(sqd((strings, coeffs), states, return_eigvec=False))
+            print(f"{single!r} {sharded!r}")
+            """
+        )
+        env = {**os.environ, "XLA_FLAGS": "--xla_force_host_platform_device_count=4"}
+        # check=False deliberately: the assertion below reports the child's stderr, which is far
+        # more useful than CalledProcessError's bare exit code for a jax sharding raise.
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        assert proc.returncode == 0, f"sharded sqd raised:\n{proc.stderr[-3000:]}"
+        single, sharded = (float(v) for v in proc.stdout.split()[-2:])
+        assert single == pytest.approx(sharded, abs=1e-12), (
+            f"sharded {sharded} disagrees with single-device {single}"
+        )
