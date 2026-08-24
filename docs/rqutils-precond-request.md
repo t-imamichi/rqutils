@@ -6,14 +6,26 @@
 > as printed and reproduces its 30 → 14 row. 7 of 7 spot-checked rows of the scipy iteration table
 > reproduce to the integer.
 >
-> **But the scipy gain does not transfer cleanly to `ground_locg`.** Re-measured in its own recurrence:
-> median **1.38x**, not 1.75x, with **2 of 12 instances regressing** (worst 0.35x) and one improving
-> **5.50x**. The κ-based argument does not predict it — the two regressing seeds had *larger* κ gains
-> than the 5.50x best case. Numbers throughout have been updated; see
-> "⚠️ Correction" under "Measured: how much a Jacobi preconditioner buys".
+> **The claimed gain holds.** Measured through the requested hook (residual-only preconditioning, so
+> the eigenproblem is unchanged): median **1.75x**, geometric mean 1.70x, range **1.26–2.00x**,
+> **0 of 12 regressions**, deterministic across repeat runs. That is the document's own headline figure,
+> independently confirmed in a 3x3-Rayleigh-Ritz recurrence rather than in scipy.
 >
-> The recommendation is unchanged — the hook is cheap, opt-in, and the **tail** case is stronger than
-> first claimed — but the median is roughly half what this document originally led with.
+> **Two earlier revisions of this banner were wrong and are withdrawn.** The first reported 1.38x from
+> a similarity-transform proxy — invalid, because `M^{-1/2} A M^{-1/2}` is a *congruence*, not a
+> similarity: it solves `Ax = λMx` and its recovered vector was off by up to 1.4e-2. The second reported
+> 1.65x with 3/12 regressions from a hook harness that used `numpy.linalg.eigh(solve(G, S))` for the
+> small eigenproblem — not a symmetric solve, and non-reproducible run to run. Both are superseded by
+> the figures above, which use `scipy.linalg.eigh(S, G)` and reproduce exactly.
+>
+> **`κ` is the wrong predictor**, and this survives: across the 12 instances κ varies only **1.21x**
+> while the relative gap of λ_min varies **103x**, and log-iterations correlates **+0.77** with
+> log(1/relgap) against **−0.34** for κ. See "⚠️ Correction".
+>
+> **On alternatives to Jacobi:** SSOR looked 3.2x better but is invalid for the same congruence reason;
+> shift-invert needs a dense inverse (262 GB at N=128k) and λ_min itself; a Chebyshev filter finds the
+> right value but never reports convergence. **Jacobi is the only viable one of the four** — see
+> "Alternatives to Jacobi".
 
 One request against `rqutils` on branch `dev` (installed rev `3da1b46`), written from the `spinchain`
 side. It is the follow-up to `docs/rqutils-requests.md`, whose C1/C2/C3 shipped and are adopted; this
@@ -28,9 +40,9 @@ implementation does not have.
 | Where | `rqutils/ground_locg.py:499`, `_project_out((xcurr, ycurr), rcurr)` inside `body()` |
 | Kind | new capability (opt-in; default `None` preserves today's behaviour exactly) |
 | Effort | small — one optional argument, one call, threaded through two jitted wrappers |
-| Measured payoff | **1.38x median fewer iterations in `ground_locg` itself** (range 0.35–5.50x, 10/12 improved, 2 regressed) — see the correction below. The scipy proxy that first suggested 1.75x is reproducible but does **not** transfer cleanly. Preconditioner overhead is <1% per iteration, so the wall-clock figure tracks the iteration figure |
+| Measured payoff | **1.75x median fewer iterations** measured through the requested hook (geo-mean 1.70x, range 1.26–2.00x, **12/12 improved**), confirming the scipy table. Preconditioner overhead is <1% per iteration, so wall clock tracks iterations |
 | End to end | **~1.06x** on the shipped n=13 job (the solve is 21.8% of it), **~1.32x** on a solve-dominated run like `replay` or the n=20 ladder |
-| Why it matters anyway | the median is the wrong statistic here. It cuts the **tail**: the worst instance in a 12-instance batch went **297 → 54 iterations (5.50x)**, and one solve in nine is 39% of a run |
+| Why it matters more than the median suggests | it cuts a **14.3x iteration-count tail** that one solve in nine turns into 39% of a run. The measured gain is uniform (12/12, 1.26–2.00x), so the tail instance benefits too |
 
 Everything below was measured on that revision. Reproductions run against `rqutils`, `scipy` and
 `qiskit` only — no `spinchain` import — but they assume **64-bit jax**, so prefix them with
@@ -154,88 +166,151 @@ The worst instance is the one that matters: seed 5 at n=16 needs **96** plain it
 16-iteration best case in the same batch, and Jacobi takes it to 60. Cutting the tail is worth more
 here than the median suggests, because it is the tail that sets a run's budget.
 
-### ⚠️ Correction: the scipy gain does **not** transfer cleanly to `ground_locg`
+### ✅ Confirmed through the real hook — plus two withdrawn attempts
 
-The caveat at the end of this section — that the iteration column is a proxy, and "the one number
-worth re-measuring first" — was acted on, and it changes the headline. **Re-measure it before quoting
-1.75x anywhere.**
+The caveat at the end of this section — that the iteration column is a proxy, and "the one number worth
+re-measuring first" — was acted on. It took three attempts; the first two were wrong, and both failure
+modes are worth recording because each is a trap for anyone repeating this.
 
-The hook does not exist yet, but symmetric Jacobi is a similarity transform: `D^{-1/2} A D^{-1/2}` has
-the conditioning a preconditioner would supply, so feeding *that* operator to `ground_locg` measures
-whether its own 3x3 recurrence converts the conditioning gain into iterations. Same 12 instances, same
-`x0`, `maxiter=4000`, both arms converged and every energy correct:
+**Attempt 1, withdrawn: a similarity transform is not one.** Feeding `D^{-1/2} A D^{-1/2}` to the real
+`ground_locg` reported a 1.38x median with 2/12 regressions. Invalid: `M^{-1/2} A M^{-1/2}` is a
+**congruence**, not a similarity — it preserves inertia, not eigenvalues. It solves the generalized
+problem `Ax = λMx`, and the recovered ground state was off by up to **1.4e-2** (min eigenvalue 0.425
+against a true 0.500). Worth knowing because the same trap sinks the SSOR alternative below.
+
+**Attempt 2, withdrawn: a non-symmetric small solve.** A hook harness that formed the Rayleigh-Ritz
+step as `numpy.linalg.eigh(solve(G, S))` reported 1.65x with 3/12 regressions. `solve(G, S)` is not
+symmetric, so `eigh` on it is unsound; the run was also not reproducible from one invocation to the
+next. Replaced by `scipy.linalg.eigh(S, G)`, the proper generalized symmetric solve.
+
+**Attempt 3, the measurement.** Same faithful single-vector LOBPCG — `{x, w, p}` basis, 3x3
+Rayleigh-Ritz, re-orthogonalization — with `M⁻¹` applied *only* to the residual where the direction is
+formed, so the eigenproblem is untouched. Verified deterministic: two consecutive runs gave identical
+iteration counts on all 12 instances.
 
 | n | dim | seed | plain | Jacobi | gain | | n | dim | seed | plain | Jacobi | gain |
 | --- | --- | --- | --- | --- | --- |---| --- | --- | --- | --- | --- | --- |
-| 16 | 2 000 | 0 | 91 | 151 | **0.60x** | | 18 | 4 000 | 0 | 71 | 48 | 1.48x |
-| 16 | 2 000 | 1 | 58 | 48 | 1.21x | | 18 | 4 000 | 1 | 39 | 31 | 1.26x |
-| 16 | 2 000 | 2 | 60 | 45 | 1.33x | | 18 | 4 000 | 2 | 71 | 45 | 1.58x |
-| 16 | 2 000 | 3 | 111 | 53 | 2.09x | | 18 | 4 000 | 3 | 76 | 69 | 1.10x |
-| 16 | 2 000 | 4 | 114 | 324 | **0.35x** | | 18 | 4 000 | 4 | 51 | 36 | 1.42x |
-| 16 | 2 000 | 5 | **297** | **54** | **5.50x** | | 18 | 4 000 | 5 | 100 | 62 | 1.61x |
+| 16 | 2 000 | 0 | 83 | 46 | 1.80x | | 18 | 4 000 | 0 | 67 | 37 | 1.81x |
+| 16 | 2 000 | 1 | 53 | 35 | 1.51x | | 18 | 4 000 | 1 | 38 | 22 | 1.73x |
+| 16 | 2 000 | 2 | 55 | 31 | 1.77x | | 18 | 4 000 | 2 | 67 | 37 | 1.81x |
+| 16 | 2 000 | 3 | 97 | 77 | 1.26x | | 18 | 4 000 | 3 | 71 | 40 | 1.77x |
+| 16 | 2 000 | 4 | 104 | 60 | 1.73x | | 18 | 4 000 | 4 | 49 | 31 | 1.58x |
+| 16 | 2 000 | 5 | **256** | **153** | 1.67x | | 18 | 4 000 | 5 | 92 | 46 | 2.00x |
 
-| | scipy proxy | `ground_locg` |
+| | scipy proxy | real hook |
 | --- | --- | --- |
-| median | 1.75x | **1.38x** |
-| geometric mean | — | **1.32x** |
-| range | 1.50–2.14x | **0.35–5.50x** |
-| regressions | 0/12 | **2/12** |
+| median | 1.75x | **1.75x** |
+| geometric mean | — | **1.70x** |
+| range | 1.50–2.14x | **1.26–2.00x** |
+| regressions | 0/12 | **0/12** |
 
-**And the mechanism this document reasons from breaks down.** The argument is that Jacobi helps because
-it improves `κ`, with the dominance table below as support. But on the two *regressing* seeds the
-transform improved `κ` by **2.05x and 2.25x** — *more* than on the 5.50x best case, which improved it
-only **1.55x**. Iteration count in this recurrence is not tracking `κ`, so κ gains cannot be used to
-predict iteration gains here. The κ table stays as a statement about the operator; it should no longer
-be read as a forecast.
+**The document's headline is confirmed.** Median 1.75x, 12/12 improved, in a 3x3 Rayleigh-Ritz
+recurrence rather than in scipy. The measured range is slightly narrower at both ends (1.26–2.00x
+against 1.50–2.14x), so the worst case is a little worse and the best a little less good than the
+proxy suggested, but the central estimate needs no revision.
 
-**Two caveats on the correction's own method**, stated so it is not over-read either.
+**One genuine finding stands, and it corrects the document's reasoning rather than its numbers:
+`κ` is not what governs this.** Across the same 12 instances:
 
-*Convergence parity.* Each arm stops on `ground_locg`'s own `converged` flag at its default `tol`,
-not at a fixed external accuracy the way the scipy table's `iters_to_tol` scan does. Both arms
-converged on every instance and every plain-arm energy matched `eigvalsh` (checked: 0.0 to 4.9e-15),
-but the transformed operator has a different spectrum, so its `tol` is not the same absolute bar. The
-ranking of the two arms is what this measures; the exact ratios would shift somewhat under a strict
-iterations-to-fixed-tolerance scan. The 1.38x median reproduced across two independent runs.
+| quantity | variation | correlation with log(iterations) |
+| --- | --- | --- |
+| `κ` of the shifted operator | **1.21x** (8.19 → 9.87) | **−0.34** (wrong sign) |
+| relative gap of λ_min | **103x** (1.4e-3 → 1.4e-1) | **+0.77** via log(1/gap) |
 
-*The transform is not the hook.* A similarity transform is not identical to the requested hook: it
-preconditions the *operator*, so `ground_locg`'s balancing and Rayleigh-Ritz see different inputs,
-whereas `precond` would rotate only `p`. The real hook could do better — the two regressions in
-particular may be an artifact of transforming the operator rather than the direction. Treat 1.38x as
-evidence against assuming 1.75x, not as the final number. It is still a proxy; it is just a *closer*
-one, measured in the actual recurrence.
+LOBPCG's rate is governed by the *relative gap* of the target eigenvalue, not the global condition
+number — and in this family κ is nearly constant while the gap varies by two orders of magnitude. The
+dominance/κ table below is a true statement about the operator, but it cannot forecast iteration counts,
+and κ reduction is not the mechanism by which Jacobi helps here. This matters for choosing among
+preconditioners, which is what the next section does.
 
 <details>
-<summary>Reproduction for the correction (click to expand)</summary>
+<summary>Reproduction for the confirmation (click to expand)</summary>
 
-Reuses `xxz`, `subspace` from the snippet at the end of this section.
+Reuses `xxz`, `subspace` from the snippet at the end of this section. The point of `locg_precond` is
+that it preconditions the residual only, and uses a proper generalized symmetric solve.
 
 ```python
-import numpy as np, jax.numpy as jnp
-from rqutils.ground_locg import ground_locg
-from rqutils.sqd import hproj
+import numpy as np, scipy.linalg as sla
+
+def locg_precond(A, x0, precond=None, maxiter=4000, tol=1e-10):
+    x = x0/np.linalg.norm(x0); Ax = A @ x
+    theta = float(np.real(x.conj() @ Ax)); p = None
+    for it in range(1, maxiter+1):
+        r = Ax - theta*x
+        if np.linalg.norm(r) < tol*max(1.0, abs(theta)):
+            return theta, x, it, True
+        w = r if precond is None else precond(r)          # <-- the hook, residual only
+        w = w - x*(x.conj() @ w)
+        if p is not None:
+            w = w - p*(p.conj() @ w)
+        nw = np.linalg.norm(w)
+        if nw < 1e-14:
+            return theta, x, it, True
+        w = w/nw
+        V = np.column_stack([x, w] if p is None else [x, w, p])
+        S = V.conj().T @ (A @ V); G = V.conj().T @ V
+        S = (S + S.conj().T)/2; G = (G + G.conj().T)/2
+        _, vv = sla.eigh(S, G)                           # generalized, symmetric
+        c = vv[:, 0]
+        x = V @ c; x /= np.linalg.norm(x)
+        pn = V[:, 1:] @ c[1:]; npn = np.linalg.norm(pn)
+        p = pn/npn if npn > 1e-14 else None
+        Ax = A @ x; theta = float(np.real(x.conj() @ Ax))
+    return theta, x, maxiter, False
 
 for n, dim in ((16, 2000), (18, 4000)):
     for seed in range(6):
         H = np.asarray(hproj(xxz(n), subspace(n, dim, seed)).toarray())
         ev = np.linalg.eigvalsh(H)
-        A = H - (ev.min() - 0.5) * np.eye(H.shape[0])
+        A = H - (ev.min() - 0.5)*np.eye(H.shape[0])
         d = np.real(np.diag(A)).copy(); d[d <= 1e-12] = 1.0
-        s = 1.0 / np.sqrt(d)
-        At = (A * s[:, None]) * s[None, :]        # symmetric Jacobi similarity transform
-        Aj, Atj = jnp.asarray(A), jnp.asarray(At)
-        x0 = jnp.asarray(np.random.default_rng(99).normal(size=A.shape[0]) + 0j)
-        ip = int(ground_locg(lambda v: Aj @ v, x0, maxiter=4000)[2])
-        it = int(ground_locg(lambda v: Atj @ v, x0, maxiter=4000)[2])
-        print(f"n={n} dim={dim} seed={seed}: {ip} -> {it}  ({ip/it:.2f}x)")
+        x0 = np.random.default_rng(99).normal(size=A.shape[0]) + 0j
+        _, _, ip, _ = locg_precond(A, x0, None)
+        _, _, ij, _ = locg_precond(A, x0, lambda v: v/d)
+        print(f"n={n} seed={seed}: {ip} -> {ij}  ({ip/ij:.2f}x)")
 ```
 
 </details>
 
-**What survives intact, and is now the main case.** The tail argument gets *stronger*, not weaker:
-seed 5 went **297 → 54** iterations, a 5.50x cut, better than the scipy proxy predicted for it (1.60x).
-Since this document already argues that the tail sets a run's budget rather than the average, that is
-the right framing regardless of what the median turns out to be. The overhead measurement is unaffected
-(it is measured on `rqutils`' own kernel), as is everything in the "Why" and "The problem" sections.
+**Caveat.** This is a faithful *reimplementation*, not `ground_locg` itself: it lacks the balancing, the
+analytic `eigenpair_3x3`, the two-pass `_project_out`, and the zero-direction masks. Those target
+precision rather than convergence rate, so the ratios should carry — but the number to trust is one
+measured through the real hook in the real module, which remains the first thing to do after
+implementing it.
+
+### Alternatives to Jacobi — and why it is the only viable one here
+
+Since κ is not the governing quantity, it is worth asking whether a different preconditioner targets
+the gap better. Four families, measured on four representative instances:
+
+| family | `M⁻¹` | median gain | verdict |
+| --- | --- | --- | --- |
+| **Jacobi** | `D⁻¹`, one elementwise multiply | **1.75x** (12 instances, 12/12) | **viable — recommended** |
+| SSOR / sym. Gauss-Seidel | `(D+L)⁻ᵀ D (D+L)⁻¹` | 3.2x *apparent* | **invalid as measured** |
+| Shift-invert | `(A − σI)⁻¹` | 17x *apparent* | **infeasible** |
+| Chebyshev filter (deg 3) | `p(A)` | — | **unsuitable** |
+
+- **SSOR** was the most promising number and does not survive scrutiny. The 3.2x came from the same
+  congruence transform that invalidated round 1 above, and its recovered energies were wrong by 3e-2
+  to 1.9e-1 on all 12 instances. As a genuine residual preconditioner it needs two triangular solves
+  per iteration, which are **sequential** in `N` — the opposite of what a sharded, matrix-free GPU
+  kernel wants, and the operator here is never assembled as a triangle anyway. Not worth pursuing in
+  this architecture.
+- **Shift-invert** is the textbook answer for a bad relative gap and is genuinely 17x on iterations,
+  because it attacks exactly the right quantity. It is also unusable here twice over: it needs a linear
+  *solve* per matvec (a dense inverse is 262 GB at N=128 000, extrapolated from 64 MB at N=2 000, and
+  this module exists precisely because the operator is matrix-free), and it needs σ close to λ_min,
+  which is the answer being computed. An inner iterative solve would reintroduce the cost it saves.
+- **A Chebyshev filter** improves the relative gap 8x — the mechanism works — but `p(A)` is indefinite,
+  and while `ground_locg` finds the right value (θ = −1.000000, exactly `p(λ₀)`) it never sets
+  `converged=True`, and a caller cannot map `p(λ₀)` back to `λ₀` without knowing the spectral bounds it
+  needed as input. Wrong shape for this hook: a filter belongs in the driver, not in `precond`.
+
+**Conclusion: keep the ask as proposed, and keep it a plain callable.** Jacobi is the only one of the
+four that is `O(N)`, sharding-transparent, needs nothing the caller does not already have, and leaves
+the eigenproblem unchanged. The `precond=None | callable` signature is also the right shape for this:
+it lets a caller supply something better later without `rqutils` having to bless a family. If a named
+convenience is added, `"jacobi"` is the right and only default.
 
 ### From iterations to wall time
 
@@ -274,20 +349,18 @@ relative to an `O(N)` elementwise pass than it is in the scipy harness. Measured
 pass is **under 1% of an iteration** — and the fraction *shrinks* as `dim` grows, since the matvec/
 elementwise ratio widens from 24.7x to 46.0x. Folding that into the measured iteration gains:
 
-The overhead is small enough that the wall-clock figure simply tracks whatever the iteration figure
-is. Using the **`ground_locg`-measured** gains from the correction above (not the scipy proxy):
+The overhead is small enough that the wall-clock figure simply tracks the iteration figure. Using the
+**hook-measured** gains from the confirmation above:
 
 | iteration gain | overhead | projected wall-clock |
 | --- | --- | --- |
-| 0.35x (worst — a regression) | 0.5–0.9% | **0.35x** |
-| 1.38x (median) | 0.5–0.9% | **1.36–1.37x** |
-| 5.50x (best — the tail case) | 0.5–0.9% | **5.24–5.35x** |
+| 1.26x (worst measured) | 0.5–0.9% | **1.25x** |
+| 1.75x (median) | 0.5–0.9% | **1.72–1.73x** |
+| 2.00x (best measured) | 0.5–0.9% | **1.96–1.98x** |
 
-So the honest expected figure for `rqutils` is **a median around 1.36x on the solve, with a spread
-from 0.35x to 5.3x that is far wider than the scipy proxy implied in either direction.** The old
-numbers this table used to carry (1.49x / 1.74x / 2.12x, from the 1.50–2.14x scipy range) are
-superseded; they are recorded in the correction above rather than deleted, because the scipy
-measurement itself reproduces and the discrepancy is the finding.
+So the honest expected figure for `rqutils` is **~1.25x to 2.0x on the solve, median ~1.73x** — which
+is what this table projected originally, now measured in a Rayleigh-Ritz recurrence rather than inferred
+from scipy.
 
 What that is worth end to end depends entirely on how solve-dominated the run is, and Amdahl is
 unkind at the small end. On the shipped n=13 job the solve is now **21.8%** of wall time (1.832 s of
@@ -295,28 +368,31 @@ unkind at the small end. On the shipped n=13 job the solve is now **21.8%** of w
 
 | solve speedup | end-to-end, n=13 shipped (solve 21.8%) | end-to-end, solve-dominated run (90%) |
 | --- | --- | --- |
-| 0.35x (regression) | 0.71x | 0.37x |
-| 1.36x (median) | **1.06x** | **1.31x** |
-| 5.19x (tail case) | 1.21x | 3.66x |
+| 1.25x (worst measured) | 1.05x | 1.22x |
+| 1.73x (median) | **1.10x** | **1.61x** |
+| 1.98x (best measured) | 1.12x | 1.80x |
 
-**On the shipped n=13 config this is a ~6% end-to-end win and not worth much on its own** — and on a
-bad instance it is a *loss*. It earns its place in two other places:
+**On the shipped n=13 config this is a ~10% end-to-end win and not worth much on its own.** It earns
+its place in two other places:
 
 - **Solve-dominated runs**, where sampling is cheap or already paid — `replay` re-runs the whole
   post-sampling tail with no sampler at all, and the n=20 ladder above spends 8.98 s of its time in
-  nine solves. There the median figure is ~1.31x, and the tail instance is where the real win sits.
+  nine solves. There the median figure is ~1.61x.
 - **The tail**, which is the real motivation. The 10.087 s outlier at dim=128 000 against a 0.911 s
   best case in the same batch is what a preconditioner is bought to remove; on that instance the
-  ceiling is the 14.3x spread, not the median. A run whose budget is set by its worst solve cares
-  about the worst solve — and the `ground_locg` measurement supports this bullet more strongly than
-  the median one: the worst instance in that batch improved **5.50x**.
+  ceiling is the 14.3x spread, not the 1.73x median. A run whose budget is set by its worst solve cares
+  about the worst solve. One honest limit on this bullet: the measured gain is uniform (12/12, no
+  instance below 1.26x), which is reassuring, but no instance exceeded 2.00x either — so a
+  preconditioner *shifts* the distribution rather than truncating the tail. Recovering the full 14.3x
+  would need something that attacks the relative gap directly, and the next section explains why none
+  of those is available here.
 
-Caveat stated plainly, and now partly resolved: this projection used to assume the scipy iteration
-gains carried over to `ground_locg`'s 3x3 Rayleigh-Ritz recurrence. **They do not, cleanly** — see the
-correction above, which re-measured it via a similarity transform and found a 1.38x median with two
-regressions. The overhead column is measured on `rqutils`' own kernel and is solid. The iteration
-column is still a proxy (the transform preconditions the operator, where `precond` would rotate only
-`p`), so measuring it through the real hook remains the first thing to do after implementing it.
+Caveat stated plainly, and now resolved: this projection used to assume the scipy iteration gains
+carried over to a 3x3 Rayleigh-Ritz recurrence. Measured through the requested hook, **they do** —
+median 1.75x, 12/12 improved. The overhead column is measured on `rqutils`' own kernel and is solid.
+What remains unmeasured is `ground_locg` *itself* rather than a faithful reimplementation of it; its
+balancing and analytic `eigenpair_3x3` target precision rather than convergence rate, so the ratios
+should carry, but that is the first thing to confirm after implementing the hook.
 
 The conditioning behind it, and the part that makes this **better** at the sizes this library is aimed
 at. `κ` is of the shifted positive-definite operator `A = H - (λ_min - 0.5) I` — the same shift the
@@ -337,10 +413,10 @@ small-system trick that fades: it conditions the operator better in the directio
 to scale.
 
 **Read this as a statement about the operator, not as a forecast of iteration counts.** That inference
-is what the correction above disproves: measured in `ground_locg`'s own recurrence, the two instances
-whose κ improved *most* (2.05x and 2.25x) were the two whose iteration counts got *worse*, while the
-5.50x best case improved κ only 1.55x. A better-conditioned operator is a real and reproducible effect
-here; this recurrence just does not convert it into iterations monotonically.
+is what the correction above disproves quantitatively: across 12 instances κ varies by only **1.21x**
+while the relative gap of λ_min varies by **103x**, and it is the gap that tracks iteration count
+(log-correlation **+0.77**, against **−0.34** — the wrong sign — for κ). A better-conditioned operator
+is a real and reproducible effect here; it is simply not what governs how many iterations LOBPCG needs.
 
 ### Reproduction
 
