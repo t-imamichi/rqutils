@@ -692,6 +692,400 @@ judged on whether it **opens the relative gap**, not on `κ` -- across these sam
 varies 1.21x while the relative gap varies 103x, and log-iterations correlates +0.77 with `log(1/gap)`
 against −0.34 (wrong sign) for `κ`.
 
+### ❌ The product-state solver as a shift source — three routes, all closed
+
+Asked as: *could a Jacobi preconditioner use an eigenvalue from the product-state solver
+(`rqutils/product.py`, SCIP)?* It is a better idea than the two candidates above -- every previous
+rejection traced back to having **no viable lower bound on `λ_min`**, and `solve_product` returns
+SCIP's branch-and-bound `lower_bound`, which is *certified* rather than a norm inequality. It still
+fails, for one root cause worth stating once:
+
+> **`solve_product` optimizes over a manifold on the wrong side of `λ_min`.** Product states are a
+> strict subset of Hilbert space, so its minimum is a variational **upper** bound on the ground
+> energy. `lower_bound` certifies the *product-state* optimum, not the spectrum -- it is SCIP's own
+> optimality gap (`eigval` and `lower_bound` agree to ~2e-4 at `tol=1e-4`), not a spectral bound.
+
+| n | `λ_min(H_full)` | `prod_eigval` | `prod_lower_bound` | `lb ≤ λ_min`? |
+| --- | --- | --- | --- | --- |
+| 8 | −3.19678 | −2.41108 | −2.41130 | **no** |
+| 10 | −4.00079 | −3.03639 | −3.03657 | **no** |
+| 12 | −4.79110 | −3.66146 | −3.66182 | **no** |
+
+**Route 1 — `σ = lower_bound − ε` against the projected operator. Rejected, with the worst possible
+failure profile.** Against the *projected* `H` the bound initially appeared to hold, because a randomly
+sampled subspace misses the entangled ground state badly enough that `λ_proj` lands above the product
+optimum. It is a coincidence of bad subspaces, not a theorem. Sweeping subspace quality (`top-amp` =
+the true ground state's largest-amplitude basis states) breaks it everywhere it matters:
+
+| n | dim | subspace | `λ_proj` | `prod_lb` | valid? |
+| --- | --- | --- | --- | --- | --- |
+| 8 | 12 | random | −0.62500 | −2.41130 | ✅ |
+| 8 | 64 | top-amp | −2.89506 | −2.41130 | ❌ |
+| 8 | 128 | top-amp | −3.18222 | −2.41130 | ❌ |
+| 12 | 204 | random | −1.52630 | −3.66182 | ✅ |
+| 12 | 1024 | top-amp | −4.74143 | −3.66182 | ❌ |
+| 12 | 2048 | top-amp | −4.78817 | −3.66182 | ❌ |
+
+**Every `random` row passes and every decent-sized `top-amp` row fails.** The bound holds exactly when
+the subspace is worse than a product state and inverts the moment it beats one -- which is the entire
+purpose of SQD, since the ground state is entangled. At n=12/dim=2048 the projection has captured
+−4.788 of a true −4.791 while the bound sits 1.13 too high. The failure is silent: `H − σI` comes out
+*indefinite* rather than raising, so Jacobi divides by negatives and returns the ~3x pessimization with
+correct energies. Same signature as every rejection above.
+
+**Route 2 — relax the Bloch sphere to the Bloch ball (`x²+y²+z² == 1` → `<= 1`). Structurally
+impossible, not merely ineffective.** The intent was that the ball is the set of single-qubit *density
+matrices*, so minimizing over it might relax toward a genuine spectral bound. **Measured: the identical
+objective**, −2.41108 at n=8, matching the sphere to 5 decimals at n=8/10/12. The reason is that the
+objective is a sum of products with **one factor per qubit**, hence linear in each qubit's three
+variables individually -- and a linear function over a convex ball attains its optimum on the boundary.
+The ball optimum *is* the sphere optimum, for every Hamiltonian. Do not retry this.
+
+**Route 3 — drop the constraint entirely (box `[-1,1]^{3n}`). Valid bound, same dead end already
+rejected.** This *does* bound from below (−4.375 ≤ −3.197 at n=8, holding at n=8/10/12), but it is the
+coefficient-sum bound in disguise: each component independently saturates ±1, so the optimum is exactly
+`−Σ|coeff|` (verified). Over-shift against the projected `λ_min` that `sqd` actually solves:
+
+| n | dim | box bound (= minus the coefficient sum) | `λ_proj` | over-shift |
+| --- | --- | --- | --- | --- |
+| 10 | 300 | −10.6250 | −2.3510 | **16.55x** |
+| 12 | 800 | −12.8750 | −2.3787 | **20.99x** |
+| 14 | 1 500 | −15.1250 | −2.3943 | **25.46x** |
+
+Worsening with `n`, and marginally worse than the structural row-sum bound rejected in the section
+above. Nothing new.
+
+**Conclusion on shifts: stop looking in this direction.** Three independent routes, one cause. A
+certified lower bound on `λ_min` needs a fundamentally different model -- a moment/SOS relaxation over the
+Pauli algebra rather than a product-state parameterization.
+
+**That was subsequently built and measured, and it closes the shift question for good — see
+`docs/sdp-lower-bound.md`.** A level-1 SDP bound is valid and ~1.45x loose on `H`, and yields **1.29x
+median with 0/12 regressions** through the real hook. Note it *is* by far the tightest bound anyone here
+has produced: **0.64-1.06x over-shift** against the projected operator, versus 4.14-8.14x for the
+coefficient-sum bound rejected above and 5.03-6.29x for the one this document called unattainable --
+5-8x tighter, from the Pauli list alone with no assembled matrix and no matvec. It is also **superseded by the free option**: the
+same 1.29x is available from the diagonal-only `σ = min(diag) − 2·max|diag|` at `O(N)`, with no conic
+solve. Two findings there are worth reading even though the verdict is negative.
+
+First, the bound has a **closed form**: `σ` is exactly linear in `n` (max residual 5.2e-08 over n=4..14),
+with the slope *equal to the single-bond `λ_min`*, so the conic solve recovers a linear function that two
+solves determine. Its value is in establishing the constant for a new coupling family, not per-instance
+evaluation.
+
+Second, and this **retracts the sentence this section used to end with** — a tighter bound on `H` was *not*
+the route to the 1.79x. `ground_locg` sees `hproj(H, subspace)`, whose minimum sits 0.64-1.06x of the
+projected spectral width **above** `λ_min(H)`; that gap is a property of the random projection, so **no
+bound on `H`, however tight, can reach the shift the 1.79x was measured at.** The 1.79x used the
+*projected* `λ_min`. So the remaining upside lives in estimating the **projected** operator's minimum, not
+in tightening a bound on `H` — and the only untried candidate for that is still the two-level/deflation
+preconditioner named as speculative above.
+
+### ⚠️ `solve_product`'s state vector as an `xinit` seed — 1.09x, too weak to ship
+
+What survives is the part needing no bound at all: `Solution.vec` is the optimal product state's Bloch
+vectors, a genuine variational approximation to the ground state, and `solve_product` is **fast** --
+measured 0.03 s / 0.04 s / 0.17 s / 0.78 s at n=8/12/16/18 with `tol=1e-4`. Amplitude on a bitstring is
+`Π_q amp[q][bit_q]` with `θ_q = arccos(z_q)`, `φ_q = atan2(y_q, x_q)`: `O(N·n)`, matvec-free. Unlike a
+preconditioner it cannot affect correctness -- `xinit` needs only non-vanishing overlap with `v_0`.
+
+Measured through the real `ground_locg`, random `x0` against product-state `x0`, same 12-instance batch
+(`(n,dim) = (16,2000), (18,4000)`, seeds 0-5), `maxiter=4000`, `tol=1e-10`:
+
+| n | seeds 0-5, `rand` -> `prod` | ratios |
+| --- | --- | --- |
+| 16 | 44->35, 28->27, 29->26, 45->49, 54->46, 122->66 | 1.26, 1.04, 1.12, **0.92**, 1.17, **1.85** |
+| 18 | 35->27, 19->17, 34->33, 37->47, 24->24, 46->43 | 1.30, 1.12, 1.03, **0.79**, 1.00, 1.07 |
+
+**Median 1.09x, range 0.79-1.85x, 2/12 regressions**, all 12 converged to the correct energy. Recorded
+as ⚠️ rather than ❌ because the effect is real and the structure is interesting: the best case is
+n=16 seed=5, **122->66 (1.85x)**, which was the *worst* instance in the batch -- consistent with a seed
+cutting the pathological tail, which is the thing worth buying per this document's own framing. But
+0.79x on n=18 seed=3 means it **cannot be a default**, and one tail point is not evidence of
+tail-cutting; that needs a batch selected for pathology. Compare Jacobi's 1.79x with 0/12 regressions:
+a seed only changes the starting distance, where a preconditioner changes the per-iteration contraction
+rate.
+
+A regression is mechanically unsurprising -- a product state can have *worse* overlap with the
+**projected** ground state than a random vector does, because projection onto a randomly sampled
+subspace distorts it, and a random vector has no structure to lose.
+
+**The untried extension, and the only one that addresses the real limitation:** a richer ansatz in the
+SCIP model -- e.g. bond-dimension-2 MPS, `~12n` variables with per-site normalization -- would capture
+the nearest-neighbour entanglement a 1D chain has and a product state structurally cannot. At 0.78 s
+for n=18 there is a large budget before it stops being cheap against the SQD solve, and it would
+improve both surviving uses at once (a better seed *and* a better sampling distribution for subspace
+selection). Caveat: the non-convexity worsens (spatial branch-and-bound over `12n` variables with
+cross-site products), so its scaling past n≈16 is an open question, not an assumption.
+
+### ❌ Bloch-marginal subspace sampling — uninformative at `Δ=0.5` by symmetry
+
+The remaining use of `solve_product` was to pick the *subspace* rather than to shift or seed: its Bloch
+vectors give a per-qubit marginal `p_q = P(bit=1) = (1 − z_q)/2`, so bitstrings could be drawn from that
+product distribution as a classical stand-in for SQD's quantum sampling step. Motivated by the
+break-test data above -- at n=12/dim=2048 an oracle subspace reached −4.788 of a true −4.791 where a
+random one got −3.545, so subspace quality dominates anything the eigensolver does.
+
+**It carries no information for this Hamiltonian class.** Measured `max|z_q| = 0.0000` **exactly**, so
+`p_q = 0.5` at every site and the "sampled" distribution *is* uniform:
+
+| parameters | largest abs z-component | `p_q` range |
+| --- | --- | --- |
+| `Δ=0.5, Bx=By=0.5` (the request's operator) | **0.0000** | [0.500, 0.500] |
+| `Δ=0.5, Bx=2.0, By=0` | **0.0000** | [0.500, 0.500] |
+| `Δ=0.5, Bx=By=0` (no field at all) | **0.0000** | [0.500, 0.500] |
+| `Δ=2.0, Bx=By=0.5` | 0.9852 | [0.007, 0.993] |
+| `Δ=−1.0, Bx=By=0.1` | 0.6443 | [0.178, 0.213] |
+
+The cause is symmetry, not the field: at `Δ=0.5` the XY coupling dominates ZZ, so the product optimum
+is in-plane (Néel order in x/y) and the z-magnetization vanishes identically -- it holds with the field
+switched **off**, which rules out "the transverse field polarizes in-plane" as the explanation. Only in
+the Ising-dominated regime (`Δ=2.0`) does the marginal become informative.
+
+There is a structural point underneath, and it also explains the weak seeding result. **Sampling
+computational-basis states reads only `|amplitude|²` in the z-basis, i.e. only `z_q`.** An in-plane
+product state is *maximally uninformative* in that basis while being a perfectly good variational
+state: all of its content sits in the relative phases `φ_q = atan2(y_q, x_q)`, which basis-state
+sampling discards. That is a mismatch between what `solve_product` optimizes and what subspace
+selection can read, not a harness defect -- and it is consistent with the `xinit` seeding measuring
+only 1.09x with 2/12 regressions, since the phases are all it had to offer.
+
+**A retracted intermediate result, recorded because it was nearly believed.** A first version of this
+experiment reported bloch-sampling beating random in **9/9 cells, capturing 13.6-50.3%** of the oracle's
+advantage. That was an artifact of the harness: the `random` arm drew with
+`rng.choice(2**n, replace=False)` while the `bloch` arm drew iid bits and applied `np.unique`. Those are
+different **sampling mechanisms**, and since the marginals were all 0.5 the two arms had *identical
+distributions* -- so the entire measured gap came from the mechanism, not the operator. Two controls
+caught it: sampling from a deliberately **mismatched** Hamiltonian's product state did just as well
+(−1.628 vs −1.513 at n=10/dim=51, i.e. slightly better), and printing the marginals showed
+`[0.5, 0.5, ...]`. **When two arms differ in more than the variable under test, a large effect is
+evidence of the confound, not of the hypothesis** -- and a mismatched-input control is the cheap way to
+find out.
+
+### ⛔ Subspace selection by weight shell + diagonal ranking — measured, then REJECTED by the user
+
+**Do not build on this.** The results below are sound and are kept as a record, but the direction was
+rejected on 2026-08-25 after review. The deciding gap: every measurement compares against **uniform
+random** subspaces, which is a weak baseline -- a real SQD workflow samples from a quantum circuit, and
+those samples are already biased toward the ground state. Whether this improves on *quantum-sampled*
+subspaces was never measured, so the payoff in practice is unestablished. It is also a change to how
+callers choose `states`, not an `sqd` improvement, so it does not belong in this library's scope.
+
+Read the rest of this section as a record of what was measured and why, not as a recommendation.
+
+### Low-Hamming-weight sampling bias — and the mechanism is *connectivity*, not amplitude
+
+This started as a throwaway control against the Bloch confound above ("does *any* bias beat uniform?")
+and turned into the session's one positive result. Draw each bit iid with `P(1) = p` instead of `p = 0.5`.
+
+**First harness was itself confounded, twice** -- recorded because both traps are easy to repeat. It
+reported a wandering optimum (best `p` = 0.30, 0.40, 0.20 with no pattern, and at n=12/dim=1638 `p=0.30`
+came *last* of five). Causes: (a) low-`p` arms ran out of distinct states and were topped up with
+**uniform** draws, so the arm that "won" was the one that had cheated back toward uniform; and (b)
+`np.unique` then `lex`-sort then `[:dim]` keeps a *contiguous block in lexicographic order*, which
+selects on leading bits -- kept-weight means came out 2.68-4.45 where the draw means were 1.2-6.0, i.e.
+**truncation, not `p`, was setting the final distribution.** Different `p` gave different unique-counts
+gave different truncation severity: the arms differed in more than the variable under test, again.
+
+**Clean harness** (rejection-sample until exactly `dim` distinct iid(`p`) states; no top-up, no
+truncation) gives a **monotonic** result in all five cells, 8 seeds, non-overlapping error bars:
+
+| n | dim | `p=0.20` | `p=0.30` | `p=0.40` | `p=0.50` (uniform) |
+| --- | --- | --- | --- | --- | --- |
+| 12 | 204 | **−1.6872**±0.029 | −1.5699±0.034 | −1.4708±0.044 | −1.3866±0.047 |
+| 12 | 614 | **−2.7667**±0.019 | −2.4175±0.016 | −2.1408±0.053 | −2.0854±0.044 |
+| 12 | 1 638 | **−3.8621**±0.020 | −3.6018±0.022 | −3.1697±0.026 | −3.0374±0.034 |
+| 14 | 819 | **−2.2224**±0.028 | −1.8897±0.053 | −1.8698±0.070 | −1.8610±0.035 |
+| 14 | 2 457 | **−3.3924**±0.022 | −2.9667±0.032 | −2.6179±0.034 | −2.4851±0.034 |
+
+Lower is better, and lower `p` wins monotonically every time. At n=12/dim=1638 that is **−3.862 against
+uniform's −3.037**, against top-amplitude selection (the true ground state's largest-`|amplitude|`
+states) at −4.783 -- roughly half that gap, from a one-line change to how bitstrings are drawn. Note
+top-amplitude selection is a *reference*, not a ceiling: it maximizes fidelity with the ground state,
+where `λ_min` of the projection is variational and rewards connectivity, and the hybrid section below
+beats it at n=14.
+
+**It appears to contradict the ground state's own statistics, and the resolution is the point.** The
+true ground state's mean Hamming weight is *exactly* `n/2` (measured 6.000 at n=12, 7.000 at n=14), so
+the amplitude-matched choice would be `p = 0.5` -- uniform. Low-`p` sampling deliberately samples *away*
+from where the amplitude mass sits, and wins anyway. Why:
+
+| `p` | `λ_min` | off-diagonal nnz | nnz/row | mean pairwise Hamming distance |
+| --- | --- | --- | --- | --- |
+| 0.20 | **−2.8329** | 4 972 | **8.10** | 5.128 |
+| 0.30 | −2.4760 | 3 558 | 5.79 | 5.444 |
+| 0.40 | −2.0488 | 2 108 | 3.43 | 5.801 |
+| 0.50 | −1.9420 | 1 672 | **2.72** | 6.004 |
+
+(n=12, dim=614, one seed.) **Connectivity tracks the energy in lockstep** -- a 3x range in nonzeros per
+row across the same 3x range in `λ_min` improvement. The mechanism: XXZ's `XX`/`YY` terms connect states
+at Hamming distance **2** and the field's `X`/`Y` terms at distance **1**, so a matrix element exists
+only when the subspace contains *both* endpoints. Low-`p` draws concentrate in a small region of the
+hypercube (weight 0-5 rather than 0-9), making near-neighbour pairs common; uniform draws scatter `dim`
+states thinly over all `2^n`, where typical pairs sit ~6 apart and contribute **nothing**.
+
+So the quantity a projected variational energy needs is **connected** states, not individually
+high-amplitude ones: a subspace of important-but-mutually-unconnected states is nearly diagonal, and its
+`λ_min` degenerates to its best diagonal entry. This is the same principle that put `_spread_seed` in
+`rqutils/sqd.py` -- a one-hot cannot leave the connected component containing it -- applied to subspace
+selection rather than to the initial vector.
+
+**Extending `p` below 0.20: the parameter stops controlling anything, and the question dissolves.**
+Swept `p` over 0.03-0.50 at n=12/dim=204, n=12/dim=614, n=14/dim=819, 8 seeds, with saturation
+diagnostics. The energy does flatten and marginally reverse around `p ≈ 0.03-0.05` -- but that is the
+**sampler**, not an optimum:
+
+| p | `λ_min` (n=12, dim=204) | nnz/row | realized mean weight | target `n·p` | draws per state |
+| --- | --- | --- | --- | --- | --- |
+| 0.03 | −1.9705±0.015 | 7.46 | **2.61** | 0.36 | **183.2** |
+| 0.05 | **−1.9747**±0.009 | 7.22 | **2.64** | 0.60 | 55.2 |
+| 0.10 | −1.8711±0.013 | 6.56 | 2.74 | 1.20 | 20.1 |
+| 0.15 | −1.8032±0.016 | 5.65 | 2.93 | 1.80 | 20.1 |
+| 0.20 | −1.6872±0.029 | 4.65 | 3.14 | 2.40 | 20.1 |
+| 0.30 | −1.5699±0.034 | 2.57 | 3.82 | 3.60 | 20.1 |
+| 0.50 | −1.3866±0.047 | 0.83 | 6.02 | 6.00 | 20.1 |
+
+**The realized weight detaches from the target below `p ≈ 0.20`.** At `p=0.03` the target mean weight is
+0.36 while the subspace actually has **2.61** -- there are only ~13 states of weight ≤ 1 at n=12, so
+filling 204 distinct states is impossible and the sampler reaches up to weight ~4.6, grinding through
+**183 draws per kept state** (2 296 at dim=614). Across `p` = 0.03-0.15 the realized mean weight moves
+only 2.61 → 2.93 while `n·p` moves 0.36 → 1.80: those arms have converged to nearly the same
+distribution, which is why the curve flattens. **`p` below ~0.15 is an expensive approximation to a
+weight-shell subspace**, not a measurement of `p`.
+
+So the right parameterization is the shell itself -- take all states of Hamming weight ≤ k,
+lowest-weight first, filling to `dim` (which fixes `k` automatically). Measured against the best sampled
+arm, 8 seeds:
+
+| n | dim | weight-shell | `k` reached | best sampled `p` | top-amplitude |
+| --- | --- | --- | --- | --- | --- |
+| 12 | 204 | **−1.9958**±0.014 | 3 | −1.9747 | −3.9083 |
+| 12 | 614 | **−3.0537**±0.012 | 4 | −3.0399 | −4.5878 |
+| 14 | 819 | **−2.7655**±0.012 | 4 | −2.7418 | −4.5411 |
+
+The shell construction **wins in 3/3 cells** (small margins, consistently signed) with the highest
+connectivity measured (nnz/row 7.79 / 10.46 / 9.90), has **no free parameter**, and costs one
+enumeration instead of 100-2000x oversampling. So: there is no useful turnover in `p`; the low-`p` limit
+*is* the weight-shell subspace, and it should be built directly.
+
+**The hybrid — shell for connectivity, ranking within it — works, and the *deployable* variant wins.**
+A pure shell forces most of the subspace (at n=12/dim=204, 79 of 204 states are fixed by the full shells
+≤ 2; only the 125 drawn from the 220-state weight-3 shell are free), so the experiment widens the
+candidate window by `w` shells and ranks inside it. Ranking by the **analytic diagonal**
+(`Δ/4 · Σᵢ sᵢsᵢ₊₁`, exact, matvec-free, needs no solve) against ranking by true ground-state
+`|amplitude|`:
+
+| n | dim | shell | shell+diag | shell+amp | **wind3+diag** | **wind4+diag** | top-amplitude |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 12 | 204 | −2.0504 | −2.5080 | −2.5447 | **−3.6572** | −3.5725 | −3.9083 |
+| 12 | 614 | −3.0530 | −3.4637 | −3.3063 | **−4.2597** | −4.2600 | −4.5878 |
+| 14 | 819 | −2.7373 | −3.3334 | −3.1598 | −4.5449 | **−4.5519** | −4.5411 |
+
+Three findings, in increasing order of consequence.
+
+**1. The analytic diagonal outranks true amplitude** (`shell+diag` beats `shell+amp` in 2 of 3 cells:
+−3.4637 vs −3.3063, −3.3334 vs −3.1598). So the practical criterion is the *better* one, not a
+compromise. Coherent with the connectivity mechanism: amplitude picks individually-important states with
+no guarantee they couple, while a low diagonal in a chain means locally-alternating spins, which are
+Hamming-neighbours of each other -- so the diagonal is *implicitly* a connectivity criterion. The
+`nnz/row` diagnostic confirms it, higher for `+diag` than `+amp` in all three cells.
+
+**2. Widening has a genuine interior optimum at `w = 3-4`**, unlike the `p` sweep which had none.
+Measured across `w = 1..8`: n=12/dim=204 peaks at `w=3` (−3.6572, then −3.57, −3.51, plateauing ~−3.55);
+dim=614 at `w=3-4` (−4.2597/−4.2600, then −4.19, −4.14); n=14 at `w=4` (−4.5519, then −4.49 flat). Too
+narrow starves ranking, too wide dilutes the low-diagonal preference over a window so large that
+selection scatters. An interior maximum is the signature of a real trade-off.
+
+**3. It beats top-amplitude selection at n=14** -- `wind4+diag` gives **−4.5519** against **−4.5411** --
+and that is legitimate rather than a defect. Top-amplitude selection maximizes *fidelity* with the ground
+state; `λ_min` of the projection is a *variational* quantity that rewards **connectivity**. Different
+objectives, so neither dominates, and the amplitude arm should not have been called an "oracle" or a
+ceiling (corrected above). **Verified independently**: both subspaces are exactly `dim` states, distinct
+and lex-sorted, and `hproj`'s `λ_min` agrees with a from-scratch dense `Vᵀ H V` to **5.9e-08** for both
+arms -- far tighter than the 0.011 margin claimed.
+
+So the deployable recipe reaches **93.5% / 92.8% / 100.2%** of top-amplitude selection's energy using
+only the analytic diagonal: no ground state, no solve, no SCIP, `O(N·n)` bit arithmetic.
+
+**Characterizing the optimum: `w` is the wrong parameter, and `kmax` is anchored to `n`.** Swept 13 cells
+over n=12-20 and dim=204-10 000, varying `n` and `dim` **independently** (the first three cells had
+confounded them). `w*` ranges **1 to 8** -- so the earlier "3-4" was an artifact of three nearby cells --
+and it varies systematically: *decreasing* with `dim` at fixed `n` (n=12: 3→2→1; n=14: 4→3→2; n=16:
+7→4→3) and increasing with `n`. But the **absolute** top weight `kmax = k + w*` is stable at
+`kmax/n ≈ 0.5`, exactly 0.500 in all six n=12/14 cells. That is the ground state's mean Hamming weight
+(`n/2`, measured exactly earlier), confirming the physical reading: **the window needs to reach the
+weight shell where the ground state lives, and no further.** Two competing hypotheses die here -- the
+selection ratio `window/dim` is *not* constant (2.0 to 166.4), and a rule anchored to `k` rather than `n`
+(`kmax = k+2`) is badly wrong (up to **+18.31%** shortfall).
+
+Two closed-form rules, each optimal on a different half of the grid, shortfall against the swept optimum:
+
+| strategy | worst | median | mean | projected solves |
+| --- | --- | --- | --- | --- |
+| `kmax = ceil(n/2)` | 2.77% | 0.07% | 0.86% | 1 |
+| `kmax = ceil(n/2) + 1` | 5.21% | 0.17% | 0.89% | 1 |
+| `kmax = k + 2` | 18.31% | 4.94% | 6.37% | 1 |
+| **better of the two `n/2` rules** | **0.26%** | **0.00%** | **0.02%** | 2 |
+
+`ceil(n/2)` is exact at n=12/14 and n=20/dim=3000 but loses 1.5-2.8% at n=16/18 and large `dim`;
+`ceil(n/2)+1` is the mirror image, optimal at n=16/18 and losing 5.21% at n=12/dim=204. **Probing both
+and keeping the better costs one extra projected eigensolve and is essentially optimal** (0.26% worst
+case) -- that is the recommendation, and it works *because* the optimum is broad rather than sharp: the
+region within 1% of best spans `w` = 4..9 at n=16/dim=800 and 3..9 at n=16/dim=8000, so two well-chosen
+probes bracket the basin. A sharp optimum would have needed a real search. Note this also explains an
+earlier over-reading: at n=16/18 the raw argmin picks among values differing by ~0.003, so `w*` itself is
+poorly determined there while `kmax` is not.
+
+Use `kmax = max(k, ...)` in either rule -- the window must be large enough to hold `dim`, and at large
+`dim` the shell `k` where `dim` runs out has already passed `n/2`, which is precisely where the plain
+`n/2` rule's floor binds and it forfeits its 1.5-2.8%.
+
+**Checked across `Δ`: the anchor shifts by exactly one shell and then saturates.** Swept `kmax` over its
+full legal range at `Δ` = 0.5, 2.0, 4.0 on seven cells (n=12-16, dim=204-3 000), including `kmax` values
+*below* `ceil(n/2)` which no rule variant allowed. Two corrections come out of it.
+
+First, a **retraction**: the caveat previously here said the `Δ=2.0` ground state is z-polarized (citing
+`max|z| = 0.985` from the Bloch section), so the anchor should move. That conflated two different objects.
+The **product-state approximation** becomes z-polarized; the **true ground state** does not move at all --
+its mean Hamming weight is *exactly* `n/2` at every `Δ` measured (0.5, 1.0, 2.0, 4.0), pinned by the
+spin-flip symmetry (conjugating by `X` on all sites maps weight `w → n−w`, so any non-degenerate
+eigenstate's weight distribution is symmetric about `n/2`). What changes with `Δ` is the **spread**, not
+the mean: std falls 0.741 → 0.343 as `Δ` goes 0.5 → 4.0 at n=12, and the top-2 states' mass rises
+**0.052 → 0.715** as the state concentrates onto the two Néel configurations (which themselves sit at
+weight `n/2`).
+
+Second, the anchor does shift -- by one shell, discretely, then stops. Reading the **effective** optimum
+(smallest `kmax` within 0.1% of best) rather than the raw argmin, which is essential here because the
+curves are flat past the optimum and the argmin picks among ties (at `Δ=2.0`, n=12/dim=204 reads
+`7:−6.905 8:−6.905 9:−6.905 10:−6.905` and the raw argmin reported `kmax*=10`, i.e. `kmax/n = 0.833`):
+
+| `Δ` | effective `kmax` (n=12 / 14 / 16) | as a fraction of `n` | rule that is exact |
+| --- | --- | --- | --- |
+| 0.5 | 6 / 7 / 8 | 0.500 | `ceil(n/2)` |
+| 2.0 | 7 / 8 / 9 | 0.583 / 0.571 / 0.562 | `ceil(n/2) + 1` |
+| 4.0 | 7 / 8 / 9 | 0.583 / 0.571 / 0.562 | `ceil(n/2) + 1` |
+
+`n/2 + 1` in **all six cells at both** `Δ=2.0` and `Δ=4.0` -- so the shift saturates rather than tracking
+`Δ`. Consistent with the mechanism: at `Δ=0.5` the weight distribution is broad enough (std 0.74-1.08)
+that `n/2` already spans the mass, while at `Δ ≥ 2` the state concentrates onto the two weight-`n/2` Néel
+states and the window needs **one shell beyond** to include their single-flip neighbours -- the states
+that supply the off-diagonal coupling. Connectivity again, which is what the whole mechanism predicts.
+
+**The recommendation is unchanged and now validated over an 8x range in `Δ`.** Best-of-two-probes is
+**≤0.06% everywhere** across all three `Δ`. The individual rules swap which is exact -- `ceil(n/2)` is
+optimal at `Δ=0.5` and costs +0.54% to +1.64% at `Δ=2.0`; `ceil(n/2)+1` is optimal at `Δ≥2.0` and costs up
+to +5.21% at `Δ=0.5` -- which is precisely why probing both is the right answer rather than picking one.
+
+**Remaining caveats.** Subspace fractions span 0.6-40%; `Δ` covered at 0.5/2.0/4.0 with `J=1`,
+`Bx=By=0.5` fixed throughout, so the field's role is untested. n ≤ 20. `λ_min` for the larger cells came from sparse `eigsh` at `tol=1e-10`,
+validated against dense `eigvalsh` to **7.9e-08** at n=16/dim=3000 (11.24 s → 0.02 s), three orders below
+the inter-arm differences being compared.
+
+**Remaining caveats.** It is measured only at n=12/14, on `Δ=0.5`, with subspace
+fractions 5-40%. And it owes **nothing to SCIP or `product.py`**: it is a property of the sampling
+distribution's locality, so it applies to any subspace-selection scheme, and would compose with rather
+than replace amplitude-based selection.
+
 ---
 
 ## What lands in `spinchain`

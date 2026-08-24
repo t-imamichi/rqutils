@@ -144,3 +144,6 @@ uv.lock
 
 # Claude
 .superpowers/
+
+# git worktrees created by EnterWorktree / git worktree add
+.claude/worktrees/
