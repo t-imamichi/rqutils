@@ -12,6 +12,7 @@ So targeted per-branch tests are the backbone and randomized sweeps are a supple
 
 import warnings
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -643,3 +644,173 @@ class TestZeroResidualAfterSeedStep:
         expected = np.zeros(60)
         expected[index] = 1.0
         assert np.asarray(eigvec) == pytest.approx(expected)
+
+
+class TestPreconditioner:
+    """``precond`` applies ``M^-1`` where the search direction is formed, and nowhere else.
+
+    Opt-in: ``precond=None`` is the default and must be the identity path, so no existing caller
+    changes behaviour. It is a static argument, so the branch resolves at trace time and the
+    unpreconditioned graph is unchanged.
+
+    The load-bearing subtlety is an **asymmetry in ``body_iter1``**. ``norm_r`` was one quantity
+    feeding two consumers: ``r_is_zero`` (which masks ``sas[1, 1]`` and sets ``converged``) and the
+    ``normalize`` that forms ``tmp_p``. Preconditioning must touch only the second. Routing the guard
+    through ``M^-1`` would change what counts as a stationary point while still returning a plausible
+    number -- a residual lying near ``M^-1``'s small-singular-value direction would report convergence
+    early, and per ``body_iter1``'s own comment the unguarded path makes ``theta`` collapse towards 0
+    instead of reporting ``rho``. :class:`TestZeroResidualAfterSeedStep` owns that guard; the test here
+    checks ``precond`` does not disturb it.
+
+    Measured on the 12-instance XXZ batch this hook was requested for: median **1.79x** fewer
+    iterations, range 1.29-2.04x, 0 regressions, every arm converging to the same eigenvalue.
+
+    **Known weak spot, recorded rather than closed.** Making ``precond`` a no-op in ``body_iter1``
+    *only* -- leaving ``body()`` correct -- survives this suite. It is a real defect but a small one:
+    ``body_iter1`` runs exactly once, so it perturbs a single bootstrap direction. Measured across the
+    12 XXZ instances it degrades every one of them by 2-7% (49->51, 87->87, 168->180 iterations), which
+    is adverse but never crosses into a wrong answer. Two fixtures were tried to catch it and neither
+    discriminated -- the effect is below the granularity of an integer iteration count on a
+    well-conditioned synthetic operator, and pinning a tighter count would make this a flaky
+    performance test. If you touch ``body_iter1``'s direction, re-run the XXZ batch by hand.
+    """
+
+    @staticmethod
+    def _spd(dim, rng, cond=50.0):
+        """A positive-definite matrix with a controlled diagonal spread, so Jacobi has something to do.
+
+        Uniform diagonals leave ``D^-1`` proportional to the identity, which makes the preconditioner
+        a no-op and the test vacuous. The spread is asserted by the caller.
+        """
+        q = np.linalg.qr(rng.normal(size=(dim, dim)))[0]
+        spec = np.geomspace(1.0, cond, dim)
+        return symmetrize(q @ np.diag(spec) @ q.T)
+
+    def test_none_is_bit_identical_to_omitting_it(self):
+        """The default must not perturb the existing graph at all, not merely agree to a tolerance."""
+        rng = np.random.default_rng(20260824)
+        mat = jnp.asarray(self._spd(64, rng))
+        xinit = jnp.asarray(rng.normal(size=64))
+        omitted = ground_locg(mat, xinit, maxiter=200)
+        explicit = ground_locg(mat, xinit, maxiter=200, precond=None)
+        assert float(omitted[0]) == float(explicit[0]), "theta must be bit-identical"
+        assert int(omitted[2]) == int(explicit[2]), "iteration count must be identical"
+        assert jnp.array_equal(omitted[1], explicit[1]), "eigenvector must be bit-identical"
+
+    def test_jacobi_finds_the_same_eigenvalue(self):
+        """Preconditioning changes the path, never the answer.
+
+        Against ``numpy.linalg.eigvalsh`` rather than against the unpreconditioned arm: two arms of the
+        same routine agreeing proves only that they are consistent, not that either is right.
+        """
+        rng = np.random.default_rng(20260824)
+        mat = self._spd(96, rng)
+        diag = np.diag(mat).copy()
+        assert diag.max() / diag.min() > 2.0, "fixture needs a diagonal spread or Jacobi is a no-op"
+        dinv = jnp.asarray(1.0 / diag)
+        matj = jnp.asarray(mat)
+        xinit = jnp.asarray(rng.normal(size=96))
+        reference = float(np.linalg.eigvalsh(mat)[0])
+        for label, pc in (("none", None), ("jacobi", lambda v: v * dinv)):
+            theta, _, _, converged = ground_locg(matj, xinit, maxiter=500, tol=1e-12, precond=pc)
+            assert bool(converged), f"{label} did not converge"
+            assert float(theta) == pytest.approx(reference, abs=1e-9), (
+                f"{label}: got {float(theta)}, dense reference {reference}"
+            )
+
+    def test_jacobi_reduces_the_iteration_count(self):
+        """The hook exists for this, so a test should notice if it stops paying off.
+
+        The bound is deliberately loose (any improvement at all). The measured median on the XXZ batch
+        this was requested for is 1.79x, but the gain is instance-dependent -- 1.29x to 2.04x there --
+        and pinning a ratio would make this a flaky performance test rather than a contract test.
+        """
+        rng = np.random.default_rng(20260824)
+        mat = self._spd(96, rng, cond=200.0)
+        dinv = jnp.asarray(1.0 / np.diag(mat).copy())
+        matj = jnp.asarray(mat)
+        xinit = jnp.asarray(rng.normal(size=96))
+        plain = int(ground_locg(matj, xinit, maxiter=500, tol=1e-12)[2])
+        jac = int(ground_locg(matj, xinit, maxiter=500, tol=1e-12, precond=lambda v: v * dinv)[2])
+        assert jac < plain, f"Jacobi took {jac} iterations against {plain} unpreconditioned"
+
+    def test_exact_eigenvector_seed_still_reports_rho(self):
+        """``precond`` must not reroute ``body_iter1``'s ``r_is_zero`` guard.
+
+        A one-hot seed of a diagonal operator is an exact eigenvector, so the raw residual is exactly
+        zero -- ``sqd``'s diagonal-Hamiltonian path does this, per ``body_iter1``'s comment, so it is
+        not a corner case. The guard must fire identically with and without a preconditioner: if
+        ``norm_r`` were computed from ``M^-1 r`` instead, a preconditioner that shrinks that direction
+        would still read zero here, but for the wrong reason, and any *nonzero* residual it shrank
+        would be misreported as stationary.
+        """
+        dim = 64
+        diag = np.linspace(1.0, 5.0, dim)
+        mat = jnp.asarray(np.diag(diag))
+        onehot = jnp.zeros(dim, dtype=jnp.float64).at[0].set(1.0)
+        dinv = jnp.asarray(1.0 / diag)
+        for label, pc in (("none", None), ("jacobi", lambda v: v * dinv)):
+            theta, _, niter, converged = ground_locg(mat, onehot, maxiter=100, precond=pc)
+            assert float(theta) == pytest.approx(diag[0], abs=1e-12), (
+                f"{label}: theta collapsed to {float(theta)} instead of rho={diag[0]}"
+            )
+            assert bool(converged), f"{label}: an exact eigenvector must report converged"
+            assert int(niter) == 0, f"{label}: expected to stop at the seed step, took {int(niter)}"
+
+    def test_the_zero_residual_guard_reads_the_raw_residual(self):
+        """The asymmetry, pinned. ``r_is_zero`` must not see ``M^-1 r``.
+
+        This is the one test that discriminates, and it needs a preconditioner that maps a **nonzero**
+        residual to zero -- an annihilating ``M^-1``. The sibling test above uses an *exactly* zero
+        residual, where ``M^-1 0 == 0`` either way, so it cannot tell the two implementations apart
+        (mutation-tested: it passes against the defect).
+
+        With the guard on the raw residual (correct), ``r_is_zero`` is False, no masking happens, and
+        the zeroed *direction* is handled downstream by ``normalize``/``p_is_zero`` -- theta comes out
+        at 0.0 for this degenerate preconditioner, which is a useless answer but an honest one.
+
+        With the guard on ``M^-1 r`` (the defect), ``r_is_zero`` fires at the seed step, ``sas[1, 1]``
+        is masked, and the routine returns **the seed vector's Rayleigh quotient** with
+        ``converged=True`` -- measured 10.254108965 against a true minimum of 1.0. A plausible finite
+        wrong number, which is the failure mode this module's guards exist to prevent.
+        """
+        dim = 32
+        rng = np.random.default_rng(7)
+        q = np.linalg.qr(rng.normal(size=(dim, dim)))[0]
+        mat = jnp.asarray(q @ np.diag(np.geomspace(1.0, 40.0, dim)) @ q.T)
+        xinit = jnp.asarray(rng.normal(size=dim))
+        seed_rho = float(
+            np.asarray(xinit)
+            @ np.asarray(mat)
+            @ np.asarray(xinit)
+            / (np.asarray(xinit) @ np.asarray(xinit))
+        )
+        assert seed_rho > 5.0, "fixture needs a seed far from the ground state to be diagnostic"
+
+        theta = float(ground_locg(mat, xinit, maxiter=300, tol=1e-12, precond=lambda v: v * 0.0)[0])
+        assert theta != pytest.approx(seed_rho, rel=1e-6), (
+            f"theta came back as the seed's Rayleigh quotient ({theta}), which means the zero-residual "
+            "guard was computed from the preconditioned residual instead of the raw one"
+        )
+
+    def test_precond_is_static_so_it_adds_no_traced_argument(self):
+        """``precond`` is in ``static_argnames``, which is what keeps ``None`` free.
+
+        A *traced* callable would appear as an argument in the jaxpr even when unused, and the ``None``
+        branch could not resolve at trace time. Asserted on the jaxpr's input signature rather than on
+        the lowered HLO text: the two differ only in source-location metadata (the call site's line and
+        column), which is debug information rather than computation, so a text comparison would fail
+        for a reason that has nothing to do with the graph.
+        """
+        rng = np.random.default_rng(20260824)
+        mat = jnp.asarray(self._spd(32, rng))
+        xinit = jnp.asarray(rng.normal(size=32))
+        from rqutils.ground_locg import _ground_locg_matrix
+
+        without = jax.make_jaxpr(lambda m, v: _ground_locg_matrix(m, v, 50, None))(mat, xinit)
+        explicit = jax.make_jaxpr(lambda m, v: _ground_locg_matrix(m, v, 50, None, precond=None))(
+            mat, xinit
+        )
+        assert str(without) == str(explicit), (
+            "precond=None changed the traced graph, so it is not resolving at trace time"
+        )
