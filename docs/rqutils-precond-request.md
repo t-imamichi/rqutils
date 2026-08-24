@@ -27,10 +27,14 @@
 > right value but never reports convergence. **Jacobi is the only viable one of the four** — see
 > "Alternatives to Jacobi".
 >
-> **One API change recommended:** `sqd`'s convenience should be a **`bool`, not `precond="jacobi"`**.
-> With one viable preconditioner the str is a one-element enum — a bool with validation overhead and
-> typo surface. `ground_locg`'s `precond` stays a `None | callable`, which is the real extension point.
-> See "A convenience default".
+> **Status: the `ground_locg` hook is implemented and shipped. The `sqd` convenience is rejected.**
+> The hook lands as `precond=None | callable` and measures **1.79x** median in the real module. The
+> `sqd(jacobi_precond=...)` convenience was implemented on a branch and **discarded: it makes `sqd`
+> about 3x slower.** Jacobi needs a positive-definite operator; `sqd` solves the *unshifted* `H`, which
+> is indefinite (~50% of diagonal entries ≤ 0, λ_min ≈ −2.4). Every figure in this document was measured
+> on the shifted `A = H − (λ_min − 0.5)I`, which `sqd` never builds. A caller that knows its own
+> spectral range can shift and pass `precond` itself; `sqd` cannot do it on the caller's behalf. See
+> "❌ A convenience default on `sqd`".
 
 One request against `rqutils` on branch `dev` (installed rev `3da1b46`), written from the `spinchain`
 side. It is the follow-up to `docs/rqutils-requests.md`, whose C1/C2/C3 shipped and are adopted; this
@@ -535,6 +539,54 @@ Notes on shape, in the terms this module already cares about:
 - **`p_is_zero` still means what it meant.** A zeroed preconditioned direction still indicates that
   `{x, y}` spans the residual, so the existing convergence shortcut at `:552-554` remains correct.
 
+### ❌ A convenience default on `sqd` — implemented, measured, and **rejected**
+
+**Do not build this.** It was implemented on a branch, measured, and discarded. The flag works
+correctly and makes `sqd` roughly **3x slower**.
+
+**Why.** Jacobi preconditioning requires a positive-definite operator, and `sqd` does not shift: it
+solves the raw projected `H`, which is **indefinite**. Measured on XXZ subspaces:
+
+| n | dim | diagonal range | entries ≤ 0 | λ_min |
+| --- | --- | --- | --- | --- |
+| 12 | 800 | [−1.1250, +1.1250] | **398/800 (50%)** | −2.379 |
+| 14 | 1 500 | [−1.3750, +1.3750] | **745/1500 (50%)** | −2.252 |
+
+Half the diagonal entries must be masked to 1.0 to avoid dividing by zero or by a negative, so `M⁻¹`
+degenerates into an arbitrary half-scaling that *destroys* conditioning rather than improving it.
+Measured through `ground_locg` on the unshifted operator: **0.28–0.36x, i.e. 3x worse, 8 of 8
+instances**.
+
+**This does not invalidate the 1.79x figure**, and the distinction is the whole point. Every gain in
+this document was measured on `A = H − (λ_min − 0.5)I` — the shift the reproduction snippet performs
+explicitly, and which the κ table's own caption names. `sqd` never constructs that operator. The hook
+in `ground_locg` is fine; the *convenience* is what fails, because `sqd` has nothing to build a usable
+`M⁻¹` from.
+
+**Why an internal shift does not rescue it.** A tight shift needs a lower bound on λ_min, which is the
+answer being computed. A bound from data `sqd` already has — the diagonal alone — was tried
+(`σ = min(diag) − 2·max|diag|`): it restores correctness and positive-definiteness, and yields
+**1.04–1.24x**. A crude bound over-shifts and flattens the spectrum, so most of the benefit is lost.
+Gershgorin would give a tighter bound but needs row sums, which a matrix-free operator cannot supply
+without `J` extra matvecs.
+
+**So the caller keeps the responsibility, which is the right place for it.** A caller that knows its
+own spectral range — `spinchain` does; it is what makes `hproj` + `eigvalsh` a viable reference at
+these sizes — can shift, build `diag(A)⁻¹`, and pass it through `ground_locg`'s `precond`. That path is
+measured at 1.79x. `sqd` cannot do it on the caller's behalf.
+
+Recorded rather than deleted because the implementation was straightforward and the trap is not
+obvious: the flag produces **correct energies at every `cache_level`** (verified against a dense
+reference to 5.8e-15, including the degenerate no-diagonal-terms case), so nothing about its output
+signals that it is a pessimization.
+
+<details>
+<summary>The original proposal, kept for the record (click to expand)</summary>
+
+The section below argued for spelling the convenience as a `bool` rather than `precond="jacobi"`. That
+reasoning still holds *if* such a flag were ever viable — and the shape argument is worth keeping,
+because it applies to any future single-option flag on this module.
+
 ### A convenience default, optionally — and it should be a `bool`, not a `str`
 
 Since a Jacobi preconditioner needs only the operator's diagonal, and `sqd`'s `cache_level[1] == 2`
@@ -584,14 +636,18 @@ rather than only at `(*, 2)`. That removes the one argument for a `str` that wou
 
 That is a second, separable step. The hook alone is enough for a caller to pass its own.
 
+</details>
+
 ---
 
 ## What lands in `spinchain`
 
 Nothing to delete, which is worth saying plainly — this is a performance ask, not a simplification
-one. `sqd_backend.ground_state` would pass a Jacobi preconditioner (or set `sqd`'s bool flag), and
-the expected effect is on the tail rather than the mean: the 10.087 s outlier at dim=128 000 is the
-number to watch, not the 0.911 s best case.
+one. `sqd_backend.ground_state` would build its own shifted Jacobi preconditioner and pass it through
+`ground_locg`'s `precond` -- **not** via an `sqd` flag, which was measured to be a 3x pessimization
+because `sqd` does not shift (see the rejected-convenience section). `spinchain` already computes the
+spectral information a correct shift needs. The expected effect is on the tail rather than the mean, and
+the 10.087 s outlier at dim=128 000 is the number to watch, not the 0.911 s best case.
 
 Combined with `cache_level=(1, 2)`, which `spinchain` now passes explicitly and measured at 1.46x
 end-to-end, the solve phase would stop being the thing that dominates the local runs.
