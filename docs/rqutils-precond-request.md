@@ -638,6 +638,60 @@ That is a second, separable step. The hook alone is enough for a caller to pass 
 
 </details>
 
+### ❌ Two XXZ-specific candidates for the *unshifted* operator — both measured and rejected
+
+Follow-ups to the section above, asked as: *given 1D open-boundary XXZ **with a transverse field**
+(so `Sz` is not conserved and sector decomposition is unavailable), is there a preconditioner that
+helps the operator `sqd` actually builds?* Both cheap candidates are now closed. Measured through the
+real `ground_locg` hook, `precond=None` against the candidate, same `x0`, `maxiter=4000`, `tol=1e-10`,
+on the same 12-instance batch as the 1.79x figure (`(n,dim) = (16,2000), (18,4000)`, seeds 0-5).
+
+**Candidate A — `M⁻¹ = |diag(H)|⁻¹`, no shift.** The appeal was that taking the absolute value gives a
+positive-definite `M⁻¹` with no shift at all, sidestepping the reason the `sqd` flag failed. **Measured
+0.30x median (0.16-0.88x), 12/12 regressions**, every energy verified against `eigvalsh` to 1e-6 and
+every arm converged.
+
+| n | seeds 0-5, `none` -> abs-diagonal |
+| --- | --- |
+| 16 | 44->183, 28->87, 29->100, 45->132, 54->193, 122->138 |
+| 18 | 35->102, 19->91, 34->99, 37->233, 24->75, 46->226 |
+
+This is *worse* than the masked Jacobi it was meant to improve on (0.28-0.36x), and the mechanism is
+the point: `|diag|⁻¹` amplifies the components with the **smallest** `|diag|`, which for an indefinite
+operator sit in the middle of the spectrum rather than near `λ_min`. It boosts exactly the directions
+the eigensolver should be suppressing. Positive-definiteness of `M⁻¹` was never the binding
+constraint -- correlation with `A⁻¹` was, and `|·|` destroys it. Note again that all 12 returned the
+**correct energy**: same trap as the rejected flag, a silent pessimization with nothing in the output
+to signal it.
+
+**Candidate B — a shift from the analytic diagonal plus a structural row-sum bound.** `σ = min(diag) −
+B` with `B = (n−1)·(J/4)·2 + n·(Bx+By)/2` from XXZ's structure rather than the assembled matrix.
+**Rejected without an iteration measurement**, because the bound is disqualifying on its own:
+
+| n | dim | `min(diag)` | structural `B` | true max off-diag row sum | over-shift |
+| --- | --- | --- | --- | --- | --- |
+| 10 | 300 | −0.8750 | 9.5000 | 4.6213 | **16.05x** |
+| 12 | 800 | −1.1250 | 11.5000 | 3.7678 | **20.49x** |
+
+Worse than the coefficient-sum bound already rejected at 4.14-8.14x, and degrading faster with `n`.
+The cause is that a *sampled* subspace projects most couplings away: the structural bound assumes
+every state couples through all `n−1` bonds and all `n` field terms, where the true max row sum is
+~3x smaller. Even the unattainable bound computed from the assembled matrix (`sigma_true`, which a
+matrix-free operator cannot have) still over-shifts **5.03-6.29x**. So the whole row-sum family is
+structurally incapable of a tight shift on a sampled subspace, however the bound is obtained.
+
+**Confirmed in passing:** the analytic diagonal `diag = Δ/4 · Σᵢ sᵢsᵢ₊₁` with `s = 1 − 2·bit` matches
+the true projected diagonal to **0.000e+00** with the field on, at n=10 and n=12 -- the transverse
+field is purely off-diagonal and contributes nothing. That holds and is `O(N·n)` matvec-free; it is
+the *shift*, not the diagonal, that has no viable estimator here.
+
+**What remains untried** is the third candidate: a two-level / deflation preconditioner exploiting the
+near-block structure of a sampled 1D chain (measured 0.12-0.58% nonzero at n=12-14). It is
+substantially more work than either of the above and remains speculative. Any candidate should still be
+judged on whether it **opens the relative gap**, not on `κ` -- across these same 12 instances `κ`
+varies 1.21x while the relative gap varies 103x, and log-iterations correlates +0.77 with `log(1/gap)`
+against −0.34 (wrong sign) for `κ`.
+
 ---
 
 ## What lands in `spinchain`
