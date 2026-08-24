@@ -448,10 +448,19 @@ def xxz(n, J=1.0, delta=0.5, Bx=0.5, By=0.5):
     return SparsePauliOp.from_sparse_list(lst, n).simplify(atol=0, rtol=0)
 
 def subspace(n, dim, seed):
-    """hproj wants a sorted, duplicate-free basis; bit i of a code is qubit i."""
+    """hproj wants a sorted, duplicate-free basis, with bit q of a code on qubit q.
+
+    Note the `[::-1]`: `hproj`'s `states` columns are indexed by Pauli-string CHARACTER
+    position, not by qubit number, so bit q belongs in column n-1-q. `xxz` above builds its
+    operator with `SparsePauliOp.from_sparse_list`, which is indexed by qubit -- so pairing
+    it with a `bit q -> column q` table silently projects onto the bit-reversed subspace.
+    Measured: `Z` on qubit 0 over codes {0, 1} gives diag [1, 1] with the naive pairing
+    (no dependence on qubit 0 at all) against the correct [1, -1]. See docs/gotchas.md
+    item 2; the earlier version of this helper had the bug.
+    """
     rng = np.random.default_rng(seed)
     codes = rng.choice(2**n, size=dim, replace=False)
-    m = np.array([[(int(c) >> q) & 1 for q in range(n)] for c in codes], dtype=bool)
+    m = np.array([[(int(c) >> q) & 1 for q in range(n)][::-1] for c in codes], dtype=bool)
     return m[np.lexsort(m.T[::-1])]
 
 def iters_to_tol(A, X, M, target, shift, cap=400):

@@ -321,6 +321,59 @@ class TestHproj:
         with pytest.raises(ValueError, match="exceeds the .* limit imposed by int32"):
             hproj((["ZI"], [1.0]), states, unique_states=True)
 
+    def test_states_columns_are_character_indexed_not_qubit_indexed(self):
+        """A ``states`` column is a Pauli-string *character* position, not a qubit number.
+
+        The convention crossing this pins: ``SparsePauliOp.from_sparse_list`` is indexed by **qubit**
+        (``("Z", [q], 1.0)`` puts Z on qubit ``q``), while ``states[:, j]`` is character ``j`` of the
+        Pauli string. Since character ``j`` is qubit ``n-1-j``, a caller pairing the two must reverse:
+        bit ``q`` of a basis code belongs in column ``n-1-q``.
+
+        Getting it backwards is silent. The projection stays symmetric and the eigenvalue stays a
+        genuine variational bound -- of the bit-reversed subspace -- so it reads as a poor sample
+        rather than a bug. Measured with the naive ``bit q -> column q`` pairing, ``Z`` on qubit 0 over
+        codes ``{0, 1}`` gives ``diag == [1, 1]``: no dependence on qubit 0 whatsoever, against the
+        correct ``[1, -1]``. That exact defect shipped in the ``subspace`` helper in
+        ``docs/rqutils-precond-request.md`` and propagated to a POC that copied it.
+
+        Uncovered until now because every other qiskit test here builds operators from *strings*
+        (``SparsePauliOp(["ZI"], ...)``), where character order is what the caller already wrote. Only
+        the index-based constructor exposes the flip.
+        """
+        qiskit = pytest.importorskip("qiskit")
+        num_qubits = 4
+
+        for qubit in range(num_qubits):
+            op = qiskit.quantum_info.SparsePauliOp.from_sparse_list(
+                [("Z", [qubit], 1.0)], num_qubits
+            )
+            # Two codes differing only in bit `qubit`, packed with the correct reversal.
+            codes = [0, 1 << qubit]
+            states = np.array(
+                [[(code >> k) & 1 for k in range(num_qubits)][::-1] for code in codes],
+                dtype=np.uint8,
+            )
+            states = states[np.lexsort(states.T[::-1])]
+            diagonal = np.real(np.diag(hproj(op, states).toarray()))
+            # <s|Z_q|s> is +1 when bit q is 0 and -1 when it is 1, so the pair must straddle zero.
+            assert sorted(diagonal) == pytest.approx([-1.0, 1.0]), (
+                f"Z on qubit {qubit} gave diag {diagonal}; a column/qubit mismatch would give "
+                "[1, 1] or [-1, -1], i.e. no dependence on that qubit"
+            )
+
+        # And the naive pairing really is wrong, so the reversal above is load-bearing rather than
+        # cosmetic. Asserted rather than assumed: without this, the test above would pass for a
+        # convention-free implementation too.
+        op = qiskit.quantum_info.SparsePauliOp.from_sparse_list([("Z", [0], 1.0)], num_qubits)
+        naive = np.array(
+            [[(code >> k) & 1 for k in range(num_qubits)] for code in [0, 1]], dtype=np.uint8
+        )
+        naive = naive[np.lexsort(naive.T[::-1])]
+        naive_diagonal = np.real(np.diag(hproj(op, naive).toarray()))
+        assert sorted(naive_diagonal) == pytest.approx([1.0, 1.0]), (
+            f"expected the naive pairing to be insensitive to qubit 0, got {naive_diagonal}"
+        )
+
     def test_unsorted_input_with_unique_states_raises(self):
         """``unique_states=True`` rejects unsorted states instead of projecting them wrongly.
 
