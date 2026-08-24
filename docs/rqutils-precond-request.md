@@ -26,6 +26,11 @@
 > shift-invert needs a dense inverse (262 GB at N=128k) and λ_min itself; a Chebyshev filter finds the
 > right value but never reports convergence. **Jacobi is the only viable one of the four** — see
 > "Alternatives to Jacobi".
+>
+> **One API change recommended:** `sqd`'s convenience should be a **`bool`, not `precond="jacobi"`**.
+> With one viable preconditioner the str is a one-element enum — a bool with validation overhead and
+> typo surface. `ground_locg`'s `precond` stays a `None | callable`, which is the real extension point.
+> See "A convenience default".
 
 One request against `rqutils` on branch `dev` (installed rev `3da1b46`), written from the `spinchain`
 side. It is the follow-up to `docs/rqutils-requests.md`, whose C1/C2/C3 shipped and are adopted; this
@@ -530,15 +535,52 @@ Notes on shape, in the terms this module already cares about:
 - **`p_is_zero` still means what it meant.** A zeroed preconditioned direction still indicates that
   `{x, y}` spans the residual, so the existing convergence shortcut at `:552-554` remains correct.
 
-### A convenience default, optionally
+### A convenience default, optionally — and it should be a `bool`, not a `str`
 
 Since a Jacobi preconditioner needs only the operator's diagonal, and `sqd`'s `cache_level[1] == 2`
-path **already computes every X group's diagonal**, `sqd()` could offer `precond="jacobi"` and build
-it internally at no extra matvec cost. Note the correct vector is the diagonal of the *projected*
-operator, which is the group with a zero X signature — group 0 — and not the sum over all groups:
-the other groups' arrays are off-diagonal amplitudes, legitimately complex for Paulis with an odd Y
-count. `run_sqd`'s own `vinit_from_min_diag` already reads exactly that array and takes `.real` of it,
+path **already computes every X group's diagonal**, `sqd()` could build it internally at no extra
+matvec cost. Note the correct vector is the diagonal of the *projected* operator, which is the group
+with a zero X signature — group 0 — and not the sum over all groups: the other groups' arrays are
+off-diagonal amplitudes, legitimately complex for Paulis with an odd Y count (verified: the sum is
+wrong by **1.50** and complex, where group 0 matches the true projected diagonal to **0.0** and is
+real). `run_sqd`'s own `vinit_from_min_diag` already reads exactly that array and takes `.real` of it,
 so the quantity is on hand and its realness is established.
+
+**On the spelling: this section originally proposed `sqd(precond="jacobi")`. A `bool` is the better
+choice**, and the two arguments should not be conflated:
+
+| argument | type | why |
+| --- | --- | --- |
+| `ground_locg(precond=...)` | `None \| callable` | the extension point — an arbitrary `M⁻¹` |
+| `sqd(precond=...)` | **`bool`** | a toggle for the one preconditioner `sqd` can build itself |
+
+A `str` is the right shape when it selects among several alternatives — this library uses it exactly
+that way for `qprint`'s `fmt` (3 content classes) and `output` (3 renderings). `precond="jacobi"` is a
+**one-element enum**: it admits one accepted value, so it is a `bool` wearing a string's clothes, and
+it costs the caller a magic literal plus `sqd` a validation branch and an error message for every typo
+(`"Jacobi"`, `"jacobi "`, `"diag"`). A `bool` is unmistypeable and needs no validation.
+
+The usual argument for reserving a `str` — namespace for future options — is weak here specifically,
+because the **alternatives were measured and none is available**: SSOR needs sequential triangular
+solves, shift-invert needs a dense inverse and λ_min itself, and a spectral filter belongs in the
+driver rather than in `precond` (see the previous section). The viable set is empty, not merely
+unexplored. And if that ever changes, `ground_locg`'s callable is already the escape hatch — a caller
+passes its own `M⁻¹` without `sqd` needing a vocabulary at all.
+
+So: `sqd(..., precond: bool = False)`, or `jacobi_precond: bool = False` if the name should say which
+one it is. The latter reads better at the call site and makes a future second option an additive change
+rather than a redefinition.
+
+**Cost at each cache level**, measured warm (compile excluded), n=14, dim=3000, 28 X groups:
+
+| where | cost of obtaining the diagonal |
+| --- | --- |
+| `cache_level[1] == 2` | **free** — slice `diagonals[0]`, already computed |
+| any other level | one extra `get_diagonal`, **0.061 ms** (26% of a full 28-group precompute, since a single call does not amortize the scan's per-call overhead) |
+
+Either way it is **one-time setup**, not per-iteration, so a bool flag is honest at every cache level
+rather than only at `(*, 2)`. That removes the one argument for a `str` that would have had teeth — a
+`"jacobi"` value that silently meant "only if you also asked for `cache_level[1] == 2`".
 
 That is a second, separable step. The hook alone is enough for a caller to pass its own.
 
@@ -547,7 +589,7 @@ That is a second, separable step. The hook alone is enough for a caller to pass 
 ## What lands in `spinchain`
 
 Nothing to delete, which is worth saying plainly — this is a performance ask, not a simplification
-one. `sqd_backend.ground_state` would pass a Jacobi preconditioner (or `sqd(precond="jacobi")`), and
+one. `sqd_backend.ground_state` would pass a Jacobi preconditioner (or set `sqd`'s bool flag), and
 the expected effect is on the tail rather than the mean: the 10.087 s outlier at dim=128 000 is the
 number to watch, not the 0.911 s best case.
 
