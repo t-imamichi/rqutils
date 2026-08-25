@@ -220,6 +220,79 @@ class TestDocumentedLimits:
             assert np.allclose(sparse_matrix.toarray(), dense_matrix), f"lambda_{index}"
 
 
+class TestSparseCacheImmutability:
+    """The cached ``sparse=True`` bases must not be mutable by the caller.
+
+    ``pauli_matrices`` memoizes in a module-level dict and returns the cached object directly. The
+    dense path is protected -- ``matrices.setflags(write=False)`` makes an in-place write raise -- but
+    the sparse path was not, and the source comment conceded that ``setflags`` on an object array of
+    ``csr_array`` s "would not protect its elements".
+
+    So every caller received *the same* CSR objects, and an in-place ``/=`` for a different
+    normalization convention corrupted the cache for the **process lifetime**. Measured before the
+    fix: ``pauli_matrices(3, sparse=True)[1] /= 2`` changed the cached basis by 0.5 max abs, and the
+    result stayed Hermitian -- so every later :func:`components` call returned plausible,
+    consistently wrong coefficients. Normalization is the invariant ``CLAUDE.md`` calls "the most
+    bug-prone" in this module.
+
+    Fixed by making the CSR buffers read-only rather than copying on return: a copy per call would
+    pay for every read to protect against a rare write, where ``setflags`` on ``.data``/``.indices``/
+    ``.indptr`` blocks the mutation at its source and costs nothing.
+    """
+
+    @pytest.mark.parametrize("dim", [2, 3, 4])
+    def test_in_place_division_raises(self, dim):
+        """The exact corruption: renormalizing a cached basis in place."""
+        matrices = pg.pauli_matrices(dim, sparse=True)
+        with pytest.raises(ValueError, match="read-only"):
+            matrices[1] /= 2.0
+
+    def test_in_place_multiplication_raises(self):
+        matrices = pg.pauli_matrices(3, sparse=True)
+        with pytest.raises(ValueError, match="read-only"):
+            matrices[1] *= 2.0
+
+    def test_writing_the_data_buffer_raises(self):
+        """The lower-level route: reaching past the operator into ``.data``."""
+        matrices = pg.pauli_matrices(3, sparse=True)
+        with pytest.raises(ValueError, match="read-only"):
+            matrices[1].data[0] = 9.0
+
+    def test_the_cache_survives_an_attempted_mutation(self):
+        """The property that actually matters: a failed write must leave the cache intact."""
+        before = pg.pauli_matrices(3, sparse=True)[1].toarray().copy()
+        with pytest.raises(ValueError):
+            pg.pauli_matrices(3, sparse=True)[1] /= 2.0
+        after = pg.pauli_matrices(3, sparse=True)[1].toarray()
+        assert np.allclose(before, after)
+
+    @pytest.mark.parametrize("dim", [2, 3, 4, 5])
+    def test_reads_still_work(self, dim):
+        """The guard must not break the operations the basis exists for."""
+        matrices = pg.pauli_matrices(dim, sparse=True)
+        vec = np.ones(dim)
+        for mat in matrices:
+            assert mat.toarray().shape == (dim, dim)
+            assert (mat @ vec).shape == (dim,)
+        # A caller who *wants* to rescale can still copy first.
+        scaled = matrices[1].copy()
+        scaled /= 2.0
+        assert np.allclose(scaled.toarray() * 2.0, matrices[1].toarray())
+
+    @pytest.mark.parametrize("dim", [2, 3, 4, 5, 6])
+    def test_sparse_still_agrees_with_dense(self, dim):
+        """Guarding the buffers must not change any value."""
+        sparse = pg.pauli_matrices(dim, sparse=True)
+        dense = np.asarray(pg.pauli_matrices(dim, sparse=False))
+        for isparse, idense in zip(sparse, dense, strict=True):
+            assert np.abs(isparse.toarray() - idense).max() == 0.0
+
+    def test_the_dense_path_was_already_protected(self):
+        """Pinned for contrast -- the asymmetry is what made the sparse gap easy to miss."""
+        with pytest.raises(ValueError, match="read-only|assignment destination"):
+            pg.pauli_matrices(3, sparse=False)[1] /= 2.0
+
+
 class TestShapesAndMemoization:
     """Shape conventions, which CLAUDE.md warns are transposed between the two directions."""
 

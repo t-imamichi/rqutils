@@ -235,9 +235,26 @@ def pauli_matrices(dim: int, sparse: bool = False) -> NDArray[np.complex128 | np
         # because each branch stayed internally consistent. Verified identical (max abs diff 0.0 and
         # equal nnz) for dim 2 through 6 before the swap.
         matrices = np.array([csr_array(mat) for mat in matrices])
+        # Freeze each operator's buffers, not the object array holding them. This function memoizes
+        # and returns the cached object directly, so without this every caller shares one set of CSR
+        # instances and an in-place rescale corrupts the basis for the process lifetime: measured
+        # `pauli_matrices(3, sparse=True)[1] /= 2` shifting the cached values by 0.5 max abs, with the
+        # result still Hermitian, so every later `components()` call returned plausible and
+        # consistently wrong coefficients. Normalization is the invariant CLAUDE.md calls the most
+        # bug-prone in this module, which is exactly the thing an in-place `/=` is reaching for.
+        #
+        # Read-only buffers rather than a copy on return: a copy would charge every read to guard
+        # against a rare write. `setflags` on the three buffers blocks `/=`, `*=`, `data[i] = ...` and
+        # `mat[i, j] = ...` at their source, and leaves `toarray`, `@` and every other read untouched.
+        # A caller who genuinely wants to rescale calls `.copy()` first, as the dense path already
+        # requires.
+        for mat in matrices:
+            mat.data.setflags(write=False)
+            mat.indices.setflags(write=False)
+            mat.indptr.setflags(write=False)
     else:
         # Make the matrix immutable. Only the dense array can carry the flag; the object array of
-        # csr_arrays is not written to either, but setflags on it would not protect its elements.
+        # csr_arrays needs its elements frozen individually, which the sparse branch above does.
         matrices.setflags(write=False)
 
     _pauli_matrices[(dim, sparse)] = matrices
