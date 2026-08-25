@@ -246,7 +246,9 @@ def _check_array_role(name: str, array: Any) -> None:
         ValueError: If the dtype kind does not match the role.
     """
     expected, described = _ARRAY_ROLE_KINDS[name]
-    dtype = np.asarray(array).dtype
+    # `.dtype` directly, not `np.asarray(array).dtype`: both numpy and jax arrays expose it, and the
+    # asarray round-trip measured 13x slower (1.08 us against 0.083 us) for the same information.
+    dtype = array.dtype
     if dtype.kind not in expected:
         raise ValueError(
             f"apply_h: {name}= expects {described}, but got dtype {dtype}. Check the keyword names "
@@ -307,7 +309,31 @@ def _check_cache_level(cache_level: Any) -> None:
         )
 
 
-def _check_states_shape(states: StateList, num_qubits: int) -> None:
+def _check_zsignatures_rank(zsignatures: Any) -> None:
+    """Raise unless ``zsignatures`` is one X group's 2-D ``(num_zterms, num_bytes)`` array.
+
+    Shared by :func:`get_diag_signs` and :func:`get_diagonal`, which are both public, both consume the
+    same array, and both index its leading axis -- so handed a 1-D array they read *scalars* and
+    silently return a wrongly shaped result rather than raising. Measured on ``get_diagonal``:
+    ``(4,)`` of ``[2., 2., 2., 2.]``, a plausible finite diagonal. Rank is static under ``jax.jit``,
+    so unlike ``get_xsource``'s lex-sortedness precondition this one is checkable here.
+
+    Args:
+        zsignatures: The caller's Z-signature array.
+
+    Raises:
+        ValueError: If it is not 2-D.
+    """
+    if np.ndim(zsignatures) != 2:
+        raise ValueError(
+            "`zsignatures` must be 2-D with shape (num_zterms, num_bytes) -- one X group's Z "
+            f"signatures -- but has rank {np.ndim(zsignatures)}. A 1-D array would be scanned as "
+            "scalars and silently return the wrong shape. Pass `hamiltonian.z[igroup]`, not "
+            "`hamiltonian.z[igroup][iterm]`."
+        )
+
+
+def _check_states_shape(states: Any, num_qubits: int) -> StateList:
     """Raise unless ``states`` is ``(subspace_dim, num_qubits)``.
 
     One ``O(1)`` look at a shape, shared by :func:`sqd` and :func:`hproj` so the two cannot drift.
@@ -326,13 +352,24 @@ def _check_states_shape(states: StateList, num_qubits: int) -> None:
     byte wide, so a 1-qubit Hamiltonian would accept it -- the shape genuinely matches. What catches
     that is :meth:`PauliSumXZ.pack_states`' binary check, since packed bytes exceed 1.
 
+    Coerces with :func:`numpy.asarray` and returns the result, rather than only inspecting: both
+    entry points document ``states`` as passable "as an array of integers or booleans", and
+    :func:`hproj` accepted a list of lists. Reading ``.ndim`` off the raw argument would narrow that
+    to arrays only, and would do so with an ``AttributeError`` rather than this function's documented
+    ``ValueError``. Coercing here also makes the two entry points agree, where ``sqd`` previously
+    required an array and ``hproj`` did not.
+
     Args:
-        states: The caller's state array.
+        states: The caller's states, as anything :func:`numpy.asarray` accepts.
         num_qubits: The Hamiltonian's qubit count.
+
+    Returns:
+        ``states`` as an array, for the caller to use in place of its argument.
 
     Raises:
         ValueError: If ``states`` is not 2-D, or its second axis is not ``num_qubits``.
     """
+    states = np.asarray(states)
     if states.ndim != 2:
         raise ValueError(
             f"`states` must be 2-D with shape (subspace_dim, num_qubits), got shape {states.shape}"
@@ -345,6 +382,7 @@ def _check_states_shape(states: StateList, num_qubits: int) -> None:
             "(or from `uniquify_states`) cannot be fed back in -- it would re-pack into a different "
             "subspace. Also check for a transposed array or a mismatched Hamiltonian."
         )
+    return states
 
 
 def sqd(
@@ -457,7 +495,7 @@ def sqd(
         )
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
-    _check_states_shape(states, hamiltonian.num_qubits)
+    states = _check_states_shape(states, hamiltonian.num_qubits)
 
     if not (mesh := get_abstract_mesh()).empty and (resid := states_size % mesh.size) != 0:
         LOG.debug("Adjusting states_size to make the array divisible by %d", mesh.size)
@@ -549,13 +587,12 @@ def hproj(
     """
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
-    _check_states_shape(states, hamiltonian.num_qubits)
+    states = _check_states_shape(states, hamiltonian.num_qubits)
     # Same int32 ceiling sqd() enforces, since hproj reaches get_xsource too and its returned
     # positions are int32 with -1 as the absent marker. Checked here, before the O(N) sortedness scan
     # and the np.unique below: it is an O(1) look at a shape, so it costs nothing to do first and
     # reports the real problem rather than letting a doomed call spend time first (measured on the
     # test that reaches it: 0.23 s with the check first, 23 s when it sits after the scan).
-    states = np.asarray(states)
     if states.shape[0] > _MAX_STATES:
         raise ValueError(
             f"subspace of {states.shape[0]} states exceeds the {_MAX_STATES} limit imposed by int32 "
@@ -973,7 +1010,11 @@ def _is_lex_sorted(states: NDArray[np.uint8]) -> bool:
     # true -1.0. The test is on the packed byte because pack_states makes byte 0 < 128 for every
     # genuine state, so 255 is unambiguous -- unpacking a filler at n=2 gives [1, 1], a legitimate
     # state, which is why an unpacked-side check could not work.
-    if states.shape[0] and bool(np.any(states[:, 0] >> 7)):
+    # O(1), not a pass over the column: fillers are all-255 rows and `pack_states` guarantees byte 0
+    # < 128 for every genuine state, so they sort to the end -- if any filler is present the LAST row
+    # carries one. A full `np.any(states[:, 0] >> 7)` measured 5.25 ms at N=10M against 0.00012 ms
+    # here, i.e. ~4.4x the cost of the adjacent-row pass it was prepended to, for the same answer.
+    if states.shape[0] and states[-1, 0] >= 128:
         return False
     if states.shape[0] < 2:
         return True
@@ -1133,13 +1174,7 @@ def get_diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Arr
             static under ``jax.jit``, so unlike the lex-sortedness precondition this one is
             checkable here.
     """
-    if np.ndim(zsignatures) != 2:
-        raise ValueError(
-            "`zsignatures` must be 2-D with shape (num_zterms, num_bytes) -- one X group's Z "
-            f"signatures -- but has rank {np.ndim(zsignatures)}. A 1-D array would be scanned as "
-            "scalars and silently return the wrong shape. Pass `hamiltonian.z[igroup]`, not "
-            "`hamiltonian.z[igroup][iterm]`."
-        )
+    _check_zsignatures_rank(zsignatures)
 
     def get_signs(carry, zsignature):
         out, ibyte, ibit = carry
@@ -1223,7 +1258,20 @@ def compute_diagonal(diag_signs: NDArray[np.uint8], coeffs: NDArray[np.inexact])
 def get_diagonal(
     zsignatures: NDArray[np.uint8], coeffs: NDArray[np.inexact], states: StateList
 ) -> jax.Array:
-    """Return the fully composed diagonals for one X signature."""
+    """Return the fully composed diagonals for one X signature.
+
+    Args:
+        zsignatures: Packed Z signatures for one X group, shape ``(num_zterms, num_bytes)``.
+        coeffs: Phase-folded coefficients for that group.
+        states: Uniquified, lex-sorted packed state list.
+
+    Returns:
+        The composed diagonal, one entry per state.
+
+    Raises:
+        ValueError: If ``zsignatures`` is not 2-D -- see :func:`_check_zsignatures_rank`.
+    """
+    _check_zsignatures_rank(zsignatures)
 
     def sign_bit(iterm):
         return _z_parity(states, zsignatures[iterm])
@@ -1274,87 +1322,85 @@ def apply_h(
 ) -> jax.Array:
     r"""Return :math:`Hv`, naming the per-X-group inputs so a mispairing cannot be expressed.
 
-        Name the per-X-group arrays you have and the caching strategy follows from them:
+    Name the per-X-group arrays you have and the caching strategy follows from them:
 
-        .. code-block:: python
+    .. code-block:: python
 
-            apply_h(vec, xsources=..., diag_signs=..., coeffs=..., states=states)   # was (1, 1)
-            apply_h(vec, xsignatures=..., diagonals=..., states=states)             # was (0, 2)
+        apply_h(vec, xsources=..., diag_signs=..., coeffs=..., states=states)   # was (1, 1)
+        apply_h(vec, xsignatures=..., diagonals=..., states=states)             # was (0, 2)
 
-        Every array parameter is keyword-only, so the six valid input sets are the only constructible
-        ones. **This replaced a positional ``(scanned, cache_level)`` form, which is gone** -- a breaking
-        change, and the reason it went: ``cache_level`` selected *positionally* how the members of
-        ``scanned`` were interpreted, and nothing could check that the tuple matched the strategy
-        declared. Passing raw X signatures while claiming ``cache_level[0] == 1`` -- which promises
-        precomputed X *sources* -- raised nothing and silently computed a different operator (measured
-        max abs error 0.44 on a 5-state n=4 subspace). Both are integer arrays, so the boundary could not
-        tell an index array from a signature array.
+    Every array parameter is keyword-only, so the six valid input sets are the only constructible
+    ones. **This replaced a positional ``(scanned, cache_level)`` form, which is gone** -- a breaking
+    change, and the reason it went: ``cache_level`` selected *positionally* how the members of
+    ``scanned`` were interpreted, and nothing could check that the tuple matched the strategy
+    declared. Passing raw X signatures while claiming ``cache_level[0] == 1`` -- which promises
+    precomputed X *sources* -- raised nothing and silently computed a different operator (measured
+    max abs error 0.44 on a 5-state n=4 subspace). Both are integer arrays, so the boundary could not
+    tell an index array from a signature array.
 
-        :func:`sqd` and :mod:`ground_locg` do not go through here: they call the private
-        ``_apply_h_kernel`` with an assembled tuple and a static ``cache_level`` bound via
-        ``functools.partial``, because the solver splats ``matvec(vec, *args)`` positionally.
+    :func:`sqd` and :mod:`ground_locg` do not go through here: they call the private
+    ``_apply_h_kernel`` with an assembled tuple and a static ``cache_level`` bound via
+    ``functools.partial``, because the solver splats ``matvec(vec, *args)`` positionally.
 
     A per-branch **shape** assertion cannot help, which is worth recording because it is the obvious
-        cheap alternative. X sources are ``(n_groups, n_states)`` and X signatures are
-        ``(n_groups, n_bytes)``, so the trailing dimension usually separates them -- but at ``n = 15``
-        (2 bytes) with a 2-state subspace both are exactly ``(2, 2)``, and a mispairing would sail through
-        the assertion meant to trip it.
+    cheap alternative. X sources are ``(n_groups, n_states)`` and X signatures are
+    ``(n_groups, n_bytes)``, so the trailing dimension usually separates them -- but at ``n = 15``
+    (2 bytes) with a 2-state subspace both are exactly ``(2, 2)``, and a mispairing would sail through
+    the assertion meant to trip it.
 
-        A **dtype** assertion does help, and is now applied (:func:`_check_array_role`). It separates the
-        confusable roles structurally at exactly the point shape fails: packed signatures are ``uint8``
-        (:func:`numpy.packbits` output) while source indices are ``int32`` positions using ``-1`` as the
-        absent marker, and a ``uint8`` cannot hold ``-1``; diagonals are float or complex. So
-        ``xsources=<signature array>`` now raises.
+    A **dtype** assertion does help, and is now applied (:func:`_check_array_role`), which separates the
+    confusable roles structurally at exactly the point shape fails. So ``xsources=<signature array>``
+    now raises.
 
-        What naming closes, stated exactly: it removes *mispairing* -- declaring one strategy while having
-        packed the arrays for another -- because the strategy is no longer declared separately from the
-        arrays. Combined with the dtype check above, an array passed under a wrong name of a *different*
-        kind now raises too. What remains open is a swap between two roles of the **same** kind --
-        ``xsignatures`` for ``zsignatures``, both ``uint8``. That residue is smaller again: the name sits
-        at the call site immediately beside the array it labels, rather than in a positional tuple whose
-        meaning is fixed by a separate argument several lines away.
+    What naming closes, stated exactly: it removes *mispairing* -- declaring one strategy while having
+    packed the arrays for another -- because the strategy is no longer declared separately from the
+    arrays. Combined with the dtype check above, an array passed under a wrong name of a *different*
+    kind now raises too. What remains open is a swap between two roles of the **same** kind --
+    ``xsignatures`` for ``zsignatures``, both ``uint8``. That residue is smaller again: the name sits
+    at the call site immediately beside the array it labels, rather than in a positional tuple whose
+    meaning is fixed by a separate argument several lines away.
 
-        All six strategies are one ``jax.lax.scan`` over the X groups accumulating
-        ``out + apply_xgrp(xsource, diagonal, vec)``; they differ only in where the two inputs come
-        from. That is exactly the 2x3 grid ``cache_level`` names, so it is expressed as a grid
-        rather than as six near-identical functions:
+    All six strategies are one ``jax.lax.scan`` over the X groups accumulating
+    ``out + apply_xgrp(xsource, diagonal, vec)``; they differ only in where the two inputs come
+    from. That is exactly the 2x3 grid ``cache_level`` names, so it is expressed as a grid
+    rather than as six near-identical functions:
 
-        =============  ==========================  =====================================
-        cache_level    ``xsource``                 ``diagonal``
-        =============  ==========================  =====================================
-        ``(0, *)``     ``get_xsource(x, states)``  --
-        ``(1, *)``     ``xsources`` as given       --
-        ``(*, 0)``     --                          ``get_diagonal(z, c, states)``
-        ``(*, 1)``     --                          ``compute_diagonal(signs, c)``
-        ``(*, 2)``     --                          ``diagonals`` as given
-        =============  ==========================  =====================================
+    =============  ==========================  =====================================
+    cache_level    ``xsource``                 ``diagonal``
+    =============  ==========================  =====================================
+    ``(0, *)``     ``get_xsource(x, states)``  --
+    ``(1, *)``     ``xsources`` as given       --
+    ``(*, 0)``     --                          ``get_diagonal(z, c, states)``
+    ``(*, 1)``     --                          ``compute_diagonal(signs, c)``
+    ``(*, 2)``     --                          ``diagonals`` as given
+    =============  ==========================  =====================================
 
-        The keyword names correspond one-to-one: ``xsignatures``/``xsources`` select the first index,
-        ``zsignatures``/``diag_signs``/``diagonals`` the second, and ``coeffs`` is required by the two
-        diagonal strategies that compute rather than read a diagonal.
+    The keyword names correspond one-to-one: ``xsignatures``/``xsources`` select the first index,
+    ``zsignatures``/``diag_signs``/``diagonals`` the second, and ``coeffs`` is required by the two
+    diagonal strategies that compute rather than read a diagonal.
 
-        Args:
-            vec: Vector to multiply.
-            states: Uniquified state list. Required whenever either element of the resolved
-                ``cache_level`` is 0, i.e. for every combination except ``(1, 1)`` and ``(1, 2)`` -- those
-                two read neither the X signatures nor the Z signatures, so they need no states at all.
-            xsignatures: Packed X signatures per group; selects ``cache_level[0] == 0``.
-            xsources: Precomputed X source indices per group; selects ``cache_level[0] == 1``.
-            zsignatures: Packed Z signatures per group; selects ``cache_level[1] == 0``. Needs ``coeffs``.
-            diag_signs: Precomputed diagonal sign bits per group; selects ``cache_level[1] == 1``. Needs
-                ``coeffs``.
-            diagonals: Fully precomputed diagonals per group; selects ``cache_level[1] == 2``. Must not be
-                combined with ``coeffs``, which it makes redundant.
-            coeffs: Pauli coefficients per group. Required by ``zsignatures`` and ``diag_signs``.
+    Args:
+        vec: Vector to multiply.
+        states: Uniquified state list. Required whenever either element of the resolved
+            ``cache_level`` is 0, i.e. for every combination except ``(1, 1)`` and ``(1, 2)`` -- those
+            two read neither the X signatures nor the Z signatures, so they need no states at all.
+        xsignatures: Packed X signatures per group; selects ``cache_level[0] == 0``.
+        xsources: Precomputed X source indices per group; selects ``cache_level[0] == 1``.
+        zsignatures: Packed Z signatures per group; selects ``cache_level[1] == 0``. Needs ``coeffs``.
+        diag_signs: Precomputed diagonal sign bits per group; selects ``cache_level[1] == 1``. Needs
+            ``coeffs``.
+        diagonals: Fully precomputed diagonals per group; selects ``cache_level[1] == 2``. Must not be
+            combined with ``coeffs``, which it makes redundant.
+        coeffs: Pauli coefficients per group. Required by ``zsignatures`` and ``diag_signs``.
 
-        Returns:
-            :math:`Hv`.
+    Returns:
+        :math:`Hv`.
 
-        Raises:
-            ValueError: If the named arrays do not select exactly one X source and one diagonal strategy
-                (including naming none at all); if ``coeffs`` is missing where required or supplied
-                alongside ``diagonals``; or if ``states`` is None while the resolved ``cache_level`` has a
-                0 in either position.
+    Raises:
+        ValueError: If the named arrays do not select exactly one X source and one diagonal strategy
+            (including naming none at all); if ``coeffs`` is missing where required or supplied
+            alongside ``diagonals``; or if ``states`` is None while the resolved ``cache_level`` has a
+            0 in either position.
     """
     # Each axis is one list of (keyword name, cache_level digit, array). Pairing the three together
     # means an axis is filtered, validated and unpacked from a single place -- no name-to-digit table
@@ -1393,6 +1439,12 @@ def apply_h(
         raise ValueError(f"apply_h: {dname}= requires coeffs=")
 
     cache_level = (xaxis, daxis)
+    # `_apply_h_kernel` checks this too, so it looks gratuitous -- three independent reviewers read it
+    # that way. It is not: the ORDER matters. The role check below must run after it, because a caller
+    # who has passed the wrong arrays *and* omitted `states` needs to hear about the missing input set
+    # first (it is what they must fix regardless), and the kernel's copy runs after both. Removing this
+    # line makes the dtype error surface instead, which `TestMatvecKernels::test_omitting_states_raises`
+    # catches. Keep them in step if either message changes.
     if (xaxis == 0 or daxis == 0) and states is None:
         raise ValueError(f"states is required for cache_level={cache_level}")
 

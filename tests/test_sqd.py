@@ -1311,6 +1311,24 @@ class TestPublicHelperPreconditions:
         with pytest.raises((ValueError, TypeError), match="zsignatures|rank|2-D|dimension"):
             get_diag_signs(np.zeros(2, dtype=np.uint8), np.zeros((4, 2), dtype=np.uint8))
 
+    def test_get_diagonal_rejects_a_rank_1_zsignature_array_too(self):
+        """The peer with the identical hazard: both index ``zsignatures``' leading axis.
+
+        Measured before the shared guard: ``get_diagonal`` returned ``(4,)`` of ``[2., 2., 2., 2.]``
+        from a 1-D input -- a plausible finite diagonal. It is public and is ``cache_level=(*, 0)``'s
+        diagonal source, so it is in exactly the bypass population item 10 is about.
+        """
+        with pytest.raises(ValueError, match="zsignatures|rank|2-D|dimension"):
+            get_diagonal(np.zeros(2, dtype=np.uint8), np.ones(2), np.zeros((4, 2), dtype=np.uint8))
+
+    def test_get_diagonal_still_accepts_a_proper_2d_array(self):
+        diagonal = np.asarray(
+            get_diagonal(
+                np.zeros((3, 2), dtype=np.uint8), np.ones(3), np.zeros((4, 2), dtype=np.uint8)
+            )
+        )
+        assert diagonal.shape == (4,)
+
     def test_get_diag_signs_still_accepts_a_proper_2d_array(self):
         signs = np.asarray(
             get_diag_signs(np.zeros((3, 2), dtype=np.uint8), np.zeros((4, 2), dtype=np.uint8))
@@ -1400,13 +1418,34 @@ class TestSingleFillerRow:
         # Accepted, because it genuinely is a valid 3-state subspace by this point.
         assert hproj((["ZI", "XI"], [1.0, 0.5]), unpacked, unique_states=True).shape == (3, 3)
 
-    def test_hproj_rejects_a_packed_basis_carrying_one_filler(self):
-        """The end-to-end path the fix does close: a packed padded array reaching hproj."""
+    def test_hproj_cannot_reach_this_guard_and_that_is_dimension_independent(self):
+        """The guard's real boundary, which two reviewers were right to question.
+
+        An earlier version of this test asserted ``not _is_lex_sorted(padded)`` -- a byte-for-byte
+        repeat of :meth:`test_one_filler_row_is_rejected` that never called ``hproj``, while its name
+        and docstring claimed end-to-end coverage.
+
+        Trying to write the honest version showed the coverage cannot exist. ``hproj`` packs
+        internally, so it only ever sees packed-from-unpacked rows -- and ``pack_states`` inserts the
+        pad bit at position 0, making byte 0 of *every* genuine state ``< 128`` by construction. So an
+        all-ones unpacked row repacks to 127, never 255: the round trip launders a filler into a
+        legitimate state at every width, not just at ``n = 2``. ``hproj`` therefore receives a valid
+        subspace one state too large, and no check on its input could tell.
+
+        The filler guard protects callers who hand an already-packed array to ``_is_lex_sorted`` --
+        the form ``uniquify_states`` returns and the only form in which the marker survives.
+        """
         from rqutils.paulis.symplectic import PauliSumXZ
 
-        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
-        padded = np.asarray(uniquify_states(PauliSumXZ.pack_states(states), 3))
-        assert not _is_lex_sorted(padded), "the guard must reject the packed padded array"
+        for num_qubits in (2, 8, 16):
+            states = np.zeros((2, num_qubits), dtype=np.uint8)
+            states[1, 0] = 1
+            padded = np.asarray(uniquify_states(PauliSumXZ.pack_states(states), 3))
+            assert padded[-1, 0] == 255, (num_qubits, padded)
+            repacked = np.asarray(
+                PauliSumXZ.pack_states(PauliSumXZ.unpack_states(padded, num_qubits))
+            )
+            assert repacked[-1, 0] < 128, (num_qubits, repacked)
 
     def test_genuine_sorted_input_is_still_accepted(self):
         """The guard must not reject a legitimately sorted, unique, filler-free basis."""
