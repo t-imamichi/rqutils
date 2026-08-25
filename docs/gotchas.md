@@ -34,8 +34,12 @@ outcomes were not what the list predicted, and are recorded as such rather than 
   lives in the same guard — a single filler row passed where two were rejected, giving a measured
   −1.118034 against a true −1.0.
 
-**Item 17 (Tier 3) is also fixed**, on request. The remaining Tier 3 items (11, 12, 13, 15, 16, 18, 19)
-are untouched.
+**Tier 3 items 17 and 12 are also fixed**, on request. Item 12 was done in *narrow* scope: `maxiter`
+and `tol` are exposed and non-convergence raises, but `sqd`'s return shape is untouched — returning a
+status object is item 11, a far wider break. Note `run_sqd`'s return grew by one element (the flag,
+last) as a consequence.
+
+The remaining Tier 3 items (11, 13, 15, 16, 18, 19) are untouched.
 
 Two items are **partly** fixed, with the residue stated in the row rather than left implied. **Item 2
 is intentional** — a deliberate per-module design decision, kept for its measurements and its
@@ -55,7 +59,7 @@ gotchas earlier breaking changes had already removed.
 | **9** | 2 | lex-sortedness required everywhere, enforced on one path | `states` means two different things in sibling functions | `UniqueSortedStates` type from `prepare_states()` | medium | ❌ **not a defect** (`4e0cdaf`) — `sqd` sorts internally; the opt-in path already raised |
 | **10** | 2 | public helpers bypass entry-point guards | int32 iota reached "with neither entry-point guard in the chain" | underscore them, or accept wrapper types only | medium | ⚠️ **partly fixed** (`1d76725`) — rank checked; sortedness structurally uncheckable |
 | **11** | 3 | return arity depends on a boolean | `ty` cannot follow a static flag into return arity | always return a dataclass | refactor | **open** |
-| **12** | 3 | `sqd` discards `converged` | a non-converged run returns a plausible upper bound; "the reason I4 could hide" | return the flag; expose `maxiter`/`tol` | refactor | **open** |
+| **12** | 3 | `sqd` discards `converged` | a non-converged run returns a plausible upper bound; "the reason I4 could hide" | return the flag; expose `maxiter`/`tol` | refactor | ✅ **fixed** (`38e4063`) — raises; return shape unchanged (that is item 11) |
 | **13** | 3 | `components(matrix, dim=None)` silently picks a basis | `(4,)` vs `(2,2)` differ by **2×** in normalization, both plausible | make `dim` required | small | **open** |
 | **14** | 3 | `hproj(unique_states=True)` admits exactly **one** filler row | spurious basis state; symmetric, plausible wrong eigenvalue | also reject `_is_filler` rows | 1 line | ✅ **fixed** (`4e0cdaf`) — one-filler parity hole |
 | **15** | 3 | `svsim` infers `num_qubits` from the highest qubit touched | an untouched top qubit yields a `2**(n-1)` vector, normalized, no error | require `num_qubits`; `frozen=True` on `CircuitXZ` | small | **open** |
