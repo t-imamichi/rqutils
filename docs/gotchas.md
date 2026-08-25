@@ -45,7 +45,12 @@ spelling and the parameter is primarily a Hermiticity threshold — the discard 
 documented at the parameter. Item 13's `dim` was made required but left positional, since
 `components(matrix, dim)` reads unambiguously.
 
-The remaining Tier 3 items (11, 15, 16, 19) are untouched.
+**Item 19 is also fixed**, as an assertion rather than the wrapper type it proposes: the public
+dispatch in `get_xsource` was already correct (pinned now at both `n = 63` and `n = 64`), so what was
+missing was the guard on `_pack_state_keys` itself, which the docs described as "asserted" while
+nothing enforced it.
+
+The remaining Tier 3 items (11, 15, 16) are untouched.
 
 Two items are **partly** fixed, with the residue stated in the row rather than left implied. **Item 2
 is intentional** — a deliberate per-module design decision, kept for its measurements and its
@@ -72,7 +77,7 @@ gotchas earlier breaking changes had already removed.
 | **16** | 3 | `initial_state`/`xinit` take an array *or* an int | `0` where `np.zeros(2**n)` was meant simulates a different state | split into two parameters | small | **open** |
 | **17** | 3 | cached **sparse** Pauli bases handed out mutable | in-place `/=` corrupts a process-lifetime cache; stays Hermitian and finite | copy on the sparse path | 1 line | ✅ **fixed** (`1200ab8`) — buffers frozen, not copied |
 | **18** | 3 | `from_paulisum(op, 1e-3)` — `atol` positional, gates *discarding* signal | raises the Hermiticity threshold 9 orders; `coeffs.real` then drops genuine signal | keyword-only; rename `discard_imag_below` | small | ✅ **fixed** (`14996fb`) — keyword-only; kept the name `atol` (see item) |
-| **19** | 3 | `uint64` fast path at `B <= 8` is a correctness boundary | a `uint64` key truncates a wider row and aliases distinct states | encode width in the item-7 wrapper type | medium | **open** |
+| **19** | 3 | `uint64` fast path at `B <= 8` is a correctness boundary | a `uint64` key truncates a wider row and aliases distinct states | encode width in the item-7 wrapper type | medium | ✅ **fixed** (`ef3b91a`) — asserted in `_pack_state_keys`; wrapper type still deferred |
 
 **If only three are done: 1, 3, 5** — one validation check, one `*`, one `NamedTuple`. See "Suggested
 order" at the end for why, and for the two cautions on item 2.
