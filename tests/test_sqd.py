@@ -20,6 +20,8 @@ initial-vector bugs affected all six kernels identically, so a consistency-only 
 passed while every kernel returned the same wrong number.
 """
 
+import warnings
+
 import jax
 import numpy as np
 import pytest
@@ -36,6 +38,7 @@ from rqutils.sqd import (
     _MAX_STATES,
     _is_lex_sorted,
     _pack_scanned,
+    _pack_state_keys,
     apply_h,
     compute_diagonal,
     get_diag_signs,
@@ -1103,6 +1106,78 @@ def apply_h_inputs(rng, num_qubits=4, num_terms=6, num_states=12):
             ]
         ),
     }
+
+
+class TestUint64KeyWidthBoundary:
+    """``_pack_state_keys`` must reject ``B > 8`` rather than silently aliasing distinct states.
+
+    ``get_xsource`` selects a ``uint64``-key search for ``B <= 8`` and an explicit lexicographic
+    search beyond, and that dispatch is correct -- so there is no live wrong answer through the public
+    path. What was missing is the guard at the packing function itself. Its docstring said "Only valid
+    while ``B <= 8``; :func:`get_xsource` checks that before calling", which is a *comment*: nothing
+    enforced it, and ``NOTES.md`` calls the limit "a correctness limit" while
+    ``docs/scaling-pocs.md`` calls it "a hard correctness boundary, asserted rather than documented".
+    It was in fact neither asserted nor enforced.
+
+    The failure is worse than truncation. Byte 0 is the most significant, so at ``B = 9`` its shift is
+    ``8 * (9 - 1) = 64`` bits on a ``uint64`` -- the byte vanishes entirely rather than being
+    coarsened, destroying lex order rather than merely weakening it. Measured: two 9-byte rows
+    differing *only* in byte 0 both pack to key ``0``, as does an all-zero row.
+
+    ``B = 9`` is reachable: ``B = ceil((n + 1) / 8)``, so ``n >= 64`` crosses it, and
+    ``docs/scaling-pocs.md`` measures at ``n = 64`` and beyond.
+
+    The wrapper-type fix ``docs/gotchas.md`` proposes (encoding width in item 7's packed-states type)
+    is deferred, so this is defence-in-depth on a private function: it converts a silent wrong answer
+    into a raise for anyone who reaches past ``get_xsource``.
+    """
+
+    @pytest.mark.parametrize("nbytes", [9, 10, 16])
+    def test_wide_rows_raise(self, nbytes):
+        with pytest.raises(ValueError, match="8 bytes|uint64|width"):
+            _pack_state_keys(np.zeros((2, nbytes), dtype=np.uint8))
+
+    def test_the_aliasing_it_prevents_is_real(self):
+        """The premise, at the widest legal width, so the guard is not protecting a non-problem.
+
+        Rather than call the guarded function, reproduce its arithmetic at ``B = 9`` to show that
+        byte 0's 64-bit shift loses the byte outright.
+        """
+        shifts = np.array([8 * (9 - 1 - i) for i in range(9)], dtype=np.uint64)
+        distinct = np.zeros((1, 9), dtype=np.uint8)
+        distinct[0, 0] = 1
+        allzero = np.zeros((1, 9), dtype=np.uint8)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            key_a = (distinct.astype(np.uint64) << shifts).sum(axis=1)
+            key_b = (allzero.astype(np.uint64) << shifts).sum(axis=1)
+        assert key_a[0] == key_b[0], (key_a, key_b)
+
+    @pytest.mark.parametrize("nbytes", [1, 2, 4, 8])
+    def test_legal_widths_still_pack_and_preserve_lex_order(self, nbytes):
+        """The guard must not narrow the fast path, and the keys must stay order-preserving."""
+        rng = np.random.default_rng(20260825)
+        rows = np.unique(rng.integers(0, 128, size=(64, nbytes), dtype=np.uint8), axis=0)
+        rows = rows[np.lexsort(rows.T[::-1])]
+        keys = np.asarray(_pack_state_keys(rows))
+        assert keys.shape == (rows.shape[0],)
+        # Lex order on rows must equal integer order on keys -- the whole point of the packing.
+        assert np.all(np.diff(keys) > 0), keys
+
+    def test_get_xsource_still_handles_both_sides_of_the_boundary(self):
+        """The public path is unaffected: 8 bytes takes the fast path, 9 the lexicographic one."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        for num_qubits in (63, 64):  # B = 8 and B = 9
+            hamiltonian = PauliSumXZ.from_paulisum((["X" + "I" * (num_qubits - 1)], [1.0]))
+            states = np.zeros((2, num_qubits), dtype=np.uint8)
+            states[1, 0] = 1
+            states_p = np.asarray(PauliSumXZ.pack_states(states))
+            states_u = uniquify_states(states_p, 2)
+            sources = np.asarray(get_xsource(hamiltonian.x[0], states_u))
+            assert sources.shape == (2,), (num_qubits, sources)
+            # The X flips the character-0 qubit, so the two states are each other's source.
+            assert sorted(sources.tolist()) == [0, 1], (num_qubits, sources)
 
 
 class TestConvergenceIsReported:

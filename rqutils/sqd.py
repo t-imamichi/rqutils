@@ -907,9 +907,31 @@ def _pack_state_keys(states: StateList) -> jax.Array:
 
     Byte 0 becomes the most significant, so integer order on the keys is identical to row lex order.
     That equivalence is the whole point: it lets a scalar binary search stand in for a lexicographic
-    one. Only valid while `B <= 8`; :func:`get_xsource` checks that before calling.
+    one.
+
+    Args:
+        states: Packed state rows, shape ``[N, B]`` with ``B <= 8``.
+
+    Returns:
+        One ``uint64`` key per row, ordered identically to the rows.
+
+    Raises:
+        ValueError: If ``B > 8``. :func:`get_xsource` already routes wide input to the lexicographic
+            path, so this is defence-in-depth for anyone reaching past it -- but the limit was
+            previously only *described* here, and the failure is worse than truncation: byte 0 is the
+            most significant, so at ``B = 9`` its shift is ``8 * (9 - 1) = 64`` bits on a ``uint64``
+            and the byte vanishes outright rather than being coarsened. Measured, two 9-byte rows
+            differing only in byte 0 both pack to key ``0``, aliasing distinct states and destroying
+            the lex-order equivalence the search depends on. ``B = ceil((n + 1) / 8)``, so ``n >= 64``
+            reaches it.
     """
     nbytes = states.shape[1]
+    if nbytes > 8:
+        raise ValueError(
+            f"`_pack_state_keys` needs at most 8 bytes per row to fit a uint64 key, got {nbytes}. "
+            "Byte 0 is the most significant, so a wider row shifts it out entirely and distinct "
+            "states alias onto one key. `get_xsource` routes B > 8 to the lexicographic search."
+        )
     shifts = jnp.asarray([8 * (nbytes - 1 - i) for i in range(nbytes)], dtype=jnp.uint64)
     return jnp.sum(states.astype(jnp.uint64) << shifts, axis=1)
 
