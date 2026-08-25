@@ -181,7 +181,7 @@ class PauliSumXZ:
         return np.unpackbits(states_p, axis=-1)[:, 1 : 1 + num_qubits]
 
     @classmethod
-    def from_paulisum(cls, paulisum: Any, atol: float = 1e-12) -> "PauliSumXZ":
+    def from_paulisum(cls, paulisum: Any, *, atol: float = 1e-12) -> "PauliSumXZ":
         """Build the packed representation from a Pauli sum.
 
         The only constructor, and the signature half of the bit-alignment contract: it inserts the
@@ -279,6 +279,13 @@ class PauliSumXZ:
             )
         # Discard the sub-atol rounding rather than carrying it: every downstream consumer indexes
         # `.c` expecting a real dtype where the folded phase permits one.
+        #
+        # This line is why `atol` is keyword-only. As a second positional, `from_paulisum(op, 1e-3)`
+        # read naturally as a `simplify` tolerance or a coefficient cutoff -- both plausible, since
+        # `simplify()` is called on ingest -- and instead raised the Hermiticity threshold by nine
+        # orders. The loosened check then does not merely permit the operator: this `.real` throws the
+        # imaginary part away. Measured, `from_paulisum((["ZI", "IZ"], [1 + 1e-4j, 0.5]), 1e-3)` was
+        # accepted and returned c = [0.5, 1.0], with the 1e-4 silently gone.
         coeffs = coeffs.real
 
         # Find unique X signatures together with correspondence pointers

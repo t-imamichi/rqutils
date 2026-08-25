@@ -461,6 +461,53 @@ class TestPadding:
         assert np.array_equal(signature, expected), f"signature for {num_qubits} qubits"
 
 
+class TestAtolIsKeywordOnly:
+    """``atol`` is keyword-only, because as a positional it silently widens a *discard*.
+
+    The tolerance itself is well judged and unchanged: the default 1e-12 sits ~4 orders above the
+    measured rounding (3.3e-16) and many orders below any physical coefficient, and ``atol=0.0``
+    restores the exact test. :class:`TestHermiticityTolerance` covers that reasoning.
+
+    The hazard was the *position*. ``from_paulisum(op, 1e-3)`` reads naturally as a ``simplify``
+    tolerance or a coefficient cutoff -- both plausible, since ``simplify()`` is called on ingest --
+    and it instead raises the Hermiticity threshold by nine orders. What makes that more than a
+    slow-path concern is the line right after the check: ``coeffs = coeffs.real`` **discards** any
+    imaginary part up to ``atol``, so the loosened check does not merely permit the operator, it
+    throws the signal away. Measured: ``from_paulisum((["ZI", "IZ"], [1 + 1e-4j, 0.5]), 1e-3)`` was
+    accepted and returned ``c = [0.5, 1.0]``, with the 1e-4 gone and nothing said.
+
+    Kept as ``atol`` rather than renamed to ``discard_imag_below``, which ``docs/gotchas.md``
+    proposes. ``atol`` is the conventional numpy/scipy spelling and the parameter *is* primarily a
+    Hermiticity threshold; the discard is a consequence, and documenting it at the parameter is more
+    accurate than a name that describes only the side effect. Keyword-only is what closes the actual
+    mistake.
+    """
+
+    def test_a_positional_atol_raises(self):
+        with pytest.raises(TypeError, match="positional"):
+            PauliSumXZ.from_paulisum((["ZI"], [1.0]), 1e-3)  # ty: ignore[too-many-positional-arguments]
+
+    def test_the_keyword_form_still_works(self):
+        ham = PauliSumXZ.from_paulisum((["ZI"], [1.0]), atol=1e-3)
+        assert ham.num_qubits == 2
+
+    def test_a_loosened_atol_still_discards_and_is_documented_as_such(self):
+        """Pinned so the trade stays visible: this is what the positional form did by accident."""
+        ham = PauliSumXZ.from_paulisum((["ZI", "IZ"], [1.0 + 1e-4j, 0.5]), atol=1e-3)
+        coeffs = np.asarray(ham.c).ravel()
+        assert coeffs.dtype.kind == "f", coeffs.dtype
+        assert np.allclose(np.sort(coeffs), [0.5, 1.0])
+
+    def test_the_default_still_rejects_that_operator(self):
+        """The default must not be loose enough to reach the discard."""
+        with pytest.raises(ValueError, match="Hermitian|imag"):
+            PauliSumXZ.from_paulisum((["ZI", "IZ"], [1.0 + 1e-4j, 0.5]))
+
+    def test_atol_zero_still_restores_the_exact_test(self):
+        with pytest.raises(ValueError, match="Hermitian|imag"):
+            PauliSumXZ.from_paulisum((["ZI"], [1.0 + 1e-18j]), atol=0.0)
+
+
 class TestArraysNamedTuple:
     """``arrays`` is a ``NamedTuple``, so an unpacking in the wrong order is visible.
 
