@@ -1097,6 +1097,94 @@ def apply_h_inputs(rng, num_qubits=4, num_terms=6, num_states=12):
     }
 
 
+class TestApplyHArrayRoles:
+    """``apply_h`` rejects an array passed under the wrong *name*, where dtype can tell.
+
+    Going keyword-only removed *mispairing* -- declaring one strategy while having packed the arrays
+    for another -- but not *misnaming*: ``apply_h(vec, xsources=x)`` where ``x`` is a signature array
+    was still accepted. ``docs/rqutils-requests.md`` concedes that residue is "much smaller... but it
+    is not zero".
+
+    ``apply_h``'s own docstring records why a **shape** assertion cannot close it, and that is
+    correct and reproduced here: at ``n = 15`` (2 bytes) with a 2-state subspace, X signatures and X
+    sources are *both* exactly ``(2, 2)``.
+
+    What the docstring generalized too far is "naming was the only fix available". **Dtype
+    discriminates precisely where shape collides**, and structurally rather than by luck: packed
+    signatures are ``uint8`` (``np.packbits`` output) while source indices are ``int32`` positions
+    carrying ``-1`` as the absent marker -- a ``uint8`` cannot hold ``-1``, so the two dtypes cannot
+    converge. Same for ``diagonals`` (inexact) against ``diag_signs``/``zsignatures`` (``uint8``).
+
+    Still not closed, and deliberately not claimed: swapping two arrays of the *same* role class --
+    ``xsignatures`` for ``zsignatures``, say, both ``uint8`` -- remains undetectable here.
+    """
+
+    def test_the_documented_shape_collision_is_real_but_dtypes_differ(self):
+        """The premise of the fix: the n=15 case that defeats a shape check is fine on dtype."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((["X" + "I" * 14, "Z" + "I" * 14], [1.0, 0.5]))
+        states = np.zeros((2, 15), dtype=np.uint8)
+        states[1, 0] = 1
+        states_u = uniquify_states(PauliSumXZ.pack_states(states), 2)
+        xsources = np.stack([np.asarray(get_xsource(hamiltonian.x[i], states_u)) for i in range(2)])
+        assert hamiltonian.x.shape == xsources.shape == (2, 2), "collision fixture is wrong"
+        assert hamiltonian.x.dtype != xsources.dtype
+
+    def test_signatures_passed_as_xsources_raise(self):
+        """The exact misnaming the residue names: packed signatures under ``xsources=``."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((["XZ"], [1.0]))
+        vec = np.ones(2)
+        with pytest.raises(ValueError, match="xsources"):
+            apply_h(
+                vec,
+                xsources=hamiltonian.x,  # uint8 signatures where int32 indices are meant
+                diagonals=np.zeros(2),
+            )
+
+    def test_sources_passed_as_xsignatures_raise(self):
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((["XZ"], [1.0]))
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        states_u = uniquify_states(PauliSumXZ.pack_states(states), 2)
+        xsources = np.asarray(get_xsource(hamiltonian.x[0], states_u))[None]
+        with pytest.raises(ValueError, match="xsignatures"):
+            apply_h(
+                np.ones(2),
+                xsignatures=xsources,  # int32 indices where uint8 signatures are meant
+                diagonals=np.zeros(2),
+                states=states_u,
+            )
+
+    def test_signatures_passed_as_diagonals_raise(self):
+        """``diagonals`` is inexact; ``uint8`` there is a misnamed sign-bit or signature array."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((["XZ"], [1.0]))
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        states_u = uniquify_states(PauliSumXZ.pack_states(states), 2)
+        xsources = np.asarray(get_xsource(hamiltonian.x[0], states_u))[None]
+        with pytest.raises(ValueError, match="diagonals"):
+            apply_h(np.ones(2), xsources=xsources, diagonals=hamiltonian.z[0])
+
+    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
+    def test_every_valid_input_set_is_still_accepted(self, cache_level):
+        """The guard must not reject any of the six the kernel implements."""
+        arrays = apply_h_inputs(np.random.default_rng(20260825))
+        got = np.asarray(
+            apply_h(
+                arrays["vector"],
+                states=arrays["states_u"],
+                **apply_h_kwargs(cache_level, arrays),
+            )
+        )
+        expected = arrays["matrix"] @ arrays["vector"]
+        assert np.abs(got - expected).max() < 1e-10
+
+
 class TestMatvecKernels:
     """The matvec kernels, checked directly against a dense matrix-vector product."""
 
