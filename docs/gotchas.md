@@ -39,7 +39,13 @@ and `tol` are exposed and non-convergence raises, but `sqd`'s return shape is un
 status object is item 11, a far wider break. Note `run_sqd`'s return grew by one element (the flag,
 last) as a consequence.
 
-The remaining Tier 3 items (11, 13, 15, 16, 18, 19) are untouched.
+**Items 13 and 18 are also fixed.** Item 18 deviates from its own proposal on one point: `atol`
+was made keyword-only but **not** renamed to `discard_imag_below`, since `atol` is the conventional
+spelling and the parameter is primarily a Hermiticity threshold — the discard is a consequence, now
+documented at the parameter. Item 13's `dim` was made required but left positional, since
+`components(matrix, dim)` reads unambiguously.
+
+The remaining Tier 3 items (11, 15, 16, 19) are untouched.
 
 Two items are **partly** fixed, with the residue stated in the row rather than left implied. **Item 2
 is intentional** — a deliberate per-module design decision, kept for its measurements and its
@@ -60,12 +66,12 @@ gotchas earlier breaking changes had already removed.
 | **10** | 2 | public helpers bypass entry-point guards | int32 iota reached "with neither entry-point guard in the chain" | underscore them, or accept wrapper types only | medium | ⚠️ **partly fixed** (`1d76725`) — rank checked; sortedness structurally uncheckable |
 | **11** | 3 | return arity depends on a boolean | `ty` cannot follow a static flag into return arity | always return a dataclass | refactor | **open** |
 | **12** | 3 | `sqd` discards `converged` | a non-converged run returns a plausible upper bound; "the reason I4 could hide" | return the flag; expose `maxiter`/`tol` | refactor | ✅ **fixed** (`38e4063`) — raises; return shape unchanged (that is item 11) |
-| **13** | 3 | `components(matrix, dim=None)` silently picks a basis | `(4,)` vs `(2,2)` differ by **2×** in normalization, both plausible | make `dim` required | small | **open** |
+| **13** | 3 | `components(matrix, dim=None)` silently picks a basis | `(4,)` vs `(2,2)` differ by **2×** in normalization, both plausible | make `dim` required | small | ✅ **fixed** (`14996fb`) — `dim` required, still positional |
 | **14** | 3 | `hproj(unique_states=True)` admits exactly **one** filler row | spurious basis state; symmetric, plausible wrong eigenvalue | also reject `_is_filler` rows | 1 line | ✅ **fixed** (`4e0cdaf`) — one-filler parity hole |
 | **15** | 3 | `svsim` infers `num_qubits` from the highest qubit touched | an untouched top qubit yields a `2**(n-1)` vector, normalized, no error | require `num_qubits`; `frozen=True` on `CircuitXZ` | small | **open** |
 | **16** | 3 | `initial_state`/`xinit` take an array *or* an int | `0` where `np.zeros(2**n)` was meant simulates a different state | split into two parameters | small | **open** |
 | **17** | 3 | cached **sparse** Pauli bases handed out mutable | in-place `/=` corrupts a process-lifetime cache; stays Hermitian and finite | copy on the sparse path | 1 line | ✅ **fixed** (`1200ab8`) — buffers frozen, not copied |
-| **18** | 3 | `from_paulisum(op, 1e-3)` — `atol` positional, gates *discarding* signal | raises the Hermiticity threshold 9 orders; `coeffs.real` then drops genuine signal | keyword-only; rename `discard_imag_below` | small | **open** |
+| **18** | 3 | `from_paulisum(op, 1e-3)` — `atol` positional, gates *discarding* signal | raises the Hermiticity threshold 9 orders; `coeffs.real` then drops genuine signal | keyword-only; rename `discard_imag_below` | small | ✅ **fixed** (`14996fb`) — keyword-only; kept the name `atol` (see item) |
 | **19** | 3 | `uint64` fast path at `B <= 8` is a correctness boundary | a `uint64` key truncates a wider row and aliases distinct states | encode width in the item-7 wrapper type | medium | **open** |
 
 **If only three are done: 1, 3, 5** — one validation check, one `*`, one `NamedTuple`. See "Suggested
