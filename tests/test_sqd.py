@@ -1105,6 +1105,71 @@ def apply_h_inputs(rng, num_qubits=4, num_terms=6, num_states=12):
     }
 
 
+class TestPublicHelperPreconditions:
+    """The un-underscored helpers state preconditions; these check the ones that *can* be checked.
+
+    ``uniquify_states``, ``get_xsource`` and ``get_diag_signs`` are public and called directly by six
+    scripts under ``examples/scaling/`` -- i.e. exactly the code that pushes ``N`` past where the
+    entry-point guards would have fired. ``NOTES.md`` records that this is how the int32 iota was
+    reached "with neither entry-point guard in the chain".
+
+    What is and is not reachable here, stated exactly, because two of the three preconditions cannot
+    be validated at this boundary:
+
+    - ``uniquify_states``' int32 ceiling **is** guarded, on the static ``states_size`` where the iota
+      is actually created. Already fixed; re-pinned here so the bypass path stays covered.
+    - ``get_xsource``'s **lex-sortedness** requirement cannot be checked. It is ``@jax.jit``-wrapped,
+      so ``states`` arrives as a tracer and its values are unavailable; a host-side scan like
+      ``_is_lex_sorted`` is impossible there. This is a structural limit, not an oversight, and it is
+      why ``docs/gotchas.md`` item 10 proposed wrapper types rather than validation.
+    - **Rank and dtype are static under jit**, so those *are* checkable -- and ``get_diag_signs``
+      silently accepted a 1-D ``zsignatures`` array, returning a wrongly shaped result rather than
+      raising.
+    """
+
+    def test_uniquify_states_ceiling_is_guarded_on_the_bypass_path(self):
+        """The guard sits on the static ``states_size``, where the int32 iota is created."""
+        with pytest.raises(ValueError, match="_MAX_STATES|int32|ceiling|limit"):
+            jax.eval_shape(
+                lambda st: uniquify_states(st, _MAX_STATES + 1),
+                jax.ShapeDtypeStruct((4, 2), np.uint8),
+            )
+
+    def test_get_diag_signs_rejects_a_rank_1_zsignature_array(self):
+        """Was accepted, returning shape (4, 1) from a 1-D input that should be (n_terms, n_bytes)."""
+        with pytest.raises((ValueError, TypeError), match="zsignatures|rank|2-D|dimension"):
+            get_diag_signs(np.zeros(2, dtype=np.uint8), np.zeros((4, 2), dtype=np.uint8))
+
+    def test_get_diag_signs_still_accepts_a_proper_2d_array(self):
+        signs = np.asarray(
+            get_diag_signs(np.zeros((3, 2), dtype=np.uint8), np.zeros((4, 2), dtype=np.uint8))
+        )
+        assert signs.shape[0] == 4
+
+    def test_get_xsource_sortedness_is_documented_as_uncheckable(self):
+        """Pinned so the limit is explicit: unsorted input gives wrong indices, silently.
+
+        ``get_xsource`` binary-searches into ``states``, so sortedness is load-bearing -- but the
+        function is jit'd and the values are traced, so it cannot verify it. This asserts the failure
+        mode rather than a raise, which is what makes the gap visible in the suite.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((["IX"], [1.0]))
+        states = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=np.uint8)
+        packed_sorted = np.asarray(PauliSumXZ.pack_states(states))
+        packed_unsorted = packed_sorted[::-1].copy()
+
+        good = np.asarray(get_xsource(hamiltonian.x[0], packed_sorted))
+        bad = np.asarray(get_xsource(hamiltonian.x[0], packed_unsorted))
+        # Both return plausible index arrays; only one is correct, and nothing signals which.
+        assert good.shape == bad.shape
+        assert not np.array_equal(good, bad), (
+            "if these now agree, either the fixture stopped being unsorted or get_xsource became "
+            "order-independent -- both would make this test vacuous"
+        )
+
+
 class TestSingleFillerRow:
     """``_is_lex_sorted`` must reject *one* filler row, not just two or more.
 

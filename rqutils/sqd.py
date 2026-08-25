@@ -1046,7 +1046,30 @@ def _z_parity(states: StateList, zsignature: jax.Array) -> jax.Array:
 
 @jax.jit
 def get_diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Array:
-    """Return the packed sign bits."""
+    """Return the packed sign bits, one per (state, Z term).
+
+    Args:
+        zsignatures: Packed Z signatures for one X group, shape ``(num_zterms, num_bytes)``.
+        states: Uniquified, lex-sorted packed state list, shape ``(num_states, num_bytes)``.
+
+    Returns:
+        Packed sign bits, shape ``(num_states, ceil(num_zterms / 8))``.
+
+    Raises:
+        ValueError: If ``zsignatures`` is not 2-D. This function is public and called directly by
+            scripts under ``examples/scaling/``, and the scan below iterates its leading axis: handed
+            a 1-D array it scans *scalars* rather than rows, silently returning a wrongly shaped
+            result (measured shape ``(4, 1)`` from a 2-element 1-D input) instead of raising. Rank is
+            static under ``jax.jit``, so unlike the lex-sortedness precondition this one is
+            checkable here.
+    """
+    if np.ndim(zsignatures) != 2:
+        raise ValueError(
+            "`zsignatures` must be 2-D with shape (num_zterms, num_bytes) -- one X group's Z "
+            f"signatures -- but has rank {np.ndim(zsignatures)}. A 1-D array would be scanned as "
+            "scalars and silently return the wrong shape. Pass `hamiltonian.z[igroup]`, not "
+            "`hamiltonian.z[igroup][iterm]`."
+        )
 
     def get_signs(carry, zsignature):
         out, ibyte, ibit = carry
