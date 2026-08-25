@@ -34,6 +34,9 @@ outcomes were not what the list predicted, and are recorded as such rather than 
   lives in the same guard — a single filler row passed where two were rejected, giving a measured
   −1.118034 against a true −1.0.
 
+**Item 17 (Tier 3) is also fixed**, on request. The remaining Tier 3 items (11, 12, 13, 15, 16, 18, 19)
+are untouched.
+
 Two items are **partly** fixed, with the residue stated in the row rather than left implied. **Item 2
 is intentional** — a deliberate per-module design decision, kept for its measurements and its
 cross-boundary warning. The "Already closed" section near the end is a separate, unnumbered list of
@@ -57,7 +60,7 @@ gotchas earlier breaking changes had already removed.
 | **14** | 3 | `hproj(unique_states=True)` admits exactly **one** filler row | spurious basis state; symmetric, plausible wrong eigenvalue | also reject `_is_filler` rows | 1 line | ✅ **fixed** (`4e0cdaf`) — one-filler parity hole |
 | **15** | 3 | `svsim` infers `num_qubits` from the highest qubit touched | an untouched top qubit yields a `2**(n-1)` vector, normalized, no error | require `num_qubits`; `frozen=True` on `CircuitXZ` | small | **open** |
 | **16** | 3 | `initial_state`/`xinit` take an array *or* an int | `0` where `np.zeros(2**n)` was meant simulates a different state | split into two parameters | small | **open** |
-| **17** | 3 | cached **sparse** Pauli bases handed out mutable | in-place `/=` corrupts a process-lifetime cache; stays Hermitian and finite | copy on the sparse path | 1 line | **open** |
+| **17** | 3 | cached **sparse** Pauli bases handed out mutable | in-place `/=` corrupts a process-lifetime cache; stays Hermitian and finite | copy on the sparse path | 1 line | ✅ **fixed** (`1200ab8`) — buffers frozen, not copied |
 | **18** | 3 | `from_paulisum(op, 1e-3)` — `atol` positional, gates *discarding* signal | raises the Hermiticity threshold 9 orders; `coeffs.real` then drops genuine signal | keyword-only; rename `discard_imag_below` | small | **open** |
 | **19** | 3 | `uint64` fast path at `B <= 8` is a correctness boundary | a `uint64` key truncates a wider row and aliases distinct states | encode width in the item-7 wrapper type | medium | **open** |
 
