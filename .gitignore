@@ -112,8 +112,11 @@ ENV/
 env.bak/
 venv.bak/
 
-# VS Code settings
-settings.json
+# VS Code settings (anchored: a bare `settings.json` also matches .claude/settings.json)
+.vscode/settings.json
+
+# Claude Code: share project settings, keep personal overrides local
+.claude/settings.local.json
 
 # Spyder project settings
 .spyderproject
