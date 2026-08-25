@@ -21,6 +21,40 @@ that work.
 
 ---
 
+## Summary — all 19 items at a glance
+
+Status verified against the source on `dev` at the time of writing, not read off the prose below.
+**All 19 are open**; the "Already closed" section near the end is a separate, unnumbered list of
+gotchas earlier breaking changes have already removed. "Partly landed" means a *documentation or test*
+fix shipped while the structural fix did not.
+
+| # | tier | gotcha | measured consequence | proposed fix | effort | status |
+| --- | --- | --- | --- | --- | --- | --- |
+| **1** | 1 | `pack_states` maps any nonzero to 1 | `{-1,+1}` input returns **0.000000** vs true −1.358047 | validate `{0,1}`, or accept `np.bool_` only | 1 check | **open** |
+| **2** | 1 | `states` columns are character-indexed, `svsim`/qiskit are qubit-indexed | −2.627596 vs −4.550395, n=5 | put the order in the type (`BitstringTable`) | large | **partly landed** — helper fixed + test pinned; API unchanged |
+| **3** | 2 | `sqd(ham, states, True)` sets `states_size=1` | silently pins the array to size 1 | `*` after `states` | 1 line | **open** |
+| **4** | 2 | `cache_level` digits unvalidated | `(2,0)` silently acts as `(0,0)`; `(1,5)` → `UnboundLocalError`; transposition costs **7.2–10.9×** | two keyword-only enums | small | **open** |
+| **5** | 2 | `PauliSumXZ.arrays` is a bare 3-tuple | `z, x, c = ham.arrays` type-checks and swaps X/Z | `NamedTuple` | ~free | **open** |
+| **6** | 2 | `apply_h` accepts arrays under the wrong *name* | mispairing closed, misnaming not | `NewType` per array role | medium | **partly landed** — keyword-only shipped; naming residue remains |
+| **7** | 2 | `pack_states` not idempotent; width never cross-checked | double-packing yields a different subspace | raise on `shape[1] != num_qubits` | 1 check | **open** |
+| **8** | 2 | `matrix_ufunc(hermitian=...)` positional tri-state, silent `else` | `hermitian=1` on non-Hermitian input returns a *different* operator's spectrum (error > 1.0) | keyword-only + `Symmetry` enum | medium | **open** |
+| **9** | 2 | lex-sortedness required everywhere, enforced on one path | `states` means two different things in sibling functions | `UniqueSortedStates` type from `prepare_states()` | medium | **partly landed** — `hproj` raises; `sqd` still accepts anything |
+| **10** | 2 | public helpers bypass entry-point guards | int32 iota reached "with neither entry-point guard in the chain" | underscore them, or accept wrapper types only | medium | **partly landed** — guard pushed down; API still wide |
+| **11** | 3 | return arity depends on a boolean | `ty` cannot follow a static flag into return arity | always return a dataclass | refactor | **open** |
+| **12** | 3 | `sqd` discards `converged` | a non-converged run returns a plausible upper bound; "the reason I4 could hide" | return the flag; expose `maxiter`/`tol` | refactor | **open** |
+| **13** | 3 | `components(matrix, dim=None)` silently picks a basis | `(4,)` vs `(2,2)` differ by **2×** in normalization, both plausible | make `dim` required | small | **open** |
+| **14** | 3 | `hproj(unique_states=True)` admits exactly **one** filler row | spurious basis state; symmetric, plausible wrong eigenvalue | also reject `_is_filler` rows | 1 line | **open** |
+| **15** | 3 | `svsim` infers `num_qubits` from the highest qubit touched | an untouched top qubit yields a `2**(n-1)` vector, normalized, no error | require `num_qubits`; `frozen=True` on `CircuitXZ` | small | **open** |
+| **16** | 3 | `initial_state`/`xinit` take an array *or* an int | `0` where `np.zeros(2**n)` was meant simulates a different state | split into two parameters | small | **open** |
+| **17** | 3 | cached **sparse** Pauli bases handed out mutable | in-place `/=` corrupts a process-lifetime cache; stays Hermitian and finite | copy on the sparse path | 1 line | **open** |
+| **18** | 3 | `from_paulisum(op, 1e-3)` — `atol` positional, gates *discarding* signal | raises the Hermiticity threshold 9 orders; `coeffs.real` then drops genuine signal | keyword-only; rename `discard_imag_below` | small | **open** |
+| **19** | 3 | `uint64` fast path at `B <= 8` is a correctness boundary | a `uint64` key truncates a wider row and aliases distinct states | encode width in the item-7 wrapper type | medium | **open** |
+
+**If only three are done: 1, 3, 5** — one validation check, one `*`, one `NamedTuple`. See "Suggested
+order" at the end for why, and for the two cautions on item 2.
+
+---
+
 ## Why this list is short on "just document it"
 
 This repo has already made the make-it-unrepresentable move twice, and both worked:
