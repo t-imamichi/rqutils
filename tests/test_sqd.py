@@ -272,6 +272,73 @@ class TestUniquifyStates:
         assert np.all(out[(out[:, 0] >> 7) == 1] == 255)
 
 
+class TestCacheLevelValidation:
+    """``cache_level`` digits are validated instead of falling through an implicit ``else``.
+
+    Every branch on ``cache_level`` is an equality test with no ``else``, so before this:
+
+    - an out-of-range **first** digit was silently ignored -- ``(2, 0)`` behaved exactly as
+      ``(0, 0)``, returning the same energy at 7.2x the cost;
+    - an out-of-range **second** digit surfaced as
+      ``UnboundLocalError: cannot access local variable 'diagonals'`` -- an internal error, not a
+      validation error, from a public entry point.
+
+    The likelier mistake is neither: it is the **transposition**. ``(0, 1)`` and ``(1, 0)`` are both
+    legal and return the same energy, differing only in cost -- ``NOTES.md`` measures ``(0, 2)`` at
+    10.9x slower than ``(1, 2)`` and ``(0, 0)`` at 7.2x slower than ``(1, 0)``. A transposed tuple
+    reads as "SQD is slow", never as an error, so validation cannot catch it; what the message can do
+    is name the axes so the call site is readable. Kept as a tuple rather than split into two enum
+    parameters because ``cache_level`` is bound **static** into the jit'd kernel via
+    ``functools.partial`` (``ground_locg`` splats ``args`` positionally, so ``static_argnames`` would
+    never see it) -- the validation belongs at the public boundary, not in the jit plumbing.
+    """
+
+    @pytest.mark.parametrize("bad", [(2, 0), (-1, 0), (3, 1)])
+    def test_out_of_range_first_digit_raises(self, bad):
+        """Was silently equivalent to ``(0, 0)``: same answer, 7.2x the cost."""
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises(ValueError, match="cache_level"):
+            sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=bad)
+
+    @pytest.mark.parametrize("bad", [(1, 5), (1, 3), (0, -1)])
+    def test_out_of_range_second_digit_raises_a_value_error(self, bad):
+        """Was ``UnboundLocalError``, an internal error leaking from a public entry point."""
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises(ValueError, match="cache_level"):
+            sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=bad)
+
+    @pytest.mark.parametrize("bad", [(1,), (1, 0, 0), 1, "10"])
+    def test_malformed_cache_level_raises(self, bad):
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises((ValueError, TypeError), match="cache_level"):
+            sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=bad)
+
+    def test_the_message_names_both_axes(self):
+        """A transposed tuple is legal, so the message has to make the axes readable."""
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises(ValueError) as excinfo:
+            sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=(2, 0))
+        message = str(excinfo.value)
+        assert "source" in message.lower() and "diagonal" in message.lower()
+
+    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
+    def test_every_valid_level_is_still_accepted(self, cache_level):
+        """The guard must accept exactly the six the kernel implements."""
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        assert isinstance(
+            float(sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=cache_level)), float
+        )
+
+    def test_run_sqd_validates_too(self):
+        """``run_sqd`` is public and takes the same argument, so it needs the same guard."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        hamiltonian = PauliSumXZ.from_paulisum((["ZI"], [1.0]))
+        with pytest.raises(ValueError, match="cache_level"):
+            run_sqd(hamiltonian, pack_padded(states), 2, False, (2, 0))
+
+
 class TestStatesWidthCheck:
     """``states.shape[1]`` must equal ``hamiltonian.num_qubits`` on both entry points.
 

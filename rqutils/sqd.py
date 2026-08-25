@@ -181,6 +181,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from numbers import Number
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -207,6 +208,59 @@ except ImportError:
     pass
 type Vector = np.ndarray[tuple[int], np.dtype[np.inexact]]
 type StateList = np.ndarray[tuple[int, int], np.dtype[np.uint8]]
+
+
+def _check_cache_level(cache_level: Any) -> None:
+    """Raise unless ``cache_level`` is one of the six ``(source_indices, diagonals)`` pairs.
+
+    Every branch on ``cache_level`` in this module is an equality test with an implicit ``else``, so
+    an out-of-range value used to be absorbed rather than reported:
+
+    * an out-of-range **first** digit was silently ignored -- ``(2, 0)`` behaved exactly as
+      ``(0, 0)``, returning the same energy at 7.2x the cost;
+    * an out-of-range **second** digit surfaced as ``UnboundLocalError`` on an internal variable,
+      i.e. an internal error escaping a public entry point.
+
+    The likelier mistake is the **transposition**, which validation cannot catch: ``(0, 1)`` and
+    ``(1, 0)`` are both legal and return the same energy, differing only in cost (``(0, 2)`` measures
+    10.9x slower than ``(1, 2)``, ``(0, 0)`` 7.2x slower than ``(1, 0)``), so it reads as "SQD is
+    slow" rather than as an error. What this can do is name the axes in the message, so a reader of
+    the call site can tell which digit is which.
+
+    Kept as a tuple rather than split into two enum parameters: ``cache_level`` is bound **static**
+    into the jit'd kernel through :func:`functools.partial`, because :func:`rqutils.ground_locg`
+    splats ``args`` positionally and ``static_argnames`` would never see it. The validation belongs
+    at the public boundary, not in that plumbing.
+
+    Args:
+        cache_level: The caller's value, unvalidated.
+
+    Raises:
+        TypeError: If it is not a length-2 sequence of ints.
+        ValueError: If either digit is out of range -- ``source_indices`` in ``{0, 1}``,
+            ``diagonals`` in ``{0, 1, 2}``.
+    """
+    try:
+        source_indices, diagonals = cache_level
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"`cache_level` must be a (source_indices, diagonals) pair of ints, got "
+            f"{cache_level!r}"
+        ) from exc
+    # `bool` is an `int` subclass, so (True, 0) would otherwise pass as (1, 0). That is the same
+    # True == 1 confusion `sqd`'s keyword-only change closed one level up, so reject it here too.
+    if not all(isinstance(d, int) and not isinstance(d, bool) for d in (source_indices, diagonals)):
+        raise TypeError(
+            f"`cache_level` must be a (source_indices, diagonals) pair of ints, got {cache_level!r}"
+        )
+    if source_indices not in (0, 1) or diagonals not in (0, 1, 2):
+        raise ValueError(
+            f"`cache_level` is {cache_level!r}, but the first entry (source_indices: 0=recompute "
+            "per matvec, 1=cache) must be 0 or 1 and the second (diagonals: 0=no caching, "
+            "1=cache sign bits, 2=cache diagonals) must be 0, 1 or 2. Note the two axes are not "
+            "interchangeable: caching source indices is near-free to enable and very expensive to "
+            "disable, so a transposed pair is legal but runs 7.2-10.9x slower."
+        )
 
 
 def _check_states_shape(states: StateList, num_qubits: int) -> None:
@@ -315,6 +369,7 @@ def sqd(
             :math:`2^{31} - 1`, the ceiling imposed by the int32 indices used for subspace positions
             (beyond it an index wraps negative and the subspace is silently permuted).
     """
+    _check_cache_level(cache_level)
     if states_size is None:
         # Default to the next power of two at or above the input length. states_size exists to stop
         # each distinct subspace dimension retracing the solver, and growing all-distinct dimensions
@@ -564,6 +619,10 @@ def run_sqd(
     log_level: int = logging.INFO,
 ) -> tuple[float] | tuple[float, jax.Array, jax.Array, int]:
     """JIT-compiled part of the SQD function."""
+    # `cache_level` is static, so this is a concrete tuple at trace time and the check runs once per
+    # trace rather than once per call. `sqd` validates too; this covers the direct callers, which are
+    # the six examples/scaling scripts -- i.e. the ones most likely to pass an experimental value.
+    _check_cache_level(cache_level)
     sharding = None
     if not (mesh := get_abstract_mesh()).empty:
         sharding = PartitionSpec(mesh.axis_names)
