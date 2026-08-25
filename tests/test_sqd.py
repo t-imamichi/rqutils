@@ -597,11 +597,18 @@ class TestHproj:
     def test_padded_uniquify_output_is_rejected(self):
         """A padded ``uniquify_states`` result must NOT pass, since ``hproj`` cannot mask fillers.
 
-        Filler slots are all-``255`` rows, so two or more are duplicates and fail the strictness test.
         This is the one way the sortedness guard could surprise a caller -- ``uniquify_states`` output
         is otherwise exactly what ``get_xsource`` wants -- so it is pinned rather than left to be
         rediscovered. ``sqd`` trims fillers before returning its basis, which is why
         ``examples/scaling/poc7_sharding.py`` can hand that basis straight to ``hproj``.
+
+        **This test used to assert the opposite of its own title for the single-filler case**, which is
+        how the parity hole (``docs/gotchas.md`` item 14) survived: rejection rested on two or more
+        ``255`` rows being *duplicates*, so exactly one filler was still strictly increasing and
+        passed, and the assertion below read ``is True``. The docstring's stated intent was right and
+        the assertion was wrong. There is now an explicit high-bit test in ``_is_lex_sorted``,
+        independent of sortedness, so any number of fillers is rejected --
+        see :class:`TestSingleFillerRow` for the measured consequence.
         """
         from rqutils.paulis.symplectic import PauliSumXZ
 
@@ -609,12 +616,13 @@ class TestHproj:
         states = rng.integers(0, 2, size=(12, 4), dtype=np.uint8)
         packed = PauliSumXZ.pack_states(states)
 
-        # states_size=12 happens to leave a single filler, which is still strictly increasing.
+        # states_size=12 happens to leave a single filler: strictly increasing, so only the explicit
+        # filler test catches it.
         one_filler = np.asarray(uniquify_states(packed, 12))
         assert int((one_filler[:, 0] >> 7).sum()) == 1
-        assert _is_lex_sorted(one_filler) is True
+        assert _is_lex_sorted(one_filler) is False
 
-        # Pad further and the duplicate 255 rows are rejected.
+        # Two or more are also duplicates, so they fail either way.
         many_fillers = np.asarray(uniquify_states(packed, 16))
         assert int((many_fillers[:, 0] >> 7).sum()) > 1
         assert _is_lex_sorted(many_fillers) is False
@@ -1095,6 +1103,95 @@ def apply_h_inputs(rng, num_qubits=4, num_terms=6, num_states=12):
             ]
         ),
     }
+
+
+class TestSingleFillerRow:
+    """``_is_lex_sorted`` must reject *one* filler row, not just two or more.
+
+    The parity hole ``docs/gotchas.md`` item 14 names. Filler slots are all-``255`` rows, so **two**
+    are duplicates and fail the strictness test -- which is what ``_is_lex_sorted``'s docstring
+    claimed made it reject padded input "by design". But a **single** filler row is still strictly
+    increasing and passed. Measured: ``uniquify_states(..., 3)`` on a 2-state subspace gives
+    ``[[32], [64], [255]]``, and ``_is_lex_sorted`` returned True on it while returning False for the
+    4-slot version. The guard rejected the easy case and admitted the hard one.
+
+    ``hproj`` has no filler-masking step, so that row becomes a spurious basis state in the dense
+    ``[N, N]`` projection: one row and column too large, still symmetric, plausible wrong eigenvalue.
+    Measured end to end -- **-1.118034 against a true -1.0**.
+
+    Note item 1's binary check cannot cover this. Unpacking a ``255`` filler at n=2 yields ``[1, 1]``,
+    a perfectly legitimate binary state, so a caller who round-trips through ``unpack_states`` gets a
+    silently enlarged subspace. The guard has to sit on the *packed* side, where ``255`` is
+    unambiguous because ``pack_states`` makes byte 0 of every genuine state ``< 128``.
+    """
+
+    def test_one_filler_row_is_rejected(self):
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        padded = np.asarray(uniquify_states(PauliSumXZ.pack_states(states), 3))
+        assert padded[-1, 0] == 255, "fixture must actually contain one filler row"
+        assert not _is_lex_sorted(padded)
+
+    def test_two_filler_rows_are_still_rejected(self):
+        """The case that already worked, via the duplicate test -- must not regress."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        padded = np.asarray(uniquify_states(PauliSumXZ.pack_states(states), 4))
+        assert not _is_lex_sorted(padded)
+
+    def test_unpack_states_silently_launders_a_filler_into_a_real_state(self):
+        """A *separate* hazard, recorded rather than fixed here -- and not reachable by this guard.
+
+        ``unpack_states`` destroys the filler marker: ``255`` unpacks to ``[1, 1]`` and repacks to
+        ``96``, not ``255``. So a caller who round-trips a padded ``uniquify_states`` result hands
+        ``hproj`` three *legitimately* distinct, sorted, filler-free states and gets a 3x3 projection
+        where 2x2 was meant. ``_is_lex_sorted`` cannot catch that and should not try -- by then the
+        input really is a valid subspace, one state too large.
+
+        Pinned so the boundary of the filler fix is explicit: it protects callers passing **packed**
+        arrays, which is the form ``uniquify_states`` returns and the form the marker survives in.
+        Slice with ``~_is_filler(states)`` before unpacking.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        padded = np.asarray(uniquify_states(PauliSumXZ.pack_states(states), 3))
+        unpacked = PauliSumXZ.unpack_states(padded, 2)
+        repacked = np.asarray(PauliSumXZ.pack_states(unpacked))
+        assert padded[-1, 0] == 255 and repacked[-1, 0] == 96, (padded, repacked)
+        # Accepted, because it genuinely is a valid 3-state subspace by this point.
+        assert hproj((["ZI", "XI"], [1.0, 0.5]), unpacked, unique_states=True).shape == (3, 3)
+
+    def test_hproj_rejects_a_packed_basis_carrying_one_filler(self):
+        """The end-to-end path the fix does close: a packed padded array reaching hproj."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        padded = np.asarray(uniquify_states(PauliSumXZ.pack_states(states), 3))
+        assert not _is_lex_sorted(padded), "the guard must reject the packed padded array"
+
+    def test_genuine_sorted_input_is_still_accepted(self):
+        """The guard must not reject a legitimately sorted, unique, filler-free basis."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        states = np.array([[0, 0], [0, 1], [1, 0]], dtype=np.uint8)
+        assert _is_lex_sorted(np.asarray(PauliSumXZ.pack_states(states)))
+        assert hproj((["ZI", "XI"], [1.0, 0.5]), states, unique_states=True).shape == (3, 3)
+
+    def test_an_all_ones_state_is_not_mistaken_for_a_filler(self):
+        """``[1, 1, ...]`` is a legitimate state; only the *packed* 255 marks a filler.
+
+        At n=7 a genuine all-ones row packs to byte 0 = 127 (the pad bit keeps it under 128), so the
+        high-bit test distinguishes them. This is why the check belongs on the packed side.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        all_ones = np.ones((1, 7), dtype=np.uint8)
+        packed = np.asarray(PauliSumXZ.pack_states(all_ones))
+        assert packed[0, 0] == 127, packed
+        assert _is_lex_sorted(packed)
 
 
 class TestApplyHArrayRoles:

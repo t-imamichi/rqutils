@@ -879,12 +879,32 @@ def _is_lex_sorted(states: NDArray[np.uint8]) -> bool:
     N=1M, flat in `B`. Cheap enough to be unconditional on a debug/reference path, in exchange for
     turning a silent wrong answer into a raise. :func:`sqd` never reaches `hproj`, so it is unaffected.
 
-    **Rejects a padded :func:`uniquify_states` result, by design.** Filler slots are all-``255`` rows,
-    so two or more are duplicates and fail the strictness test. That is correct here: `hproj` builds a
-    dense `[N, N]` operator with no filler-masking step, so filler rows would become spurious basis
-    states. Slice to the real rows first (`~_is_filler(states)`) if you hold a padded array; `sqd`
-    already trims before returning its basis.
+    **Rejects a padded :func:`uniquify_states` result, by design** -- and now for *any* number of
+    filler slots. Fillers are all-``255`` rows, so two or more are duplicates and fail the strictness
+    test; that is what this paragraph used to rest on, but a **single** filler row is strictly
+    increasing and passed. `hproj` builds a dense `[N, N]` operator with no filler-masking step, so
+    that row became a spurious basis state: one row and column too large, still symmetric, plausible
+    wrong eigenvalue (measured **-1.118034 against a true -1.0**). There is now an explicit high-bit
+    test, independent of sortedness.
+
+    It reads the *packed* byte deliberately. :meth:`PauliSumXZ.pack_states` makes byte 0 of every
+    genuine state ``< 128``, so ``255`` is unambiguous there -- whereas unpacking a filler at
+    ``n = 2`` yields ``[1, 1]``, a perfectly legitimate state, so no check on the unpacked form could
+    distinguish them.
+
+    Slice to the real rows first (`~_is_filler(states)`) if you hold a padded array; `sqd` already
+    trims before returning its basis.
     """
+    # Any filler row disqualifies the array, and this must be tested *independently* of sortedness.
+    # Two or more fillers are duplicates and so fail the strictness test below, which is what the
+    # "rejects a padded result by design" claim rested on -- but a SINGLE filler is still strictly
+    # increasing and used to pass. hproj has no filler-masking step, so that row became a spurious
+    # basis state: one row and column too large, still symmetric, and measured -1.118034 against a
+    # true -1.0. The test is on the packed byte because pack_states makes byte 0 < 128 for every
+    # genuine state, so 255 is unambiguous -- unpacking a filler at n=2 gives [1, 1], a legitimate
+    # state, which is why an unpacked-side check could not work.
+    if states.shape[0] and bool(np.any(states[:, 0] >> 7)):
+        return False
     if states.shape[0] < 2:
         return True
     lhs, rhs = states[:-1], states[1:]
