@@ -1105,6 +1105,102 @@ def apply_h_inputs(rng, num_qubits=4, num_terms=6, num_states=12):
     }
 
 
+class TestConvergenceIsReported:
+    """``sqd`` must not return a non-converged eigenvalue as though it were the answer.
+
+    ``run_sqd`` unpacked ``ground_locg``'s result as ``eigval, eigvec, _, _``, discarding
+    ``converged``. A non-converged LOBPCG run still returns ``state.theta`` -- a valid *variational
+    upper bound*, so finite and entirely plausible -- and ``sqd`` wrapped it in ``float()`` and
+    returned it as "Calculated ground state energy" with no indication.
+
+    ``docs/locg.md`` records that this absence "is the reason I4 could hide": a sign error made the
+    convergence test unsatisfiable, so the solver silently never converged and every answer was the
+    iteration cap's best guess. ``sqd`` also exposed no ``maxiter`` or ``tol``, so a caller could
+    neither detect the situation nor retry.
+
+    Narrow fix, deliberately: ``maxiter``/``tol`` are exposed and non-convergence raises. ``sqd``'s
+    *return shape* is unchanged -- returning a status object is item 11 in ``docs/gotchas.md`` and a
+    much wider break.
+
+    The raise lives in ``sqd``, not ``run_sqd``: the latter is ``@jax.jit``-wrapped, so ``converged``
+    is a traced boolean there and cannot be branched on at trace time.
+    """
+
+    def test_a_tight_maxiter_raises_instead_of_returning_a_guess(self):
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        with pytest.raises(RuntimeError, match="converge"):
+            sqd((strings, coeffs.tolist()), states, return_eigvec=False, maxiter=1)
+
+    def test_the_message_names_maxiter_and_tol(self):
+        """A caller who hits this needs to know which knobs exist."""
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        with pytest.raises(RuntimeError) as excinfo:
+            sqd((strings, coeffs.tolist()), states, return_eigvec=False, maxiter=1)
+        message = str(excinfo.value)
+        assert "maxiter" in message and "tol" in message
+
+    def test_the_default_path_still_converges_and_is_unchanged(self):
+        """The guard must not start rejecting the runs that always worked.
+
+        Also pins that exposing the parameters did not change the answer: the default result must
+        equal the reference, not merely avoid raising.
+        """
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        got = eigval_of(strings, coeffs, states)
+        expected = lowest_projected(strings, coeffs, states)
+        assert abs(got - expected) < 1e-6
+
+    def test_a_generous_maxiter_is_accepted(self):
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        got = eigval_of(strings, coeffs, states, maxiter=2000)
+        expected = lowest_projected(strings, coeffs, states)
+        assert abs(got - expected) < 1e-6
+
+    def test_a_loose_tol_converges_sooner_without_changing_the_answer(self):
+        """``tol`` must be plumbed through, not accepted and ignored."""
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        loose = eigval_of(strings, coeffs, states, tol=1e-6)
+        expected = lowest_projected(strings, coeffs, states)
+        assert abs(loose - expected) < 1e-4
+
+    def test_the_returned_value_would_have_been_plausible(self):
+        """Records *why* this was silent: the discarded result is a valid upper bound.
+
+        Asserts the failure mode rather than the fix, so the reason the guard exists stays visible --
+        a non-converged theta is finite, real, and above the true minimum, i.e. indistinguishable
+        from a correct answer by inspection.
+        """
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        reference = lowest_projected(strings, coeffs, states)
+        # Reach past sqd's guard to see what it would have returned.
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_p = PauliSumXZ.pack_states(states)
+        result = run_sqd(hamiltonian, states_p, states_p.shape[0], False, (1, 0), maxiter=1)
+        theta, converged = float(result[0]), bool(result[-1])
+        assert not converged
+        assert np.isfinite(theta) and theta > reference, (theta, reference)
+
+
 class TestPublicHelperPreconditions:
     """The un-underscored helpers state preconditions; these check the ones that *can* be checked.
 

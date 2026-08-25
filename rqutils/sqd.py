@@ -354,6 +354,8 @@ def sqd(
     states_size: int | None = None,
     return_eigvec: bool = True,
     cache_level: tuple[int, int] = (1, 0),
+    maxiter: int = 1000,
+    tol: float | None = None,
 ) -> float | tuple[float, Vector, StateList]:
     r"""Perform a sample-based quantum diagonalization of the Hamiltonian.
 
@@ -400,6 +402,10 @@ def sqd(
             The padding is not observable in the result: filler slots are excluded from the
             projection and trimmed from the returned basis.
         return_eigvec: Whether to return the eigenvector (coefficients and unique state bitstrings).
+        maxiter: Maximum LOBPCG iterations. **Non-convergence now raises** rather than returning
+            the iteration cap's best guess -- see ``Raises``.
+        tol: Convergence tolerance passed to :func:`rqutils.ground_locg.ground_locg`. ``None`` uses
+            the machine epsilon of the operator dtype.
         cache_level: Switches for caching the results of source indices and sign bits / diagonals.
             See the module documentation for the detailed discussion of the resource tradeoff involved.
 
@@ -409,6 +415,13 @@ def sqd(
         only, never the filler slots, so their count can be below ``states_size``.
 
     Raises:
+        RuntimeError: If LOBPCG does not converge within ``maxiter``. Previously the convergence flag
+            was discarded and the non-converged value was returned as the answer: it is
+            ``state.theta``, a valid variational **upper bound**, so finite, real and above the true
+            minimum -- indistinguishable from a correct result by inspection. ``docs/locg.md`` records
+            that this absence "is the reason I4 could hide", a sign error that made the convergence
+            test unsatisfiable so the solver silently never converged. Raise ``maxiter`` or loosen
+            ``tol`` to proceed.
         ValueError: If ``states_size`` is smaller than ``states.shape[0]``, or if it exceeds
             :math:`2^{31} - 1`, the ceiling imposed by the int32 indices used for subspace positions
             (beyond it an index wraps negative and the subspace is silently permuted).
@@ -468,11 +481,28 @@ def sqd(
 
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
-    result = run_sqd(hamiltonian, states_p, states_size, return_eigvec, cache_level)
+    result = run_sqd(
+        hamiltonian, states_p, states_size, return_eigvec, cache_level, maxiter=maxiter, tol=tol
+    )
     LOG.info("Found ground eigenpair in %f seconds.", time.time() - start)
     eigval = float(result[0])
+    # The convergence flag used to be discarded here, and a non-converged run still returns
+    # `state.theta` -- a valid variational *upper bound*, so finite, real, and above the true minimum,
+    # i.e. indistinguishable from a correct answer by inspection. docs/locg.md records that this
+    # absence "is the reason I4 could hide": a sign error made the convergence test unsatisfiable, so
+    # the solver silently never converged and every answer was the iteration cap's best guess.
+    #
+    # Raised here rather than in `run_sqd` because that function is @jax.jit-wrapped, so `converged`
+    # is a traced boolean there and cannot be branched on at trace time.
+    if not bool(result[-1]):
+        raise RuntimeError(
+            f"LOBPCG did not converge in maxiter={maxiter} iterations (tol={tol!r}). The value it "
+            f"reached, {eigval!r}, is a variational upper bound rather than the ground energy -- "
+            "finite and plausible, which is why this raises instead of returning it. Raise `maxiter`, "
+            "loosen `tol`, or check that the subspace is well conditioned."
+        )
     if return_eigvec:
-        eigvec, states_u, subspace_dim = result[1:]
+        eigvec, states_u, subspace_dim = result[1:-1]
         basis_states = PauliSumXZ.unpack_states(states_u[:subspace_dim], states.shape[1])
         return (eigval, np.array(eigvec[:subspace_dim]), basis_states)
     return eigval
@@ -653,16 +683,31 @@ def _spread_seed(
     return jnp.where(filler, jnp.zeros_like(vec), vec)
 
 
-@jax.jit(static_argnames=["states_size", "return_eigvec", "cache_level", "log_level"])
+@jax.jit(static_argnames=["states_size", "return_eigvec", "cache_level", "maxiter", "log_level"])
 def run_sqd(
     hamiltonian: PauliSumXZ,
     states_p: StateList,
     states_size: int,
     return_eigvec: bool,
     cache_level: tuple[int, int] = (1, 0),
+    maxiter: int = 1000,
+    tol: float | None = None,
     log_level: int = logging.INFO,
-) -> tuple[float] | tuple[float, jax.Array, jax.Array, int]:
-    """JIT-compiled part of the SQD function."""
+) -> tuple[float, bool] | tuple[float, jax.Array, jax.Array, int, bool]:
+    """JIT-compiled part of the SQD function.
+
+    Returns the eigenvalue, optionally the eigenvector/basis/dimension, and **the convergence flag as
+    the last element**. The flag used to be discarded here, which is what let a non-converged
+    ``theta`` -- a valid variational upper bound, so finite and plausible -- reach the caller as the
+    answer. It is returned rather than checked because this function is ``@jax.jit``-wrapped, so
+    ``converged`` is a traced boolean and cannot be branched on at trace time; :func:`sqd` raises on
+    it once the value is concrete.
+
+    Args:
+        maxiter: Maximum LOBPCG iterations, forwarded to :func:`rqutils.ground_locg.ground_locg`.
+            Static, as it is there.
+        tol: Convergence tolerance. ``None`` uses the operator dtype's machine epsilon.
+    """
     # `cache_level` is static, so this is a concrete tuple at trace time and the check runs once per
     # trace rather than once per call. `sqd` validates too; this covers the direct callers, which are
     # the six examples/scaling scripts -- i.e. the ones most likely to pass an experimental value.
@@ -799,7 +844,9 @@ def run_sqd(
     if log_level <= logging.DEBUG:
         jax.debug.print(f"Starting minimization with cache_level {cache_level}")
 
-    eigval, eigvec, _, _ = ground_locg(matvec, vinit, args=args, log_level=log_level)
+    eigval, eigvec, _, converged = ground_locg(
+        matvec, vinit, args=args, maxiter=maxiter, tol=tol, log_level=log_level
+    )
     result = (eigval,)
     if return_eigvec:
         if sharding:
@@ -807,7 +854,8 @@ def run_sqd(
             states_u = jax.reshard(states_u, PartitionSpec(None))
         subspace_dim = jnp.searchsorted(_is_filler(states_u), 1)
         result += (eigvec, states_u, subspace_dim)
-    return result
+    # Convergence last, so the existing positional unpackings above keep their meaning.
+    return result + (converged,)
 
 
 @jax.jit(static_argnames=["states_size"])
