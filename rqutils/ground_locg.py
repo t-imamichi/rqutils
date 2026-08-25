@@ -482,8 +482,7 @@ def _ground_locg_callable(
         # stylistic: `r_is_zero` feeds both the sas[1, 1] masking above and `converged` in the
         # returned state, so routing it through M^-1 would change what counts as a stationary point.
         # A nonzero residual lying near M^-1's small-singular-value direction would then report
-        # convergence early -- and per the comment above, the unguarded path makes theta "collapse
-        # towards 0 instead of reporting rho, the true answer". Only the direction is preconditioned.
+        # convergence early. Only the direction is preconditioned.
         norm_r = jnp.linalg.norm(rcurr)
         r_is_zero = norm_r == 0.0
         if precond is None:
@@ -533,17 +532,14 @@ def _ground_locg_callable(
         if log_level <= logging.DEBUG:
             jax.debug.print("LOCG iteration {}", state.niter)
 
-        # Residual basis selection.
-        # R is supposed to be already orthogonal to X, but we find that it's necessary to project
-        # out with respect to both X and P to get good convergence of the residual.
-        # _project_out only guarantees |tmp_p| >= 0.99, but the Rayleigh-Ritz step below solves a
-        # standard eigenproblem and so assumes an orthonormal basis: a short tmp_p scales sas[2, 2]
-        # by |tmp_p|^2, which for a large positive shift is a spuriously low diagonal that gets
-        # selected in place of the true minimizer.
-        # M^-1 r, or r itself. Applied here, where the search direction is formed, and nowhere
-        # else: the convergence test below reads `rnext` directly and must stay on the true residual.
-        # _project_out's "end on a subtraction of the original basis" invariant is unaffected -- it
-        # re-orthogonalizes whatever vector it is handed, and M^-1 r is just a different vector.
+        # Residual basis selection. R should already be orthogonal to X, but projecting out both X
+        # and P is needed for good residual convergence. _project_out only guarantees |tmp_p| >= 0.99
+        # while the Rayleigh-Ritz step below assumes an orthonormal basis, so tmp_p is renormalized:
+        # a short one scales sas[2, 2] by |tmp_p|^2, a spuriously low diagonal that gets selected in
+        # place of the true minimizer under a large positive shift.
+        #
+        # Preconditioning applies here, where the search direction is formed, and nowhere else -- the
+        # convergence test below reads `rnext` and must stay on the true residual.
         rdir = rcurr if precond is None else precond(rcurr)
         tmp_p, norm_p = _project_out((xcurr, ycurr), rdir)
         p_is_zero = norm_p == 0.0
@@ -570,27 +566,11 @@ def _ground_locg_callable(
         ynext = normalize(_reorthogonalize(tmp_t, xnext))
         axnext = matvec(xnext, *args)
         rnext = axnext - xnext * theta
-        # Use the intermediate AX for relative tolerance.
+        # Relative tolerance from the intermediate AX. Convergence is tested by self-consistency of
+        # the eigenpair -- |r| small relative to the floating-point error expected from computing the
+        # residual -- rather than via an estimated operator norm, which measured too lax (upstream
+        # lobpcg_standard; locking of either kind also measured worse there than none).
         #
-        # Comments from lobpcg_standard:
-        # =========
-        # I tried many variants of hard and soft locking [3]. All of them seemed
-        # to worsen performance relative to no locking.
-        #
-        # Further, I found a more experimental convergence formula compared to what
-        # is suggested in the literature, loosely based on floating-point
-        # expectations.
-        #
-        # [2] discusses various strategies for this in Sec 5.3. The solution
-        # they end up with, which estimates operator norm |A| via Gaussian
-        # products, was too crude in practice (and overly-lax). The Gaussian
-        # approximation seems like an estimate of the average eigenvalue.
-        #
-        # Instead, we test convergence via self-consistency of the eigenpair
-        # i.e., the residual norm |r| should be small, relative to the floating
-        # point error we'd expect from computing just the residuals given
-        # candidate vectors.
-        # =========
         # abs(theta) rather than +theta: the sum must not cancel for either sign of theta, and a
         # ground-state search is typically negative-definite.
         reltol = jnp.linalg.norm(axnext) + jnp.abs(theta)
@@ -735,21 +715,9 @@ def _project_out(basis, vector):
     for _ in range(2):
         vector = normalize(_subtract_projections(basis, vector))
 
-    # Comments from the original function:
-    # ================
-    # It's crucial to end on a subtraction of the original basis.
-    # This seems to be a detail not present in [2], possibly because of
-    # of reliance on soft locking.
-    #
-    # Near convergence, if the residuals R are 0 and our last
-    # operation when projecting (X, P) out from R is the orthonormalization
-    # done above, then due to catastrophic cancellation we may re-introduce
-    # (X, P) subspace components into U, which can ruin the Rayleigh-Ritz
-    # conditioning.
-    #
-    # We zero out any columns that are even remotely suspicious, so the invariant
-    # that [basis, U] is zero-or-orthogonal is ensured.
-    # ================
+    # Must end on a subtraction of the original basis, not the orthonormalization: near convergence
+    # with R = 0, catastrophic cancellation re-introduces (X, P) components into U and ruins the
+    # Rayleigh-Ritz conditioning. Suspicious vectors are zeroed to keep [basis, U] zero-or-orthogonal.
     for _ in range(2):
         vector = _subtract_projections(basis, vector)
 

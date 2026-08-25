@@ -259,6 +259,12 @@ job to set the mesh. The examples establish the expected pattern: a single axis 
 `AxisType.Explicit`, plus `jax.config.update('jax_enable_x64', True)` (without x64 you silently get
 complex64/int32 — you'll see truncation warnings).
 
+**Code comments should be concise.** One line where one line will do; a short block only for a
+non-obvious invariant or a defect the comment is there to prevent recurring. Prefer stating the
+constraint over narrating the code — if a comment restates what the next line plainly says, delete it.
+Long explanations belong in the docstring (user-facing) or `NOTES.md` (evidence, measurements,
+post-mortems), not inline.
+
 **Docstrings feed the published API reference.** Every module opens with a raw docstring that is a full
 reST document: over/underlined title, `.. currentmodule::`, prose with `.. math::` derivations of the
 normalization conventions, and an explicit API section (`.. autofunction::` / `.. autoclass::` /

@@ -176,17 +176,12 @@ class TestGetXsource:
 
         rng = np.random.default_rng(num_qubits)
         # The subspace is CONSTRUCTED to be partly closed under flipping the last qubit, not sampled
-        # and hoped over. Two reasons, both learned by getting it wrong:
-        #
-        # - If no signature has a partner inside the subspace, the expected answer is "-1
-        #   everywhere" and an implementation that finds nothing agrees with it. A random wide
-        #   signature essentially never has a partner, so the test would pass vacuously.
-        # - The variation is concentrated in the TRAILING bytes of the packed row so the leading 8
-        #   bytes collide across states. That is what makes a truncating uint64 key alias distinct
-        #   states, which is the ``B > 8`` failure this parametrization exists to catch. Note the
-        #   orientation: ``packbits`` fills from the most significant end and the pad bit is at
-        #   position 0, so *low* qubit indices land in the *leading* bytes -- the reverse of the
-        #   little-endian qubit numbering.
+        # and hoped over (see the low-weight label below for why a sampled one passes vacuously).
+        # Variation is concentrated in the TRAILING bytes so the leading 8 bytes collide across
+        # states -- that is what makes a truncating uint64 key alias distinct states, the ``B > 8``
+        # failure this parametrization exists to catch. Note the orientation: ``packbits`` fills from
+        # the most significant end and the pad bit is at position 0, so *low* qubit indices land in
+        # the *leading* bytes, the reverse of the little-endian qubit numbering.
         nvary = min(num_qubits, 12)
         base = np.zeros((200, num_qubits), dtype=np.uint8)
         base[:, num_qubits - nvary :] = rng.integers(0, 2, size=(200, nvary), dtype=np.uint8)
