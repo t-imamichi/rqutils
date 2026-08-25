@@ -212,6 +212,7 @@ type StateList = np.ndarray[tuple[int, int], np.dtype[np.uint8]]
 def sqd(
     hamiltonian: HamiltonianInput,
     states: StateList,
+    *,
     states_size: int | None = None,
     return_eigvec: bool = True,
     cache_level: tuple[int, int] = (1, 0),
@@ -236,10 +237,17 @@ def sqd(
     (0=no caching, 1=cached) and the second specifies the caching of the diagonal elements (0=no
     caching, 1=cache sign bits, 2=cache diagonals).
 
+    Everything after ``states`` is **keyword-only**. It used to be positional-or-keyword, which made
+    ``sqd(ham, states, True)`` a valid ``states_size`` of 1 (``True == 1``) rather than the
+    ``return_eigvec`` the caller meant -- no error, the array pinned to one slot. The three
+    parameters are semantically unrelated, so no reading of a bare positional was worth preserving.
+
     Args:
         hamiltonian: Hamiltonian to be projected and diagonalized.
         states: Binary array of computational basis states to project the Hamiltonian onto. Shape
-            (subspace_dim, num_qubits).
+            (subspace_dim, num_qubits). Entries must be 0 or 1 --
+            :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states` raises otherwise, since a
+            :math:`\{-1, +1\}` spin encoding would silently collapse the subspace.
         states_size: Fix the size of the states array used in computation to the specified value so
             that compilation is not triggered at each call with slightly different array sizes. Must
             be at least ``states.shape[0]``. Defaults to the next power of two at or above
@@ -331,7 +339,7 @@ def sqd(
 
 
 def hproj(
-    hamiltonian: HamiltonianInput, states: StateList, unique_states: bool = False
+    hamiltonian: HamiltonianInput, states: StateList, *, unique_states: bool = False
 ) -> csr_array:
     r"""Return the Hamiltonian projected onto the given subspace.
 
@@ -344,10 +352,14 @@ def hproj(
 
     States must have binary values and can be passed as an array of integers or booleans.
 
+    ``unique_states`` is **keyword-only**, for the reason given on :func:`sqd`: as a third positional
+    it made ``hproj(ham, states, True)`` read as a plausible but unrelated argument.
+
     Args:
         hamiltonian: Hamiltonian to be projected and diagonalized.
         states: Binary array of computational basis states to project the Hamiltonian onto. Shape
-            (subspace_dim, num_qubits).
+            (subspace_dim, num_qubits). Entries must be 0 or 1 --
+            :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states` raises otherwise.
         unique_states: Whether ``states`` can be assumed to be already uniquified **and
             lex-sorted**, skipping the internal ``np.unique(..., axis=0)``. Both halves are
             required, because :func:`get_xsource` binary-searches into ``states``; violating either

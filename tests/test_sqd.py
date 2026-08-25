@@ -272,6 +272,44 @@ class TestUniquifyStates:
         assert np.all(out[(out[:, 0] >> 7) == 1] == 255)
 
 
+class TestKeywordOnlyEntryPoints:
+    """Everything after ``states`` is keyword-only on both public entry points.
+
+    The slip this closes is ``sqd(ham, states, True)``. Every parameter after ``states`` used to be
+    positional-or-keyword, and the three are semantically unrelated (``states_size: int | None``,
+    ``return_eigvec: bool``, ``cache_level: tuple``). Since ``True == 1``, that call was a *valid*
+    ``states_size`` and did not raise -- it pinned the array to size 1. ``hproj(ham, states, True)``
+    is the same shape one function over, where the third parameter is ``unique_states``.
+
+    ``apply_h`` already received this treatment (``docs/rqutils-requests.md`` C1); the public entry
+    points were missed. No in-tree caller passed these positionally, so this is a downstream-only
+    break.
+    """
+
+    def test_sqd_rejects_a_third_positional_argument(self):
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises(TypeError, match="positional"):
+            sqd((["ZI"], [1.0]), states, True)  # ty: ignore[too-many-positional-arguments]
+
+    def test_hproj_rejects_a_third_positional_argument(self):
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises(TypeError, match="positional"):
+            hproj((["ZI"], [1.0]), states, True)  # ty: ignore[too-many-positional-arguments]
+
+    def test_the_keyword_forms_still_work(self):
+        """The two arguments a caller actually wants must remain reachable by name."""
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        assert isinstance(float(sqd((["ZI"], [1.0]), states, return_eigvec=False)), float)
+        assert hproj((["ZI"], [1.0]), states, unique_states=False).shape == (2, 2)
+
+    def test_states_size_one_is_still_expressible_by_name(self):
+        """The guard must not remove the behaviour, only the accidental way of reaching it."""
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        # states_size=1 is legal but degenerate: one slot for a two-state subspace.
+        with pytest.raises((ValueError, IndexError, RuntimeError)):
+            sqd((["ZI"], [1.0]), states, states_size=1, return_eigvec=False)
+
+
 class TestInt32Ceiling:
     """``_MAX_STATES`` is enforced where the int32 index is created, not only in the entry points.
 
