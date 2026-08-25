@@ -21,17 +21,18 @@ that work.
 
 ---
 
-## Summary — all 19 items at a glance
+## Summary — 18 open items, plus one intentional design decision
 
 Status verified against the source on `dev` at the time of writing, not read off the prose below.
-**All 19 are open**; the "Already closed" section near the end is a separate, unnumbered list of
-gotchas earlier breaking changes have already removed. "Partly landed" means a *documentation or test*
-fix shipped while the structural fix did not.
+**Item 2 is intentional** — a deliberate per-module design decision, kept in the list for its
+measurements and its cross-boundary warning. Of the remaining 18, **all are open**; the "Already closed"
+section near the end is a separate, unnumbered list of gotchas earlier breaking changes have already
+removed. "Partly landed" means a *documentation or test* fix shipped while the structural fix did not.
 
 | # | tier | gotcha | measured consequence | proposed fix | effort | status |
 | --- | --- | --- | --- | --- | --- | --- |
 | **1** | 1 | `pack_states` maps any nonzero to 1 | `{-1,+1}` input returns **0.000000** vs true −1.358047 | validate `{0,1}`, or accept `np.bool_` only | 1 check | **open** |
-| **2** | 1 | `states` columns are character-indexed, `svsim`/qiskit are qubit-indexed | −2.627596 vs −4.550395, n=5 | put the order in the type (`BitstringTable`) | large | **partly landed** — helper fixed + test pinned; API unchanged |
+| **2** | — | `sqd` is MSB-first, `svsim` is LSB-first | −2.627596 vs −4.550395, n=5, if a caller crosses the boundary | **none — document the boundary** | — | ✅ **intentional** (see below) |
 | **3** | 2 | `sqd(ham, states, True)` sets `states_size=1` | silently pins the array to size 1 | `*` after `states` | 1 line | **open** |
 | **4** | 2 | `cache_level` digits unvalidated | `(2,0)` silently acts as `(0,0)`; `(1,5)` → `UnboundLocalError`; transposition costs **7.2–10.9×** | two keyword-only enums | small | **open** |
 | **5** | 2 | `PauliSumXZ.arrays` is a bare 3-tuple | `z, x, c = ham.arrays` type-checks and swaps X/Z | `NamedTuple` | ~free | **open** |
@@ -68,12 +69,15 @@ This repo has already made the make-it-unrepresentable move twice, and both work
   2-state subspace even the *shapes* collide at `(2, 2)`, so no assertion could have closed it
   (`docs/rqutils-requests.md` C1).
 
-Items 1, 2, 4, 5 and 6 below are that same move applied to states validation, column order, cache
-level and array identity.
+Items 1, 4, 5 and 6 below are that same move applied to states validation, cache level and array
+identity. (Item 2 is *not* — the MSB/LSB split is intentional, and the move there is documentation.)
 
 ---
 
 ## Tier 1 -- silently wrong number, easily reached
+
+(Item 2 was formerly listed here. It is a **deliberate design decision**, not a gotcha to fix -- see
+its entry below, which is kept for the measurements and the cross-boundary warning.)
 
 ### 1. `pack_states` maps any nonzero to 1, so `{-1,+1}` spin encoding collapses every state
 
@@ -103,7 +107,36 @@ caller-supplied data, in the function documented as the canonical entry point.
 `packbits` is about to walk anyway, and it is the **single** choke point for both `sqd` and `hproj`.
 Alternatively accept `np.bool_` only, which makes `{-1,+1}` a `TypeError` at the boundary.
 
-### 2. `sqd` indexes `states` by Pauli-string character; `svsim` and qiskit index by qubit
+### 2. ✅ INTENTIONAL — `sqd` is MSB-first, `svsim` is LSB-first
+
+**Not a defect, and not to be unified.** Confirmed by the author 2026-08-25:
+
+> `sqd` uses MSB-first to fully optimize, but `svsim` leaves LSB-first because my SKQD code does not
+> use it.
+
+Each module's convention is the right one for its own constraints:
+
+* **`sqd` is MSB-first because the optimization depends on it.** `_pack_state_keys` (`sqd.py:697-701`)
+  requires byte 0 to be most significant so that integer order on the packed keys is *identical* to row
+  lex order — "that equivalence is the whole point: it lets a scalar binary search stand in for a
+  lexicographic one". That buys a measured **12-19x** on `get_xsource`, which `NOTES.md` puts at
+  **66-97%** of a solve. The convention is load-bearing, not incidental.
+* **`svsim` stays LSB-first because nothing pays for it.** The author's SKQD code does not cross the
+  `svsim` → `sqd` boundary, so the conversion cost is never incurred and matching qiskit's qubit
+  indexing is the more natural choice for a state-vector simulator.
+
+The measurements below stand and are worth keeping — **not** as an argument for changing either module,
+but because a caller who *does* cross the boundary gets a plausible wrong number. What that calls for is
+a documented boundary, not a signature change. The original "breaking fix" proposal is struck through at
+the end of this item.
+
+Note the item's own cost measurement already pointed this way: reversing the column order is cheap
+(0.006-0.18%) but "buys nothing on its own, since neither convention is intrinsically better and a flip
+breaks existing callers silently".
+
+---
+
+#### The convention, measured (retained for reference)
 
 `rqutils/sqd.py:241` (`states` shape `(subspace_dim, num_qubits)`) against `rqutils/svsim.py:238`
 (qubit `q` is bit `q` of the state-vector index). `tests/conftest.py:124` pins the `sqd` side
@@ -181,12 +214,23 @@ coupling exposed the gotcha immediately. **A regression test for this needs asym
 it will pass while the bug is present. (Same shape as the `uint64`-overrun trap in `NOTES.md`, which
 only fires when the leading bytes collide.)
 
-**Breaking fix.** Put the convention in the type: `BitstringTable(rows, order=Literal['msb_first',
-'lsb_first'])`, accepted by `sqd`/`hproj`/`pack_states`, reversed internally when needed. Or accept
-integer basis indices plus `num_qubits` and do the unpacking in-library, so a caller never expresses a
-bit order at all. Splitting the entry points (`sqd_from_character_ordered_states` /
-`..._from_qubit_indexed_states`) also works -- and note the names should say *character vs qubit*, not
-*MSB vs LSB*: the distinction is which axis the column index means, not the endianness of an integer.
+**What this needs instead: documentation at the boundary, not a signature change.** Since the
+divergence is intentional, the actionable residue is that a caller crossing `svsim` → `sqd` has no
+in-library signal. Non-breaking and worth doing:
+
+* State the convention in `sqd`'s and `pack_states`' docstrings — a `states` column is a Pauli-string
+  **character** position, so bit `q` of a `svsim` index belongs in column `n-1-q`. `sqd`'s docstring
+  currently says only "States must have binary values".
+* Offer a named adapter (e.g. `states_from_basis_indices(indices, num_qubits)`) so the reversal has one
+  obvious spelling instead of a `[:, ::-1]` each caller writes for itself. This is additive.
+* Fix the docstring at `symplectic.py:152` ("this class is little-endian in qubit order"), which reads
+  as a claim about layout and is the opposite of what the layout does; `symplectic.py:39` is accurate.
+
+~~**Superseded proposal.** Put the convention in the type: `BitstringTable(rows,
+order=Literal['msb_first', 'lsb_first'])`, accepted by `sqd`/`hproj`/`pack_states`, reversed internally
+when needed; or accept integer basis indices plus `num_qubits`; or split the entry points.~~ Rejected —
+the conventions are deliberate per module, and unifying them would cost `sqd` its binary-search
+optimization or `svsim` its qiskit-natural indexing for no measured gain.
 
 ## Tier 2 -- wrong result, or a silent 7-11x slowdown, from an ordinary slip
 
@@ -448,12 +492,14 @@ If only three are done: **1**, **3**, **5**. One validation check, one `*`, one 
 them they close the most severe silent failure, the easiest slip, and a hazard class this repo has
 already been bitten by twice. All three are local and low-risk.
 
-**2** is the highest-value structural change and the largest, and the one with a demonstrated victim --
-the repo's own `subspace` helper shipped the mistake, and no test covered the path. Two cautions from
-fixing it: its regression test is easy to write vacuously (see the uniform-chain note under that item),
-and the change to make is *explicitness*, not flipping the default -- reversing the column order costs
-0.006-0.18% but buys nothing by itself, since neither convention is intrinsically better and a flip
-breaks existing callers silently.
+**2 is intentional and off the list** — `sqd` is MSB-first because its binary-search optimization
+depends on it, `svsim` is LSB-first because the SKQD path never crosses the boundary. The residue is
+documentation (docstrings plus an optional named adapter), which is non-breaking and can happen
+independently. Two things from that item are still worth carrying forward, though, since they apply to
+*any* work near this boundary: the repo's own `subspace` helper shipped the mistake with no test covering
+the path, and a regression test here is easy to write **vacuously** — a uniform chain is symmetric under
+bit reversal, so reversing the columns measured a difference of exactly 0.000000. Asymmetric couplings
+are required.
 
 Items **7** and **14** are one-line checks with good severity-to-effort ratios and could ride along
 with the first three.
