@@ -209,6 +209,46 @@ type Vector = np.ndarray[tuple[int], np.dtype[np.inexact]]
 type StateList = np.ndarray[tuple[int, int], np.dtype[np.uint8]]
 
 
+def _check_states_shape(states: StateList, num_qubits: int) -> None:
+    """Raise unless ``states`` is ``(subspace_dim, num_qubits)``.
+
+    One ``O(1)`` look at a shape, shared by :func:`sqd` and :func:`hproj` so the two cannot drift.
+    It closes three distinct mistakes that all used to produce a plausible finite answer:
+
+    * **Re-feeding packed states.** :meth:`PauliSumXZ.pack_states` is not idempotent, and ``sqd``
+      takes *unpacked* states while the natural intermediate a caller keeps -- from
+      :func:`uniquify_states`, or from ``pack_states`` called directly -- is *packed*. Feeding that
+      back re-packs it: ``astype(uint8)`` is a no-op and ``packbits`` then reads each byte as one bit
+      via nonzero-to-1, so the subspace silently changes. Realistic loop: run ``sqd``, do
+      configuration recovery, run ``sqd`` again.
+    * **A transposed array**, ``(num_qubits, subspace_dim)``.
+    * **A mismatched Hamiltonian**, right shape family and wrong qubit count.
+
+    Note it does not close *every* re-feed on its own: at ``num_qubits <= 7`` a packed row is one
+    byte wide, so a 1-qubit Hamiltonian would accept it -- the shape genuinely matches. What catches
+    that is :meth:`PauliSumXZ.pack_states`' binary check, since packed bytes exceed 1.
+
+    Args:
+        states: The caller's state array.
+        num_qubits: The Hamiltonian's qubit count.
+
+    Raises:
+        ValueError: If ``states`` is not 2-D, or its second axis is not ``num_qubits``.
+    """
+    if states.ndim != 2:
+        raise ValueError(
+            f"`states` must be 2-D with shape (subspace_dim, num_qubits), got shape {states.shape}"
+        )
+    if states.shape[1] != num_qubits:
+        raise ValueError(
+            f"`states` has {states.shape[1]} columns but the Hamiltonian has {num_qubits} qubits; "
+            "`states` must be (subspace_dim, num_qubits) and *unpacked*. Note "
+            "`PauliSumXZ.pack_states` is not idempotent, so a packed array kept from a previous call "
+            "(or from `uniquify_states`) cannot be fed back in -- it would re-pack into a different "
+            "subspace. Also check for a transposed array or a mismatched Hamiltonian."
+        )
+
+
 def sqd(
     hamiltonian: HamiltonianInput,
     states: StateList,
@@ -305,6 +345,7 @@ def sqd(
         )
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
+    _check_states_shape(states, hamiltonian.num_qubits)
 
     if not (mesh := get_abstract_mesh()).empty and (resid := states_size % mesh.size) != 0:
         LOG.debug("Adjusting states_size to make the array divisible by %d", mesh.size)
@@ -379,6 +420,7 @@ def hproj(
     """
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
+    _check_states_shape(states, hamiltonian.num_qubits)
     # Same int32 ceiling sqd() enforces, since hproj reaches get_xsource too and its returned
     # positions are int32 with -1 as the absent marker. Checked here, before the O(N) sortedness scan
     # and the np.unique below: it is an O(1) look at a shape, so it costs nothing to do first and
@@ -441,8 +483,11 @@ def _hproj_cols_elems(hamiltonian: PauliSumXZ, states_p: StateList) -> tuple[jax
     """
 
     def get_from_one(_, ham):
-        columns = get_xsource(ham[0], states_p)
-        diagonals = get_diagonal(ham[1], ham[2], states_p)
+        # `ham` is a PackedArrays, so these read by name. As a bare tuple this was
+        # `ham[0]`/`ham[1]`/`ham[2]`, where swapping the first two type-checks and silently
+        # computes with X and Z exchanged -- `x` and `z` are same-dtype integer arrays.
+        columns = get_xsource(ham.x, states_p)
+        diagonals = get_diagonal(ham.z, ham.c, states_p)
         return None, (columns, diagonals)
 
     return jax.lax.scan(get_from_one, None, hamiltonian.arrays)[1]

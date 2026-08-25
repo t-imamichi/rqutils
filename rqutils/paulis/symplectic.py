@@ -49,7 +49,7 @@ Symplectic Pauli sum representation API
 """
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import numpy as np
@@ -61,6 +61,29 @@ try:
     HAS_QISKIT = True
 except ImportError:
     HAS_QISKIT = False
+
+
+class PackedArrays(NamedTuple):
+    """The ``(x, z, c)`` arrays of a :class:`PauliSumXZ`, named so a misordered read is visible.
+
+    ``x`` and ``z`` are same-dtype integer arrays, so a bare tuple let ``z, x, c = ham.arrays``
+    type-check, run, and compute with X and Z swapped -- the hazard that got :func:`rqutils.sqd.apply_h`'s
+    positional form deleted (0.44 max abs error there), one abstraction lower. A ``NamedTuple`` cannot
+    stop a misordered unpacking, but it gives consumers a spelling that names what they mean, and it is
+    a registered pytree, so :func:`jax.lax.scan` hands its body an instance of this type rather than a
+    raw tuple -- which is what lets ``rqutils.sqd._hproj_cols_elems`` read ``ham.x`` instead of
+    ``ham[0]`` inside the scan. Being a ``tuple`` subclass, every existing splat and index still works.
+
+    Attributes:
+        x: Packed X signatures, shape ``(num_xgroups, num_bytes)``.
+        z: Packed Z signatures, shape ``(num_xgroups, max_zterms, num_bytes)``.
+        c: Phase-folded coefficients, shape ``(num_xgroups, max_zterms)``. See
+            :class:`PauliSumXZ` for the dtype rule.
+    """
+
+    x: jax.Array
+    z: jax.Array
+    c: jax.Array
 
 
 @register_dataclass
@@ -309,11 +332,17 @@ class PauliSumXZ:
         return cls(xsignatures, zsignatures, phcoeffs, num_qubits)
 
     @property
-    def arrays(self) -> tuple[jax.Array, jax.Array, jax.Array]:
+    def arrays(self) -> "PackedArrays":
         """The packed ``(x, z, c)`` arrays, for splatting into a traced function.
 
+        A :class:`PackedArrays` rather than a bare tuple: ``x`` and ``z`` are same-dtype integer
+        arrays, so ``z, x, c = ham.arrays`` used to type-check and silently swap them. Still a
+        ``tuple`` subclass and still a pytree, so splatting, indexing and
+        :func:`jax.lax.scan` all behave as before.
+
         Returns:
-            ``(x, z, c)``: the packed X signatures, the packed Z signatures, and the phase-folded
-            coefficients. See the class docstring for shapes and for ``c``'s dtype rule.
+            The packed X signatures, packed Z signatures, and phase-folded coefficients, as the
+            named fields ``x``, ``z`` and ``c``. See the class docstring for shapes and for ``c``'s
+            dtype rule.
         """
-        return self.x, self.z, self.c
+        return PackedArrays(self.x, self.z, self.c)

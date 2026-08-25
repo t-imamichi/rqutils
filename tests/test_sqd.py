@@ -272,6 +272,63 @@ class TestUniquifyStates:
         assert np.all(out[(out[:, 0] >> 7) == 1] == 255)
 
 
+class TestStatesWidthCheck:
+    """``states.shape[1]`` must equal ``hamiltonian.num_qubits`` on both entry points.
+
+    The realistic failure is that ``pack_states`` is **not idempotent**. ``sqd`` takes unpacked
+    ``(N, n)`` states and *returns* unpacked ones, but the natural intermediate a caller keeps -- from
+    ``uniquify_states``, or from ``pack_states`` called directly as the docstring encourages -- is
+    *packed*, shape ``(N, ceil((n+1)/8))``. Feeding that back in re-packs it: ``astype(uint8)`` is a
+    no-op and ``packbits`` then treats each byte as one bit via nonzero-to-1, yielding a different
+    subspace. Nothing caught it, because both inputs are 2-D uint8 and the width was never compared
+    against the Hamiltonian. This is a realistic loop -- run ``sqd``, do configuration recovery, run
+    ``sqd`` again.
+
+    One ``O(1)`` comparison closes double-packing, a transposed array, and a mismatched Hamiltonian at
+    once. Note it does not close *every* re-feed: at ``n <= 7`` a packed row is 1 byte wide, so a
+    1-qubit Hamiltonian would accept it -- the shape genuinely matches there. Item 1's binary check is
+    what catches that case, since packed bytes exceed 1.
+    """
+
+    def test_sqd_rejects_packed_states(self):
+        """The measured loop: pack the states, feed them back, get a different subspace."""
+        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
+        packed = pack_padded(states)
+        assert packed.shape[1] != states.shape[1], "fixture must actually change width"
+        with pytest.raises(ValueError, match="num_qubits|width|shape"):
+            sqd((["ZZII"], [1.0]), packed, return_eigvec=False)
+
+    def test_hproj_rejects_packed_states(self):
+        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
+        with pytest.raises(ValueError, match="num_qubits|width|shape"):
+            hproj((["ZZII"], [1.0]), pack_padded(states))
+
+    def test_a_transposed_array_is_rejected(self):
+        """Same check, second payoff: (n, N) instead of (N, n)."""
+        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
+        with pytest.raises(ValueError, match="num_qubits|width|shape"):
+            sqd((["ZZII"], [1.0]), states.T.copy(), return_eigvec=False)
+
+    def test_a_mismatched_hamiltonian_is_rejected(self):
+        """Third payoff: right shape family, wrong qubit count."""
+        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
+        with pytest.raises(ValueError, match="num_qubits|width|shape"):
+            sqd((["ZZ"], [1.0]), states, return_eigvec=False)
+
+    def test_the_error_names_both_widths(self):
+        states = np.array([[0, 1, 0, 1]], dtype=np.uint8)
+        with pytest.raises(ValueError) as excinfo:
+            sqd((["ZZ"], [1.0]), states, return_eigvec=False)
+        message = str(excinfo.value)
+        assert "4" in message and "2" in message
+
+    def test_matching_widths_still_work(self):
+        """The guard must not narrow what already worked."""
+        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
+        assert isinstance(float(sqd((["ZZII"], [1.0]), states, return_eigvec=False)), float)
+        assert hproj((["ZZII"], [1.0]), states).shape == (2, 2)
+
+
 class TestKeywordOnlyEntryPoints:
     """Everything after ``states`` is keyword-only on both public entry points.
 

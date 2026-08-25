@@ -19,6 +19,7 @@ effect was silently discarding the imaginary part of a non-Hermitian operator. S
 
 import warnings
 
+import jax
 import numpy as np
 import pytest
 from conftest import dense_pauli_sum, gate_unitary
@@ -458,6 +459,60 @@ class TestPadding:
 
         assert np.array_equal(packed_state, expected), f"pack_states for {num_qubits} qubits"
         assert np.array_equal(signature, expected), f"signature for {num_qubits} qubits"
+
+
+class TestArraysNamedTuple:
+    """``arrays`` is a ``NamedTuple``, so an unpacking in the wrong order is visible.
+
+    As a bare 3-tuple of same-typed integer arrays, ``z, x, c = ham.arrays`` type-checked, ran, and
+    computed with X and Z swapped -- the same hazard that got ``apply_h``'s positional form deleted
+    (measured 0.44 max abs error there), one abstraction lower. A ``NamedTuple`` cannot prevent a
+    misordered unpacking either, but it gives every consumer a spelling that *says* which array it
+    means, and ``rqutils.sqd._hproj_cols_elems`` was reading ``ham[0]``/``ham[1]``/``ham[2]``
+    positionally inside a ``jax.lax.scan``.
+
+    The constraint the change had to respect: ``arrays`` exists to be splatted into a traced
+    function, and ``_hproj_cols_elems`` scans over it. A ``NamedTuple`` is a registered pytree, so
+    ``jax.lax.scan`` maps over its leaves and hands the body an instance of the same type -- which
+    is what makes the named access available inside the scan. Asserted below rather than assumed.
+    """
+
+    def test_fields_are_named(self):
+        ham = PauliSumXZ.from_paulisum((["XZ", "ZX"], [1.0, 0.5]))
+        arrays = ham.arrays
+        assert arrays.x is ham.x
+        assert arrays.z is ham.z
+        assert arrays.c is ham.c
+
+    def test_still_unpacks_and_indexes_positionally(self):
+        """Existing splat and index call sites must keep working -- this is not a breaking change."""
+        ham = PauliSumXZ.from_paulisum((["XZ", "ZX"], [1.0, 0.5]))
+        x, z, c = ham.arrays
+        assert x is ham.x and z is ham.z and c is ham.c
+        assert len(ham.arrays) == 3
+        assert ham.arrays[0] is ham.x
+
+    def test_survives_a_lax_scan_as_a_named_type(self):
+        """The load-bearing property: ``scan`` must hand the body a named instance, not a raw tuple.
+
+        If the type were lost, the fix would be cosmetic at the only call site that indexes it.
+        """
+        ham = PauliSumXZ.from_paulisum((["XZ", "ZX"], [1.0, 0.5]))
+        seen = []
+
+        def body(carry, one):
+            seen.append(type(one).__name__)
+            # Named access inside the scan body is the point of the change.
+            return carry, one.x.sum()
+
+        jax.lax.scan(body, None, ham.arrays)
+        assert seen and seen[0] == type(ham.arrays).__name__, seen
+
+    def test_is_a_tuple_subclass_so_jax_treats_it_as_a_pytree(self):
+        ham = PauliSumXZ.from_paulisum((["XZ"], [1.0]))
+        assert isinstance(ham.arrays, tuple)
+        leaves = jax.tree.leaves(ham.arrays)
+        assert len(leaves) == 3
 
 
 class TestBinaryStateValidation:
