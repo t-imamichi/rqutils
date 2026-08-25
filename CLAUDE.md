@@ -19,7 +19,19 @@ feature branches (`metal`, not `main`) that get pushed mid-session, so "my commi
 goes stale within a turn — amend then and you rewrite published history. `git branch -r --contains
 <sha>` is the per-commit check.
 
-**`metal` is stale — `dev` is authoritative.** Confirmed 2026-08-25. The two lines diverged in both
+**`dev` is the only live branch. `metal` and `product` are both stale — reference only, do not merge.**
+Confirmed 2026-08-25. Both are ahead of `dev` in commit count, which makes them look like work waiting to
+be integrated; they are not.
+
+**`product`** holds the `rqutils/product.py` (SCIP product-state solver) investigation and an SDP
+lower-bound spike. Its **conclusions are already on `dev`**: `CLAUDE.md` and `NOTES.md` here are
+byte-identical to `product`'s, and `docs/rqutils-precond-request.md` / `docs/sdp-lower-bound.md` carry
+the findings. What lives *only* on `product` is the code — `rqutils/product.py` itself, its `pyscipopt`
+and `clarabel` dependencies, and `examples/scaling/poc_sdp_*.py` — plus the commit-by-commit record.
+**`dev` has no `rqutils/product.py`**, so ignore any prose here that describes it as a module; the
+investigation is **closed** (see "Closed investigations" below) and the module was never brought over.
+
+**`metal`** diverged in both
 directions (18 vs 28 commits) and several items were done *independently on both* — the MLX removal, the
 `2^31` subspace ceiling, `apply_h`'s keyword-only rewrite (C1), C2 and C3 — so `git log --cherry-pick`
 reports every `metal` commit as unique and the overlap is invisible from the log alone. Where they overlap,
@@ -134,8 +146,7 @@ Rules, each of which cost a defect to learn — **evidence in `NOTES.md`**:
 ## Architecture
 
 Seven largely independent modules under `rqutils/`; nothing but `sqd.py → {paulis/symplectic.py,
-ground_locg.py}` and `qprint.py → paulis/general.py` couples them. Plus `product.py`, a SCIP
-product-state solver, which nothing else imports.
+ground_locg.py}` and `qprint.py → paulis/general.py` couples them.
 
 **Two unrelated Pauli representations — do not confuse them:**
 
@@ -219,10 +230,10 @@ the object for lazy `__repr__`, `'latex'` a string, `'mpl'` a Figure). `QPrintBa
 subclasses only override `_qobj_data`, `_add_labels`, `_format_lhs`. **Test the full `fmt` × `output`
 grid, not a diagonal of it** — four bugs lived in cells nothing exercised (`NOTES.md`).
 
-**`product.py`** — SCIP product-state solver (`solve_product`), a hard `pyscipopt` dependency. Returns
-both the product-state objective and SCIP's `lower_bound`; **both are *upper* bounds on the true ground
-energy**, since product states are a strict subset of Hilbert space. `NoSolutionError` is distinct
-because `getVal()` does *not* fail when no solution exists — it returns an unfinished search point.
+**`product.py` is not on this branch.** It lives on the stale `product` branch only (a SCIP
+product-state solver, `solve_product`, with `pyscipopt`/`clarabel` deps). Recorded here because
+`docs/rqutils-precond-request.md` and `docs/sdp-lower-bound.md` reference it: both values it returns are
+*upper* bounds on the true ground energy, which is why the whole preconditioner-shift line is closed.
 
 ## Conventions to follow when editing
 
@@ -240,8 +251,8 @@ static — a traced loop index cannot subscript a static dimension tuple
 **Optional dependencies** — uniform `try: import X / except ImportError: HAS_X = False / else:
 HAS_X = True` at module top, every use guarded by `HAS_X and isinstance(...)`. Type aliases are
 conditionally widened (`CircuitInput |= QuantumCircuit`), and the runtime path raises a `RuntimeError`
-rather than failing at import. `numpy`, `scipy`, `h5py`, `pyscipopt`, and **`jax`** are hard
-dependencies.
+rather than failing at import. `numpy`, `scipy`, `h5py`, and **`jax`** are hard dependencies
+(`pyscipopt` is not — it is only on the stale `product` branch).
 
 **Sharding is implicit** — the library reads `jax.sharding.get_abstract_mesh()`; it is the *caller's*
 job to set the mesh. The examples establish the expected pattern: a single axis named `'x'` with
