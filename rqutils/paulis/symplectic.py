@@ -109,10 +109,34 @@ class PauliSumXZ:
 
         Args:
             states: Binary array of computational basis states, shape ``(num_states, num_qubits)``.
+                Every entry must be 0 or 1; see ``Raises``.
 
         Returns:
             Packed states, shape ``(num_states, ceil((num_qubits + 1) / 8))``.
+
+        Raises:
+            ValueError: If any entry is not 0 or 1. Both coercions in the packing expression are
+                lossy and neither used to be checked, so the two natural caller mistakes produced a
+                plausible finite energy rather than an error. :func:`numpy.packbits` maps *every*
+                nonzero entry to 1, so spins in the standard :math:`\\{-1, +1\\}` convention pack to
+                the all-ones bitstring for every row -- ``uniquify_states`` then collapses the whole
+                subspace to one state and ``sqd`` returns its diagonal element (measured
+                **0.000000** on a 4-qubit XXZ chain against a true −1.358047). And
+                ``astype(np.uint8)`` wraps, so ``256`` becomes ``0``. This is the single choke point
+                for both :func:`rqutils.sqd.sqd` and :func:`rqutils.sqd.hproj`, and the scan is
+                ``O(N*n)`` on an array :func:`numpy.packbits` is about to walk anyway.
         """
+        # Checked before `astype`, which would erase the evidence: 256 wraps to 0 and -1 to 255,
+        # so an "is it 0 or 1?" test on the converted array cannot see what the caller passed.
+        if not np.all((states == 0) | (states == 1)):
+            bad = np.asarray(states)[(np.asarray(states) != 0) & (np.asarray(states) != 1)]
+            raise ValueError(
+                "`states` must be binary (every entry 0 or 1), but it contains "
+                f"{bad[0]!r}{f' and {bad.size - 1} other non-binary entries' if bad.size > 1 else ''}. "
+                "Note `np.packbits` maps every nonzero value to 1, so a {-1, +1} spin encoding "
+                "would otherwise pack to the all-ones bitstring for every row and collapse the "
+                "subspace to a single state. Convert with `(spins + 1) // 2` or `spins > 0`."
+            )
         return np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
 
     @staticmethod

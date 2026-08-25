@@ -460,6 +460,54 @@ class TestPadding:
         assert np.array_equal(signature, expected), f"signature for {num_qubits} qubits"
 
 
+class TestBinaryStateValidation:
+    """``pack_states`` must reject non-binary input rather than silently collapsing it.
+
+    ``np.packbits`` maps **every** nonzero entry to 1, and ``astype(np.uint8)`` wraps. Neither is
+    checked, so two ordinary caller mistakes used to produce a plausible finite energy:
+
+    - spins in the standard ``{-1, +1}`` convention pack to the *all-ones* bitstring for every row,
+      so ``uniquify_states`` collapses the whole subspace to one state and ``sqd`` returns that
+      state's diagonal element. Measured on a 4-qubit XXZ chain: **0.000000** against a true ground
+      energy of −1.358047, with the same physical states in both arms.
+    - ``256`` wraps to ``0``, so ``[[0, 1, 256]]`` and ``[[0, 1, 0]]`` pack identically.
+
+    ``pack_states`` is the single choke point for both ``sqd`` and ``hproj``, and the check is
+    ``O(N*n)`` on an array ``packbits`` is about to walk anyway.
+    """
+
+    def test_spin_encoding_raises_instead_of_collapsing(self):
+        """``{-1, +1}`` input is the documented gotcha: every row packed to the same bitstring."""
+        spins = np.array([[-1, 1, -1, 1], [1, 1, 1, 1]], dtype=np.int8)
+        with pytest.raises(ValueError, match="binary"):
+            PauliSumXZ.pack_states(spins)
+
+    def test_values_above_one_raise_instead_of_wrapping(self):
+        """``256`` wraps to 0 under ``astype(uint8)``; 2 is nonzero and packs as 1."""
+        for bad in (np.array([[0, 1, 256]]), np.array([[0, 1, 2]])):
+            with pytest.raises(ValueError, match="binary"):
+                PauliSumXZ.pack_states(bad)
+
+    def test_the_error_names_an_offending_value(self):
+        """A caller holding spins needs to see *what* was wrong, not just that something was."""
+        with pytest.raises(ValueError) as excinfo:
+            PauliSumXZ.pack_states(np.array([[0, 1, -1]], dtype=np.int8))
+        assert "-1" in str(excinfo.value)
+
+    @pytest.mark.parametrize("dtype", [np.uint8, np.int8, np.int64, bool])
+    def test_genuine_binary_input_still_packs_in_every_dtype(self, dtype):
+        """The guard must not narrow what was already accepted -- bools included."""
+        states = np.array([[0, 1, 1, 0], [1, 0, 0, 1]], dtype=dtype)
+        packed = PauliSumXZ.pack_states(states)
+        expected = np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
+        assert np.array_equal(packed, expected)
+
+    def test_empty_and_single_row_inputs_are_accepted(self):
+        """Degenerate shapes must not trip the guard (`np.all` over an empty axis is True)."""
+        assert PauliSumXZ.pack_states(np.zeros((0, 4), dtype=np.uint8)).shape == (0, 1)
+        assert PauliSumXZ.pack_states(np.ones((1, 4), dtype=np.uint8)).shape == (1, 1)
+
+
 class TestDataclass:
     """``PauliSumXZ`` is a frozen, JAX-registered dataclass."""
 
