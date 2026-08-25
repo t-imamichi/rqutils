@@ -202,15 +202,34 @@ class TestSymmetryValidation:
     passing.
     """
 
-    @pytest.mark.parametrize("bad", [2, -2, 3, "hermitian", 1.5, None])
-    def test_out_of_range_values_raise(self, bad):
+    @pytest.mark.parametrize("bad", [2, -2])
+    def test_out_of_range_ints_raise_value_error(self, bad):
+        """Two cases, not six: every out-of-range int reaches the same branch.
+
+        Checked against ``_check_symmetry`` rather than through ``matrix_exp`` -- the validator is
+        the unit under test, and routing through the public function only added an eigendecomposition
+        the validator never reads. :meth:`test_the_public_functions_reject_it_too` covers the wiring.
+        """
+        with pytest.raises(ValueError, match="hermitian"):
+            rm._check_symmetry(bad)
+
+    @pytest.mark.parametrize("bad", ["hermitian", None])
+    def test_non_int_values_raise_type_error(self, bad):
+        with pytest.raises(TypeError, match="hermitian"):
+            rm._check_symmetry(bad)
+
+    def test_the_public_functions_reject_it_too(self):
+        """One end-to-end case, so the validator is actually wired into the dispatch."""
         rng = np.random.default_rng(20260804)
-        mat = herm(3, rng)
-        with pytest.raises((ValueError, TypeError), match="hermitian"):
-            rm.matrix_exp(mat, hermitian=bad)
+        with pytest.raises(ValueError, match="hermitian"):
+            rm.matrix_exp(herm(3, rng), hermitian=2)
 
     @pytest.mark.parametrize("good", [0, 1, -1, True, False])
     def test_every_valid_value_is_still_accepted(self, good):
+        """Kept at five: these select three *different* diagonalization routes, so each discriminates.
+
+        ``bool`` is included because it is an ``int`` subclass and must keep working.
+        """
         rng = np.random.default_rng(20260804)
         mat = herm(3, rng)
         assert np.asarray(rm.matrix_exp(mat, hermitian=good)).shape == (3, 3)

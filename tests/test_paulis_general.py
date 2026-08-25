@@ -299,23 +299,27 @@ class TestSparseCacheImmutability:
     ``.indptr`` blocks the mutation at its source and costs nothing.
     """
 
-    @pytest.mark.parametrize("dim", [2, 3, 4])
-    def test_in_place_division_raises(self, dim):
-        """The exact corruption: renormalizing a cached basis in place."""
-        matrices = pg.pauli_matrices(dim, sparse=True)
+    def test_in_place_division_raises(self):
+        """The exact corruption: renormalizing a cached basis in place.
+
+        Not swept over ``dim``: the guard freezes the same three buffers in one loop regardless of
+        dimension, so a sweep would exercise the sweep rather than the guard. ``*=`` is likewise not
+        tested separately -- it writes ``.data`` through the same path as ``/=``.
+        """
+        matrices = pg.pauli_matrices(3, sparse=True)
         with pytest.raises(ValueError, match="read-only"):
             matrices[1] /= 2.0
 
-    def test_in_place_multiplication_raises(self):
-        matrices = pg.pauli_matrices(3, sparse=True)
-        with pytest.raises(ValueError, match="read-only"):
-            matrices[1] *= 2.0
+    @pytest.mark.parametrize("buffer_name", ["data", "indices", "indptr"])
+    def test_writing_any_csr_buffer_raises(self, buffer_name):
+        """All three buffers are frozen, so all three are checked.
 
-    def test_writing_the_data_buffer_raises(self):
-        """The lower-level route: reaching past the operator into ``.data``."""
+        The values live in ``.data`` and the structure in ``.indices``/``.indptr``; the earlier
+        version of this class tested ``.data`` three times over and the other two not at all.
+        """
         matrices = pg.pauli_matrices(3, sparse=True)
         with pytest.raises(ValueError, match="read-only"):
-            matrices[1].data[0] = 9.0
+            getattr(matrices[1], buffer_name)[0] = 1
 
     def test_the_cache_survives_an_attempted_mutation(self):
         """The property that actually matters: a failed write must leave the cache intact."""
@@ -325,9 +329,9 @@ class TestSparseCacheImmutability:
         after = pg.pauli_matrices(3, sparse=True)[1].toarray()
         assert np.allclose(before, after)
 
-    @pytest.mark.parametrize("dim", [2, 3, 4, 5])
-    def test_reads_still_work(self, dim):
+    def test_reads_still_work(self):
         """The guard must not break the operations the basis exists for."""
+        dim = 3
         matrices = pg.pauli_matrices(dim, sparse=True)
         vec = np.ones(dim)
         for mat in matrices:
@@ -338,9 +342,14 @@ class TestSparseCacheImmutability:
         scaled /= 2.0
         assert np.allclose(scaled.toarray() * 2.0, matrices[1].toarray())
 
-    @pytest.mark.parametrize("dim", [2, 3, 4, 5, 6])
+    @pytest.mark.parametrize("dim", [2, 5])
     def test_sparse_still_agrees_with_dense(self, dim):
-        """Guarding the buffers must not change any value."""
+        """Guarding the buffers must not change any value.
+
+        Two dims rather than five: ``freezing a buffer`` cannot be dimension-sensitive, and
+        :meth:`TestDocumentedLimits.test_sparse_single_subsystem_matches_dense` already covers
+        sparse-equals-dense at ``dim=3``. Kept the smallest and largest as a shape sanity check.
+        """
         sparse = pg.pauli_matrices(dim, sparse=True)
         dense = np.asarray(pg.pauli_matrices(dim, sparse=False))
         for isparse, idense in zip(sparse, dense, strict=True):

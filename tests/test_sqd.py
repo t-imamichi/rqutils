@@ -1472,36 +1472,26 @@ class TestSingleFillerRow:
 class TestApplyHArrayRoles:
     """``apply_h`` rejects an array passed under the wrong *name*, where dtype can tell.
 
-    Going keyword-only removed *mispairing* -- declaring one strategy while having packed the arrays
-    for another -- but not *misnaming*: ``apply_h(vec, xsources=x)`` where ``x`` is a signature array
-    was still accepted. ``docs/rqutils-requests.md`` concedes that residue is "much smaller... but it
-    is not zero".
+        Going keyword-only removed *mispairing* -- declaring one strategy while having packed the arrays
+        for another -- but not *misnaming*: ``apply_h(vec, xsources=x)`` where ``x`` is a signature array
+        was still accepted. ``docs/rqutils-requests.md`` concedes that residue is "much smaller... but it
+        is not zero".
 
     ``apply_h``'s own docstring records why a **shape** assertion cannot close it, and that is
-    correct and reproduced here: at ``n = 15`` (2 bytes) with a 2-state subspace, X signatures and X
-    sources are *both* exactly ``(2, 2)``.
+        correct: at ``n = 15`` (2 bytes) with a 2-state subspace, X signatures and X sources are *both*
+        exactly ``(2, 2)``. That counterexample is pinned by
+        :meth:`TestMatvecKernels.test_shape_assertion_would_not_have_closed_this`, which also
+        asserts the dtype difference this fix relies on -- rather than rebuilding the fixture here.
 
-    What the docstring generalized too far is "naming was the only fix available". **Dtype
-    discriminates precisely where shape collides**, and structurally rather than by luck: packed
-    signatures are ``uint8`` (``np.packbits`` output) while source indices are ``int32`` positions
-    carrying ``-1`` as the absent marker -- a ``uint8`` cannot hold ``-1``, so the two dtypes cannot
-    converge. Same for ``diagonals`` (inexact) against ``diag_signs``/``zsignatures`` (``uint8``).
+        What the docstring generalized too far is "naming was the only fix available". **Dtype
+        discriminates precisely where shape collides**, and structurally rather than by luck: packed
+        signatures are ``uint8`` (``np.packbits`` output) while source indices are ``int32`` positions
+        carrying ``-1`` as the absent marker -- a ``uint8`` cannot hold ``-1``, so the two dtypes cannot
+        converge. Same for ``diagonals`` (inexact) against ``diag_signs``/``zsignatures`` (``uint8``).
 
-    Still not closed, and deliberately not claimed: swapping two arrays of the *same* role class --
-    ``xsignatures`` for ``zsignatures``, say, both ``uint8`` -- remains undetectable here.
+        Still not closed, and deliberately not claimed: swapping two arrays of the *same* role class --
+        ``xsignatures`` for ``zsignatures``, say, both ``uint8`` -- remains undetectable here.
     """
-
-    def test_the_documented_shape_collision_is_real_but_dtypes_differ(self):
-        """The premise of the fix: the n=15 case that defeats a shape check is fine on dtype."""
-        from rqutils.paulis.symplectic import PauliSumXZ
-
-        hamiltonian = PauliSumXZ.from_paulisum((["X" + "I" * 14, "Z" + "I" * 14], [1.0, 0.5]))
-        states = np.zeros((2, 15), dtype=np.uint8)
-        states[1, 0] = 1
-        states_u = uniquify_states(PauliSumXZ.pack_states(states), 2)
-        xsources = np.stack([np.asarray(get_xsource(hamiltonian.x[i], states_u)) for i in range(2)])
-        assert hamiltonian.x.shape == xsources.shape == (2, 2), "collision fixture is wrong"
-        assert hamiltonian.x.dtype != xsources.dtype
 
     def test_signatures_passed_as_xsources_raise(self):
         """The exact misnaming the residue names: packed signatures under ``xsources=``."""
@@ -1693,6 +1683,11 @@ class TestMatvecKernels:
             "the counterexample requires the signature and index arrays to collide in shape; "
             f"got {hamiltonian.x.shape} and {xsources.shape}"
         )
+        # The discriminator a shape check cannot provide, and the premise `_check_array_role` rests
+        # on: uint8 packed signatures against int32 positions, which cannot converge because a uint8
+        # cannot hold the -1 absent marker. Asserted on the same fixture rather than in a second copy
+        # of it (see TestApplyHArrayRoles).
+        assert hamiltonian.x.dtype != xsources.dtype, (hamiltonian.x.dtype, xsources.dtype)
 
     @pytest.mark.parametrize("cache_level", [(0, 0), (0, 1), (0, 2), (1, 0)])
     def test_omitting_states_raises(self, cache_level):
