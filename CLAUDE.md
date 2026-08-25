@@ -14,6 +14,12 @@ macOS (it is GNU coreutils) — use the Bash tool's own timeout rather than wrap
 The shell is fish: **quote grep globs** (`--include="*.py"`). Unquoted, fish fails with
 `(eval):1: no matches found` before grep runs — which looks like "no results", not "no command".
 
+**Worktrees need `worktree.baseRef: "head"`** (in `.claude/settings.json`). The default `fresh`
+branches from `origin/main`, 144 commits behind `dev` and predating the `dev` extra, so `uv run
+--extra dev` fails outright. A fresh worktree also gets a bare venv: run the full
+`--extra dev --extra qiskit --extra mpl --extra qutip` or 23 tests **silently skip**, including
+the qiskit reference comparisons this file calls the trustworthy oracle.
+
 **Check `git rev-list --left-right --count origin/<branch>...HEAD` before amending.** Work happens on
 feature branches (`metal`, not `main`) that get pushed mid-session, so "my commits are still local"
 goes stale within a turn — amend then and you rewrite published history. `git branch -r --contains
@@ -68,6 +74,8 @@ Docs (regenerates `docs/source/apidoc/` via `sphinx-apidoc`, which is **not** co
 ```bash
 cd docs && uv run --extra docs make html    # output in docs/build/html
 cd docs && uv run --extra docs make clean   # also removes source/apidoc
+# Sphinx caches: a rebuild prints NO warnings even when they exist. `make clean` first, or a
+# docstring regression reads as a clean build.
 ```
 
 ## Linting and type checking
@@ -132,6 +140,8 @@ Rules, each of which cost a defect to learn — **evidence in `NOTES.md`**:
   Deliberate — several tests pick a seed for a specific pathology and assert the fixture still has it,
   and moving draws into fixtures makes RNG stream position depend on fixture ordering. Keep new
   generators as plain functions taking `rng`; `unique_states`/`collapsing_states` are the pattern.
+  They take `rng` **last**: `real_pauli_strings(num_qubits, count, rng)` (returns strings only —
+  draw coefficients separately) and `unique_states(num_draws, num_qubits, rng)`.
 - **Sweep `cache_level`, don't sample it** — three bugs hid behind the default `(1, 0)`, each masked by
   the one before. One needed a *complex* fixture, not just the parameter varied.
 - **Assert the sharding *spec*, not just the values.** A replicated run agrees with single-device to
@@ -266,9 +276,12 @@ normalization conventions, and an explicit API section (`.. autofunction::` / `.
 napoleon. Adding a public module requires **both** those directives **and** a manual line in the
 `toctree` of `docs/source/index.rst`.
 
-**Docstrings with LaTeX must be raw strings**, `.. autoclass::` needs `:members:`, and `:math:`
-exponents must be braced — three hazards that no tool catches, detailed with the sweep command in
-`NOTES.md`.
+**Docstrings with LaTeX must be raw strings**, `.. autoclass::` needs `:members:`, `:math:`
+exponents must be braced, and a docstring's body indentation must be **uniform** — writing
+8-space continuations into a 4-space docstring makes reST read the deeper lines as a block quote
+and nests `Args:`/`Returns:`/`Raises:` beyond napoleon's reach. Four hazards that no tool
+catches: ruff, `ty`, pytest and the control-char sweep all pass. Detailed with both check
+commands in `NOTES.md`.
 
 **Writing `Raises:` sections finds bugs** — it caught three wrong claims in one pass. Trigger every
 raise you document (`NOTES.md`).
