@@ -181,6 +181,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from numbers import Number
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -209,12 +210,190 @@ type Vector = np.ndarray[tuple[int], np.dtype[np.inexact]]
 type StateList = np.ndarray[tuple[int, int], np.dtype[np.uint8]]
 
 
+# Which dtype kind each `apply_h` keyword's array must have. `u` is an unsigned integer (packed
+# bytes), `i` a signed integer (positions, which use -1 as an absent marker), `fc` float or complex.
+# This is the discriminator a shape check cannot provide: at n=15 with a 2-state subspace, X
+# signatures and X sources are both (2, 2), but never both uint8.
+_ARRAY_ROLE_KINDS = {
+    "xsignatures": ("u", "packed X signatures (uint8, from PauliSumXZ)"),
+    "xsources": ("i", "X source indices (int32, from get_xsource; -1 marks absent)"),
+    "zsignatures": ("u", "packed Z signatures (uint8, from PauliSumXZ)"),
+    "diag_signs": ("u", "packed diagonal sign bits (uint8, from get_diag_signs)"),
+    "diagonals": ("fc", "precomputed diagonals (float or complex, from get_diagonal)"),
+}
+
+
+def _check_array_role(name: str, array: Any) -> None:
+    """Raise if the array under ``name`` has the wrong dtype kind for that role.
+
+    Closes part of the misnaming residue :func:`apply_h` documents. Deliberately *not* a shape check:
+    at ``n = 15`` (2 bytes) with a 2-state subspace, X signatures and X sources are both exactly
+    ``(2, 2)``, so a shape assertion sails through the mispairing it exists to trip -- which is why
+    the positional form was deleted rather than asserted.
+
+    Dtype separates them structurally at exactly that point. Packed signatures are ``uint8``
+    (:func:`numpy.packbits` output); source indices are ``int32`` positions carrying ``-1`` as the
+    absent marker, and a ``uint8`` cannot hold ``-1``. Diagonals are float or complex.
+
+    What it still does **not** reach: swapping two arrays of the same kind, e.g. ``xsignatures`` for
+    ``zsignatures`` (both ``uint8``). That residue stays open.
+
+    Args:
+        name: The keyword the caller used.
+        array: The array they passed under it.
+
+    Raises:
+        ValueError: If the dtype kind does not match the role.
+    """
+    expected, described = _ARRAY_ROLE_KINDS[name]
+    # `.dtype` directly, not `np.asarray(array).dtype`: both numpy and jax arrays expose it, and the
+    # asarray round-trip measured 13x slower (1.08 us against 0.083 us) for the same information.
+    dtype = array.dtype
+    if dtype.kind not in expected:
+        raise ValueError(
+            f"apply_h: {name}= expects {described}, but got dtype {dtype}. Check the keyword names "
+            "against the arrays -- a shape check cannot catch this (X signatures and X sources are "
+            "both (2, 2) at n=15 with 2 states), so the dtype is what distinguishes them."
+        )
+
+
+def _check_cache_level(cache_level: Any) -> None:
+    """Raise unless ``cache_level`` is one of the six ``(source_indices, diagonals)`` pairs.
+
+    Every branch on ``cache_level`` in this module is an equality test with an implicit ``else``, so
+    an out-of-range value used to be absorbed rather than reported:
+
+    * an out-of-range **first** digit was silently ignored -- ``(2, 0)`` behaved exactly as
+      ``(0, 0)``, returning the same energy at 7.2x the cost;
+    * an out-of-range **second** digit surfaced as ``UnboundLocalError`` on an internal variable,
+      i.e. an internal error escaping a public entry point.
+
+    The likelier mistake is the **transposition**, which validation cannot catch: ``(0, 1)`` and
+    ``(1, 0)`` are both legal and return the same energy, differing only in cost (``(0, 2)`` measures
+    10.9x slower than ``(1, 2)``, ``(0, 0)`` 7.2x slower than ``(1, 0)``), so it reads as "SQD is
+    slow" rather than as an error. What this can do is name the axes in the message, so a reader of
+    the call site can tell which digit is which.
+
+    Kept as a tuple rather than split into two enum parameters: ``cache_level`` is bound **static**
+    into the jit'd kernel through :func:`functools.partial`, because :func:`rqutils.ground_locg`
+    splats ``args`` positionally and ``static_argnames`` would never see it. The validation belongs
+    at the public boundary, not in that plumbing.
+
+    Args:
+        cache_level: The caller's value, unvalidated.
+
+    Raises:
+        TypeError: If it is not a length-2 sequence of ints.
+        ValueError: If either digit is out of range -- ``source_indices`` in ``{0, 1}``,
+            ``diagonals`` in ``{0, 1, 2}``.
+    """
+    try:
+        source_indices, diagonals = cache_level
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"`cache_level` must be a (source_indices, diagonals) pair of ints, got {cache_level!r}"
+        ) from exc
+    # `bool` is an `int` subclass, so (True, 0) would otherwise pass as (1, 0). That is the same
+    # True == 1 confusion `sqd`'s keyword-only change closed one level up, so reject it here too.
+    if not all(isinstance(d, int) and not isinstance(d, bool) for d in (source_indices, diagonals)):
+        raise TypeError(
+            f"`cache_level` must be a (source_indices, diagonals) pair of ints, got {cache_level!r}"
+        )
+    if source_indices not in (0, 1) or diagonals not in (0, 1, 2):
+        raise ValueError(
+            f"`cache_level` is {cache_level!r}, but the first entry (source_indices: 0=recompute "
+            "per matvec, 1=cache) must be 0 or 1 and the second (diagonals: 0=no caching, "
+            "1=cache sign bits, 2=cache diagonals) must be 0, 1 or 2. Note the two axes are not "
+            "interchangeable: caching source indices is near-free to enable and very expensive to "
+            "disable, so a transposed pair is legal but runs 7.2-10.9x slower."
+        )
+
+
+def _check_zsignatures_rank(zsignatures: Any) -> None:
+    """Raise unless ``zsignatures`` is one X group's 2-D ``(num_zterms, num_bytes)`` array.
+
+    Shared by :func:`get_diag_signs` and :func:`get_diagonal`, which are both public, both consume the
+    same array, and both index its leading axis -- so handed a 1-D array they read *scalars* and
+    silently return a wrongly shaped result rather than raising. Measured on ``get_diagonal``:
+    ``(4,)`` of ``[2., 2., 2., 2.]``, a plausible finite diagonal. Rank is static under ``jax.jit``,
+    so unlike ``get_xsource``'s lex-sortedness precondition this one is checkable here.
+
+    Args:
+        zsignatures: The caller's Z-signature array.
+
+    Raises:
+        ValueError: If it is not 2-D.
+    """
+    if np.ndim(zsignatures) != 2:
+        raise ValueError(
+            "`zsignatures` must be 2-D with shape (num_zterms, num_bytes) -- one X group's Z "
+            f"signatures -- but has rank {np.ndim(zsignatures)}. A 1-D array would be scanned as "
+            "scalars and silently return the wrong shape. Pass `hamiltonian.z[igroup]`, not "
+            "`hamiltonian.z[igroup][iterm]`."
+        )
+
+
+def _check_states_shape(states: Any, num_qubits: int) -> StateList:
+    """Raise unless ``states`` is ``(subspace_dim, num_qubits)``.
+
+    One ``O(1)`` look at a shape, shared by :func:`sqd` and :func:`hproj` so the two cannot drift.
+    It closes three distinct mistakes that all used to produce a plausible finite answer:
+
+    * **Re-feeding packed states.** :meth:`PauliSumXZ.pack_states` is not idempotent, and ``sqd``
+      takes *unpacked* states while the natural intermediate a caller keeps -- from
+      :func:`uniquify_states`, or from ``pack_states`` called directly -- is *packed*. Feeding that
+      back re-packs it: ``astype(uint8)`` is a no-op and ``packbits`` then reads each byte as one bit
+      via nonzero-to-1, so the subspace silently changes. Realistic loop: run ``sqd``, do
+      configuration recovery, run ``sqd`` again.
+    * **A transposed array**, ``(num_qubits, subspace_dim)``.
+    * **A mismatched Hamiltonian**, right shape family and wrong qubit count.
+
+    Note it does not close *every* re-feed on its own: at ``num_qubits <= 7`` a packed row is one
+    byte wide, so a 1-qubit Hamiltonian would accept it -- the shape genuinely matches. What catches
+    that is :meth:`PauliSumXZ.pack_states`' binary check, since packed bytes exceed 1.
+
+    Coerces with :func:`numpy.asarray` and returns the result, rather than only inspecting: both
+    entry points document ``states`` as passable "as an array of integers or booleans", and
+    :func:`hproj` accepted a list of lists. Reading ``.ndim`` off the raw argument would narrow that
+    to arrays only, and would do so with an ``AttributeError`` rather than this function's documented
+    ``ValueError``. Coercing here also makes the two entry points agree, where ``sqd`` previously
+    required an array and ``hproj`` did not.
+
+    Args:
+        states: The caller's states, as anything :func:`numpy.asarray` accepts.
+        num_qubits: The Hamiltonian's qubit count.
+
+    Returns:
+        ``states`` as an array, for the caller to use in place of its argument.
+
+    Raises:
+        ValueError: If ``states`` is not 2-D, or its second axis is not ``num_qubits``.
+    """
+    states = np.asarray(states)
+    if states.ndim != 2:
+        raise ValueError(
+            f"`states` must be 2-D with shape (subspace_dim, num_qubits), got shape {states.shape}"
+        )
+    if states.shape[1] != num_qubits:
+        raise ValueError(
+            f"`states` has {states.shape[1]} columns but the Hamiltonian has {num_qubits} qubits; "
+            "`states` must be (subspace_dim, num_qubits) and *unpacked*. Note "
+            "`PauliSumXZ.pack_states` is not idempotent, so a packed array kept from a previous call "
+            "(or from `uniquify_states`) cannot be fed back in -- it would re-pack into a different "
+            "subspace. Also check for a transposed array or a mismatched Hamiltonian."
+        )
+    return states
+
+
 def sqd(
     hamiltonian: HamiltonianInput,
     states: StateList,
+    *,
     states_size: int | None = None,
     return_eigvec: bool = True,
     cache_level: tuple[int, int] = (1, 0),
+    maxiter: int = 1000,
+    tol: float | None = None,
 ) -> float | tuple[float, Vector, StateList]:
     r"""Perform a sample-based quantum diagonalization of the Hamiltonian.
 
@@ -236,10 +415,17 @@ def sqd(
     (0=no caching, 1=cached) and the second specifies the caching of the diagonal elements (0=no
     caching, 1=cache sign bits, 2=cache diagonals).
 
+    Everything after ``states`` is **keyword-only**. It used to be positional-or-keyword, which made
+    ``sqd(ham, states, True)`` a valid ``states_size`` of 1 (``True == 1``) rather than the
+    ``return_eigvec`` the caller meant -- no error, the array pinned to one slot. The three
+    parameters are semantically unrelated, so no reading of a bare positional was worth preserving.
+
     Args:
         hamiltonian: Hamiltonian to be projected and diagonalized.
         states: Binary array of computational basis states to project the Hamiltonian onto. Shape
-            (subspace_dim, num_qubits).
+            (subspace_dim, num_qubits). Entries must be 0 or 1 --
+            :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states` raises otherwise, since a
+            :math:`\{-1, +1\}` spin encoding would silently collapse the subspace.
         states_size: Fix the size of the states array used in computation to the specified value so
             that compilation is not triggered at each call with slightly different array sizes. Must
             be at least ``states.shape[0]``. Defaults to the next power of two at or above
@@ -254,6 +440,10 @@ def sqd(
             The padding is not observable in the result: filler slots are excluded from the
             projection and trimmed from the returned basis.
         return_eigvec: Whether to return the eigenvector (coefficients and unique state bitstrings).
+        maxiter: Maximum LOBPCG iterations. **Non-convergence now raises** rather than returning
+            the iteration cap's best guess -- see ``Raises``.
+        tol: Convergence tolerance passed to :func:`rqutils.ground_locg.ground_locg`. ``None`` uses
+            the machine epsilon of the operator dtype.
         cache_level: Switches for caching the results of source indices and sign bits / diagonals.
             See the module documentation for the detailed discussion of the resource tradeoff involved.
 
@@ -263,10 +453,18 @@ def sqd(
         only, never the filler slots, so their count can be below ``states_size``.
 
     Raises:
+        RuntimeError: If LOBPCG does not converge within ``maxiter``. Previously the convergence flag
+            was discarded and the non-converged value was returned as the answer: it is
+            ``state.theta``, a valid variational **upper bound**, so finite, real and above the true
+            minimum -- indistinguishable from a correct result by inspection. ``docs/locg.md`` records
+            that this absence "is the reason I4 could hide", a sign error that made the convergence
+            test unsatisfiable so the solver silently never converged. Raise ``maxiter`` or loosen
+            ``tol`` to proceed.
         ValueError: If ``states_size`` is smaller than ``states.shape[0]``, or if it exceeds
             :math:`2^{31} - 1`, the ceiling imposed by the int32 indices used for subspace positions
             (beyond it an index wraps negative and the subspace is silently permuted).
     """
+    _check_cache_level(cache_level)
     if states_size is None:
         # Default to the next power of two at or above the input length. states_size exists to stop
         # each distinct subspace dimension retracing the solver, and growing all-distinct dimensions
@@ -297,6 +495,7 @@ def sqd(
         )
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
+    states = _check_states_shape(states, hamiltonian.num_qubits)
 
     if not (mesh := get_abstract_mesh()).empty and (resid := states_size % mesh.size) != 0:
         LOG.debug("Adjusting states_size to make the array divisible by %d", mesh.size)
@@ -320,18 +519,35 @@ def sqd(
 
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
-    result = run_sqd(hamiltonian, states_p, states_size, return_eigvec, cache_level)
+    result = run_sqd(
+        hamiltonian, states_p, states_size, return_eigvec, cache_level, maxiter=maxiter, tol=tol
+    )
     LOG.info("Found ground eigenpair in %f seconds.", time.time() - start)
     eigval = float(result[0])
+    # The convergence flag used to be discarded here, and a non-converged run still returns
+    # `state.theta` -- a valid variational *upper bound*, so finite, real, and above the true minimum,
+    # i.e. indistinguishable from a correct answer by inspection. docs/locg.md records that this
+    # absence "is the reason I4 could hide": a sign error made the convergence test unsatisfiable, so
+    # the solver silently never converged and every answer was the iteration cap's best guess.
+    #
+    # Raised here rather than in `run_sqd` because that function is @jax.jit-wrapped, so `converged`
+    # is a traced boolean there and cannot be branched on at trace time.
+    if not bool(result[-1]):
+        raise RuntimeError(
+            f"LOBPCG did not converge in maxiter={maxiter} iterations (tol={tol!r}). The value it "
+            f"reached, {eigval!r}, is a variational upper bound rather than the ground energy -- "
+            "finite and plausible, which is why this raises instead of returning it. Raise `maxiter`, "
+            "loosen `tol`, or check that the subspace is well conditioned."
+        )
     if return_eigvec:
-        eigvec, states_u, subspace_dim = result[1:]
+        eigvec, states_u, subspace_dim = result[1:-1]
         basis_states = PauliSumXZ.unpack_states(states_u[:subspace_dim], states.shape[1])
         return (eigval, np.array(eigvec[:subspace_dim]), basis_states)
     return eigval
 
 
 def hproj(
-    hamiltonian: HamiltonianInput, states: StateList, unique_states: bool = False
+    hamiltonian: HamiltonianInput, states: StateList, *, unique_states: bool = False
 ) -> csr_array:
     r"""Return the Hamiltonian projected onto the given subspace.
 
@@ -344,10 +560,14 @@ def hproj(
 
     States must have binary values and can be passed as an array of integers or booleans.
 
+    ``unique_states`` is **keyword-only**, for the reason given on :func:`sqd`: as a third positional
+    it made ``hproj(ham, states, True)`` read as a plausible but unrelated argument.
+
     Args:
         hamiltonian: Hamiltonian to be projected and diagonalized.
         states: Binary array of computational basis states to project the Hamiltonian onto. Shape
-            (subspace_dim, num_qubits).
+            (subspace_dim, num_qubits). Entries must be 0 or 1 --
+            :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states` raises otherwise.
         unique_states: Whether ``states`` can be assumed to be already uniquified **and
             lex-sorted**, skipping the internal ``np.unique(..., axis=0)``. Both halves are
             required, because :func:`get_xsource` binary-searches into ``states``; violating either
@@ -367,12 +587,12 @@ def hproj(
     """
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
+    states = _check_states_shape(states, hamiltonian.num_qubits)
     # Same int32 ceiling sqd() enforces, since hproj reaches get_xsource too and its returned
     # positions are int32 with -1 as the absent marker. Checked here, before the O(N) sortedness scan
     # and the np.unique below: it is an O(1) look at a shape, so it costs nothing to do first and
     # reports the real problem rather than letting a doomed call spend time first (measured on the
     # test that reaches it: 0.23 s with the check first, 23 s when it sits after the scan).
-    states = np.asarray(states)
     if states.shape[0] > _MAX_STATES:
         raise ValueError(
             f"subspace of {states.shape[0]} states exceeds the {_MAX_STATES} limit imposed by int32 "
@@ -429,8 +649,11 @@ def _hproj_cols_elems(hamiltonian: PauliSumXZ, states_p: StateList) -> tuple[jax
     """
 
     def get_from_one(_, ham):
-        columns = get_xsource(ham[0], states_p)
-        diagonals = get_diagonal(ham[1], ham[2], states_p)
+        # `ham` is a PackedArrays, so these read by name. As a bare tuple this was
+        # `ham[0]`/`ham[1]`/`ham[2]`, where swapping the first two type-checks and silently
+        # computes with X and Z exchanged -- `x` and `z` are same-dtype integer arrays.
+        columns = get_xsource(ham.x, states_p)
+        diagonals = get_diagonal(ham.z, ham.c, states_p)
         return None, (columns, diagonals)
 
     return jax.lax.scan(get_from_one, None, hamiltonian.arrays)[1]
@@ -497,16 +720,35 @@ def _spread_seed(
     return jnp.where(filler, jnp.zeros_like(vec), vec)
 
 
-@jax.jit(static_argnames=["states_size", "return_eigvec", "cache_level", "log_level"])
+@jax.jit(static_argnames=["states_size", "return_eigvec", "cache_level", "maxiter", "log_level"])
 def run_sqd(
     hamiltonian: PauliSumXZ,
     states_p: StateList,
     states_size: int,
     return_eigvec: bool,
     cache_level: tuple[int, int] = (1, 0),
+    maxiter: int = 1000,
+    tol: float | None = None,
     log_level: int = logging.INFO,
-) -> tuple[float] | tuple[float, jax.Array, jax.Array, int]:
-    """JIT-compiled part of the SQD function."""
+) -> tuple[float, bool] | tuple[float, jax.Array, jax.Array, int, bool]:
+    """JIT-compiled part of the SQD function.
+
+    Returns the eigenvalue, optionally the eigenvector/basis/dimension, and **the convergence flag as
+    the last element**. The flag used to be discarded here, which is what let a non-converged
+    ``theta`` -- a valid variational upper bound, so finite and plausible -- reach the caller as the
+    answer. It is returned rather than checked because this function is ``@jax.jit``-wrapped, so
+    ``converged`` is a traced boolean and cannot be branched on at trace time; :func:`sqd` raises on
+    it once the value is concrete.
+
+    Args:
+        maxiter: Maximum LOBPCG iterations, forwarded to :func:`rqutils.ground_locg.ground_locg`.
+            Static, as it is there.
+        tol: Convergence tolerance. ``None`` uses the operator dtype's machine epsilon.
+    """
+    # `cache_level` is static, so this is a concrete tuple at trace time and the check runs once per
+    # trace rather than once per call. `sqd` validates too; this covers the direct callers, which are
+    # the six examples/scaling scripts -- i.e. the ones most likely to pass an experimental value.
+    _check_cache_level(cache_level)
     sharding = None
     if not (mesh := get_abstract_mesh()).empty:
         sharding = PartitionSpec(mesh.axis_names)
@@ -639,7 +881,9 @@ def run_sqd(
     if log_level <= logging.DEBUG:
         jax.debug.print(f"Starting minimization with cache_level {cache_level}")
 
-    eigval, eigvec, _, _ = ground_locg(matvec, vinit, args=args, log_level=log_level)
+    eigval, eigvec, _, converged = ground_locg(
+        matvec, vinit, args=args, maxiter=maxiter, tol=tol, log_level=log_level
+    )
     result = (eigval,)
     if return_eigvec:
         if sharding:
@@ -647,7 +891,8 @@ def run_sqd(
             states_u = jax.reshard(states_u, PartitionSpec(None))
         subspace_dim = jnp.searchsorted(_is_filler(states_u), 1)
         result += (eigvec, states_u, subspace_dim)
-    return result
+    # Convergence last, so the existing positional unpackings above keep their meaning.
+    return result + (converged,)
 
 
 @jax.jit(static_argnames=["states_size"])
@@ -699,9 +944,31 @@ def _pack_state_keys(states: StateList) -> jax.Array:
 
     Byte 0 becomes the most significant, so integer order on the keys is identical to row lex order.
     That equivalence is the whole point: it lets a scalar binary search stand in for a lexicographic
-    one. Only valid while `B <= 8`; :func:`get_xsource` checks that before calling.
+    one.
+
+    Args:
+        states: Packed state rows, shape ``[N, B]`` with ``B <= 8``.
+
+    Returns:
+        One ``uint64`` key per row, ordered identically to the rows.
+
+    Raises:
+        ValueError: If ``B > 8``. :func:`get_xsource` already routes wide input to the lexicographic
+            path, so this is defence-in-depth for anyone reaching past it -- but the limit was
+            previously only *described* here, and the failure is worse than truncation: byte 0 is the
+            most significant, so at ``B = 9`` its shift is ``8 * (9 - 1) = 64`` bits on a ``uint64``
+            and the byte vanishes outright rather than being coarsened. Measured, two 9-byte rows
+            differing only in byte 0 both pack to key ``0``, aliasing distinct states and destroying
+            the lex-order equivalence the search depends on. ``B = ceil((n + 1) / 8)``, so ``n >= 64``
+            reaches it.
     """
     nbytes = states.shape[1]
+    if nbytes > 8:
+        raise ValueError(
+            f"`_pack_state_keys` needs at most 8 bytes per row to fit a uint64 key, got {nbytes}. "
+            "Byte 0 is the most significant, so a wider row shifts it out entirely and distinct "
+            "states alias onto one key. `get_xsource` routes B > 8 to the lexicographic search."
+        )
     shifts = jnp.asarray([8 * (nbytes - 1 - i) for i in range(nbytes)], dtype=jnp.uint64)
     return jnp.sum(states.astype(jnp.uint64) << shifts, axis=1)
 
@@ -719,12 +986,36 @@ def _is_lex_sorted(states: NDArray[np.uint8]) -> bool:
     N=1M, flat in `B`. Cheap enough to be unconditional on a debug/reference path, in exchange for
     turning a silent wrong answer into a raise. :func:`sqd` never reaches `hproj`, so it is unaffected.
 
-    **Rejects a padded :func:`uniquify_states` result, by design.** Filler slots are all-``255`` rows,
-    so two or more are duplicates and fail the strictness test. That is correct here: `hproj` builds a
-    dense `[N, N]` operator with no filler-masking step, so filler rows would become spurious basis
-    states. Slice to the real rows first (`~_is_filler(states)`) if you hold a padded array; `sqd`
-    already trims before returning its basis.
+    **Rejects a padded :func:`uniquify_states` result, by design** -- and now for *any* number of
+    filler slots. Fillers are all-``255`` rows, so two or more are duplicates and fail the strictness
+    test; that is what this paragraph used to rest on, but a **single** filler row is strictly
+    increasing and passed. `hproj` builds a dense `[N, N]` operator with no filler-masking step, so
+    that row became a spurious basis state: one row and column too large, still symmetric, plausible
+    wrong eigenvalue (measured **-1.118034 against a true -1.0**). There is now an explicit high-bit
+    test, independent of sortedness.
+
+    It reads the *packed* byte deliberately. :meth:`PauliSumXZ.pack_states` makes byte 0 of every
+    genuine state ``< 128``, so ``255`` is unambiguous there -- whereas unpacking a filler at
+    ``n = 2`` yields ``[1, 1]``, a perfectly legitimate state, so no check on the unpacked form could
+    distinguish them.
+
+    Slice to the real rows first (`~_is_filler(states)`) if you hold a padded array; `sqd` already
+    trims before returning its basis.
     """
+    # Any filler row disqualifies the array, and this must be tested *independently* of sortedness.
+    # Two or more fillers are duplicates and so fail the strictness test below, which is what the
+    # "rejects a padded result by design" claim rested on -- but a SINGLE filler is still strictly
+    # increasing and used to pass. hproj has no filler-masking step, so that row became a spurious
+    # basis state: one row and column too large, still symmetric, and measured -1.118034 against a
+    # true -1.0. The test is on the packed byte because pack_states makes byte 0 < 128 for every
+    # genuine state, so 255 is unambiguous -- unpacking a filler at n=2 gives [1, 1], a legitimate
+    # state, which is why an unpacked-side check could not work.
+    # O(1), not a pass over the column: fillers are all-255 rows and `pack_states` guarantees byte 0
+    # < 128 for every genuine state, so they sort to the end -- if any filler is present the LAST row
+    # carries one. A full `np.any(states[:, 0] >> 7)` measured 5.25 ms at N=10M against 0.00012 ms
+    # here, i.e. ~4.4x the cost of the adjacent-row pass it was prepended to, for the same answer.
+    if states.shape[0] and states[-1, 0] >= 128:
+        return False
     if states.shape[0] < 2:
         return True
     lhs, rhs = states[:-1], states[1:]
@@ -866,7 +1157,24 @@ def _z_parity(states: StateList, zsignature: jax.Array) -> jax.Array:
 
 @jax.jit
 def get_diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Array:
-    """Return the packed sign bits."""
+    """Return the packed sign bits, one per (state, Z term).
+
+    Args:
+        zsignatures: Packed Z signatures for one X group, shape ``(num_zterms, num_bytes)``.
+        states: Uniquified, lex-sorted packed state list, shape ``(num_states, num_bytes)``.
+
+    Returns:
+        Packed sign bits, shape ``(num_states, ceil(num_zterms / 8))``.
+
+    Raises:
+        ValueError: If ``zsignatures`` is not 2-D. This function is public and called directly by
+            scripts under ``examples/scaling/``, and the scan below iterates its leading axis: handed
+            a 1-D array it scans *scalars* rather than rows, silently returning a wrongly shaped
+            result (measured shape ``(4, 1)`` from a 2-element 1-D input) instead of raising. Rank is
+            static under ``jax.jit``, so unlike the lex-sortedness precondition this one is
+            checkable here.
+    """
+    _check_zsignatures_rank(zsignatures)
 
     def get_signs(carry, zsignature):
         out, ibyte, ibit = carry
@@ -950,7 +1258,20 @@ def compute_diagonal(diag_signs: NDArray[np.uint8], coeffs: NDArray[np.inexact])
 def get_diagonal(
     zsignatures: NDArray[np.uint8], coeffs: NDArray[np.inexact], states: StateList
 ) -> jax.Array:
-    """Return the fully composed diagonals for one X signature."""
+    """Return the fully composed diagonals for one X signature.
+
+    Args:
+        zsignatures: Packed Z signatures for one X group, shape ``(num_zterms, num_bytes)``.
+        coeffs: Phase-folded coefficients for that group.
+        states: Uniquified, lex-sorted packed state list.
+
+    Returns:
+        The composed diagonal, one entry per state.
+
+    Raises:
+        ValueError: If ``zsignatures`` is not 2-D -- see :func:`_check_zsignatures_rank`.
+    """
+    _check_zsignatures_rank(zsignatures)
 
     def sign_bit(iterm):
         return _z_parity(states, zsignatures[iterm])
@@ -1021,19 +1342,23 @@ def apply_h(
     ``_apply_h_kernel`` with an assembled tuple and a static ``cache_level`` bound via
     ``functools.partial``, because the solver splats ``matvec(vec, *args)`` positionally.
 
-    Naming was the only fix available, which is worth recording because a per-branch shape or dtype
-    assertion is the obvious cheap alternative. X sources are ``(n_groups, n_states)`` and X signatures
-    are ``(n_groups, n_bytes)``, so the trailing dimension usually separates them -- but at ``n = 15``
+    A per-branch **shape** assertion cannot help, which is worth recording because it is the obvious
+    cheap alternative. X sources are ``(n_groups, n_states)`` and X signatures are
+    ``(n_groups, n_bytes)``, so the trailing dimension usually separates them -- but at ``n = 15``
     (2 bytes) with a 2-state subspace both are exactly ``(2, 2)``, and a mispairing would sail through
     the assertion meant to trip it.
 
+    A **dtype** assertion does help, and is now applied (:func:`_check_array_role`), which separates the
+    confusable roles structurally at exactly the point shape fails. So ``xsources=<signature array>``
+    now raises.
+
     What naming closes, stated exactly: it removes *mispairing* -- declaring one strategy while having
     packed the arrays for another -- because the strategy is no longer declared separately from the
-    arrays. It does **not** detect an array passed under the wrong name (``xsources=x`` is still
-    accepted, since a signature array and an index array remain indistinguishable at the boundary).
-    That residue is much smaller: the name sits at the call site immediately beside the array it
-    labels, rather than in a positional tuple whose meaning is fixed by a separate argument several
-    lines away.
+    arrays. Combined with the dtype check above, an array passed under a wrong name of a *different*
+    kind now raises too. What remains open is a swap between two roles of the **same** kind --
+    ``xsignatures`` for ``zsignatures``, both ``uint8``. That residue is smaller again: the name sits
+    at the call site immediately beside the array it labels, rather than in a positional tuple whose
+    meaning is fixed by a separate argument several lines away.
 
     All six strategies are one ``jax.lax.scan`` over the X groups accumulating
     ``out + apply_xgrp(xsource, diagonal, vec)``; they differ only in where the two inputs come
@@ -1104,7 +1429,7 @@ def apply_h(
             "apply_h: pass exactly one of diagonals=, diag_signs= or zsignatures= "
             f"(got {sorted(name for name, _, _ in dgiven) or 'none'})"
         )
-    (_, xaxis, xarray), (dname, daxis, darray) = xgiven[0], dgiven[0]
+    (xname, xaxis, xarray), (dname, daxis, darray) = xgiven[0], dgiven[0]
 
     # coeffs is not optional-with-a-default: it is required by exactly two of the three diagonal forms
     # and meaningless in the third, so silently ignoring a stray one would hide a mistake.
@@ -1114,6 +1439,29 @@ def apply_h(
         raise ValueError(f"apply_h: {dname}= requires coeffs=")
 
     cache_level = (xaxis, daxis)
+    # `_apply_h_kernel` checks this too, so it looks gratuitous -- three independent reviewers read it
+    # that way. It is not: the ORDER matters. The role check below must run after it, because a caller
+    # who has passed the wrong arrays *and* omitted `states` needs to hear about the missing input set
+    # first (it is what they must fix regardless), and the kernel's copy runs after both. Removing this
+    # line makes the dtype error surface instead, which `TestMatvecKernels::test_omitting_states_raises`
+    # catches. Keep them in step if either message changes.
+    if (xaxis == 0 or daxis == 0) and states is None:
+        raise ValueError(f"states is required for cache_level={cache_level}")
+
+    # Dtype closes part of the misnaming residue -- see this function's docstring for what it does and
+    # does not reach. A *shape* check cannot: X signatures and X sources are both exactly (2, 2) at
+    # n=15 with a 2-state subspace, which is why the positional form was deleted rather than asserted.
+    # Dtype separates them structurally at precisely that point: packed signatures are uint8 (packbits
+    # output) while source indices are int32 positions using -1 as the absent marker, and a uint8
+    # cannot hold -1.
+    #
+    # Ordered last on purpose. The checks above concern the input *set* -- which arrays were named, and
+    # whether they are mutually consistent -- and a caller must fix those first regardless of dtypes.
+    # Running the role check after them keeps it strictly additive: it never displaces an error that
+    # was already being raised.
+    _check_array_role(xname, xarray)
+    _check_array_role(dname, darray)
+
     return _apply_h_kernel(
         vec, _pack_scanned(cache_level, xarray, darray, coeffs), states, cache_level
     )

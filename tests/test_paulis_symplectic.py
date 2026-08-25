@@ -19,6 +19,7 @@ effect was silently discarding the imaginary part of a non-Hermitian operator. S
 
 import warnings
 
+import jax
 import numpy as np
 import pytest
 from conftest import dense_pauli_sum, gate_unitary
@@ -458,6 +459,155 @@ class TestPadding:
 
         assert np.array_equal(packed_state, expected), f"pack_states for {num_qubits} qubits"
         assert np.array_equal(signature, expected), f"signature for {num_qubits} qubits"
+
+
+class TestAtolIsKeywordOnly:
+    """``atol`` is keyword-only, because as a positional it silently widens a *discard*.
+
+    The tolerance itself is well judged and unchanged: the default 1e-12 sits ~4 orders above the
+    measured rounding (3.3e-16) and many orders below any physical coefficient, and ``atol=0.0``
+    restores the exact test. :class:`TestHermiticityTolerance` covers that reasoning.
+
+    The hazard was the *position*. ``from_paulisum(op, 1e-3)`` reads naturally as a ``simplify``
+    tolerance or a coefficient cutoff -- both plausible, since ``simplify()`` is called on ingest --
+    and it instead raises the Hermiticity threshold by nine orders. What makes that more than a
+    slow-path concern is the line right after the check: ``coeffs = coeffs.real`` **discards** any
+    imaginary part up to ``atol``, so the loosened check does not merely permit the operator, it
+    throws the signal away. Measured: ``from_paulisum((["ZI", "IZ"], [1 + 1e-4j, 0.5]), 1e-3)`` was
+    accepted and returned ``c = [0.5, 1.0]``, with the 1e-4 gone and nothing said.
+
+    Kept as ``atol`` rather than renamed to ``discard_imag_below``, which ``docs/gotchas.md``
+    proposes. ``atol`` is the conventional numpy/scipy spelling and the parameter *is* primarily a
+    Hermiticity threshold; the discard is a consequence, and documenting it at the parameter is more
+    accurate than a name that describes only the side effect. Keyword-only is what closes the actual
+    mistake.
+    """
+
+    def test_a_positional_atol_raises(self):
+        with pytest.raises(TypeError, match="positional"):
+            PauliSumXZ.from_paulisum((["ZI"], [1.0]), 1e-3)  # ty: ignore[too-many-positional-arguments]
+
+    def test_the_keyword_form_still_works(self):
+        ham = PauliSumXZ.from_paulisum((["ZI"], [1.0]), atol=1e-3)
+        assert ham.num_qubits == 2
+
+    def test_a_loosened_atol_still_discards_and_is_documented_as_such(self):
+        """Pinned so the trade stays visible: this is what the positional form did by accident."""
+        ham = PauliSumXZ.from_paulisum((["ZI", "IZ"], [1.0 + 1e-4j, 0.5]), atol=1e-3)
+        coeffs = np.asarray(ham.c).ravel()
+        assert coeffs.dtype.kind == "f", coeffs.dtype
+        assert np.allclose(np.sort(coeffs), [0.5, 1.0])
+
+    def test_the_default_still_rejects_that_operator(self):
+        """The default must not be loose enough to reach the discard."""
+        with pytest.raises(ValueError, match="Hermitian|imag"):
+            PauliSumXZ.from_paulisum((["ZI", "IZ"], [1.0 + 1e-4j, 0.5]))
+
+    def test_atol_zero_still_restores_the_exact_test(self):
+        with pytest.raises(ValueError, match="Hermitian|imag"):
+            PauliSumXZ.from_paulisum((["ZI"], [1.0 + 1e-18j]), atol=0.0)
+
+
+class TestArraysNamedTuple:
+    """``arrays`` is a ``NamedTuple``, so an unpacking in the wrong order is visible.
+
+    As a bare 3-tuple of same-typed integer arrays, ``z, x, c = ham.arrays`` type-checked, ran, and
+    computed with X and Z swapped -- the same hazard that got ``apply_h``'s positional form deleted
+    (measured 0.44 max abs error there), one abstraction lower. A ``NamedTuple`` cannot prevent a
+    misordered unpacking either, but it gives every consumer a spelling that *says* which array it
+    means, and ``rqutils.sqd._hproj_cols_elems`` was reading ``ham[0]``/``ham[1]``/``ham[2]``
+    positionally inside a ``jax.lax.scan``.
+
+    The constraint the change had to respect: ``arrays`` exists to be splatted into a traced
+    function, and ``_hproj_cols_elems`` scans over it. A ``NamedTuple`` is a registered pytree, so
+    ``jax.lax.scan`` maps over its leaves and hands the body an instance of the same type -- which
+    is what makes the named access available inside the scan. Asserted below rather than assumed.
+    """
+
+    def test_fields_are_named(self):
+        ham = PauliSumXZ.from_paulisum((["XZ", "ZX"], [1.0, 0.5]))
+        arrays = ham.arrays
+        assert arrays.x is ham.x
+        assert arrays.z is ham.z
+        assert arrays.c is ham.c
+
+    def test_still_unpacks_and_indexes_positionally(self):
+        """Existing splat and index call sites must keep working -- this is not a breaking change."""
+        ham = PauliSumXZ.from_paulisum((["XZ", "ZX"], [1.0, 0.5]))
+        x, z, c = ham.arrays
+        assert x is ham.x and z is ham.z and c is ham.c
+        assert len(ham.arrays) == 3
+        assert ham.arrays[0] is ham.x
+
+    def test_survives_a_lax_scan_as_a_named_type(self):
+        """The load-bearing property: ``scan`` must hand the body a named instance, not a raw tuple.
+
+        If the type were lost, the fix would be cosmetic at the only call site that indexes it.
+        """
+        ham = PauliSumXZ.from_paulisum((["XZ", "ZX"], [1.0, 0.5]))
+        seen = []
+
+        def body(carry, one):
+            seen.append(type(one).__name__)
+            # Named access inside the scan body is the point of the change.
+            return carry, one.x.sum()
+
+        jax.lax.scan(body, None, ham.arrays)
+        assert seen and seen[0] == type(ham.arrays).__name__, seen
+
+    def test_is_a_tuple_subclass_so_jax_treats_it_as_a_pytree(self):
+        ham = PauliSumXZ.from_paulisum((["XZ"], [1.0]))
+        assert isinstance(ham.arrays, tuple)
+        leaves = jax.tree.leaves(ham.arrays)
+        assert len(leaves) == 3
+
+
+class TestBinaryStateValidation:
+    """``pack_states`` must reject non-binary input rather than silently collapsing it.
+
+    ``np.packbits`` maps **every** nonzero entry to 1, and ``astype(np.uint8)`` wraps. Neither is
+    checked, so two ordinary caller mistakes used to produce a plausible finite energy:
+
+    - spins in the standard ``{-1, +1}`` convention pack to the *all-ones* bitstring for every row,
+      so ``uniquify_states`` collapses the whole subspace to one state and ``sqd`` returns that
+      state's diagonal element. Measured on a 4-qubit XXZ chain: **0.000000** against a true ground
+      energy of −1.358047, with the same physical states in both arms.
+    - ``256`` wraps to ``0``, so ``[[0, 1, 256]]`` and ``[[0, 1, 0]]`` pack identically.
+
+    ``pack_states`` is the single choke point for both ``sqd`` and ``hproj``, and the check is
+    ``O(N*n)`` on an array ``packbits`` is about to walk anyway.
+    """
+
+    def test_spin_encoding_raises_instead_of_collapsing(self):
+        """``{-1, +1}`` input is the documented gotcha: every row packed to the same bitstring."""
+        spins = np.array([[-1, 1, -1, 1], [1, 1, 1, 1]], dtype=np.int8)
+        with pytest.raises(ValueError, match="binary"):
+            PauliSumXZ.pack_states(spins)
+
+    def test_values_above_one_raise_instead_of_wrapping(self):
+        """``256`` wraps to 0 under ``astype(uint8)``; 2 is nonzero and packs as 1."""
+        for bad in (np.array([[0, 1, 256]]), np.array([[0, 1, 2]])):
+            with pytest.raises(ValueError, match="binary"):
+                PauliSumXZ.pack_states(bad)
+
+    def test_the_error_names_an_offending_value(self):
+        """A caller holding spins needs to see *what* was wrong, not just that something was."""
+        with pytest.raises(ValueError) as excinfo:
+            PauliSumXZ.pack_states(np.array([[0, 1, -1]], dtype=np.int8))
+        assert "-1" in str(excinfo.value)
+
+    @pytest.mark.parametrize("dtype", [np.uint8, np.int8, np.int64, bool])
+    def test_genuine_binary_input_still_packs_in_every_dtype(self, dtype):
+        """The guard must not narrow what was already accepted -- bools included."""
+        states = np.array([[0, 1, 1, 0], [1, 0, 0, 1]], dtype=dtype)
+        packed = PauliSumXZ.pack_states(states)
+        expected = np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
+        assert np.array_equal(packed, expected)
+
+    def test_empty_and_single_row_inputs_are_accepted(self):
+        """Degenerate shapes must not trip the guard (`np.all` over an empty axis is True)."""
+        assert PauliSumXZ.pack_states(np.zeros((0, 4), dtype=np.uint8)).shape == (0, 1)
+        assert PauliSumXZ.pack_states(np.ones((1, 4), dtype=np.uint8)).shape == (1, 1)
 
 
 class TestDataclass:

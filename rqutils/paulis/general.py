@@ -235,9 +235,27 @@ def pauli_matrices(dim: int, sparse: bool = False) -> NDArray[np.complex128 | np
         # because each branch stayed internally consistent. Verified identical (max abs diff 0.0 and
         # equal nnz) for dim 2 through 6 before the swap.
         matrices = np.array([csr_array(mat) for mat in matrices])
+        # Freeze each operator's buffers, not the object array holding them. This function memoizes
+        # and returns the cached object directly, so without this every caller shares one set of CSR
+        # instances and an in-place rescale corrupts the basis for the process lifetime: measured
+        # `pauli_matrices(3, sparse=True)[1] /= 2` shifting the cached values by 0.5 max abs, with the
+        # result still Hermitian, so every later `components()` call returned plausible and
+        # consistently wrong coefficients. Normalization is the invariant CLAUDE.md calls the most
+        # bug-prone in this module, which is exactly the thing an in-place `/=` is reaching for.
+        #
+        # Read-only buffers rather than a copy on return, and the gap is not marginal: copying on
+        # every cache hit measured 276 us against 0.10 us for returning the cached object, i.e. 2698x
+        # slower, at dim=6. `setflags` on the three buffers blocks `/=`, `*=`, `data[i] = ...` and
+        # `mat[i, j] = ...` at their source, costs one loop per `dim` at build time (1.15 ms cold for
+        # dim=6), and leaves `toarray`, `@` and every other read untouched. A caller who genuinely
+        # wants to rescale calls `.copy()` first, as the dense path already requires.
+        for mat in matrices:
+            mat.data.setflags(write=False)
+            mat.indices.setflags(write=False)
+            mat.indptr.setflags(write=False)
     else:
         # Make the matrix immutable. Only the dense array can carry the flag; the object array of
-        # csr_arrays is not written to either, but setflags on it would not protect its elements.
+        # csr_arrays needs its elements frozen individually, which the sparse branch above does.
         matrices.setflags(write=False)
 
     _pauli_matrices[(dim, sparse)] = matrices
@@ -248,7 +266,7 @@ _pauli_matrices = {}
 
 
 def components(
-    matrix: ArrayLike, dim: MatrixDimension | None = None, npmod: ModuleType = np
+    matrix: ArrayLike, dim: MatrixDimension, npmod: ModuleType = np
 ) -> NDArray[np.complex128]:
     r"""Return the Pauli decomposition coefficients :math:`\nu_{k_1 \dots k_n}` of the matrix.
 
@@ -265,6 +283,11 @@ def components(
         dimensions.
 
     Raises:
+        TypeError: If `dim` is omitted. It used to default to `None` and be inferred from
+            `matrix.shape[-1]`, which is ambiguous for any composite dimension: a 4x4 matrix inferred
+            one 4-level qudit where two qubits may have been meant, and the two differ by a factor
+            `sqrt(2)` in coefficient norm (the `2**(len(dim) - 2)` normalization is 0.5 against 1.0)
+            with nothing to indicate which was used.
         ValueError: If `prod(dim)` does not match the matrix dimension. **Only under `npmod is np`**
             -- the check cannot run on traced values, so under `npmod=jax.numpy` a mismatched `dim`
             instead surfaces as an opaque `TypeError` from the contraction ("dot_general requires
@@ -275,10 +298,13 @@ def components(
     # gating it left `components(m, dim=3, npmod=jnp)` raising "object of type 'int' has no len()"
     # from the return statement, naming nothing. Only the *validation* below belongs behind the gate,
     # per CLAUDE.md's npmod rule.
-    # Both arms go through normalize_dim, including the fallback: hand-rolling the one-element tuple
-    # would key paulis()'s memo dict on a numpy int under npmod=jnp, where `matrix.shape[-1]` is not
-    # necessarily a plain int, so the same problem could occupy two cache entries.
-    dim = normalize_dim(matrix.shape[-1] if dim is None else dim)
+    # `dim` is required: inferring it from the matrix shape was ambiguous in a silent way. A 4x4
+    # matrix inferred (4,) -- one 4-level qudit -- where the caller may have meant (2, 2). Both pass
+    # the prod(dim) check below and both yield 16 valid coefficients, but they are decompositions in
+    # different bases: the 2**(len(dim) - 2) normalization is 0.5 for one subsystem against 1.0 for
+    # two, so the coefficient vectors differ in norm by sqrt(2) (measured 1.4142135623730951) with
+    # nothing to say which the caller received.
+    dim = normalize_dim(dim)
 
     if npmod is np and np.prod(dim) != matrix.shape[-1]:
         raise ValueError(

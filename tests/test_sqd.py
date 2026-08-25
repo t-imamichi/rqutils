@@ -20,6 +20,8 @@ initial-vector bugs affected all six kernels identically, so a consistency-only 
 passed while every kernel returned the same wrong number.
 """
 
+import warnings
+
 import jax
 import numpy as np
 import pytest
@@ -36,6 +38,7 @@ from rqutils.sqd import (
     _MAX_STATES,
     _is_lex_sorted,
     _pack_scanned,
+    _pack_state_keys,
     apply_h,
     compute_diagonal,
     get_diag_signs,
@@ -272,6 +275,168 @@ class TestUniquifyStates:
         assert np.all(out[(out[:, 0] >> 7) == 1] == 255)
 
 
+class TestCacheLevelValidation:
+    """``cache_level`` digits are validated instead of falling through an implicit ``else``.
+
+    Every branch on ``cache_level`` is an equality test with no ``else``, so before this:
+
+    - an out-of-range **first** digit was silently ignored -- ``(2, 0)`` behaved exactly as
+      ``(0, 0)``, returning the same energy at 7.2x the cost;
+    - an out-of-range **second** digit surfaced as
+      ``UnboundLocalError: cannot access local variable 'diagonals'`` -- an internal error, not a
+      validation error, from a public entry point.
+
+    The likelier mistake is neither: it is the **transposition**. ``(0, 1)`` and ``(1, 0)`` are both
+    legal and return the same energy, differing only in cost -- ``NOTES.md`` measures ``(0, 2)`` at
+    10.9x slower than ``(1, 2)`` and ``(0, 0)`` at 7.2x slower than ``(1, 0)``. A transposed tuple
+    reads as "SQD is slow", never as an error, so validation cannot catch it; what the message can do
+    is name the axes so the call site is readable. Kept as a tuple rather than split into two enum
+    parameters because ``cache_level`` is bound **static** into the jit'd kernel via
+    ``functools.partial`` (``ground_locg`` splats ``args`` positionally, so ``static_argnames`` would
+    never see it) -- the validation belongs at the public boundary, not in the jit plumbing.
+    """
+
+    @pytest.mark.parametrize("bad", [(2, 0), (-1, 0), (3, 1)])
+    def test_out_of_range_first_digit_raises(self, bad):
+        """Was silently equivalent to ``(0, 0)``: same answer, 7.2x the cost."""
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises(ValueError, match="cache_level"):
+            sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=bad)
+
+    @pytest.mark.parametrize("bad", [(1, 5), (1, 3), (0, -1)])
+    def test_out_of_range_second_digit_raises_a_value_error(self, bad):
+        """Was ``UnboundLocalError``, an internal error leaking from a public entry point."""
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises(ValueError, match="cache_level"):
+            sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=bad)
+
+    @pytest.mark.parametrize("bad", [(1,), (1, 0, 0), 1, "10"])
+    def test_malformed_cache_level_raises(self, bad):
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises((ValueError, TypeError), match="cache_level"):
+            sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=bad)
+
+    def test_the_message_names_both_axes(self):
+        """A transposed tuple is legal, so the message has to make the axes readable."""
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises(ValueError) as excinfo:
+            sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=(2, 0))
+        message = str(excinfo.value)
+        assert "source" in message.lower() and "diagonal" in message.lower()
+
+    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
+    def test_every_valid_level_is_still_accepted(self, cache_level):
+        """The guard must accept exactly the six the kernel implements."""
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        assert isinstance(
+            float(sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=cache_level)), float
+        )
+
+    def test_run_sqd_validates_too(self):
+        """``run_sqd`` is public and takes the same argument, so it needs the same guard."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        hamiltonian = PauliSumXZ.from_paulisum((["ZI"], [1.0]))
+        with pytest.raises(ValueError, match="cache_level"):
+            run_sqd(hamiltonian, pack_padded(states), 2, False, (2, 0))
+
+
+class TestStatesWidthCheck:
+    """``states.shape[1]`` must equal ``hamiltonian.num_qubits`` on both entry points.
+
+    The realistic failure is that ``pack_states`` is **not idempotent**. ``sqd`` takes unpacked
+    ``(N, n)`` states and *returns* unpacked ones, but the natural intermediate a caller keeps -- from
+    ``uniquify_states``, or from ``pack_states`` called directly as the docstring encourages -- is
+    *packed*, shape ``(N, ceil((n+1)/8))``. Feeding that back in re-packs it: ``astype(uint8)`` is a
+    no-op and ``packbits`` then treats each byte as one bit via nonzero-to-1, yielding a different
+    subspace. Nothing caught it, because both inputs are 2-D uint8 and the width was never compared
+    against the Hamiltonian. This is a realistic loop -- run ``sqd``, do configuration recovery, run
+    ``sqd`` again.
+
+    One ``O(1)`` comparison closes double-packing, a transposed array, and a mismatched Hamiltonian at
+    once. Note it does not close *every* re-feed: at ``n <= 7`` a packed row is 1 byte wide, so a
+    1-qubit Hamiltonian would accept it -- the shape genuinely matches there. Item 1's binary check is
+    what catches that case, since packed bytes exceed 1.
+    """
+
+    def test_sqd_rejects_packed_states(self):
+        """The measured loop: pack the states, feed them back, get a different subspace."""
+        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
+        packed = pack_padded(states)
+        assert packed.shape[1] != states.shape[1], "fixture must actually change width"
+        with pytest.raises(ValueError, match="num_qubits|width|shape"):
+            sqd((["ZZII"], [1.0]), packed, return_eigvec=False)
+
+    def test_hproj_rejects_packed_states(self):
+        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
+        with pytest.raises(ValueError, match="num_qubits|width|shape"):
+            hproj((["ZZII"], [1.0]), pack_padded(states))
+
+    def test_a_transposed_array_is_rejected(self):
+        """Same check, second payoff: (n, N) instead of (N, n)."""
+        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
+        with pytest.raises(ValueError, match="num_qubits|width|shape"):
+            sqd((["ZZII"], [1.0]), states.T.copy(), return_eigvec=False)
+
+    def test_a_mismatched_hamiltonian_is_rejected(self):
+        """Third payoff: right shape family, wrong qubit count."""
+        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
+        with pytest.raises(ValueError, match="num_qubits|width|shape"):
+            sqd((["ZZ"], [1.0]), states, return_eigvec=False)
+
+    def test_the_error_names_both_widths(self):
+        states = np.array([[0, 1, 0, 1]], dtype=np.uint8)
+        with pytest.raises(ValueError) as excinfo:
+            sqd((["ZZ"], [1.0]), states, return_eigvec=False)
+        message = str(excinfo.value)
+        assert "4" in message and "2" in message
+
+    def test_matching_widths_still_work(self):
+        """The guard must not narrow what already worked."""
+        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
+        assert isinstance(float(sqd((["ZZII"], [1.0]), states, return_eigvec=False)), float)
+        assert hproj((["ZZII"], [1.0]), states).shape == (2, 2)
+
+
+class TestKeywordOnlyEntryPoints:
+    """Everything after ``states`` is keyword-only on both public entry points.
+
+    The slip this closes is ``sqd(ham, states, True)``. Every parameter after ``states`` used to be
+    positional-or-keyword, and the three are semantically unrelated (``states_size: int | None``,
+    ``return_eigvec: bool``, ``cache_level: tuple``). Since ``True == 1``, that call was a *valid*
+    ``states_size`` and did not raise -- it pinned the array to size 1. ``hproj(ham, states, True)``
+    is the same shape one function over, where the third parameter is ``unique_states``.
+
+    ``apply_h`` already received this treatment (``docs/rqutils-requests.md`` C1); the public entry
+    points were missed. No in-tree caller passed these positionally, so this is a downstream-only
+    break.
+    """
+
+    def test_sqd_rejects_a_third_positional_argument(self):
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises(TypeError, match="positional"):
+            sqd((["ZI"], [1.0]), states, True)  # ty: ignore[too-many-positional-arguments]
+
+    def test_hproj_rejects_a_third_positional_argument(self):
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises(TypeError, match="positional"):
+            hproj((["ZI"], [1.0]), states, True)  # ty: ignore[too-many-positional-arguments]
+
+    def test_the_keyword_forms_still_work(self):
+        """The two arguments a caller actually wants must remain reachable by name."""
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        assert isinstance(float(sqd((["ZI"], [1.0]), states, return_eigvec=False)), float)
+        assert hproj((["ZI"], [1.0]), states, unique_states=False).shape == (2, 2)
+
+    def test_states_size_one_is_still_expressible_by_name(self):
+        """The guard must not remove the behaviour, only the accidental way of reaching it."""
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        # states_size=1 is legal but degenerate: one slot for a two-state subspace.
+        with pytest.raises((ValueError, IndexError, RuntimeError)):
+            sqd((["ZI"], [1.0]), states, states_size=1, return_eigvec=False)
+
+
 class TestInt32Ceiling:
     """``_MAX_STATES`` is enforced where the int32 index is created, not only in the entry points.
 
@@ -435,11 +600,18 @@ class TestHproj:
     def test_padded_uniquify_output_is_rejected(self):
         """A padded ``uniquify_states`` result must NOT pass, since ``hproj`` cannot mask fillers.
 
-        Filler slots are all-``255`` rows, so two or more are duplicates and fail the strictness test.
         This is the one way the sortedness guard could surprise a caller -- ``uniquify_states`` output
         is otherwise exactly what ``get_xsource`` wants -- so it is pinned rather than left to be
         rediscovered. ``sqd`` trims fillers before returning its basis, which is why
         ``examples/scaling/poc7_sharding.py`` can hand that basis straight to ``hproj``.
+
+        **This test used to assert the opposite of its own title for the single-filler case**, which is
+        how the parity hole (``docs/gotchas.md`` item 14) survived: rejection rested on two or more
+        ``255`` rows being *duplicates*, so exactly one filler was still strictly increasing and
+        passed, and the assertion below read ``is True``. The docstring's stated intent was right and
+        the assertion was wrong. There is now an explicit high-bit test in ``_is_lex_sorted``,
+        independent of sortedness, so any number of fillers is rejected --
+        see :class:`TestSingleFillerRow` for the measured consequence.
         """
         from rqutils.paulis.symplectic import PauliSumXZ
 
@@ -447,12 +619,13 @@ class TestHproj:
         states = rng.integers(0, 2, size=(12, 4), dtype=np.uint8)
         packed = PauliSumXZ.pack_states(states)
 
-        # states_size=12 happens to leave a single filler, which is still strictly increasing.
+        # states_size=12 happens to leave a single filler: strictly increasing, so only the explicit
+        # filler test catches it.
         one_filler = np.asarray(uniquify_states(packed, 12))
         assert int((one_filler[:, 0] >> 7).sum()) == 1
-        assert _is_lex_sorted(one_filler) is True
+        assert _is_lex_sorted(one_filler) is False
 
-        # Pad further and the duplicate 255 rows are rejected.
+        # Two or more are also duplicates, so they fail either way.
         many_fillers = np.asarray(uniquify_states(packed, 16))
         assert int((many_fillers[:, 0] >> 7).sum()) > 1
         assert _is_lex_sorted(many_fillers) is False
@@ -935,6 +1108,445 @@ def apply_h_inputs(rng, num_qubits=4, num_terms=6, num_states=12):
     }
 
 
+class TestUint64KeyWidthBoundary:
+    """``_pack_state_keys`` must reject ``B > 8`` rather than silently aliasing distinct states.
+
+    ``get_xsource`` selects a ``uint64``-key search for ``B <= 8`` and an explicit lexicographic
+    search beyond, and that dispatch is correct -- so there is no live wrong answer through the public
+    path. What was missing is the guard at the packing function itself. Its docstring said "Only valid
+    while ``B <= 8``; :func:`get_xsource` checks that before calling", which is a *comment*: nothing
+    enforced it, and ``NOTES.md`` calls the limit "a correctness limit" while
+    ``docs/scaling-pocs.md`` calls it "a hard correctness boundary, asserted rather than documented".
+    It was in fact neither asserted nor enforced.
+
+    The failure is worse than truncation. Byte 0 is the most significant, so at ``B = 9`` its shift is
+    ``8 * (9 - 1) = 64`` bits on a ``uint64`` -- the byte vanishes entirely rather than being
+    coarsened, destroying lex order rather than merely weakening it. Measured: two 9-byte rows
+    differing *only* in byte 0 both pack to key ``0``, as does an all-zero row.
+
+    ``B = 9`` is reachable: ``B = ceil((n + 1) / 8)``, so ``n >= 64`` crosses it, and
+    ``docs/scaling-pocs.md`` measures at ``n = 64`` and beyond.
+
+    The wrapper-type fix ``docs/gotchas.md`` proposes (encoding width in item 7's packed-states type)
+    is deferred, so this is defence-in-depth on a private function: it converts a silent wrong answer
+    into a raise for anyone who reaches past ``get_xsource``.
+    """
+
+    @pytest.mark.parametrize("nbytes", [9, 10, 16])
+    def test_wide_rows_raise(self, nbytes):
+        with pytest.raises(ValueError, match="8 bytes|uint64|width"):
+            _pack_state_keys(np.zeros((2, nbytes), dtype=np.uint8))
+
+    def test_the_aliasing_it_prevents_is_real(self):
+        """The premise, at the widest legal width, so the guard is not protecting a non-problem.
+
+        Rather than call the guarded function, reproduce its arithmetic at ``B = 9`` to show that
+        byte 0's 64-bit shift loses the byte outright.
+        """
+        shifts = np.array([8 * (9 - 1 - i) for i in range(9)], dtype=np.uint64)
+        distinct = np.zeros((1, 9), dtype=np.uint8)
+        distinct[0, 0] = 1
+        allzero = np.zeros((1, 9), dtype=np.uint8)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            key_a = (distinct.astype(np.uint64) << shifts).sum(axis=1)
+            key_b = (allzero.astype(np.uint64) << shifts).sum(axis=1)
+        assert key_a[0] == key_b[0], (key_a, key_b)
+
+    @pytest.mark.parametrize("nbytes", [1, 2, 4, 8])
+    def test_legal_widths_still_pack_and_preserve_lex_order(self, nbytes):
+        """The guard must not narrow the fast path, and the keys must stay order-preserving."""
+        rng = np.random.default_rng(20260825)
+        rows = np.unique(rng.integers(0, 128, size=(64, nbytes), dtype=np.uint8), axis=0)
+        rows = rows[np.lexsort(rows.T[::-1])]
+        keys = np.asarray(_pack_state_keys(rows))
+        assert keys.shape == (rows.shape[0],)
+        # Lex order on rows must equal integer order on keys -- the whole point of the packing.
+        assert np.all(np.diff(keys) > 0), keys
+
+    def test_get_xsource_still_handles_both_sides_of_the_boundary(self):
+        """The public path is unaffected: 8 bytes takes the fast path, 9 the lexicographic one."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        for num_qubits in (63, 64):  # B = 8 and B = 9
+            hamiltonian = PauliSumXZ.from_paulisum((["X" + "I" * (num_qubits - 1)], [1.0]))
+            states = np.zeros((2, num_qubits), dtype=np.uint8)
+            states[1, 0] = 1
+            states_p = np.asarray(PauliSumXZ.pack_states(states))
+            states_u = uniquify_states(states_p, 2)
+            sources = np.asarray(get_xsource(hamiltonian.x[0], states_u))
+            assert sources.shape == (2,), (num_qubits, sources)
+            # The X flips the character-0 qubit, so the two states are each other's source.
+            assert sorted(sources.tolist()) == [0, 1], (num_qubits, sources)
+
+
+class TestConvergenceIsReported:
+    """``sqd`` must not return a non-converged eigenvalue as though it were the answer.
+
+    ``run_sqd`` unpacked ``ground_locg``'s result as ``eigval, eigvec, _, _``, discarding
+    ``converged``. A non-converged LOBPCG run still returns ``state.theta`` -- a valid *variational
+    upper bound*, so finite and entirely plausible -- and ``sqd`` wrapped it in ``float()`` and
+    returned it as "Calculated ground state energy" with no indication.
+
+    ``docs/locg.md`` records that this absence "is the reason I4 could hide": a sign error made the
+    convergence test unsatisfiable, so the solver silently never converged and every answer was the
+    iteration cap's best guess. ``sqd`` also exposed no ``maxiter`` or ``tol``, so a caller could
+    neither detect the situation nor retry.
+
+    Narrow fix, deliberately: ``maxiter``/``tol`` are exposed and non-convergence raises. ``sqd``'s
+    *return shape* is unchanged -- returning a status object is item 11 in ``docs/gotchas.md`` and a
+    much wider break.
+
+    The raise lives in ``sqd``, not ``run_sqd``: the latter is ``@jax.jit``-wrapped, so ``converged``
+    is a traced boolean there and cannot be branched on at trace time.
+    """
+
+    def test_a_tight_maxiter_raises_instead_of_returning_a_guess(self):
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        with pytest.raises(RuntimeError, match="converge"):
+            sqd((strings, coeffs.tolist()), states, return_eigvec=False, maxiter=1)
+
+    def test_the_message_names_maxiter_and_tol(self):
+        """A caller who hits this needs to know which knobs exist."""
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        with pytest.raises(RuntimeError) as excinfo:
+            sqd((strings, coeffs.tolist()), states, return_eigvec=False, maxiter=1)
+        message = str(excinfo.value)
+        assert "maxiter" in message and "tol" in message
+
+    def test_the_default_path_still_converges_and_is_unchanged(self):
+        """The guard must not start rejecting the runs that always worked.
+
+        Also pins that exposing the parameters did not change the answer: the default result must
+        equal the reference, not merely avoid raising.
+        """
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        got = eigval_of(strings, coeffs, states)
+        expected = lowest_projected(strings, coeffs, states)
+        assert abs(got - expected) < 1e-6
+
+    def test_a_generous_maxiter_is_accepted(self):
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        got = eigval_of(strings, coeffs, states, maxiter=2000)
+        expected = lowest_projected(strings, coeffs, states)
+        assert abs(got - expected) < 1e-6
+
+    def test_a_loose_tol_converges_sooner_without_changing_the_answer(self):
+        """``tol`` must be plumbed through, not accepted and ignored."""
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        loose = eigval_of(strings, coeffs, states, tol=1e-6)
+        expected = lowest_projected(strings, coeffs, states)
+        assert abs(loose - expected) < 1e-4
+
+    def test_the_returned_value_would_have_been_plausible(self):
+        """Records *why* this was silent: the discarded result is a valid upper bound.
+
+        Asserts the failure mode rather than the fix, so the reason the guard exists stays visible --
+        a non-converged theta is finite, real, and above the true minimum, i.e. indistinguishable
+        from a correct answer by inspection.
+        """
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        reference = lowest_projected(strings, coeffs, states)
+        # Reach past sqd's guard to see what it would have returned.
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_p = PauliSumXZ.pack_states(states)
+        result = run_sqd(hamiltonian, states_p, states_p.shape[0], False, (1, 0), maxiter=1)
+        theta, converged = float(result[0]), bool(result[-1])
+        assert not converged
+        assert np.isfinite(theta) and theta > reference, (theta, reference)
+
+
+class TestPublicHelperPreconditions:
+    """The un-underscored helpers state preconditions; these check the ones that *can* be checked.
+
+    ``uniquify_states``, ``get_xsource`` and ``get_diag_signs`` are public and called directly by six
+    scripts under ``examples/scaling/`` -- i.e. exactly the code that pushes ``N`` past where the
+    entry-point guards would have fired. ``NOTES.md`` records that this is how the int32 iota was
+    reached "with neither entry-point guard in the chain".
+
+    What is and is not reachable here, stated exactly, because two of the three preconditions cannot
+    be validated at this boundary:
+
+    - ``uniquify_states``' int32 ceiling **is** guarded, on the static ``states_size`` where the iota
+      is actually created. Already fixed; re-pinned here so the bypass path stays covered.
+    - ``get_xsource``'s **lex-sortedness** requirement cannot be checked. It is ``@jax.jit``-wrapped,
+      so ``states`` arrives as a tracer and its values are unavailable; a host-side scan like
+      ``_is_lex_sorted`` is impossible there. This is a structural limit, not an oversight, and it is
+      why ``docs/gotchas.md`` item 10 proposed wrapper types rather than validation.
+    - **Rank and dtype are static under jit**, so those *are* checkable -- and ``get_diag_signs``
+      silently accepted a 1-D ``zsignatures`` array, returning a wrongly shaped result rather than
+      raising.
+    """
+
+    def test_uniquify_states_ceiling_is_guarded_on_the_bypass_path(self):
+        """The guard sits on the static ``states_size``, where the int32 iota is created."""
+        with pytest.raises(ValueError, match="_MAX_STATES|int32|ceiling|limit"):
+            jax.eval_shape(
+                lambda st: uniquify_states(st, _MAX_STATES + 1),
+                jax.ShapeDtypeStruct((4, 2), np.uint8),
+            )
+
+    def test_get_diag_signs_rejects_a_rank_1_zsignature_array(self):
+        """Was accepted, returning shape (4, 1) from a 1-D input that should be (n_terms, n_bytes)."""
+        with pytest.raises((ValueError, TypeError), match="zsignatures|rank|2-D|dimension"):
+            get_diag_signs(np.zeros(2, dtype=np.uint8), np.zeros((4, 2), dtype=np.uint8))
+
+    def test_get_diagonal_rejects_a_rank_1_zsignature_array_too(self):
+        """The peer with the identical hazard: both index ``zsignatures``' leading axis.
+
+        Measured before the shared guard: ``get_diagonal`` returned ``(4,)`` of ``[2., 2., 2., 2.]``
+        from a 1-D input -- a plausible finite diagonal. It is public and is ``cache_level=(*, 0)``'s
+        diagonal source, so it is in exactly the bypass population item 10 is about.
+        """
+        with pytest.raises(ValueError, match="zsignatures|rank|2-D|dimension"):
+            get_diagonal(np.zeros(2, dtype=np.uint8), np.ones(2), np.zeros((4, 2), dtype=np.uint8))
+
+    def test_get_diagonal_still_accepts_a_proper_2d_array(self):
+        diagonal = np.asarray(
+            get_diagonal(
+                np.zeros((3, 2), dtype=np.uint8), np.ones(3), np.zeros((4, 2), dtype=np.uint8)
+            )
+        )
+        assert diagonal.shape == (4,)
+
+    def test_get_diag_signs_still_accepts_a_proper_2d_array(self):
+        signs = np.asarray(
+            get_diag_signs(np.zeros((3, 2), dtype=np.uint8), np.zeros((4, 2), dtype=np.uint8))
+        )
+        assert signs.shape[0] == 4
+
+    def test_get_xsource_sortedness_is_documented_as_uncheckable(self):
+        """Pinned so the limit is explicit: unsorted input gives wrong indices, silently.
+
+        ``get_xsource`` binary-searches into ``states``, so sortedness is load-bearing -- but the
+        function is jit'd and the values are traced, so it cannot verify it. This asserts the failure
+        mode rather than a raise, which is what makes the gap visible in the suite.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((["IX"], [1.0]))
+        states = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=np.uint8)
+        packed_sorted = np.asarray(PauliSumXZ.pack_states(states))
+        packed_unsorted = packed_sorted[::-1].copy()
+
+        good = np.asarray(get_xsource(hamiltonian.x[0], packed_sorted))
+        bad = np.asarray(get_xsource(hamiltonian.x[0], packed_unsorted))
+        # Both return plausible index arrays; only one is correct, and nothing signals which.
+        assert good.shape == bad.shape
+        assert not np.array_equal(good, bad), (
+            "if these now agree, either the fixture stopped being unsorted or get_xsource became "
+            "order-independent -- both would make this test vacuous"
+        )
+
+
+class TestSingleFillerRow:
+    """``_is_lex_sorted`` must reject *one* filler row, not just two or more.
+
+    The parity hole ``docs/gotchas.md`` item 14 names. Filler slots are all-``255`` rows, so **two**
+    are duplicates and fail the strictness test -- which is what ``_is_lex_sorted``'s docstring
+    claimed made it reject padded input "by design". But a **single** filler row is still strictly
+    increasing and passed. Measured: ``uniquify_states(..., 3)`` on a 2-state subspace gives
+    ``[[32], [64], [255]]``, and ``_is_lex_sorted`` returned True on it while returning False for the
+    4-slot version. The guard rejected the easy case and admitted the hard one.
+
+    ``hproj`` has no filler-masking step, so that row becomes a spurious basis state in the dense
+    ``[N, N]`` projection: one row and column too large, still symmetric, plausible wrong eigenvalue.
+    Measured end to end -- **-1.118034 against a true -1.0**.
+
+    Note item 1's binary check cannot cover this. Unpacking a ``255`` filler at n=2 yields ``[1, 1]``,
+    a perfectly legitimate binary state, so a caller who round-trips through ``unpack_states`` gets a
+    silently enlarged subspace. The guard has to sit on the *packed* side, where ``255`` is
+    unambiguous because ``pack_states`` makes byte 0 of every genuine state ``< 128``.
+    """
+
+    def test_one_filler_row_is_rejected(self):
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        padded = np.asarray(uniquify_states(PauliSumXZ.pack_states(states), 3))
+        assert padded[-1, 0] == 255, "fixture must actually contain one filler row"
+        assert not _is_lex_sorted(padded)
+
+    def test_two_filler_rows_are_still_rejected(self):
+        """The case that already worked, via the duplicate test -- must not regress."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        padded = np.asarray(uniquify_states(PauliSumXZ.pack_states(states), 4))
+        assert not _is_lex_sorted(padded)
+
+    def test_unpack_states_silently_launders_a_filler_into_a_real_state(self):
+        """A *separate* hazard, recorded rather than fixed here -- and not reachable by this guard.
+
+        ``unpack_states`` destroys the filler marker: ``255`` unpacks to ``[1, 1]`` and repacks to
+        ``96``, not ``255``. So a caller who round-trips a padded ``uniquify_states`` result hands
+        ``hproj`` three *legitimately* distinct, sorted, filler-free states and gets a 3x3 projection
+        where 2x2 was meant. ``_is_lex_sorted`` cannot catch that and should not try -- by then the
+        input really is a valid subspace, one state too large.
+
+        Pinned so the boundary of the filler fix is explicit: it protects callers passing **packed**
+        arrays, which is the form ``uniquify_states`` returns and the form the marker survives in.
+        Slice with ``~_is_filler(states)`` before unpacking.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        padded = np.asarray(uniquify_states(PauliSumXZ.pack_states(states), 3))
+        unpacked = PauliSumXZ.unpack_states(padded, 2)
+        repacked = np.asarray(PauliSumXZ.pack_states(unpacked))
+        assert padded[-1, 0] == 255 and repacked[-1, 0] == 96, (padded, repacked)
+        # Accepted, because it genuinely is a valid 3-state subspace by this point.
+        assert hproj((["ZI", "XI"], [1.0, 0.5]), unpacked, unique_states=True).shape == (3, 3)
+
+    def test_hproj_cannot_reach_this_guard_and_that_is_dimension_independent(self):
+        """The guard's real boundary, which two reviewers were right to question.
+
+        An earlier version of this test asserted ``not _is_lex_sorted(padded)`` -- a byte-for-byte
+        repeat of :meth:`test_one_filler_row_is_rejected` that never called ``hproj``, while its name
+        and docstring claimed end-to-end coverage.
+
+        Trying to write the honest version showed the coverage cannot exist. ``hproj`` packs
+        internally, so it only ever sees packed-from-unpacked rows -- and ``pack_states`` inserts the
+        pad bit at position 0, making byte 0 of *every* genuine state ``< 128`` by construction. So an
+        all-ones unpacked row repacks to 127, never 255: the round trip launders a filler into a
+        legitimate state at every width, not just at ``n = 2``. ``hproj`` therefore receives a valid
+        subspace one state too large, and no check on its input could tell.
+
+        The filler guard protects callers who hand an already-packed array to ``_is_lex_sorted`` --
+        the form ``uniquify_states`` returns and the only form in which the marker survives.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        for num_qubits in (2, 8, 16):
+            states = np.zeros((2, num_qubits), dtype=np.uint8)
+            states[1, 0] = 1
+            padded = np.asarray(uniquify_states(PauliSumXZ.pack_states(states), 3))
+            assert padded[-1, 0] == 255, (num_qubits, padded)
+            repacked = np.asarray(
+                PauliSumXZ.pack_states(PauliSumXZ.unpack_states(padded, num_qubits))
+            )
+            assert repacked[-1, 0] < 128, (num_qubits, repacked)
+
+    def test_genuine_sorted_input_is_still_accepted(self):
+        """The guard must not reject a legitimately sorted, unique, filler-free basis."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        states = np.array([[0, 0], [0, 1], [1, 0]], dtype=np.uint8)
+        assert _is_lex_sorted(np.asarray(PauliSumXZ.pack_states(states)))
+        assert hproj((["ZI", "XI"], [1.0, 0.5]), states, unique_states=True).shape == (3, 3)
+
+    def test_an_all_ones_state_is_not_mistaken_for_a_filler(self):
+        """``[1, 1, ...]`` is a legitimate state; only the *packed* 255 marks a filler.
+
+        At n=7 a genuine all-ones row packs to byte 0 = 127 (the pad bit keeps it under 128), so the
+        high-bit test distinguishes them. This is why the check belongs on the packed side.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        all_ones = np.ones((1, 7), dtype=np.uint8)
+        packed = np.asarray(PauliSumXZ.pack_states(all_ones))
+        assert packed[0, 0] == 127, packed
+        assert _is_lex_sorted(packed)
+
+
+class TestApplyHArrayRoles:
+    """``apply_h`` rejects an array passed under the wrong *name*, where dtype can tell.
+
+        Going keyword-only removed *mispairing* -- declaring one strategy while having packed the arrays
+        for another -- but not *misnaming*: ``apply_h(vec, xsources=x)`` where ``x`` is a signature array
+        was still accepted. ``docs/rqutils-requests.md`` concedes that residue is "much smaller... but it
+        is not zero".
+
+    ``apply_h``'s own docstring records why a **shape** assertion cannot close it, and that is
+        correct: at ``n = 15`` (2 bytes) with a 2-state subspace, X signatures and X sources are *both*
+        exactly ``(2, 2)``. That counterexample is pinned by
+        :meth:`TestMatvecKernels.test_shape_assertion_would_not_have_closed_this`, which also
+        asserts the dtype difference this fix relies on -- rather than rebuilding the fixture here.
+
+        What the docstring generalized too far is "naming was the only fix available". **Dtype
+        discriminates precisely where shape collides**, and structurally rather than by luck: packed
+        signatures are ``uint8`` (``np.packbits`` output) while source indices are ``int32`` positions
+        carrying ``-1`` as the absent marker -- a ``uint8`` cannot hold ``-1``, so the two dtypes cannot
+        converge. Same for ``diagonals`` (inexact) against ``diag_signs``/``zsignatures`` (``uint8``).
+
+        Still not closed, and deliberately not claimed: swapping two arrays of the *same* role class --
+        ``xsignatures`` for ``zsignatures``, say, both ``uint8`` -- remains undetectable here.
+    """
+
+    def test_signatures_passed_as_xsources_raise(self):
+        """The exact misnaming the residue names: packed signatures under ``xsources=``."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((["XZ"], [1.0]))
+        vec = np.ones(2)
+        with pytest.raises(ValueError, match="xsources"):
+            apply_h(
+                vec,
+                xsources=hamiltonian.x,  # uint8 signatures where int32 indices are meant
+                diagonals=np.zeros(2),
+            )
+
+    def test_sources_passed_as_xsignatures_raise(self):
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((["XZ"], [1.0]))
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        states_u = uniquify_states(PauliSumXZ.pack_states(states), 2)
+        xsources = np.asarray(get_xsource(hamiltonian.x[0], states_u))[None]
+        with pytest.raises(ValueError, match="xsignatures"):
+            apply_h(
+                np.ones(2),
+                xsignatures=xsources,  # int32 indices where uint8 signatures are meant
+                diagonals=np.zeros(2),
+                states=states_u,
+            )
+
+    def test_signatures_passed_as_diagonals_raise(self):
+        """``diagonals`` is inexact; ``uint8`` there is a misnamed sign-bit or signature array."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((["XZ"], [1.0]))
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        states_u = uniquify_states(PauliSumXZ.pack_states(states), 2)
+        xsources = np.asarray(get_xsource(hamiltonian.x[0], states_u))[None]
+        with pytest.raises(ValueError, match="diagonals"):
+            apply_h(np.ones(2), xsources=xsources, diagonals=hamiltonian.z[0])
+
+    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
+    def test_every_valid_input_set_is_still_accepted(self, cache_level):
+        """The guard must not reject any of the six the kernel implements."""
+        arrays = apply_h_inputs(np.random.default_rng(20260825))
+        got = np.asarray(
+            apply_h(
+                arrays["vector"],
+                states=arrays["states_u"],
+                **apply_h_kwargs(cache_level, arrays),
+            )
+        )
+        expected = arrays["matrix"] @ arrays["vector"]
+        assert np.abs(got - expected).max() < 1e-10
+
+
 class TestMatvecKernels:
     """The matvec kernels, checked directly against a dense matrix-vector product."""
 
@@ -1071,6 +1683,11 @@ class TestMatvecKernels:
             "the counterexample requires the signature and index arrays to collide in shape; "
             f"got {hamiltonian.x.shape} and {xsources.shape}"
         )
+        # The discriminator a shape check cannot provide, and the premise `_check_array_role` rests
+        # on: uint8 packed signatures against int32 positions, which cannot converge because a uint8
+        # cannot hold the -1 absent marker. Asserted on the same fixture rather than in a second copy
+        # of it (see TestApplyHArrayRoles).
+        assert hamiltonian.x.dtype != xsources.dtype, (hamiltonian.x.dtype, xsources.dtype)
 
     @pytest.mark.parametrize("cache_level", [(0, 0), (0, 1), (0, 2), (1, 0)])
     def test_omitting_states_raises(self, cache_level):

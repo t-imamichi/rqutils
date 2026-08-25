@@ -49,7 +49,7 @@ Symplectic Pauli sum representation API
 """
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import numpy as np
@@ -61,6 +61,29 @@ try:
     HAS_QISKIT = True
 except ImportError:
     HAS_QISKIT = False
+
+
+class PackedArrays(NamedTuple):
+    """The ``(x, z, c)`` arrays of a :class:`PauliSumXZ`, named so a misordered read is visible.
+
+    ``x`` and ``z`` are same-dtype integer arrays, so a bare tuple let ``z, x, c = ham.arrays``
+    type-check, run, and compute with X and Z swapped -- the hazard that got :func:`rqutils.sqd.apply_h`'s
+    positional form deleted (0.44 max abs error there), one abstraction lower. A ``NamedTuple`` cannot
+    stop a misordered unpacking, but it gives consumers a spelling that names what they mean, and it is
+    a registered pytree, so :func:`jax.lax.scan` hands its body an instance of this type rather than a
+    raw tuple -- which is what lets ``rqutils.sqd._hproj_cols_elems`` read ``ham.x`` instead of
+    ``ham[0]`` inside the scan. Being a ``tuple`` subclass, every existing splat and index still works.
+
+    Attributes:
+        x: Packed X signatures, shape ``(num_xgroups, num_bytes)``.
+        z: Packed Z signatures, shape ``(num_xgroups, max_zterms, num_bytes)``.
+        c: Phase-folded coefficients, shape ``(num_xgroups, max_zterms)``. See
+            :class:`PauliSumXZ` for the dtype rule.
+    """
+
+    x: jax.Array
+    z: jax.Array
+    c: jax.Array
 
 
 @register_dataclass
@@ -109,10 +132,38 @@ class PauliSumXZ:
 
         Args:
             states: Binary array of computational basis states, shape ``(num_states, num_qubits)``.
+                Every entry must be 0 or 1; see ``Raises``.
 
         Returns:
             Packed states, shape ``(num_states, ceil((num_qubits + 1) / 8))``.
+
+        Raises:
+            ValueError: If any entry is not 0 or 1. Both coercions in the packing expression are
+                lossy and neither used to be checked, so the two natural caller mistakes produced a
+                plausible finite energy rather than an error. :func:`numpy.packbits` maps *every*
+                nonzero entry to 1, so spins in the standard :math:`\\{-1, +1\\}` convention pack to
+                the all-ones bitstring for every row -- ``uniquify_states`` then collapses the whole
+                subspace to one state and ``sqd`` returns its diagonal element (measured
+                **0.000000** on a 4-qubit XXZ chain against a true −1.358047). And
+                ``astype(np.uint8)`` wraps, so ``256`` becomes ``0``. This is the single choke point
+                for both :func:`rqutils.sqd.sqd` and :func:`rqutils.sqd.hproj`, and the scan is
+                ``O(N*n)`` on an array :func:`numpy.packbits` is about to walk anyway.
         """
+        # Checked before `astype`, which would erase the evidence: 256 wraps to 0 and -1 to 255,
+        # so an "is it 0 or 1?" test on the converted array cannot see what the caller passed.
+        # min/max rather than `(states == 0) | (states == 1)`: one pass instead of two comparisons
+        # and an OR, measured 1.05 ms against 4.14 ms at N=1M, n=32. Equivalent for the integer and
+        # bool dtypes this receives, since the only values in [0, 1] are 0 and 1.
+        states = np.asarray(states)
+        if states.size and (states.min() < 0 or states.max() > 1):
+            bad = states[(states != 0) & (states != 1)]
+            suffix = f" and {bad.size - 1} other non-binary entries" if bad.size > 1 else ""
+            raise ValueError(
+                f"`states` must be binary (every entry 0 or 1), but it contains {bad[0]!r}{suffix}. "
+                "Note `np.packbits` maps every nonzero value to 1, so a {-1, +1} spin encoding "
+                "would otherwise pack to the all-ones bitstring for every row and collapse the "
+                "subspace to a single state. Convert with `(spins + 1) // 2` or `spins > 0`."
+            )
         return np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
 
     @staticmethod
@@ -134,7 +185,7 @@ class PauliSumXZ:
         return np.unpackbits(states_p, axis=-1)[:, 1 : 1 + num_qubits]
 
     @classmethod
-    def from_paulisum(cls, paulisum: Any, atol: float = 1e-12) -> "PauliSumXZ":
+    def from_paulisum(cls, paulisum: Any, *, atol: float = 1e-12) -> "PauliSumXZ":
         """Build the packed representation from a Pauli sum.
 
         The only constructor, and the signature half of the bit-alignment contract: it inserts the
@@ -232,6 +283,13 @@ class PauliSumXZ:
             )
         # Discard the sub-atol rounding rather than carrying it: every downstream consumer indexes
         # `.c` expecting a real dtype where the folded phase permits one.
+        #
+        # This line is why `atol` is keyword-only. As a second positional, `from_paulisum(op, 1e-3)`
+        # read naturally as a `simplify` tolerance or a coefficient cutoff -- both plausible, since
+        # `simplify()` is called on ingest -- and instead raised the Hermiticity threshold by nine
+        # orders. The loosened check then does not merely permit the operator: this `.real` throws the
+        # imaginary part away. Measured, `from_paulisum((["ZI", "IZ"], [1 + 1e-4j, 0.5]), 1e-3)` was
+        # accepted and returned c = [0.5, 1.0], with the 1e-4 silently gone.
         coeffs = coeffs.real
 
         # Find unique X signatures together with correspondence pointers
@@ -285,11 +343,17 @@ class PauliSumXZ:
         return cls(xsignatures, zsignatures, phcoeffs, num_qubits)
 
     @property
-    def arrays(self) -> tuple[jax.Array, jax.Array, jax.Array]:
+    def arrays(self) -> "PackedArrays":
         """The packed ``(x, z, c)`` arrays, for splatting into a traced function.
 
+        A :class:`PackedArrays` rather than a bare tuple: ``x`` and ``z`` are same-dtype integer
+        arrays, so ``z, x, c = ham.arrays`` used to type-check and silently swap them. Still a
+        ``tuple`` subclass and still a pytree, so splatting, indexing and
+        :func:`jax.lax.scan` all behave as before.
+
         Returns:
-            ``(x, z, c)``: the packed X signatures, the packed Z signatures, and the phase-folded
-            coefficients. See the class docstring for shapes and for ``c``'s dtype rule.
+            The packed X signatures, packed Z signatures, and phase-folded coefficients, as the
+            named fields ``x``, ``z`` and ``c``. See the class docstring for shapes and for ``c``'s
+            dtype rule.
         """
-        return self.x, self.z, self.c
+        return PackedArrays(self.x, self.z, self.c)

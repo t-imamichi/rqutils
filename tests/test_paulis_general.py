@@ -195,6 +195,65 @@ class TestNpmodParity:
         )
 
 
+class TestDimIsRequired:
+    """``components`` requires ``dim``; it must not infer a basis from the matrix shape.
+
+    With ``dim=None`` a 4x4 matrix inferred ``(4,)`` -- one 4-level qudit -- where the caller may have
+    meant ``(2, 2)``, two qubits. Both pass the ``prod(dim)`` check (``4 == 4`` and ``2*2 == 4``) and
+    both return 16 valid complex coefficients, but they are decompositions in *different bases*: the
+    normalization factor ``2**(len(dim) - 2)`` is ``0.5`` for one subsystem against ``1.0`` for two, a
+    2x difference, so the coefficient vectors differ in norm by ``sqrt(2)``. Measured 1.4142135623730951.
+
+    Nothing signalled which one the caller got. The shapes do differ -- ``(16,)`` against ``(4, 4)`` --
+    but a caller who flattens, or who only sums squares, sees two equally plausible answers.
+
+    Under ``npmod=jnp`` it was worse: the ``prod(dim)`` check is gated on ``npmod is np``, so a wrong
+    ``dim`` gave an opaque ``dot_general`` error rather than a ``ValueError``. Requiring ``dim`` does
+    not fix that gating, but it removes the case where no ``dim`` was supplied at all.
+
+    Every in-tree caller already passes ``dim``, so this is a downstream-only break.
+    """
+
+    def test_omitting_dim_raises(self):
+        matrix = np.eye(4, dtype=np.complex128)
+        with pytest.raises(TypeError, match="dim"):
+            pg.components(matrix)  # ty: ignore[missing-argument]
+
+    def test_the_two_readings_of_a_4x4_really_do_differ(self):
+        """The premise: this is a genuine ambiguity, not a hypothetical one."""
+        rng = np.random.default_rng(20260825)
+        matrix = herm(4, rng)
+        one_qudit = np.asarray(pg.components(matrix, dim=4))
+        two_qubit = np.asarray(pg.components(matrix, dim=(2, 2)))
+        assert one_qudit.shape == (16,)
+        assert two_qubit.shape == (4, 4)
+        ratio = np.linalg.norm(two_qubit.ravel()) / np.linalg.norm(one_qudit.ravel())
+        assert abs(ratio - np.sqrt(2.0)) < 1e-12, ratio
+
+    @pytest.mark.parametrize("dim", [2, 3, 4, (2, 2), (2, 3)])
+    def test_explicit_dim_still_works(self, dim):
+        rng = np.random.default_rng(20260825)
+        total = int(np.prod(dim))
+        matrix = herm(total, rng)
+        expected = tuple(d**2 for d in ((dim,) if isinstance(dim, int) else dim))
+        assert np.asarray(pg.components(matrix, dim=dim)).shape == expected
+
+    def test_dim_may_still_be_passed_positionally(self):
+        """Required, not keyword-only -- ``components(matrix, dim)`` reads unambiguously."""
+        rng = np.random.default_rng(20260825)
+        matrix = herm(4, rng)
+        assert np.allclose(
+            np.asarray(pg.components(matrix, (2, 2))),
+            np.asarray(pg.components(matrix, dim=(2, 2))),
+        )
+
+    def test_a_mismatched_dim_still_raises_under_numpy(self):
+        """The existing ``prod(dim)`` guard must survive the signature change."""
+        rng = np.random.default_rng(20260825)
+        with pytest.raises(ValueError):
+            pg.components(herm(4, rng), dim=(2, 3))
+
+
 class TestDocumentedLimits:
     """Limits CLAUDE.md records as known rough edges, pinned so they fail loudly, not obscurely."""
 
@@ -218,6 +277,88 @@ class TestDocumentedLimits:
         assert len(sparse) == 9
         for index, (dense_matrix, sparse_matrix) in enumerate(zip(dense, sparse)):
             assert np.allclose(sparse_matrix.toarray(), dense_matrix), f"lambda_{index}"
+
+
+class TestSparseCacheImmutability:
+    """The cached ``sparse=True`` bases must not be mutable by the caller.
+
+    ``pauli_matrices`` memoizes in a module-level dict and returns the cached object directly. The
+    dense path is protected -- ``matrices.setflags(write=False)`` makes an in-place write raise -- but
+    the sparse path was not, and the source comment conceded that ``setflags`` on an object array of
+    ``csr_array`` s "would not protect its elements".
+
+    So every caller received *the same* CSR objects, and an in-place ``/=`` for a different
+    normalization convention corrupted the cache for the **process lifetime**. Measured before the
+    fix: ``pauli_matrices(3, sparse=True)[1] /= 2`` changed the cached basis by 0.5 max abs, and the
+    result stayed Hermitian -- so every later :func:`components` call returned plausible,
+    consistently wrong coefficients. Normalization is the invariant ``CLAUDE.md`` calls "the most
+    bug-prone" in this module.
+
+    Fixed by making the CSR buffers read-only rather than copying on return: a copy per call would
+    pay for every read to protect against a rare write, where ``setflags`` on ``.data``/``.indices``/
+    ``.indptr`` blocks the mutation at its source and costs nothing.
+    """
+
+    def test_in_place_division_raises(self):
+        """The exact corruption: renormalizing a cached basis in place.
+
+        Not swept over ``dim``: the guard freezes the same three buffers in one loop regardless of
+        dimension, so a sweep would exercise the sweep rather than the guard. ``*=`` is likewise not
+        tested separately -- it writes ``.data`` through the same path as ``/=``.
+        """
+        matrices = pg.pauli_matrices(3, sparse=True)
+        with pytest.raises(ValueError, match="read-only"):
+            matrices[1] /= 2.0
+
+    @pytest.mark.parametrize("buffer_name", ["data", "indices", "indptr"])
+    def test_writing_any_csr_buffer_raises(self, buffer_name):
+        """All three buffers are frozen, so all three are checked.
+
+        The values live in ``.data`` and the structure in ``.indices``/``.indptr``; the earlier
+        version of this class tested ``.data`` three times over and the other two not at all.
+        """
+        matrices = pg.pauli_matrices(3, sparse=True)
+        with pytest.raises(ValueError, match="read-only"):
+            getattr(matrices[1], buffer_name)[0] = 1
+
+    def test_the_cache_survives_an_attempted_mutation(self):
+        """The property that actually matters: a failed write must leave the cache intact."""
+        before = pg.pauli_matrices(3, sparse=True)[1].toarray().copy()
+        with pytest.raises(ValueError):
+            pg.pauli_matrices(3, sparse=True)[1] /= 2.0
+        after = pg.pauli_matrices(3, sparse=True)[1].toarray()
+        assert np.allclose(before, after)
+
+    def test_reads_still_work(self):
+        """The guard must not break the operations the basis exists for."""
+        dim = 3
+        matrices = pg.pauli_matrices(dim, sparse=True)
+        vec = np.ones(dim)
+        for mat in matrices:
+            assert mat.toarray().shape == (dim, dim)
+            assert (mat @ vec).shape == (dim,)
+        # A caller who *wants* to rescale can still copy first.
+        scaled = matrices[1].copy()
+        scaled /= 2.0
+        assert np.allclose(scaled.toarray() * 2.0, matrices[1].toarray())
+
+    @pytest.mark.parametrize("dim", [2, 5])
+    def test_sparse_still_agrees_with_dense(self, dim):
+        """Guarding the buffers must not change any value.
+
+        Two dims rather than five: ``freezing a buffer`` cannot be dimension-sensitive, and
+        :meth:`TestDocumentedLimits.test_sparse_single_subsystem_matches_dense` already covers
+        sparse-equals-dense at ``dim=3``. Kept the smallest and largest as a shape sanity check.
+        """
+        sparse = pg.pauli_matrices(dim, sparse=True)
+        dense = np.asarray(pg.pauli_matrices(dim, sparse=False))
+        for isparse, idense in zip(sparse, dense, strict=True):
+            assert np.abs(isparse.toarray() - idense).max() == 0.0
+
+    def test_the_dense_path_was_already_protected(self):
+        """Pinned for contrast -- the asymmetry is what made the sparse gap easy to miss."""
+        with pytest.raises(ValueError, match="read-only|assignment destination"):
+            pg.pauli_matrices(3, sparse=False)[1] /= 2.0
 
 
 class TestShapesAndMemoization:

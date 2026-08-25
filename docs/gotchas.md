@@ -23,33 +23,61 @@ that work.
 
 ## Summary — 18 open items, plus one intentional design decision
 
-Status verified against the source on `dev` at the time of writing, not read off the prose below.
-**Item 2 is intentional** — a deliberate per-module design decision, kept in the list for its
-measurements and its cross-boundary warning. Of the remaining 18, **all are open**; the "Already closed"
-section near the end is a separate, unnumbered list of gotchas earlier breaking changes have already
-removed. "Partly landed" means a *documentation or test* fix shipped while the structural fix did not.
+**Tier 1 and Tier 2 are done** (branch `worktree-gotchas-tier12`, 511 tests passing from a 437
+baseline, three linters clean). Each fix was written test-first and its commit is linked below. Two
+outcomes were not what the list predicted, and are recorded as such rather than reshaped to fit:
+
+* **Item 9 is not a defect.** Measured: `sqd` returns the identical energy for sorted and unsorted
+  input because it sorts internally, `hproj`'s default path does too, and the opt-in
+  `unique_states=True` path *already* raised on both unsorted and duplicate input.
+* **Item 14 (Tier 3) was fixed instead**, since investigating item 9 confirmed its parity hole and it
+  lives in the same guard — a single filler row passed where two were rejected, giving a measured
+  −1.118034 against a true −1.0.
+
+**Tier 3 items 17 and 12 are also fixed**, on request. Item 12 was done in *narrow* scope: `maxiter`
+and `tol` are exposed and non-convergence raises, but `sqd`'s return shape is untouched — returning a
+status object is item 11, a far wider break. Note `run_sqd`'s return grew by one element (the flag,
+last) as a consequence.
+
+**Items 13 and 18 are also fixed.** Item 18 deviates from its own proposal on one point: `atol`
+was made keyword-only but **not** renamed to `discard_imag_below`, since `atol` is the conventional
+spelling and the parameter is primarily a Hermiticity threshold — the discard is a consequence, now
+documented at the parameter. Item 13's `dim` was made required but left positional, since
+`components(matrix, dim)` reads unambiguously.
+
+**Item 19 is also fixed**, as an assertion rather than the wrapper type it proposes: the public
+dispatch in `get_xsource` was already correct (pinned now at both `n = 63` and `n = 64`), so what was
+missing was the guard on `_pack_state_keys` itself, which the docs described as "asserted" while
+nothing enforced it.
+
+The remaining Tier 3 items (11, 15, 16) are untouched.
+
+Two items are **partly** fixed, with the residue stated in the row rather than left implied. **Item 2
+is intentional** — a deliberate per-module design decision, kept for its measurements and its
+cross-boundary warning. The "Already closed" section near the end is a separate, unnumbered list of
+gotchas earlier breaking changes had already removed.
 
 | # | tier | gotcha | measured consequence | proposed fix | effort | status |
 | --- | --- | --- | --- | --- | --- | --- |
-| **1** | 1 | `pack_states` maps any nonzero to 1 | `{-1,+1}` input returns **0.000000** vs true −1.358047 | validate `{0,1}`, or accept `np.bool_` only | 1 check | **open** |
+| **1** | 1 | `pack_states` maps any nonzero to 1 | `{-1,+1}` input returns **0.000000** vs true −1.358047 | validate `{0,1}`, or accept `np.bool_` only | 1 check | ✅ **fixed** (`b334799`) |
 | **2** | — | `sqd` is MSB-first, `svsim` is LSB-first | −2.627596 vs −4.550395, n=5, if a caller crosses the boundary | **none — document the boundary** | — | ✅ **intentional** (see below) |
-| **3** | 2 | `sqd(ham, states, True)` sets `states_size=1` | silently pins the array to size 1 | `*` after `states` | 1 line | **open** |
-| **4** | 2 | `cache_level` digits unvalidated | `(2,0)` silently acts as `(0,0)`; `(1,5)` → `UnboundLocalError`; transposition costs **7.2–10.9×** | two keyword-only enums | small | **open** |
-| **5** | 2 | `PauliSumXZ.arrays` is a bare 3-tuple | `z, x, c = ham.arrays` type-checks and swaps X/Z | `NamedTuple` | ~free | **open** |
-| **6** | 2 | `apply_h` accepts arrays under the wrong *name* | mispairing closed, misnaming not | `NewType` per array role | medium | **partly landed** — keyword-only shipped; naming residue remains |
-| **7** | 2 | `pack_states` not idempotent; width never cross-checked | double-packing yields a different subspace | raise on `shape[1] != num_qubits` | 1 check | **open** |
-| **8** | 2 | `matrix_ufunc(hermitian=...)` positional tri-state, silent `else` | `hermitian=1` on non-Hermitian input returns a *different* operator's spectrum (error > 1.0) | keyword-only + `Symmetry` enum | medium | **open** |
-| **9** | 2 | lex-sortedness required everywhere, enforced on one path | `states` means two different things in sibling functions | `UniqueSortedStates` type from `prepare_states()` | medium | **partly landed** — `hproj` raises; `sqd` still accepts anything |
-| **10** | 2 | public helpers bypass entry-point guards | int32 iota reached "with neither entry-point guard in the chain" | underscore them, or accept wrapper types only | medium | **partly landed** — guard pushed down; API still wide |
+| **3** | 2 | `sqd(ham, states, True)` sets `states_size=1` | silently pins the array to size 1 | `*` after `states` | 1 line | ✅ **fixed** (`8f23204`) |
+| **4** | 2 | `cache_level` digits unvalidated | `(2,0)` silently acts as `(0,0)`; `(1,5)` → `UnboundLocalError`; transposition costs **7.2–10.9×** | two keyword-only enums | small | ✅ **fixed** (`b561bc4`) |
+| **5** | 2 | `PauliSumXZ.arrays` is a bare 3-tuple | `z, x, c = ham.arrays` type-checks and swaps X/Z | `NamedTuple` | ~free | ✅ **fixed** (`8d8fbcc`) |
+| **6** | 2 | `apply_h` accepts arrays under the wrong *name* | mispairing closed, misnaming not | `NewType` per array role | medium | ⚠️ **partly fixed** (`95fea5a`) — dtype closes cross-kind misnaming; same-kind swap open |
+| **7** | 2 | `pack_states` not idempotent; width never cross-checked | double-packing yields a different subspace | raise on `shape[1] != num_qubits` | 1 check | ✅ **fixed** (`8d8fbcc`) |
+| **8** | 2 | `matrix_ufunc(hermitian=...)` positional tri-state, silent `else` | `hermitian=1` on non-Hermitian input returns a *different* operator's spectrum (error > 1.0) | keyword-only + `Symmetry` enum | medium | ✅ **fixed** (`9b0a7f3`) |
+| **9** | 2 | lex-sortedness required everywhere, enforced on one path | `states` means two different things in sibling functions | `UniqueSortedStates` type from `prepare_states()` | medium | ❌ **not a defect** (`4e0cdaf`) — `sqd` sorts internally; the opt-in path already raised |
+| **10** | 2 | public helpers bypass entry-point guards | int32 iota reached "with neither entry-point guard in the chain" | underscore them, or accept wrapper types only | medium | ⚠️ **partly fixed** (`1d76725`) — rank checked; sortedness structurally uncheckable |
 | **11** | 3 | return arity depends on a boolean | `ty` cannot follow a static flag into return arity | always return a dataclass | refactor | **open** |
-| **12** | 3 | `sqd` discards `converged` | a non-converged run returns a plausible upper bound; "the reason I4 could hide" | return the flag; expose `maxiter`/`tol` | refactor | **open** |
-| **13** | 3 | `components(matrix, dim=None)` silently picks a basis | `(4,)` vs `(2,2)` differ by **2×** in normalization, both plausible | make `dim` required | small | **open** |
-| **14** | 3 | `hproj(unique_states=True)` admits exactly **one** filler row | spurious basis state; symmetric, plausible wrong eigenvalue | also reject `_is_filler` rows | 1 line | **open** |
+| **12** | 3 | `sqd` discards `converged` | a non-converged run returns a plausible upper bound; "the reason I4 could hide" | return the flag; expose `maxiter`/`tol` | refactor | ✅ **fixed** (`38e4063`) — raises; return shape unchanged (that is item 11) |
+| **13** | 3 | `components(matrix, dim=None)` silently picks a basis | `(4,)` vs `(2,2)` differ by **2×** in normalization, both plausible | make `dim` required | small | ✅ **fixed** (`14996fb`) — `dim` required, still positional |
+| **14** | 3 | `hproj(unique_states=True)` admits exactly **one** filler row | spurious basis state; symmetric, plausible wrong eigenvalue | also reject `_is_filler` rows | 1 line | ✅ **fixed** (`4e0cdaf`) — one-filler parity hole |
 | **15** | 3 | `svsim` infers `num_qubits` from the highest qubit touched | an untouched top qubit yields a `2**(n-1)` vector, normalized, no error | require `num_qubits`; `frozen=True` on `CircuitXZ` | small | **open** |
 | **16** | 3 | `initial_state`/`xinit` take an array *or* an int | `0` where `np.zeros(2**n)` was meant simulates a different state | split into two parameters | small | **open** |
-| **17** | 3 | cached **sparse** Pauli bases handed out mutable | in-place `/=` corrupts a process-lifetime cache; stays Hermitian and finite | copy on the sparse path | 1 line | **open** |
-| **18** | 3 | `from_paulisum(op, 1e-3)` — `atol` positional, gates *discarding* signal | raises the Hermiticity threshold 9 orders; `coeffs.real` then drops genuine signal | keyword-only; rename `discard_imag_below` | small | **open** |
-| **19** | 3 | `uint64` fast path at `B <= 8` is a correctness boundary | a `uint64` key truncates a wider row and aliases distinct states | encode width in the item-7 wrapper type | medium | **open** |
+| **17** | 3 | cached **sparse** Pauli bases handed out mutable | in-place `/=` corrupts a process-lifetime cache; stays Hermitian and finite | copy on the sparse path | 1 line | ✅ **fixed** (`1200ab8`) — buffers frozen, not copied |
+| **18** | 3 | `from_paulisum(op, 1e-3)` — `atol` positional, gates *discarding* signal | raises the Hermiticity threshold 9 orders; `coeffs.real` then drops genuine signal | keyword-only; rename `discard_imag_below` | small | ✅ **fixed** (`14996fb`) — keyword-only; kept the name `atol` (see item) |
+| **19** | 3 | `uint64` fast path at `B <= 8` is a correctness boundary | a `uint64` key truncates a wider row and aliases distinct states | encode width in the item-7 wrapper type | medium | ✅ **fixed** (`ef3b91a`) — asserted in `_pack_state_keys`; wrapper type still deferred |
 
 **If only three are done: 1, 3, 5** — one validation check, one `*`, one `NamedTuple`. See "Suggested
 order" at the end for why, and for the two cautions on item 2.
