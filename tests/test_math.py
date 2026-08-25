@@ -181,6 +181,67 @@ class TestHermitianHint:
         )
 
 
+class TestSymmetryValidation:
+    """Out-of-range ``hermitian`` values raise, and the flags are keyword-only.
+
+    Two separate defects, and only one of them is about the *value*:
+
+    - **Silent fallthrough.** Valid values are ``1``/``True``, ``-1``, ``0``/``False``; the dispatch
+      is an if/elif chain whose ``else`` catches everything else and runs the general ``eig`` path --
+      slower, less accurate, no signal. ``hermitian=2`` or a typo'd string looked like a hint and was
+      one only by accident.
+    - **Positional order.** ``hermitian`` was the *second* positional parameter and
+      ``with_diagonals: bool`` the third, so ``matrix_exp(mat, True)`` reads naturally as "with
+      diagonals" and meant "Hermitian" -- and ``with_diagonals`` changes the return *arity*, so the
+      mistake surfaces as an unpacking error somewhere else, if at all.
+
+    Note what is deliberately **not** changed: ``hermitian=1`` on a non-Hermitian matrix still
+    returns the exponential of a different matrix, silently. That is the caller's assertion and
+    verifying it costs an ``O(n^2)`` comparison on every call;
+    :meth:`TestHermitianHint.test_wrong_hint_is_silently_wrong` pins that contract and must keep
+    passing.
+    """
+
+    @pytest.mark.parametrize("bad", [2, -2, 3, "hermitian", 1.5, None])
+    def test_out_of_range_values_raise(self, bad):
+        rng = np.random.default_rng(20260804)
+        mat = herm(3, rng)
+        with pytest.raises((ValueError, TypeError), match="hermitian"):
+            rm.matrix_exp(mat, hermitian=bad)
+
+    @pytest.mark.parametrize("good", [0, 1, -1, True, False])
+    def test_every_valid_value_is_still_accepted(self, good):
+        rng = np.random.default_rng(20260804)
+        mat = herm(3, rng)
+        assert np.asarray(rm.matrix_exp(mat, hermitian=good)).shape == (3, 3)
+
+    def test_flags_are_keyword_only(self):
+        """``matrix_exp(mat, True)`` used to mean "Hermitian" while reading as "with diagonals"."""
+        rng = np.random.default_rng(20260804)
+        mat = herm(3, rng)
+        with pytest.raises(TypeError, match="positional"):
+            rm.matrix_exp(mat, True)  # ty: ignore[too-many-positional-arguments]
+        with pytest.raises(TypeError, match="positional"):
+            rm.matrix_angle(mat, True)  # ty: ignore[too-many-positional-arguments]
+
+    def test_matrix_ufunc_flags_are_keyword_only(self):
+        rng = np.random.default_rng(20260804)
+        mat = herm(3, rng)
+        with pytest.raises(TypeError, match="positional"):
+            rm.matrix_ufunc(np.exp, mat, 1)  # ty: ignore[too-many-positional-arguments]
+
+    def test_the_symmetry_enum_is_accepted_and_documents_the_values(self):
+        """A named alternative to the magic 1/-1/0, for callers who want it."""
+        rng = np.random.default_rng(20260804)
+        mat = herm(3, rng)
+        assert rm.Symmetry.HERMITIAN == 1
+        assert rm.Symmetry.ANTI_HERMITIAN == -1
+        assert rm.Symmetry.GENERAL == 0
+        named = np.asarray(rm.matrix_exp(mat, hermitian=rm.Symmetry.HERMITIAN))
+        magic = np.asarray(rm.matrix_exp(mat, hermitian=1))
+        assert np.allclose(named, magic)
+
+
 class TestNpmodParity:
     """``npmod=jax.numpy`` must agree with numpy, and survive ``jax.jit``."""
 
