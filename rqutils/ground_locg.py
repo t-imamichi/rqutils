@@ -287,6 +287,90 @@ def normalize(vector: jax.Array, norm: jax.Array | None = None) -> jax.Array:
     return vector / jnp.where(norm == 0.0, 1.0, norm)
 
 
+def _lambda_max_bound(
+    matvec: Callable[..., jax.Array],
+    args: tuple,
+    vector: jax.Array,
+    steps: int = 10,
+    margin: float = 1.05,
+) -> jax.Array:
+    r"""Upper bound on :math:`\lambda_{\max}` from ``steps`` of power iteration, times ``margin``.
+
+    Only an *upper* bound is needed, which is why this is cheap where a lower bound on
+    :math:`\lambda_0` is not: power iteration converges to the dominant eigenvalue from below, so the
+    ``margin`` covers the shortfall. ``docs/rqutils-precond-request.md`` closes the shift line for want
+    of a usable lower bound; nothing here needs one.
+
+    ``margin`` is a *multiplicative* slack on the magnitude, added as ``|estimate| * (margin - 1)``
+    rather than as ``estimate * margin``, so it widens the interval for either sign -- an operator whose
+    dominant eigenvalue is negative would otherwise have its bound moved the wrong way.
+
+    Preserves sharding by construction: every operation is the caller's ``matvec`` or an elementwise
+    scale, so the result inherits ``vector``'s sharding the same way :func:`normalize` does.
+    """
+
+    def step(vec, _):
+        return normalize(matvec(vec, *args)), None
+
+    vec = jax.lax.scan(step, normalize(vector), None, length=steps)[0]
+    estimate = jnp.sum(vec.conjugate() * matvec(vec, *args)).real
+    return estimate + jnp.abs(estimate) * (margin - 1.0)
+
+
+def _chebyshev_prefilter(
+    matvec: Callable[..., jax.Array],
+    args: tuple,
+    vector: jax.Array,
+    degree: int,
+    cycles: int,
+) -> jax.Array:
+    r"""Damp the unwanted band of the spectrum before the LOBPCG iteration starts.
+
+    Applies :math:`T_{\text{degree}}` of :math:`(A - c)/e` mapping ``[theta, hi]`` onto
+    :math:`[-1, 1]`, ``cycles`` times. Eigenvalues inside that band are damped by
+    :math:`1/T_{\text{degree}}`; anything below ``theta`` sits outside :math:`[-1, 1]` and grows like
+    :math:`\cosh`, so the ground state comes out amplified relative to everything else. Cost is
+    ``cycles * (degree + 1)`` matrix-vector products and three live vectors, independent of ``degree``.
+
+    THE LOWER EDGE IS THE CURRENT RAYLEIGH QUOTIENT, RE-READ EACH CYCLE, AND THAT CHOICE IS LOAD-BEARING
+    -- not an approximation to a better bound. Using an accurate ``lambda_1`` instead is faster where the
+    gap is comfortable and **returns a wrong answer** where it is not: measured 8.1x at relgap 1.3e-2 but
+    an energy off by 15, silently, at relgap 4.0e-05, because the filter interval then begins at
+    ``lambda_0`` and damps the ground state along with the rest. A Rayleigh quotient starts *above*
+    ``lambda_0`` and descends toward it, so it can never bracket the target out.
+
+    Filtering alone does not converge: as ``theta`` approaches ``lambda_0`` the lower edge does too, so
+    the filter begins attacking its own target and accuracy plateaus around 1e-5 to 1e-7. That is why
+    this is a *prefilter* handing off to the full iteration rather than a solver -- see
+    ``docs/locg-chebyshev-prefilter.md`` for both measurements.
+
+    Note this does **not** reproduce the depleted-residual failure that makes a power-iteration start
+    *worse* than a random one (measured 177 LOBPCG iterations against 77). Power iteration collapses onto
+    the dominant direction, leaving a residual with nothing left to expose; a polynomial filter
+    suppresses the unwanted band multiplicatively and leaves the residual rich in the directions
+    block-size-1 LOBPCG can actually search.
+    """
+    hi = _lambda_max_bound(matvec, args, vector)
+
+    def cycle(vec, _):
+        theta = jnp.sum(vec.conjugate() * matvec(vec, *args)).real
+        centre = (hi + theta) / 2
+        half = (hi - theta) / 2
+        # A degenerate interval would divide by zero. It means theta has reached hi, i.e. the iterate
+        # is at the top of the spectrum rather than the bottom, so there is nothing to filter.
+        half = jnp.where(half == 0.0, 1.0, half)
+
+        def term(carry, _):
+            previous, current = carry
+            nxt = 2.0 * (matvec(current, *args) - centre * current) / half - previous
+            return (current, nxt), None
+
+        first = (matvec(vec, *args) - centre * vec) / half
+        return normalize(jax.lax.scan(term, (vec, first), None, length=degree - 1)[0][1]), None
+
+    return jax.lax.scan(cycle, normalize(vector), None, length=cycles)[0]
+
+
 def ground_locg(
     mat: Callable[[jax.Array], jax.Array] | jax.Array,
     xinit: jax.Array | int,
@@ -295,6 +379,7 @@ def ground_locg(
     tol: float | None = None,
     vspace: tuple[int, DTypeLike] | None = None,
     precond: Callable[[jax.Array], jax.Array] | None = None,
+    prefilter: tuple[int, int] | None = None,
     debug: bool = False,
     log_level: int = logging.WARNING,
 ) -> _Result | _DebugResult:
@@ -325,6 +410,22 @@ def ground_locg(
             12-instance XXZ batch, :math:`M^{-1} = \mathrm{diag}(A)^{-1}` gave a median **1.79x**
             reduction in iterations (range 1.29-2.04x, no regressions), at an :math:`O(N)` cost of
             under 1% of an iteration.
+        prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter applied to ``xinit`` before the
+            iteration starts, damping the unwanted band of the spectrum so the LOBPCG loop begins
+            closer to :math:`v_0`. ``None`` (the default) leaves the traced graph unchanged, so no
+            existing caller is affected; it is a static argument, so the branch resolves at trace
+            time. Costs ``cycles * (degree + 1)`` extra matrix-vector products plus ~11 for the
+            :math:`\lambda_{\max}` estimate, and three live vectors -- **no growing basis**, which is
+            what makes it compatible with this module's single-vector memory budget. Like ``mat`` and
+            ``precond`` it is sharding-transparent, since it only calls ``mat`` and scales
+            elementwise. **It cannot change the answer, only the path**: every convergence test still
+            reads the true residual, and the returned eigenpair is the same one to the tolerance the
+            solver was going to reach anyway (measured: eigenvector overlap 1.0000000 against the
+            unfiltered result, energies agreeing with ``eigsh(tol=0)`` to 2.8e-14 across 18
+            configurations). ``(16, 4)`` measured a 1.11-3.87x wall-clock reduction, median 1.38x,
+            with no configuration slower; see ``docs/locg-chebyshev-prefilter.md`` for the
+            measurements, why the filter's lower edge must be the running Rayleigh quotient rather
+            than an accurate :math:`\lambda_1`, and why filtering alone does not converge.
         debug: If True, additionally return per-iteration diagnostics. Note that the diagnostic
             path uses ``jax.lax.scan`` to collect fixed-size output, and therefore always runs the
             full ``maxiter`` iterations with no early exit; rows past convergence are
@@ -353,21 +454,30 @@ def ground_locg(
             tol,
             vspace=vspace,
             precond=precond,
+            prefilter=prefilter,
             debug=debug,
             log_level=log_level,
         )
     return _ground_locg_matrix(
-        mat, xinit, maxiter, tol, precond=precond, debug=debug, log_level=log_level
+        mat,
+        xinit,
+        maxiter,
+        tol,
+        precond=precond,
+        prefilter=prefilter,
+        debug=debug,
+        log_level=log_level,
     )
 
 
-@jax.jit(static_argnames=["maxiter", "precond", "debug", "log_level"])
+@jax.jit(static_argnames=["maxiter", "precond", "prefilter", "debug", "log_level"])
 def _ground_locg_matrix(
     mat: jax.Array,
     xinit: jax.Array,
     maxiter: int,
     tol: jax.Array | float | None,
     precond: Callable[[jax.Array], jax.Array] | None = None,
+    prefilter: tuple[int, int] | None = None,
     debug: bool = False,
     log_level: int = logging.WARNING,
 ):
@@ -388,12 +498,23 @@ def _ground_locg_matrix(
         tol,
         vspace=vspace,
         precond=precond,
+        prefilter=prefilter,
         debug=debug,
         log_level=log_level,
     )
 
 
-@jax.jit(static_argnames=["matvec", "maxiter", "vspace", "precond", "debug", "log_level"])
+@jax.jit(
+    static_argnames=[
+        "matvec",
+        "maxiter",
+        "vspace",
+        "precond",
+        "prefilter",
+        "debug",
+        "log_level",
+    ]
+)
 def _ground_locg_callable(
     matvec: Callable[[jax.Array], jax.Array],
     xinit: jax.Array | int,
@@ -402,6 +523,7 @@ def _ground_locg_callable(
     tol: jax.Array | float | None,
     vspace: tuple[int, DTypeLike] | None = None,
     precond: Callable[[jax.Array], jax.Array] | None = None,
+    prefilter: tuple[int, int] | None = None,
     debug: bool = False,
     log_level: int = logging.WARNING,
 ):
@@ -618,6 +740,14 @@ def _ground_locg_callable(
         xinit.dtype, jax.eval_shape(lambda vec: matvec(vec, *args), xinit).dtype
     )
     xinit = xinit.astype(work_dtype)
+
+    # After the dtype promotion, so the filter's Chebyshev recurrence runs at the operator's
+    # precision rather than a lower-precision xinit's, and before body_iter0, so rho_init below is
+    # the filtered vector's Rayleigh quotient and maxiter=0 still reports something meaningful.
+    if prefilter is not None:
+        degree, cycles = prefilter
+        if degree > 1 and cycles > 0:
+            xinit = _chebyshev_prefilter(matvec, args, xinit, degree, cycles)
 
     seed, diag0 = body_iter0(xinit)
     # Seed theta with the Rayleigh quotient of xinit so that maxiter=0 returns a meaningful value
