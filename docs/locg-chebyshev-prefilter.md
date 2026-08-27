@@ -6,8 +6,32 @@
 
 **Date.** 2026-08-27, CPU, float64 (`jax_enable_x64`), branch `dev`.
 
-**Status.** Prototyped out-of-tree and validated on 18 configurations; **not implemented**. This
-records the measurement and the design so it can be reviewed before any code moves.
+**Status.** **Implemented** on branch `locg-chebyshev` as `ground_locg(prefilter=(degree, cycles))`,
+default `None`. 12 tests in `tests/test_ground_locg.py::TestChebyshevPrefilter` plus
+`tests/_sharded_prefilter.py`; suite 549 → 560. In-tree measurement reproduces the prototype: 18/18
+configurations faster, median **1.36×**, range 1.11–3.07×, no regressions. Sharding verified on a
+4-device mesh (202 → 51 iterations, spec `P('x',)` preserved, energies agreeing to 1e-13).
+
+Sharding coverage is 1/2/4 devices x partitioned/replicated (12 cases), asserting the output *spec*.
+Ragged mesh splits are **not** swept because they are unreachable: explicit sharding rejects
+`dim % mesh.size != 0` at `device_put`, before `ground_locg` runs. That is `sqd`'s concern, where
+`uniquify_states` pads to a power of two.
+
+**Still not the default**, and §5 item 4 stands: every figure here is single-device CPU.
+`examples/scaling/poc9_prefilter_gpu.py` exists to settle the GPU question in one run on a CUDA box --
+it sweeps degree x cycles, reports through `fmt_ratio` (which refuses to call a difference inside the
+measured spread a win), and asserts the sharding spec on real devices. Its docstring states why the
+*direction* is genuinely uncertain rather than merely unmeasured: the prefilter trades ~79 matvecs for
+roughly half the iterations, and whether that pays depends on the matvec-to-bookkeeping cost ratio,
+which measured ~25% on CPU and is exactly what differs between backends. `apply_h`'s matvec is a
+gather-heavy irregular kernel while the LOBPCG bookkeeping is bandwidth-bound streaming, so the ratio
+can move either way.
+
+The prefilter is GPU-*safe* as written, which is checkable without a GPU: its jaxpr contains three
+`scan`s and **zero** callbacks (`pure_callback`, `io_callback`) or `device_put`s, so there is no
+per-cycle host synchronisation. An earlier prototype computed the Rayleigh quotient with a Python
+`float(...)` each cycle, which would have stalled the device once per cycle; the shipped version is
+fully traced.
 
 ---
 
@@ -107,9 +131,17 @@ Larger sizes, single configuration (`Jz=0.8`, seed 0), for scale: n=22 1.50×, n
   DFT as an outer solver at ~1e-6, not as a machine-precision eigensolver. **The hybrid is the point**:
   filter cheaply to get close, then let `ground_locg`'s guards deliver the last digits.
 
-## 5. Suggested implementation
+## 5. Implementation as shipped on `locg-chebyshev`
 
-Add an optional prefilter to `ground_locg`, off by default.
+Two module-level helpers plus one call site, all in `rqutils/ground_locg.py`:
+`_lambda_max_bound` (10 power steps, ×1.05 multiplicative margin) and `_chebyshev_prefilter`
+(the `lax.scan` recurrence). The call site sits **after** the work-dtype promotion, so the recurrence
+runs at the operator's precision, and **before** `body_iter0`, so `rho_init` reflects the filtered
+vector and `maxiter=0` still returns something meaningful. `prefilter` is a static argument on both
+`_ground_locg_matrix` and `_ground_locg_callable`, so `None` leaves the traced graph byte-identical
+(pinned by `test_prefilter_is_static_so_it_adds_no_traced_argument`).
+
+The original plan, retained for the reasoning:
 
 1. `ground_locg(..., prefilter: tuple[int, int] | None = None)` — `(degree, cycles)`, `None` keeping
    today's behaviour exactly so no existing caller changes. Follow the shape of the existing
