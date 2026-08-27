@@ -52,9 +52,8 @@ class TestProjectOut:
         proving the vector is not renormalized to unity, and (3) the returned norm must agree with
         the vector's actual norm, so the caller's renormalization uses the right divisor.
         """
-        # Orthonormal basis: _project_out subtracts <e_i|v> e_i, leaving exactly [0, 0, 1].
-        # The returned norm is deliberately unused here -- the exact-value assertion below is
-        # strictly stronger than any bound on it, and >= 0.99 would be implied by it anyway. The
+        # Orthonormal basis: _project_out subtracts <e_i|v> e_i, leaving exactly [0, 0, 1]. The norm
+        # is unused -- the exact-value assertion is stronger than any bound on it; the
         # non-orthonormal case below is where the norm itself is load-bearing.
         basis = (jnp.array([1.0, 0.0, 0.0]), jnp.array([0.0, 1.0, 0.0]))
         out, _ = _project_out(basis, jnp.array([0.0, 0.0, 2.0]))

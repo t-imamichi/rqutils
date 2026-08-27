@@ -26,12 +26,9 @@ from conftest import dense_pauli_sum, gate_unitary
 
 from rqutils.paulis.symplectic import PauliSumXZ
 
-# The dense references come from conftest (``dense_pauli_sum`` for the Kronecker sum, ``gate_unitary``
-# for a single-qubit Pauli embedded at a little-endian index). Both were previously reimplemented here
-# -- verified bit-exact against the conftest versions before the switch. The independence that matters
-# is from ``PauliSumXZ``, the code under test, and conftest shares no code with it either; a second
-# local copy bought nothing and duplicated the trickiest convention in this file (the
-# ``reversed(range(num_qubits))`` Kronecker ordering) twice over.
+# Dense references come from conftest (``dense_pauli_sum``, ``gate_unitary``). What matters is
+# independence from ``PauliSumXZ``, the code under test; conftest shares no code with it either, so a
+# second local copy would only duplicate the ``reversed(range(num_qubits))`` Kronecker ordering.
 
 
 def signature_bits(packed, num_qubits):

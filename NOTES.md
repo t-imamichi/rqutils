@@ -88,11 +88,11 @@ Some guards are only reachable when *other* defects compound with them, so the e
 (theta matches `eigvalsh`) stays green while the invariant the guard protects is already destroyed.
 
 `ground_locg`'s `_reorthogonalize` (audit item I5) is the worked example, and a cautionary one: it was
-twice recorded as unpinnable — first from a compromised A/B (patched in a live session, so both
-`@jax.jit` arms reused one compiled kernel and returned bit-identical numbers), then from a *correct*
-A/B whose conclusion was drawn from the wrong assertion. Theta *does* survive, because the 1.0 drift
-needed I4's 2000-iteration runs. The test that discriminates asserts the **invariant** (`|<x|y>|`,
-straight off the `debug=True` diagnostics) rather than the end result, and fails 3 of 4 arms.
+twice recorded as unpinnable — first from an A/B compromised by the live-session jit trap above, then
+from a *correct* A/B whose conclusion was drawn from the wrong assertion. Theta *does* survive, because
+the 1.0 drift needed I4's 2000-iteration runs. The test that discriminates asserts the **invariant**
+(`|<x|y>|`, straight off the `debug=True` diagnostics) rather than the end result, and fails 3 of 4
+arms.
 
 Before recording a negative result, check whether a *more direct* assertion exists; reach for the
 docstring note only once it does not.
@@ -173,9 +173,7 @@ zero-direction masks.
 **`docs/locg.md` is stale** — it audits the pre-rewrite module, so its line numbers, its "no pytest
 suite exists" scope note, and its A1–A5 gaps (all since fixed) don't apply. Cite it for the I-numbers
 and the measurements only; read the module docstring for what currently holds. One severity is partly
-retracted there: I5's full 1.0 collapse needed I4's 2000-iteration runs to develop, so the
-*eigenvalue* stays correct without the guard — but the guard is pinned by `TestBasisOrthogonality`
-(see the testing section above).
+retracted there — I5; see the testing section above for the retraction and the test that pins it.
 
 ### `sqd`: `get_xsource` setup dominates a solve
 
@@ -196,9 +194,9 @@ matrix and is pinned by `TestHproj::test_unsorted_input_with_unique_states_is_wr
 Two paths selected statically on width: `uint64` keys for `B ≤ 8` bytes, an explicit lexicographic
 search beyond. That boundary is a **correctness** limit — a `uint64` key silently truncates a wider
 row and aliases distinct states — so if you touch it, note that a test only catches the overrun when
-the subspace's *leading* bytes collide and partners genuinely exist. `packbits` puts low qubit indices
-in the *leading* bytes, the reverse of the qubit numbering, and getting that backwards makes the test
-pass vacuously.
+the subspace's *leading* bytes collide and partners genuinely exist — and that low qubit indices land
+in the *leading* bytes (see the packed-signature note below), which is easy to get backwards and makes
+the test pass vacuously.
 
 ### `sqd`: why `apply_h`'s positional form was deleted rather than deprecated
 

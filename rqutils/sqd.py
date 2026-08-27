@@ -466,18 +466,13 @@ def sqd(
     """
     _check_cache_level(cache_level)
     if states_size is None:
-        # Default to the next power of two at or above the input length. states_size exists to stop
-        # each distinct subspace dimension retracing the solver, and growing all-distinct dimensions
-        # are the *normal* SQD access pattern rather than an edge case: an SKQD run walks one
-        # dimension per Krylov rung plus one per configuration-recovery round, so every call sees a
-        # dimension it has not seen before and a default of states.shape[0] pins nothing. Bucketing
-        # to powers of two collapses that to O(log N) traces (measured 1.25x over five growing
-        # dimensions 60..260 at n=10, and 1.43x over the first five rungs of an n=13 job, energies
-        # bit-identical in both -- it is purely a compilation-coalescing knob).
-        #
-        # Padding is not observable: filler slots are excluded from the projection and trimmed from
-        # the returned basis, so this is transparent to callers that never passed a value. Callers
-        # that want the old behaviour pass states.shape[0] explicitly.
+        # Default to the next power of two at or above the input length. All-distinct and growing
+        # dimensions are the *normal* SQD access pattern -- an SKQD run walks one per Krylov rung plus
+        # one per recovery round -- so a default of states.shape[0] pins no shape and retraces the
+        # solver every call. Bucketing collapses that to O(log N) traces: measured 1.25x over five
+        # dimensions 60..260 at n=10 and 1.43x over five rungs at n=13, energies bit-identical.
+        # Padding is unobservable (filler is excluded from the projection and trimmed from the
+        # returned basis); pass states.shape[0] explicitly for the old behaviour.
         states_size = 1 << max((states.shape[0] - 1).bit_length(), 1)
     if states_size < states.shape[0]:
         raise ValueError("states_size smaller than the states array length")
@@ -829,13 +824,8 @@ def run_sqd(
         # and worked, which is what made the asymmetry easy to miss.
         diagonal = diagonal.real
         # Set the fill-in components to the maximum value so that argmin only sees the valid entries.
-        #
-        # This looks like `_spread_seed`'s sharding bug and is not: there the predicate and the operand
-        # had *independent* provenance (`vec` came from an iota with an explicit `out_sharding` while
-        # `states_u` might still be replicated), so their specs could disagree. Here `diagonal` derives
-        # from `states_u` too, so the two track together by construction -- verified P(None)/P(None)
-        # unresharded and P('x')/P('x') after the reshard. No reshard is needed, and adding one would
-        # imply a hazard that cannot arise on this line.
+        # No reshard needed, unlike `_spread_seed`: `diagonal` derives from `states_u`, so predicate
+        # and operand specs track by construction (verified P(None) and P('x') on both).
         diagonal = jnp.where(_is_filler(states_u) == 1, jnp.max(diagonal), diagonal)
         imin = jnp.argmin(diagonal)
         # Weight the minimum-diagonal state heavily -- it is the best single guess available, and

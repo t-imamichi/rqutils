@@ -193,10 +193,10 @@ entry point; `hproj(...)` is the dense/debug path. Two conventions dominate:
   axis is a genuine memory-for-speed trade; the source-index axis is near-free to enable and very
   expensive to disable — **prefer `cache_level[0] = 1`** (`get_xsource` setup is 66–97% of a solve; see
   `NOTES.md`). They are one kernel indexed by that 2×3 grid, reached two ways. The **public `apply_h`
-  is keyword-only**: name the arrays you have and the strategy follows, so the six valid input sets are
-  the only constructible ones. Internally `run_sqd` calls the private `_apply_h_kernel` with an
-  assembled tuple and `cache_level` bound via `functools.partial` — it **must** stay static there,
-  since `ground_locg` splats `args` positionally and `static_argnames` would never see it.
+  is keyword-only**: name the arrays you have and the strategy follows (see "Known rough edges" for the
+  break this was). Internally `run_sqd` calls the private `_apply_h_kernel` with an assembled tuple and
+  `cache_level` bound via `functools.partial` — it **must** stay static there, since `ground_locg`
+  splats `args` positionally and `static_argnames` would never see it.
   `states_size` exists solely to pin array shapes and prevent JIT recompilation.
 
 **`states` must be lex-sorted** — `get_xsource` is a binary search, not a sort. Always required (the
@@ -240,8 +240,7 @@ the object for lazy `__repr__`, `'latex'` a string, `'mpl'` a Figure). `QPrintBa
 subclasses only override `_qobj_data`, `_add_labels`, `_format_lhs`. **Test the full `fmt` × `output`
 grid, not a diagonal of it** — four bugs lived in cells nothing exercised (`NOTES.md`).
 
-**`product.py` is not on this branch.** It lives on the stale `product` branch only (a SCIP
-product-state solver, `solve_product`, with `pyscipopt`/`clarabel` deps). Recorded here because
+**`product.py` is not on this branch** (see the branch note above). Mentioned only because
 `docs/rqutils-precond-request.md` and `docs/sdp-lower-bound.md` reference it: both values it returns are
 *upper* bounds on the true ground energy, which is why the whole preconditioner-shift line is closed.
 
@@ -268,6 +267,12 @@ rather than failing at import. `numpy`, `scipy`, `h5py`, and **`jax`** are hard 
 job to set the mesh. The examples establish the expected pattern: a single axis named `'x'` with
 `AxisType.Explicit`, plus `jax.config.update('jax_enable_x64', True)` (without x64 you silently get
 complex64/int32 — you'll see truncation warnings).
+
+**Code comments should be concise.** One line where one line will do; a short block only for a
+non-obvious invariant or a defect the comment is there to prevent recurring. Prefer stating the
+constraint over narrating the code — if a comment restates what the next line plainly says, delete it.
+Long explanations belong in the docstring (user-facing) or `NOTES.md` (evidence, measurements,
+post-mortems), not inline.
 
 **Docstrings feed the published API reference.** Every module opens with a raw docstring that is a full
 reST document: over/underlined title, `.. currentmodule::`, prose with `.. math::` derivations of the
@@ -302,9 +307,9 @@ with numbers in `NOTES.md`.
   boundary. `NOTES.md` explains why the guard placement is what it is.
 - **`hproj(unique_states=True)` now raises on unsorted or duplicate-containing input, where it used to
   return a wrong matrix.** A behavioural change, though "break" means callers were silently receiving a
-  non-symmetric projection. `get_xsource` binary-searches into `states`, so both halves of "uniquified
-  and lex-sorted" are load-bearing; the check is host-side numpy at 12–14% of `hproj`, on that opt-in
-  path only. Pass `np.unique(states, axis=0)`, or leave `unique_states=False`.
+  non-symmetric projection. Both halves of "uniquified and lex-sorted" are load-bearing (see the
+  binary-search note above); the check is host-side numpy at 12–14% of `hproj`, on that opt-in path
+  only. Pass `np.unique(states, axis=0)`, or leave `unique_states=False`.
 - **`apply_h` is keyword-only; its positional `(scanned, cache_level)` form is gone.** A call like
   `apply_h(vec, (xsources, diagonals), None, (1, 2))` now raises `TypeError`; the replacement is
   `apply_h(vec, xsources=..., diagonals=...)`. Deliberately a hard break rather than a deprecation
