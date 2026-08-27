@@ -394,6 +394,7 @@ def sqd(
     cache_level: tuple[int, int] = (1, 0),
     maxiter: int = 1000,
     tol: float | None = None,
+    prefilter: tuple[int, int] | None = None,
 ) -> float | tuple[float, Vector, StateList]:
     r"""Perform a sample-based quantum diagonalization of the Hamiltonian.
 
@@ -446,6 +447,24 @@ def sqd(
             the machine epsilon of the operator dtype.
         cache_level: Switches for caching the results of source indices and sign bits / diagonals.
             See the module documentation for the detailed discussion of the resource tradeoff involved.
+        prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter, forwarded verbatim to
+            :func:`rqutils.ground_locg.ground_locg` -- see its docstring for the semantics and the
+            knob-choosing guidance. ``None`` (the default) leaves the traced graph unchanged, so no
+            existing caller is affected; it is static here, as it is there.
+
+            **Its measured speedups were not taken on this path.** Every figure in
+            ``docs/locg-chebyshev-prefilter.md`` (median 1.88x at ``(32, 2)``) comes from
+            ``ground_locg`` driven with *dense* operators. The prefilter buys roughly half the
+            iterations for ``cycles * (degree + 1)`` extra matvecs plus ~11 for the
+            :math:`\lambda_{\max}` estimate -- about 79 at ``(32, 2)`` -- so whether it pays depends
+            on the matvec-to-bookkeeping cost ratio, and that doc names this ratio as the genuinely
+            uncertain quantity rather than a merely unmeasured one. Here the matvec is
+            :func:`apply_h`, a gather-heavy irregular kernel whose cost is dominated by
+            ``cache_level``, which is a different point on that ratio than any published figure.
+            Treat the numbers as indicative of the mechanism, not as a prediction for ``sqd``: A/B
+            whole ``sqd`` calls on your own subspaces before adopting it. The accuracy guarantee is
+            unaffected -- the filter only moves the starting vector, and every convergence test still
+            reads the true residual.
 
     Returns:
         Calculated ground state energy, or a tuple of energy, ground state vector, and sorted
@@ -515,7 +534,14 @@ def sqd(
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
     result = run_sqd(
-        hamiltonian, states_p, states_size, return_eigvec, cache_level, maxiter=maxiter, tol=tol
+        hamiltonian,
+        states_p,
+        states_size,
+        return_eigvec,
+        cache_level,
+        maxiter=maxiter,
+        tol=tol,
+        prefilter=prefilter,
     )
     LOG.info("Found ground eigenpair in %f seconds.", time.time() - start)
     eigval = float(result[0])
@@ -715,7 +741,16 @@ def _spread_seed(
     return jnp.where(filler, jnp.zeros_like(vec), vec)
 
 
-@jax.jit(static_argnames=["states_size", "return_eigvec", "cache_level", "maxiter", "log_level"])
+@jax.jit(
+    static_argnames=[
+        "states_size",
+        "return_eigvec",
+        "cache_level",
+        "maxiter",
+        "prefilter",
+        "log_level",
+    ]
+)
 def run_sqd(
     hamiltonian: PauliSumXZ,
     states_p: StateList,
@@ -724,6 +759,7 @@ def run_sqd(
     cache_level: tuple[int, int] = (1, 0),
     maxiter: int = 1000,
     tol: float | None = None,
+    prefilter: tuple[int, int] | None = None,
     log_level: int = logging.INFO,
 ) -> tuple[float, bool] | tuple[float, jax.Array, jax.Array, int, bool]:
     """JIT-compiled part of the SQD function.
@@ -739,6 +775,12 @@ def run_sqd(
         maxiter: Maximum LOBPCG iterations, forwarded to :func:`rqutils.ground_locg.ground_locg`.
             Static, as it is there.
         tol: Convergence tolerance. ``None`` uses the operator dtype's machine epsilon.
+        prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter, forwarded to
+            :func:`rqutils.ground_locg.ground_locg`. Static, as it is there -- and note the contrast
+            with ``cache_level``, which cannot use ``static_argnames`` at all because ``ground_locg``
+            splats ``args`` positionally, so it is bound through :func:`functools.partial` instead.
+            ``prefilter`` is passed by keyword to ``ground_locg``, so it needs no such treatment.
+            See :func:`sqd` on why this option's published speedups do not transfer to this path.
     """
     # `cache_level` is static, so this is a concrete tuple at trace time and the check runs once per
     # trace rather than once per call. `sqd` validates too; this covers the direct callers, which are
@@ -872,7 +914,7 @@ def run_sqd(
         jax.debug.print(f"Starting minimization with cache_level {cache_level}")
 
     eigval, eigvec, _, converged = ground_locg(
-        matvec, vinit, args=args, maxiter=maxiter, tol=tol, log_level=log_level
+        matvec, vinit, args=args, maxiter=maxiter, tol=tol, prefilter=prefilter, log_level=log_level
     )
     result = (eigval,)
     if return_eigvec:

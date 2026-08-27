@@ -1807,3 +1807,260 @@ class TestShardedCacheLevels:
             assert single == pytest.approx(sharded, abs=1e-12), (
                 f"cache_level={cache_level}: sharded {sharded} disagrees with single-device {single}"
             )
+
+
+class TestSqdPrefilter:
+    """``sqd(prefilter=...)`` must change the path and never the answer.
+
+    The option is plumbing: it is forwarded verbatim to :func:`rqutils.ground_locg.ground_locg`,
+    whose own ``TestChebyshevPrefilter`` covers the filter's numerics (the three-term recurrence, the
+    running-Rayleigh-quotient lower edge, complex operators, degenerate knobs). What is *only*
+    testable here, and untested by that class, is the interaction with the three things ``sqd`` puts
+    between the caller and the solver:
+
+    * **Filler slots.** ``uniquify_states`` pads the subspace to ``states_size`` with 255 rows. The
+      prefilter normalizes and takes Rayleigh quotients over the *full padded* vector, and it calls
+      the matvec ``cycles * (degree + 1)`` times before the solver's first iteration, so any leakage
+      between the padding and the genuine subspace gets far more exposure in a filtered run than in
+      an unfiltered one. Nothing in ``ground_locg``'s ``TestChebyshevPrefilter`` can cover this: its
+      fixtures are dense and unpadded, and ragged mesh splits are explicitly out of scope there
+      *because* padding is ``sqd``'s concern.
+
+      Measured on this fixture, the padded operator is **block-diagonal** -- the genuine-from-filler
+      and filler-from-genuine coupling blocks are both exactly 0.0 -- so the filter cannot move
+      weight across the boundary. What this test therefore pins is the *energy*, not a mechanism:
+      it is a padded-versus-unpadded comparison against the dense reference. Do not read a passing
+      run as evidence that ``_spread_seed``'s filler mask is what protects the answer; removing that
+      mask leaves every assertion here green (verified), because the unmasked seed's filler weight
+      converges to the genuine block anyway -- ``apply_h`` is asymmetric on filler rows, which makes
+      the filler block's own spectrum unreachable rather than merely unfavoured.
+    * **The spread seed.** ``run_sqd`` starts from ``_spread_seed``, not a one-hot, so that a subspace
+      whose projected Hamiltonian splits into disconnected blocks cannot silently return one block's
+      minimum. A filter is a spectral transformation applied to exactly that vector, so it is capable
+      of depleting the very overlap the spread seed exists to provide.
+    * **The static-argument plumbing.** ``prefilter`` reaches ``run_sqd``'s ``static_argnames`` while
+      ``cache_level`` deliberately cannot (``ground_locg`` splats ``args`` positionally), so the two
+      travel by different routes and the new one needs its own pin.
+
+    Every value assertion is against :func:`lowest_projected`, the dense reference -- not against the
+    unfiltered ``sqd`` arm -- so a defect common to both arms cannot pass.
+
+    **No timing is asserted.** The published 1.88x median comes from ``ground_locg`` on dense
+    operators; here the matvec is ``apply_h``, a gather-heavy irregular kernel whose cost is dominated
+    by ``cache_level``, i.e. a different point on the matvec-to-bookkeeping ratio that
+    ``docs/locg-chebyshev-prefilter.md`` names as the genuinely uncertain quantity. An iteration-count
+    assertion of the kind ``ground_locg``'s ``test_reduces_the_iteration_count`` makes would be
+    pinning an unmeasured claim on this path, so correctness is all that is claimed.
+    """
+
+    def test_none_is_bit_identical_to_omitting_it(self):
+        """The default must not perturb the existing result at all, not merely agree to a tolerance."""
+        rng = np.random.default_rng(20260828)
+        num_qubits = 5
+        strings = real_pauli_strings(num_qubits, 7, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(24, num_qubits, rng)
+        omitted = sqd((strings, list(coeffs)), states)
+        explicit = sqd((strings, list(coeffs)), states, prefilter=None)
+        assert float(omitted[0]) == float(explicit[0]), "energy must be bit-identical"
+        assert np.array_equal(omitted[1], explicit[1]), "eigenvector must be bit-identical"
+        assert np.array_equal(omitted[2], explicit[2]), "returned basis must be identical"
+
+    def test_prefilter_none_adds_no_traced_argument(self):
+        """A traced tuple would recompile per value and defeat the trace-time branch.
+
+        Asserted on ``run_sqd``, the jit boundary that owns the ``static_argnames`` entry. ``sqd``
+        itself is not jitted, so making the jaxpr comparison there would prove nothing about where
+        the staticness actually has to hold.
+        """
+        rng = np.random.default_rng(20260828)
+        num_qubits = 4
+        strings = real_pauli_strings(num_qubits, 6, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(12, num_qubits, rng)
+
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((strings, list(coeffs)))
+        states_p = pack_padded(states)
+        size = 16
+
+        def trace(**kwargs):
+            return jax.make_jaxpr(
+                lambda h, s: run_sqd(h, s, size, False, (1, 0), maxiter=50, **kwargs)
+            )(hamiltonian, states_p)
+
+        assert str(trace()) == str(trace(prefilter=None)), (
+            "prefilter=None changed the traced graph, so it is not resolving at trace time"
+        )
+        # The converse: a real value must reach the graph. Without this, a `prefilter` silently
+        # dropped on the way to `ground_locg` would pass the equality above for the wrong reason --
+        # every arm identical because the option does nothing at all.
+        assert str(trace(prefilter=(16, 2))) != str(trace()), (
+            "prefilter=(16, 2) left the traced graph unchanged, so it is not reaching ground_locg"
+        )
+
+    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
+    def test_agrees_with_reference_across_every_kernel(self, cache_level):
+        """Swept over ``cache_level``, not sampled at the default.
+
+        Per ``CLAUDE.md`` three bugs have hidden behind the default ``(1, 0)``, each masked by the one
+        before. The axes are not independent here: ``cache_level`` selects which of the six matvec
+        kernels the Chebyshev recurrence calls, and the recurrence calls it ``cycles * (degree + 1)``
+        times rather than once per iteration, so a kernel-specific defect gets a different amount of
+        exposure in the filtered arm than in the unfiltered one.
+        """
+        rng = np.random.default_rng(20260828)
+        num_qubits = 5
+        strings = real_pauli_strings(num_qubits, 7, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(24, num_qubits, rng)
+        reference = lowest_projected(strings, coeffs, states)
+        got = eigval_of(strings, coeffs, states, cache_level=cache_level, prefilter=(16, 2))
+        assert got == pytest.approx(reference, rel=1e-10), (
+            f"cache_level={cache_level} with a prefilter gave {got}, expected {reference}"
+        )
+
+    def test_filler_slots_do_not_contaminate_the_filtered_vector(self):
+        """Padding meets a normalizing filter -- an interaction that only exists in ``sqd``.
+
+        Uses ``collapsing_states`` so filler rows are present in the padded arm, and an unpadded
+        control so "does padding change the answer?" has an arm where padding is truly absent -- per
+        ``CLAUDE.md``, a control whose filler slots exist in both arms is not a control, and the
+        padding test that read like one passed against a mutant returning -1.2 for a true -0.83.
+
+        ``states_size`` is pinned well above the unique count, so the padded arm is mostly filler:
+        this fixture collapses 40 draws over 4 qubits to 14 uniques, leaving 50 of 64 slots filler.
+
+        **Scope, measured rather than assumed.** The padded operator is block-diagonal here (both
+        coupling blocks exactly 0.0), so this asserts an energy, not a no-leakage mechanism, and it
+        does **not** pin ``_spread_seed``'s filler mask -- see the class docstring for the mutation
+        result and why the filler block is unreachable regardless.
+        """
+        rng = np.random.default_rng(20260828)
+        num_qubits = 4
+        strings = real_pauli_strings(num_qubits, 6, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = collapsing_states(40, num_qubits, rng)
+        unique = np.unique(states, axis=0)
+
+        # The control arm: states_size == the exact unique count, so there are NO filler slots.
+        padded_size = 64
+        assert len(unique) < padded_size, "fixture must leave room for filler slots"
+        reference = lowest_projected(strings, coeffs, states)
+
+        unpadded = eigval_of(strings, coeffs, unique, states_size=len(unique), prefilter=(16, 2))
+        padded = eigval_of(strings, coeffs, states, states_size=padded_size, prefilter=(16, 2))
+        assert unpadded == pytest.approx(reference, rel=1e-10), (
+            f"filler-free arm gave {unpadded}, expected {reference}"
+        )
+        assert padded == pytest.approx(reference, rel=1e-10), (
+            f"{padded_size - len(unique)} filler slots contaminated the filtered vector: got "
+            f"{padded}, expected {reference}"
+        )
+
+    def test_disconnected_components_survive_the_filter(self):
+        """The filter must not deplete the overlap ``_spread_seed`` exists to provide.
+
+        Reuses ``TestSqdInitialVector::test_disconnected_components``' fixture and seed: the projected
+        Hamiltonian splits into blocks of 4 and 10, the minimum-diagonal state sits in the size-4
+        block whose own minimum is -1.293, and the true minimum is -2.191 in the other block. A
+        one-hot seed returned -1.293 -- an exact eigenvalue, just not the lowest, with
+        ``converged=True``.
+
+        This is the case where a filter could plausibly *reintroduce* that defect rather than merely
+        fail: the spread seed's whole job is a non-vanishing overlap with every block, and a spectral
+        filter is applied to exactly that vector. If it collapsed the iterate toward the dominant
+        block the way power iteration does, the answer would come back as the wrong block's minimum
+        -- a genuine eigenvalue, converged, and undetectable without this external reference.
+        """
+        rng = np.random.default_rng(3)
+        num_qubits = 5
+        strings = real_pauli_strings(num_qubits, 6, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = rng.integers(0, 2, size=(20, num_qubits)).astype(np.uint8)
+
+        import scipy.sparse as sp
+
+        matrix = project_dense(strings, coeffs, states).real
+        num_components = sp.csgraph.connected_components(
+            sp.csr_matrix(matrix != 0), directed=False
+        )[0]
+        assert num_components == 2, f"fixture is no longer disconnected ({num_components} blocks)"
+
+        reference = lowest_projected(strings, coeffs, states)
+        got = eigval_of(strings, coeffs, states, prefilter=(16, 2))
+        assert got == pytest.approx(reference, rel=1e-10), (
+            f"filtered run on a disconnected subspace gave {got}, expected {reference} -- the filter "
+            "depleted the spread seed's overlap with the block holding the true minimum"
+        )
+
+    def test_returns_the_same_eigenvector_not_merely_the_same_energy(self):
+        """An energy check alone would pass on a different member of a near-degenerate pair.
+
+        The same geometry ``ground_locg``'s ``TestChebyshevPrefilter`` guards, asserted here through
+        ``sqd``'s return path, which additionally trims the eigenvector to the genuine unique rows.
+        A filter that returned a neighbouring eigenvector, or a trim that lost alignment with the
+        basis, would both surface as a fallen overlap.
+        """
+        rng = np.random.default_rng(20260828)
+        num_qubits = 6
+        strings = real_pauli_strings(num_qubits, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(48, num_qubits, rng)
+        plain = sqd((strings, list(coeffs)), states)
+        filtered = sqd((strings, list(coeffs)), states, prefilter=(32, 2))
+        assert np.array_equal(plain[2], filtered[2]), "the two arms returned different bases"
+        # Length, not just overlap: `sqd` trims the eigenvector to `subspace_dim`, and this fixture
+        # pads 36 uniques to 64, so 28 filler slots are trimmed away. A comparison of the two arms
+        # cannot see that trim -- both are trimmed identically, so dropping it leaves the overlap at
+        # 1.0 (verified against a mutant returning the untrimmed vector). Pinning the length against
+        # the basis is what makes the padded tail's absence an assertion rather than an assumption.
+        assert np.asarray(filtered[1]).shape[0] == np.asarray(filtered[2]).shape[0], (
+            f"eigenvector ({np.asarray(filtered[1]).shape[0]}) and basis "
+            f"({np.asarray(filtered[2]).shape[0]}) disagree -- the padded tail was not trimmed"
+        )
+        first = np.asarray(plain[1]).ravel()
+        second = np.asarray(filtered[1]).ravel()
+        overlap = abs(np.vdot(first, second)) / (np.linalg.norm(first) * np.linalg.norm(second))
+        assert overlap > 1.0 - 1e-9, (
+            f"filtered run found a different eigenvector (overlap {overlap})"
+        )
+
+    def test_degenerate_prefilter_values_are_a_no_op(self):
+        """``degree <= 1`` or ``cycles == 0`` must reach the guard, not divide by zero.
+
+        ``ground_locg`` pins this on its own entry point; repeated here because the value travels
+        through ``sqd``'s validation and ``run_sqd``'s ``static_argnames`` first, and a plumbing layer
+        that normalized or rejected the degenerate tuples would break the no-op contract without
+        touching the filter itself.
+
+        **Asserted on the traced graph, not on the energy.** An energy comparison cannot do this job
+        here: measured on this fixture, a *working* ``(16, 1)`` also returns a bit-identical energy
+        (only ``(32, 2)`` moves the last ulp), so "same energy as the baseline" is satisfied by a
+        genuine filter and cannot distinguish one from a no-op. Verified against a mutant that
+        coerces ``cycles=0`` to ``1`` in ``sqd``: the energy form passed, this form fails.
+        """
+        rng = np.random.default_rng(20260828)
+        num_qubits = 4
+        strings = real_pauli_strings(num_qubits, 6, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(12, num_qubits, rng)
+
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((strings, list(coeffs)))
+        states_p = pack_padded(states)
+
+        def trace(**kwargs):
+            return str(
+                jax.make_jaxpr(lambda h, s: run_sqd(h, s, 16, False, (1, 0), maxiter=50, **kwargs))(
+                    hamiltonian, states_p
+                )
+            )
+
+        unfiltered = trace()
+        for prefilter in [(1, 4), (16, 0), (0, 0)]:
+            assert trace(prefilter=prefilter) == unfiltered, (
+                f"prefilter={prefilter} is degenerate and must not add filter ops to the graph"
+            )
