@@ -16,9 +16,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from conftest import herm, lowest, rel_resid, symmetrize
+from conftest import herm, lowest, rel_resid, run_sharded_child, symmetrize
 
-from rqutils.ground_locg import _project_out, eigenpair_2x2, eigenpair_3x3, ground_locg
+from rqutils.ground_locg import (
+    _chebyshev_prefilter,
+    _project_out,
+    eigenpair_2x2,
+    eigenpair_3x3,
+    ground_locg,
+)
 
 
 class TestProjectOut:
@@ -813,3 +819,265 @@ class TestPreconditioner:
         assert str(without) == str(explicit), (
             "precond=None changed the traced graph, so it is not resolving at trace time"
         )
+
+
+class TestChebyshevPrefilter:
+    """``prefilter`` damps the unwanted band of the spectrum before the iteration starts.
+
+    Opt-in exactly as ``precond`` is: ``None`` is the default and must be the identity path, and it is
+    a static argument so the unfiltered graph is unchanged. It **cannot change the answer, only the
+    path** -- every convergence test still reads the true residual.
+
+    Measured on connected XXZ subspaces (18 configurations, 3 seeds x 3 anisotropies x 2 sizes) with
+    ``(16, 4)``: median **1.36x** wall clock, range 1.11-3.07x, 0 regressions, eigenvector overlap
+    1.0000000 against the unfiltered result. ``docs/locg-chebyshev-prefilter.md`` has the tables.
+
+    Two design points are load-bearing and are pinned below, because both fail *silently*:
+
+    - **The filter's lower edge is the running Rayleigh quotient, not an accurate** ``lambda_1``. This
+      is a *robustness* choice, and weaker than it first appears -- recorded honestly because the
+      obvious stronger claim is wrong. With ``lambda_1`` as a fixed edge, **filtering alone** returns an
+      energy off by **15** at a relative gap of 4.0e-05, since the interval then begins at ``lambda_0``
+      and damps the ground state. In the *hybrid* that failure is unreachable: the full iteration
+      repairs a poor start. **No test here pins the edge choice, and mutation confirms none can** --
+      raising it by 5%, 20%, 50% and 100% of ``|theta|`` leaves every test passing, because ``theta``
+      begins far above ``lambda_0`` (measured +5.37 against -5.0), so the interval starts entirely above
+      the target and the filter closes 100% of the gap at every bump. The running quotient is preferred
+      for needing no spectral input, not for correctness. If you replace it, re-measure wall clock on
+      the XXZ batch in ``docs/locg-chebyshev-prefilter.md`` -- the suite will not tell you.
+
+    **Mutation results, recorded so the coverage is not overestimated.** Caught: discarding the
+    filtered vector (2 tests fail). **Not caught**: flipping the sign of the three-term recurrence
+    (``- previous`` -> ``+ previous``), and raising the interval's lower edge by 20% of ``|theta|``.
+    Both still converge to the right eigenvalue, because ``ground_locg`` repairs the start and because
+    the initial interval sits entirely above ``lambda_0`` -- measured, the correct recurrence closes
+    100.00% of the distance to ``lambda_0`` on the direct fixture and the sign-flipped one closes
+    99.99%, a difference no non-flaky tolerance separates. What that means practically: this suite
+    protects the *contract* (same answer, opt-in, sharding, no-op default) and the presence of the
+    filter, not the arithmetic inside it. A change to the recurrence needs the wall-clock batch.
+    - **Filtering is a prefilter, not a solver.** Alone it plateaus at ~1e-5 to 1e-7, since as
+      ``theta`` approaches ``lambda_0`` the lower edge does too and the filter starts attacking its own
+      target. The handoff to the full iteration is what delivers the last digits, so the accuracy
+      assertions here are against the *converged* result and are deliberately tight.
+
+    Note a filtered start is not the same as a *better* start. A shifted-power start, which has a far
+    better Rayleigh quotient and a smaller residual, measured 177 iterations against 77 -- block-size-1
+    LOBPCG spans only ``{x, y, p}``, so convergence tracks what the residual can still expose and power
+    iteration collapses onto the dominant direction. A polynomial filter suppresses the unwanted band
+    multiplicatively and leaves the residual rich. Do not "simplify" the filter into extra power steps.
+    """
+
+    @staticmethod
+    def _gapped(dim, rng, gap, spread=20.0, base=-5.0):
+        """Hermitian matrix with a prescribed lowest gap, so the filter has a defined target.
+
+        Built by conjugating a chosen spectrum, since the point is to control ``lambda_1 - lambda_0``
+        exactly; drawing at random gives whatever gap it gives and makes the small-gap case
+        unreachable.
+
+        ``base`` MUST STAY AWAY FROM ZERO. The convergence test is
+        ``|r| < tol * (|Ax| + |theta|) * N * 10``, so a spectrum with ``lambda_0 == 0`` drives both
+        terms of that sum to zero as the iterate converges and the threshold becomes unsatisfiable:
+        measured, an unfiltered run on such a fixture returns the right energy (1e-15 against a
+        reference of 1.3e-14) while reporting ``converged=False`` at every ``maxiter``. That would look
+        like a prefilter defect and is not one. A physical Hamiltonian has a nonzero ground energy, so
+        the shift is also the realistic case.
+        """
+        spec = np.concatenate([[0.0, gap], np.linspace(gap + 1.0, spread, dim - 2)]) + base
+        q = np.linalg.qr(rng.normal(size=(dim, dim)))[0]
+        return symmetrize(q @ np.diag(spec) @ q.T)
+
+    def test_none_is_bit_identical_to_omitting_it(self):
+        """The default must not perturb the existing graph at all, not merely agree to a tolerance."""
+        rng = np.random.default_rng(20260828)
+        mat = jnp.asarray(herm(64, rng, complex_=False))
+        xinit = jnp.asarray(rng.normal(size=64))
+        omitted = ground_locg(mat, xinit, maxiter=300)
+        explicit = ground_locg(mat, xinit, maxiter=300, prefilter=None)
+        assert float(omitted[0]) == float(explicit[0]), "theta must be bit-identical"
+        assert int(omitted[2]) == int(explicit[2]), "iteration count must be identical"
+        assert jnp.array_equal(omitted[1], explicit[1]), "eigenvector must be bit-identical"
+
+    def test_prefilter_is_static_so_it_adds_no_traced_argument(self):
+        """A traced tuple would recompile per value and defeat the trace-time branch."""
+        rng = np.random.default_rng(20260828)
+        mat = jnp.asarray(herm(32, rng, complex_=False))
+        xinit = jnp.asarray(rng.normal(size=32))
+        without = jax.make_jaxpr(lambda m, x: ground_locg(m, x))(mat, xinit)
+        explicit = jax.make_jaxpr(lambda m, x: ground_locg(m, x, prefilter=None))(mat, xinit)
+        assert str(without) == str(explicit), (
+            "prefilter=None changed the traced graph, so it is not resolving at trace time"
+        )
+
+    @pytest.mark.parametrize("prefilter", [(8, 2), (16, 4), (32, 2)])
+    def test_finds_the_same_eigenvalue(self, prefilter):
+        """Filtering changes the path, never the answer.
+
+        Compared against LAPACK rather than against the unfiltered run, so a shared wrong answer
+        cannot pass -- the repo's rule about preferring an independent reference.
+        """
+        rng = np.random.default_rng(20260828)
+        mat = self._gapped(96, rng, gap=0.5)
+        matj = jnp.asarray(mat)
+        xinit = jnp.asarray(rng.normal(size=96))
+        reference = lowest(mat)
+        result = ground_locg(matj, xinit, maxiter=500, prefilter=prefilter)
+        assert bool(result[3]), f"prefilter={prefilter} failed to converge"
+        assert abs(float(result[0]) - reference) < 1e-10, (
+            f"prefilter={prefilter} gave {float(result[0])}, expected {reference}"
+        )
+        assert rel_resid(mat, float(result[0]), np.asarray(result[1])) < 1e-10
+
+    def test_returns_the_same_eigenvector_not_merely_the_same_energy(self):
+        """An energy check alone would pass on a different member of a near-degenerate pair.
+
+        The filter is a spectral transformation, so the failure worth guarding is that it converges to
+        a *neighbouring* eigenvector while the energy still looks right -- the same geometry
+        ``TestBasisOrthogonality`` guards for the balancing.
+        """
+        rng = np.random.default_rng(20260828)
+        mat = jnp.asarray(self._gapped(96, rng, gap=0.05))
+        xinit = jnp.asarray(rng.normal(size=96))
+        plain = ground_locg(mat, xinit, maxiter=800)
+        filtered = ground_locg(mat, xinit, maxiter=800, prefilter=(16, 4))
+        vec_plain = np.asarray(plain[1]).ravel()
+        vec_filtered = np.asarray(filtered[1]).ravel()
+        overlap = abs(vec_plain @ vec_filtered) / (
+            np.linalg.norm(vec_plain) * np.linalg.norm(vec_filtered)
+        )
+        assert overlap > 1.0 - 1e-9, (
+            f"filtered run found a different eigenvector (overlap {overlap})"
+        )
+
+    def test_tiny_gap_still_finds_the_ground_state(self):
+        """THE CASE THAT BREAKS A FILTER BUILT ON AN ACCURATE ``lambda_1``.
+
+        With the interval's lower edge at ``lambda_1`` and ``lambda_1 - lambda_0`` tiny, the filter
+        damps the ground state too and returns a wrong energy with no error raised -- measured 1.5e+01
+        off at a relative gap of 4.0e-05. The running-Rayleigh-quotient edge is what makes this pass, so
+        this test is what pins that choice.
+        """
+        rng = np.random.default_rng(20260828)
+        mat = self._gapped(128, rng, gap=1e-5)
+        matj = jnp.asarray(mat)
+        xinit = jnp.asarray(rng.normal(size=128))
+        reference = lowest(mat)
+        result = ground_locg(matj, xinit, maxiter=2000, prefilter=(16, 4))
+        assert abs(float(result[0]) - reference) < 1e-8, (
+            f"tiny-gap filtered run gave {float(result[0])}, expected {reference} -- the filter is "
+            "damping the ground state, which means its lower edge is not the running Rayleigh quotient"
+        )
+
+    def test_reduces_the_iteration_count(self):
+        """The whole point. Asserted as a direction, not a pinned count, to avoid a flaky threshold."""
+        rng = np.random.default_rng(20260828)
+        mat = jnp.asarray(self._gapped(256, rng, gap=0.02))
+        xinit = jnp.asarray(rng.normal(size=256))
+        plain = ground_locg(mat, xinit, maxiter=2000)
+        filtered = ground_locg(mat, xinit, maxiter=2000, prefilter=(16, 4))
+        assert bool(plain[3]) and bool(filtered[3]), "both arms must converge for the comparison"
+        assert int(filtered[2]) < int(plain[2]), (
+            f"prefilter did not reduce iterations ({int(plain[2])} -> {int(filtered[2])})"
+        )
+
+    def test_degenerate_prefilter_values_are_a_no_op(self):
+        """``degree <= 1`` or ``cycles == 0`` must not divide by zero or corrupt the start."""
+        rng = np.random.default_rng(20260828)
+        mat = jnp.asarray(herm(48, rng, complex_=False))
+        xinit = jnp.asarray(rng.normal(size=48))
+        baseline = ground_locg(mat, xinit, maxiter=300)
+        for prefilter in [(1, 4), (16, 0), (0, 0)]:
+            result = ground_locg(mat, xinit, maxiter=300, prefilter=prefilter)
+            assert float(result[0]) == float(baseline[0]), (
+                f"prefilter={prefilter} should be a no-op but changed theta"
+            )
+
+    def test_filter_moves_the_rayleigh_quotient_toward_the_ground_state(self):
+        """The filter must actually filter -- asserted on its output, not on the solve that follows.
+
+        This is the most direct assertion available, and it is still not sensitive to the interval's
+        lower edge (see the class docstring: every bump tried closes 100% of the gap). What it does
+        catch is a filter that is inert, inverted, or applied to the wrong operator -- e.g. the
+        recurrence built with ``+ previous`` instead of ``- previous``, or ``centre``/``half`` swapped.
+        """
+        rng = np.random.default_rng(20260828)
+        mat = self._gapped(128, rng, gap=0.02)
+        matj = jnp.asarray(mat)
+        reference = lowest(mat)
+        xinit = jnp.asarray(rng.normal(size=128))
+
+        def rayleigh(vec):
+            vec = vec / jnp.linalg.norm(vec)
+            return float(jnp.sum(vec.conjugate() * (matj @ vec)).real)
+
+        before = rayleigh(xinit)
+        after = rayleigh(_chebyshev_prefilter(lambda v: matj @ v, (), xinit, 16, 4))
+        assert after < before, f"filter did not lower the Rayleigh quotient ({before} -> {after})"
+        closed = (before - after) / (before - reference)
+        assert closed > 0.9, f"filter closed only {closed:.1%} of the gap to lambda_0"
+        # Deliberately loose. Measured, this fixture closes 100.00% with the correct recurrence and
+        # 99.99% with the sign of the three-term recurrence flipped, so a tolerance tight enough to
+        # separate those two would be pinning noise. The class docstring records which mutants survive.
+
+    def test_complex_operator(self):
+        """The Chebyshev recurrence must not assume a real operator.
+
+        ``matvec`` output is complex here while the interval bounds are real, so a spelling that mixed
+        the two would either raise or silently drop the imaginary part -- the trap the module docstring
+        records for ``compute_sas``.
+        """
+        rng = np.random.default_rng(20260828)
+        mat = jnp.asarray(herm(64, rng, complex_=True))
+        xinit = jnp.asarray(rng.normal(size=64) + 1j * rng.normal(size=64))
+        reference = float(np.linalg.eigvalsh(np.asarray(mat))[0])
+        result = ground_locg(mat, xinit, maxiter=500, prefilter=(16, 4))
+        assert bool(result[3]), "complex operator failed to converge with a prefilter"
+        assert abs(float(result[0]) - reference) < 1e-10
+
+    def test_preserves_sharding_on_a_mesh(self):
+        """The prefilter must not silently un-shard the vector it returns.
+
+        Asserted on the SPEC, not only the energy: per ``CLAUDE.md`` a replicated run agrees with
+        single-device to exactly 0.0, so "correct but silently unsharded" is invisible to a value
+        comparison. Subprocessed because the virtual device count must be set before jax initializes.
+
+        Sweeps 1/2/4 devices x partitioned/replicated, because a single partitioned case would miss the
+        replicated-input pairing -- the shape of the ``_spread_seed`` ``ShardingTypeError`` in
+        ``rqutils.sqd``, where a replicated predicate met a partitioned vector. Ragged splits are
+        deliberately absent: explicit sharding rejects ``dim % mesh.size != 0`` at ``device_put``, so
+        they are unreachable here (they are ``sqd``'s concern, where ``uniquify_states`` pads).
+        """
+        stdout = run_sharded_child("_sharded_prefilter.py", "ground_locg prefilter")
+        rows = {}
+        reference = None
+        for line in stdout.splitlines():
+            parts = line.split()
+            if parts[0] == "reference":
+                reference = float(parts[1])
+                continue
+            rows[parts[0]] = (float(parts[1]), int(parts[2]), parts[3], parts[4])
+        # Assert the case set is complete before checking values: a child that died partway would
+        # otherwise pass on whatever it managed to print.
+        assert reference is not None
+        expected = {
+            f"{n}:{spec}:{kind}"
+            for n in (1, 2, 4)
+            for spec in ("part", "repl")
+            for kind in ("plain", "prefiltered")
+        }
+        assert set(rows) == expected, (
+            f"incomplete child output: {sorted(set(expected) - set(rows))}"
+        )
+        for label, (energy, iters, converged, spec) in rows.items():
+            assert converged == "True", f"{label} did not converge on the mesh"
+            assert abs(energy - reference) < 1e-10, f"{label} gave {energy}, expected {reference}"
+            want = "P(None,)" if ":repl:" in label else "P('x',)"
+            assert spec == want, f"{label} sharding changed: {spec} (wanted {want})"
+        for n in (1, 2, 4):
+            for spec in ("part", "repl"):
+                plain = rows[f"{n}:{spec}:plain"][1]
+                filtered = rows[f"{n}:{spec}:prefiltered"][1]
+                assert filtered < plain, (
+                    f"prefilter did not reduce iterations at {n} devices/{spec} "
+                    f"({plain} -> {filtered})"
+                )

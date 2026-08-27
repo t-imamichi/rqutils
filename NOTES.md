@@ -71,6 +71,17 @@ the finding you are looking for. Two further traps:
 Verify a new test actually fails against the bug it targets by reverting the fix **in place**; a copy
 of the repo does not work, since the venv holds an editable install pointing at the original.
 
+**The same trap applies to patch scripts, not just mutations.** A `str.replace` whose anchor `assert`s
+present can still write nothing you notice, because the anchor may no longer match what is on disk --
+`ruff format` reflows lines, and a `CLAUDE.md`/`NOTES.md` split moves prose between files, so an anchor
+copied from your own earlier draft goes stale. Two measured consequences from one session: a duplicate
+test was deleted while the assertion meant to replace it never landed (a net coverage **loss** that
+reported success), and a multi-anchor script aborted midway while I assumed the earlier anchors had
+applied -- they had not, since the write happens at the end. So: put the `open(..., "w")` last so a
+failed assert changes nothing, verify each edit landed rather than inferring it from "ok", and
+mutation-test the *surviving* assertion afterwards. Note `pytest` prints "no tests ran" rather than
+failing when the class path is wrong, so a mis-copied class name looks like a pass.
+
 ### A green suite after reverting a fix means the test is missing, not that the guard is dead
 
 Some guards are only reachable when *other* defects compound with them, so the end-to-end assertion
@@ -336,8 +347,22 @@ bad = [(m.__name__, n) for m in (rqutils.sqd, rqutils.ground_locg, rqutils.svsim
        for n, o in list(vars(m).items()) + [('<module>', m)]
        if isinstance(getattr(o, '__doc__', None), str) and any(c in o.__doc__ for c in '\x07\x08\x0b\x0c')]
 print('control-char docstrings:', bad)"
-``` Also brace
-`:math:` exponents (`2^{31}`, not `2^31`); unbraced renders as `2³1` and nothing warns.
+```
+
+Also brace `:math:` exponents (`2^{31}`, not `2^31`); unbraced renders as `2³1` and nothing warns.
+
+**A docstring's body indentation must be uniform, and no tool catches a break.** Writing 8-space
+continuation lines into a 4-space docstring makes reST read the deeper lines as a **block quote**,
+which nests `Args:`/`Returns:`/`Raises:` where napoleon cannot parse them -- so the published
+reference for that function silently loses its parameter table. Measured: this happened to
+`apply_h` while ruff, `ty`, pytest and the control-char sweep above all passed, and the docs build
+still reported success (the sweep sees byte values, not layout). Print the indentation ladder
+instead -- a healthy docstring shows one dominant level with deeper ones only for nested blocks:
+
+```bash
+awk '/r"""<first words of the summary>/,/^    """$/' rqutils/sqd.py \
+  | awk '{match($0, /^ */); if (length($0)) print RLENGTH}' | sort -n | uniq -c
+```
 
 `.. autoclass::` needs `:members:` or member docstrings are unpublished — `PauliSumXZ`'s four
 documented public members rendered nowhere until it was added (`CircuitXZ` is deliberately bare, so
