@@ -14,12 +14,20 @@ what the session's measurements *constrain* (a lot), and the candidates worth tr
   Chebyshev prefilter beats it in 3 of 4 cases while needing no basis and no tuning knob. Rejected on
   cost, not correctness.
 
-Candidate B (§4) is the leading untested option, and it is a narrow one — it targets a plateau the
-shipped hybrid does not care about.
+**§5's two "cheap, safe" wins have also been tested and rejected** — adaptive scheduling made things
+*worse* (median 1.31× → 1.11×, 6 losses where the fixed schedule had none), and bounds continuation is
+worth ~5% for real plumbing. §5a records the one reusable finding: the filter's growth factor is a clean,
+free stopping signal, and over-filtering is genuinely unstable (growth to 1e+23, a Rayleigh quotient
+excursion to +4.60) — just not in a way that matters, since `ground_locg` repairs it.
 
-Both rejections carry a methodological warning worth reading before testing anything else: a host-side
-prototype of a device-resident algorithm measures the JAX boundary (2.0× per matvec here), not the
-algorithm. §3b nearly recorded 0.39–0.86× as Davidson's verdict for that reason.
+That leaves **candidate B (§4) as the only untested option**, and it is a narrow one — it targets a
+plateau the shipped hybrid does not care about. The practical recommendation is to stop here: the
+prefilter's 1.11–3.07× is banked, and six ideas have now been measured and rejected against it.
+
+All the rejections carry one methodological warning, hit three times: **timing JAX code outside the jit
+boundary it normally lives inside measures the boundary, not the code.** A host-side Davidson read
+0.39–0.86× and became 1.05–2.62× once jitted; `_lambda_max_bound` timed standalone read 103% of a solve
+against a true ~5%. Warming does not fix it.
 
 ---
 
@@ -209,19 +217,79 @@ candidate A unless the prefilter is being pushed toward a standalone solver.
 
 ---
 
-## 5. Two cheap, safe, small wins
+## 5. Two cheap, safe, small wins — **BOTH TESTED AND REJECTED**
 
-- **Carry the spectral bounds across a solve sequence.** The recovery loop solves a monotone sequence.
-  Eigenvector continuation failed (constraint 4 — a zero-padded eigenvector is the extreme
-  depleted-residual case, measured 79 → 129 iterations and one size converging to a *different*
-  eigenvalue). But continuation of `lambda_max` and the previous `theta` moves no vector, so it cannot
-  reproduce that failure: it saves the ~11 power-iteration matvecs per solve and starts the filter
-  tighter. Worth a few percent, and safe.
-- **Adaptive prefilter scheduling.** `(16, 4)` is fixed today, but the measured win correlates with how
-  much `ground_locg` was going to iterate anyway (biggest gains where it ran 216–249 iterations,
-  smallest at 1.11× where it ran ~129). Running 2 cycles, checking the Rayleigh-quotient improvement,
-  and deciding whether to continue converts a fixed 72-matvec cost into a problem-adaptive one and
-  should lift the floor cases.
+Implemented and measured 2026-08-28, then reverted. Neither pays, and the reasons are more useful than
+the ideas were.
+
+### 5a. Adaptive prefilter scheduling — rejected
+
+The original claim: `(16, 4)` is fixed, the win correlates with how much `ground_locg` was going to
+iterate anyway, so stopping early on a per-problem signal "converts a fixed 72-matvec cost into a
+problem-adaptive one."
+
+**A clean stopping signal does exist**, and it is worth recording because it is free. The filter's
+**growth factor** `‖T_degree(...)v‖` — already computed, since `normalize` divides by it — behaves as
+a sharp indicator across all 18 configurations:
+
+| cycle | growth factor |
+| --- | --- |
+| 1 | 1e8 – 1e12 |
+| 2 | 15 – 330 |
+| 3+ | collapses toward 1.0 |
+
+The mechanism: the recurrence amplifies whatever lies outside `[θ, hi]`, so while `θ` is far above `λ₀`
+the ground state is well outside the band and grows enormously. Once `θ` has descended to `λ₀` the
+ground state sits *at* the interval edge where `T_degree ≈ 1`, and the filter separates nothing further.
+
+**Continuing past that point is genuinely unstable.** A marginally-stable recursion run on a vector with
+no signal left amplifies its own rounding: measured growth factors up to **1e+23** and a Rayleigh
+quotient excursion from −9.97 to **+4.60** at cycle 6 on one configuration. `(16, 4)` stops before this,
+so the shipped default was safe by luck rather than by construction — which is worth knowing.
+
+**But the change made things worse**, measured over 18 configurations:
+
+| setting | min | median | max | losses |
+| --- | --- | --- | --- | --- |
+| **`(16, 4)`, shipped** | **1.06×** | **1.31×** | 3.10× | **0** |
+| `(16, 8)` with adaptive latch | 0.88× | 1.11× | 2.26× | 6 |
+| `(16, 16)` with adaptive latch | 0.67× | 0.83× | 2.00× | 14 |
+
+Two errors in the original reasoning, both mine:
+
+1. **The premise is impossible under `lax.scan`.** A scan has a *static* trip count, so a latch stops
+   the vector updating but every matvec still executes. `(16, 16)` pays 16 cycles regardless. Only a
+   `lax.while_loop` would actually save the work, and that adds a traced loop for a benefit that only
+   materializes when `cycles` was set too high to begin with.
+2. **The floor cases are not over-filtered.** They stop being useful after cycle 3–4 — which is what
+   `(16, 4)` already does. Adaptive stopping can only recover waste that the default does not create.
+
+**The safety benefit is also not real.** Pre-change code at `cycles` = 4, 8, 16, 24 across six
+configurations returned energies correct to **3.6e-15 in every case**. `ground_locg` repairs whatever the
+filter hands it, so over-filtering degrades the prefilter without ever producing a wrong answer — the
+same conclusion the shipped suite's mutation testing reached (§7 item 4). So there is nothing to protect
+against.
+
+### 5b. Carrying spectral bounds across a solve sequence — rejected on size
+
+`_lambda_max_bound` costs 11 matvecs. The prefilter costs 79, and the solve 49–249. So carrying
+`lambda_max` across a monotone sequence saves at most **~5%** of a solve — and it would mean threading
+spectral state through `sqd` → `run_sqd` → `ground_locg`, where `cache_level` must already stay static
+because `ground_locg` splats `args` positionally (`CLAUDE.md`). The measured drift across a growing
+sequence is small (2.4% on the first step, then 0.3–0.5%), so the *idea* is sound; it is the payoff that
+is not worth the plumbing.
+
+### A measurement trap, hit three times
+
+A first attempt reported `_lambda_max_bound` at **103% of a solve**, which is impossible. It is not
+jitted standalone — only when called from inside `_ground_locg_callable` — so timing it directly measures
+**re-tracing**: 48.23 ms traced against 19.23 ms jitted, where 11 matvecs is 18.62 ms. Jitted, it costs
+exactly what it should.
+
+This is the third instance of the same class of error in this investigation, after the host-side Davidson
+(0.39–0.86× → 1.05–2.62× once jitted) and the ARPACK comparison. **Timing a JAX helper outside the jit
+boundary it normally lives inside measures the boundary, not the code.** Warming does not fix it; the
+call must be jitted the way the caller jits it.
 
 ---
 
