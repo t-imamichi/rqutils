@@ -213,10 +213,17 @@ entry point; `hproj(...)` is the dense/debug path. Two conventions dominate:
   splats `args` positionally and `static_argnames` would never see it.
   `states_size` exists solely to pin array shapes and prevent JIT recompilation.
 
-`sqd` forwards `ground_locg`'s `prefilter` (static, via `run_sqd`'s `static_argnames`) but **not its
-`precond`** — preconditioning `sqd` is a closed investigation (see below). The prefilter's published
-1.88x is `ground_locg`-on-dense-operators; **it is unmeasured through `apply_h`**, so treat it as
-off-by-default plumbing, not a recommended setting.
+**The rule for a new solver option on `run_sqd`:** forwarded to `ground_locg` by *keyword* → put it
+in `static_argnames`; riding inside the positionally-splatted `args` → bind it with
+`functools.partial`. `cache_level` is the second case (hence the note above), `prefilter` the first —
+so the `static_argnames` list is not evidence that `cache_level` could join it.
+
+`sqd` forwards `prefilter` but **not `precond`** — preconditioning `sqd` is a closed investigation
+(see below), so that gap is deliberate, not an oversight to fix. The prefilter's published 1.88x is
+`ground_locg`-on-dense-operators; **it is unmeasured through `apply_h`**, so treat it as
+off-by-default plumbing, not a recommended setting. Malformed values are rejected by
+`_check_prefilter`, since the filter's own `degree > 1 and cycles > 0` gate would absorb them as a
+silent no-op.
 
 **`states` must be lex-sorted** — `get_xsource` is a binary search, not a sort. Always required (the
 sort was equally wrong on unsorted input) but previously undocumented; `hproj(unique_states=True)`
@@ -233,7 +240,10 @@ Hamiltonian splits into disconnected blocks silently returned that block's minim
 with the Rayleigh–Ritz step solved analytically (`eigenpair_2x2`, `eigenpair_3x3` via Cardano) instead
 of via `eigh`, to keep memory down for huge vectors. It is sharding-transparent **only if the `mat`
 callable preserves output sharding** — that contract is why every `apply_*` in `sqd.py` passes
-`out_sharding=jax.typeof(vec).sharding`. It also takes an optional `precond` (`None` | callable).
+`out_sharding=jax.typeof(vec).sharding`. It also takes an optional `precond` (`None` | callable) and an optional `prefilter`
+(`None` | `(degree, cycles)` Chebyshev, start at `(32, 2)`; its call site must stay **after** the
+dtype promotion and **before** `body_iter0` — `docs/locg-chebyshev-prefilter.md` has the tables and
+three rejected variants).
 
 Every guard in it is load-bearing and was measured; `docs/locg.md` catalogues seven defects (I1–I7)
 that each failed *silently*. **Don't "simplify" the balancing, the re-orthogonalizations, or the

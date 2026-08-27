@@ -82,6 +82,41 @@ failed assert changes nothing, verify each edit landed rather than inferring it 
 mutation-test the *surviving* assertion afterwards. Note `pytest` prints "no tests ran" rather than
 failing when the class path is wrong, so a mis-copied class name looks like a pass.
 
+### `sqd`'s filler slots are protected by unreachability, not by `_spread_seed`'s mask
+
+Found while pinning `TestSqdPrefilter` (2026-08-28). Removing the `jnp.where(filler, 0, vec)` mask in
+`_spread_seed` leaves **every** assertion in that class green, at every `states_size`. That is not a
+missing test — it is the guard being redundant with something stronger.
+
+Probing the padded operator directly (40 draws over 4 qubits collapsing to 14 uniques, padded to 64, so
+50 filler slots):
+
+- Both coupling blocks are **exactly 0.0** — genuine rows never pull from filler rows and vice versa, so
+  the padded operator is block-diagonal and the filter cannot move weight across the boundary.
+- `apply_h` is **asymmetric** on filler rows (98 entries where `|H - H.T| > 1e-12`).
+- The filler block's own lowest eigenvalue is **−10.59**, far below the genuine block's **−4.33**.
+
+The asymmetry is what saves it. A symmetric block at −10.59 would be a legitimate lower eigenvalue for
+LOBPCG to find; because `apply_h` is asymmetric there, that spectrum is **unreachable** rather than
+merely unfavoured. Measured: an iterate started *entirely* inside the filler block converges to −4.23
+and reports `converged=False`, and the unmasked spread seed — which puts *more* weight on filler slots
+(norm 4.47) than on genuine ones (2.15) — still returns the correct −4.330397418179033.
+
+So the mask is defence in depth, and no energy assertion can pin it. Don't record it as dead code on
+the strength of a green suite, and don't claim a filler test covers it.
+
+### Comparing energies cannot prove an option is a no-op
+
+Same session. `TestSqdPrefilter`'s degenerate-value test first asserted that `prefilter=(1, 4)`,
+`(16, 0)` and `(0, 0)` gave the baseline energy. It passed — and pinned nothing: on that fixture a
+*working* `(16, 1)` also returns a bit-identical energy, and only `(32, 2)` moves the last ulp
+(−3.533932511396396 against −3.533932511396397). A mutant coercing `cycles=0` to `1` in `run_sqd`
+survived the energy form and dies against `str(jax.make_jaxpr(...))` equality.
+
+Two mutants also survived by being aimed at the wrong layer: a coercion added to `sqd` while the test
+traced `run_sqd` directly, and a mutation of `vinit_nodiag` when that fixture takes
+`vinit_from_min_diag`. Both read as missing coverage and were not.
+
 ### A green suite after reverting a fix means the test is missing, not that the guard is dead
 
 Some guards are only reachable when *other* defects compound with them, so the end-to-end assertion

@@ -309,6 +309,55 @@ def _check_cache_level(cache_level: Any) -> None:
         )
 
 
+def _check_prefilter(prefilter: Any) -> None:
+    """Raise unless ``prefilter`` is None or a ``(degree, cycles)`` pair of non-negative ints.
+
+    Same reason :func:`_check_cache_level` exists, and the same failure shape.
+    :mod:`rqutils.ground_locg` gates the filter on ``if degree > 1 and cycles > 0``, an equality-style
+    branch with an implicit ``else``, so an out-of-range value is **absorbed into a silent no-op**
+    rather than reported: measured, ``(2, -1)``, ``(-4, 2)`` and ``(True, 2)`` all returned the exact
+    unfiltered energy at zero speedup, which reads as "the prefilter does not help on my problem".
+    That misdiagnosis is the one thing this option cannot afford, because its docstring tells callers
+    to A/B it on their own subspaces. Malformed *types* were no better: ``(2,)``, ``"32,2"`` and ``32``
+    reached ``ground_locg``'s tuple unpack and surfaced its ``ValueError``/``TypeError`` from inside a
+    public entry point.
+
+    ``bool`` is rejected for the reason :func:`_check_cache_level` gives -- it is an ``int`` subclass,
+    so ``(True, 2)`` would otherwise pass as ``(1, 2)``, i.e. as a documented no-op.
+
+    The **intentional** no-ops stay legal: ``degree <= 1`` or ``cycles == 0`` is how a caller disables
+    the filter without restructuring a sweep, and :mod:`rqutils.ground_locg` pins that contract. Only
+    negative values, non-ints and wrong shapes are errors -- a distinction only expressible here,
+    since that single ``degree > 1 and cycles > 0`` test cannot make it.
+
+    Args:
+        prefilter: The caller's value, unvalidated.
+
+    Raises:
+        TypeError: If it is not None or a length-2 sequence of ints.
+        ValueError: If either entry is negative.
+    """
+    if prefilter is None:
+        return
+    try:
+        degree, cycles = prefilter
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"`prefilter` must be None or a (degree, cycles) pair of ints, got {prefilter!r}"
+        ) from exc
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (degree, cycles)):
+        raise TypeError(
+            f"`prefilter` must be None or a (degree, cycles) pair of ints, got {prefilter!r}"
+        )
+    if degree < 0 or cycles < 0:
+        raise ValueError(
+            f"`prefilter` is {prefilter!r}, but both entries must be non-negative. A negative value "
+            "is silently absorbed as a no-op by the filter's `degree > 1 and cycles > 0` gate, so it "
+            "returns the unfiltered energy at zero speedup rather than reporting anything. To disable "
+            "the filter deliberately, pass None (or degree<=1 / cycles=0, which stay legal)."
+        )
+
+
 def _check_zsignatures_rank(zsignatures: Any) -> None:
     """Raise unless ``zsignatures`` is one X group's 2-D ``(num_zterms, num_bytes)`` array.
 
@@ -448,23 +497,19 @@ def sqd(
         cache_level: Switches for caching the results of source indices and sign bits / diagonals.
             See the module documentation for the detailed discussion of the resource tradeoff involved.
         prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter, forwarded verbatim to
-            :func:`rqutils.ground_locg.ground_locg` -- see its docstring for the semantics and the
-            knob-choosing guidance. ``None`` (the default) leaves the traced graph unchanged, so no
-            existing caller is affected; it is static here, as it is there.
+            :func:`rqutils.ground_locg.ground_locg` -- see its docstring for the semantics, the cost,
+            the accuracy guarantee and the knob-choosing guidance. ``None`` (the default) leaves the
+            traced graph unchanged, so no existing caller is affected; it is static here, as it is
+            there. Validated by :func:`_check_prefilter`, which rejects the malformed values the
+            filter's own gate would absorb as a silent no-op.
 
             **Its measured speedups were not taken on this path.** Every figure in
             ``docs/locg-chebyshev-prefilter.md`` (median 1.88x at ``(32, 2)``) comes from
-            ``ground_locg`` driven with *dense* operators. The prefilter buys roughly half the
-            iterations for ``cycles * (degree + 1)`` extra matvecs plus ~11 for the
-            :math:`\lambda_{\max}` estimate -- about 79 at ``(32, 2)`` -- so whether it pays depends
-            on the matvec-to-bookkeeping cost ratio, and that doc names this ratio as the genuinely
-            uncertain quantity rather than a merely unmeasured one. Here the matvec is
+            ``ground_locg`` driven with *dense* operators, whereas here the matvec is
             :func:`apply_h`, a gather-heavy irregular kernel whose cost is dominated by
-            ``cache_level``, which is a different point on that ratio than any published figure.
-            Treat the numbers as indicative of the mechanism, not as a prediction for ``sqd``: A/B
-            whole ``sqd`` calls on your own subspaces before adopting it. The accuracy guarantee is
-            unaffected -- the filter only moves the starting vector, and every convergence test still
-            reads the true residual.
+            ``cache_level`` -- a different point on the matvec-to-bookkeeping ratio that doc names as
+            the genuinely uncertain quantity. A/B whole ``sqd`` calls on your own subspaces before
+            adopting it.
 
     Returns:
         Calculated ground state energy, or a tuple of energy, ground state vector, and sorted
@@ -481,9 +526,14 @@ def sqd(
             ``tol`` to proceed.
         ValueError: If ``states_size`` is smaller than ``states.shape[0]``, or if it exceeds
             :math:`2^{31} - 1`, the ceiling imposed by the int32 indices used for subspace positions
-            (beyond it an index wraps negative and the subspace is silently permuted).
+            (beyond it an index wraps negative and the subspace is silently permuted); or if either
+            ``prefilter`` entry is negative -- see :func:`_check_prefilter`, which explains why a
+            negative value would otherwise be absorbed as a silent no-op.
+        TypeError: If ``cache_level`` is not a pair of ints, or ``prefilter`` is neither None nor a
+            ``(degree, cycles)`` pair of ints.
     """
     _check_cache_level(cache_level)
+    _check_prefilter(prefilter)
     if states_size is None:
         # Default to the next power of two at or above the input length. All-distinct and growing
         # dimensions are the *normal* SQD access pattern -- an SKQD run walks one per Krylov rung plus
@@ -776,16 +826,15 @@ def run_sqd(
             Static, as it is there.
         tol: Convergence tolerance. ``None`` uses the operator dtype's machine epsilon.
         prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter, forwarded to
-            :func:`rqutils.ground_locg.ground_locg`. Static, as it is there -- and note the contrast
-            with ``cache_level``, which cannot use ``static_argnames`` at all because ``ground_locg``
-            splats ``args`` positionally, so it is bound through :func:`functools.partial` instead.
-            ``prefilter`` is passed by keyword to ``ground_locg``, so it needs no such treatment.
-            See :func:`sqd` on why this option's published speedups do not transfer to this path.
+            :func:`rqutils.ground_locg.ground_locg`. Static, as it is there -- passed by keyword, so
+            unlike ``cache_level`` it needs no :func:`functools.partial` binding. See :func:`sqd` on
+            why this option's published speedups do not transfer to this path.
     """
     # `cache_level` is static, so this is a concrete tuple at trace time and the check runs once per
     # trace rather than once per call. `sqd` validates too; this covers the direct callers, which are
     # the six examples/scaling scripts -- i.e. the ones most likely to pass an experimental value.
     _check_cache_level(cache_level)
+    _check_prefilter(prefilter)
     sharding = None
     if not (mesh := get_abstract_mesh()).empty:
         sharding = PartitionSpec(mesh.axis_names)

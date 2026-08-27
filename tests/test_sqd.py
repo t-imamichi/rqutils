@@ -75,6 +75,29 @@ def eigval_of(pauli_strings, coeffs, states, **kwargs):
     return float(np.asarray(result).ravel()[0])
 
 
+def run_sqd_jaxpr(rng, **kwargs):
+    """Return ``run_sqd``'s traced graph as a string, for static-argument comparisons.
+
+    ``run_sqd`` is the jit boundary that owns the ``static_argnames`` entries, so a staticness claim
+    has to be asserted there -- ``sqd`` is not jitted, and a jaxpr comparison against it would prove
+    nothing about where the staticness actually has to hold.
+
+    A plain function taking ``rng``, not a ``@pytest.fixture``: the prohibition in ``conftest`` is
+    about RNG stream position depending on fixture ordering, and ``unique_states`` is the pattern.
+    Returns ``str`` rather than the ``ClosedJaxpr`` because every caller compares text.
+    """
+    from rqutils.paulis.symplectic import PauliSumXZ
+
+    strings = real_pauli_strings(4, 6, rng)
+    hamiltonian = PauliSumXZ.from_paulisum((strings, list(rng.normal(size=len(strings)))))
+    states_p = pack_padded(unique_states(12, 4, rng))
+    return str(
+        jax.make_jaxpr(lambda h, s: run_sqd(h, s, 16, False, (1, 0), maxiter=50, **kwargs))(
+            hamiltonian, states_p
+        )
+    )
+
+
 class TestComputeDiagonal:
     """``compute_diagonal`` composes a diagonal from packed sign bits and coefficients."""
 
@@ -1826,14 +1849,9 @@ class TestSqdPrefilter:
       fixtures are dense and unpadded, and ragged mesh splits are explicitly out of scope there
       *because* padding is ``sqd``'s concern.
 
-      Measured on this fixture, the padded operator is **block-diagonal** -- the genuine-from-filler
-      and filler-from-genuine coupling blocks are both exactly 0.0 -- so the filter cannot move
-      weight across the boundary. What this test therefore pins is the *energy*, not a mechanism:
-      it is a padded-versus-unpadded comparison against the dense reference. Do not read a passing
-      run as evidence that ``_spread_seed``'s filler mask is what protects the answer; removing that
-      mask leaves every assertion here green (verified), because the unmasked seed's filler weight
-      converges to the genuine block anyway -- ``apply_h`` is asymmetric on filler rows, which makes
-      the filler block's own spectrum unreachable rather than merely unfavoured.
+      The padded operator is block-diagonal here, so what this pins is the *energy*, not a
+      no-leakage mechanism, and it does **not** pin ``_spread_seed``'s filler mask -- removing that
+      mask leaves every assertion green. ``NOTES.md`` has the measurements and why.
     * **The spread seed.** ``run_sqd`` starts from ``_spread_seed``, not a one-hot, so that a subspace
       whose projected Hamiltonian splits into disconnected blocks cannot silently return one block's
       minimum. A filter is a spectral transformation applied to exactly that vector, so it is capable
@@ -1845,12 +1863,9 @@ class TestSqdPrefilter:
     Every value assertion is against :func:`lowest_projected`, the dense reference -- not against the
     unfiltered ``sqd`` arm -- so a defect common to both arms cannot pass.
 
-    **No timing is asserted.** The published 1.88x median comes from ``ground_locg`` on dense
-    operators; here the matvec is ``apply_h``, a gather-heavy irregular kernel whose cost is dominated
-    by ``cache_level``, i.e. a different point on the matvec-to-bookkeeping ratio that
-    ``docs/locg-chebyshev-prefilter.md`` names as the genuinely uncertain quantity. An iteration-count
-    assertion of the kind ``ground_locg``'s ``test_reduces_the_iteration_count`` makes would be
-    pinning an unmeasured claim on this path, so correctness is all that is claimed.
+    **No timing or iteration-count assertion**: the published figures were taken on dense
+    ``ground_locg``, not on ``apply_h``, so pinning one here would pin an unmeasured claim. See
+    ``sqd``'s ``prefilter`` docstring.
     """
 
     def test_none_is_bit_identical_to_omitting_it(self):
@@ -1873,30 +1888,14 @@ class TestSqdPrefilter:
         itself is not jitted, so making the jaxpr comparison there would prove nothing about where
         the staticness actually has to hold.
         """
-        rng = np.random.default_rng(20260828)
-        num_qubits = 4
-        strings = real_pauli_strings(num_qubits, 6, rng)
-        coeffs = rng.normal(size=len(strings))
-        states = unique_states(12, num_qubits, rng)
-
-        from rqutils.paulis.symplectic import PauliSumXZ
-
-        hamiltonian = PauliSumXZ.from_paulisum((strings, list(coeffs)))
-        states_p = pack_padded(states)
-        size = 16
-
-        def trace(**kwargs):
-            return jax.make_jaxpr(
-                lambda h, s: run_sqd(h, s, size, False, (1, 0), maxiter=50, **kwargs)
-            )(hamiltonian, states_p)
-
-        assert str(trace()) == str(trace(prefilter=None)), (
+        unfiltered = run_sqd_jaxpr(np.random.default_rng(20260828))
+        assert run_sqd_jaxpr(np.random.default_rng(20260828), prefilter=None) == unfiltered, (
             "prefilter=None changed the traced graph, so it is not resolving at trace time"
         )
         # The converse: a real value must reach the graph. Without this, a `prefilter` silently
         # dropped on the way to `ground_locg` would pass the equality above for the wrong reason --
         # every arm identical because the option does nothing at all.
-        assert str(trace(prefilter=(16, 2))) != str(trace()), (
+        assert run_sqd_jaxpr(np.random.default_rng(20260828), prefilter=(16, 2)) != unfiltered, (
             "prefilter=(16, 2) left the traced graph unchanged, so it is not reaching ground_locg"
         )
 
@@ -1932,10 +1931,8 @@ class TestSqdPrefilter:
         ``states_size`` is pinned well above the unique count, so the padded arm is mostly filler:
         this fixture collapses 40 draws over 4 qubits to 14 uniques, leaving 50 of 64 slots filler.
 
-        **Scope, measured rather than assumed.** The padded operator is block-diagonal here (both
-        coupling blocks exactly 0.0), so this asserts an energy, not a no-leakage mechanism, and it
-        does **not** pin ``_spread_seed``'s filler mask -- see the class docstring for the mutation
-        result and why the filler block is unreachable regardless.
+        Asserts an energy, not a no-leakage mechanism, and does not pin ``_spread_seed``'s filler
+        mask -- see the class docstring and ``NOTES.md``.
         """
         rng = np.random.default_rng(20260828)
         num_qubits = 4
@@ -1946,7 +1943,6 @@ class TestSqdPrefilter:
 
         # The control arm: states_size == the exact unique count, so there are NO filler slots.
         padded_size = 64
-        assert len(unique) < padded_size, "fixture must leave room for filler slots"
         reference = lowest_projected(strings, coeffs, states)
 
         unpadded = eigval_of(strings, coeffs, unique, states_size=len(unique), prefilter=(16, 2))
@@ -2027,6 +2023,29 @@ class TestSqdPrefilter:
             f"filtered run found a different eigenvector (overlap {overlap})"
         )
 
+    @pytest.mark.parametrize(
+        "prefilter",
+        [(2, -1), (-4, 2), (True, 2), (1.5, 2), (32, 2.0), (2,), "32,2", 32],
+    )
+    def test_malformed_values_raise_rather_than_no_op(self, prefilter):
+        """A malformed value must be reported, not absorbed.
+
+        ``ground_locg`` gates the filter on ``degree > 1 and cycles > 0``, an equality-style branch
+        with an implicit ``else``, so before ``_check_prefilter`` the out-of-range values here
+        returned the exact unfiltered energy at zero speedup -- measured -3.533932511396397 against a
+        working ``(32, 2)``'s -3.533932511396396. That reads as "the prefilter does not help on my
+        problem", which is the one misdiagnosis this option cannot afford given its docstring tells
+        callers to A/B it themselves. The malformed *types* were worse: they surfaced
+        ``ground_locg``'s own tuple-unpack ``ValueError``/``TypeError`` from inside a public entry
+        point. ``(True, 2)`` is the ``bool``-is-an-``int`` hole ``_check_cache_level`` also closes.
+        """
+        rng = np.random.default_rng(20260828)
+        strings = real_pauli_strings(4, 6, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(12, 4, rng)
+        with pytest.raises((TypeError, ValueError)):
+            eigval_of(strings, coeffs, states, prefilter=prefilter)
+
     def test_degenerate_prefilter_values_are_a_no_op(self):
         """``degree <= 1`` or ``cycles == 0`` must reach the guard, not divide by zero.
 
@@ -2041,26 +2060,9 @@ class TestSqdPrefilter:
         genuine filter and cannot distinguish one from a no-op. Verified against a mutant that
         coerces ``cycles=0`` to ``1`` in ``sqd``: the energy form passed, this form fails.
         """
-        rng = np.random.default_rng(20260828)
-        num_qubits = 4
-        strings = real_pauli_strings(num_qubits, 6, rng)
-        coeffs = rng.normal(size=len(strings))
-        states = unique_states(12, num_qubits, rng)
-
-        from rqutils.paulis.symplectic import PauliSumXZ
-
-        hamiltonian = PauliSumXZ.from_paulisum((strings, list(coeffs)))
-        states_p = pack_padded(states)
-
-        def trace(**kwargs):
-            return str(
-                jax.make_jaxpr(lambda h, s: run_sqd(h, s, 16, False, (1, 0), maxiter=50, **kwargs))(
-                    hamiltonian, states_p
-                )
-            )
-
-        unfiltered = trace()
+        unfiltered = run_sqd_jaxpr(np.random.default_rng(20260828))
         for prefilter in [(1, 4), (16, 0), (0, 0)]:
-            assert trace(prefilter=prefilter) == unfiltered, (
+            got = run_sqd_jaxpr(np.random.default_rng(20260828), prefilter=prefilter)
+            assert got == unfiltered, (
                 f"prefilter={prefilter} is degenerate and must not add filter ops to the graph"
             )
