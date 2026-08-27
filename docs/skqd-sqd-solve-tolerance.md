@@ -37,6 +37,13 @@ re-derived per workload before adopting it.
 This is a caller-side decision in `spinchain`, and it must be made **per call site** — the full-basis
 path in `exact.py` needs machine epsilon and must not inherit a loosened default.
 
+**One open lead, in §8.** Chasing the randomized-block-Krylov literature turned up that
+`ground_locg`'s iteration count is highly *variable* on connected subspaces (118–372 across n=18..24)
+where ARPACK's matvec count is stable (141–201) — so ARPACK is 2.0–2.7× faster where `ground_locg`
+iterates a lot and 0.75× where it does not. That variance, not per-iteration cost, is the remaining
+lever on `sqd`. It is recorded in §8 with the three reasons it was not pursued (host-side, unshardable,
+CPU-only timings).
+
 ---
 
 ## 2. Why the solve is over-converged
@@ -361,6 +368,70 @@ Recorded so these are not mistaken for unexplored options. All measured on this 
   its 1.20× came *from* the bucketing. The padding waste is real and is not addressable by shape
   tuning — only by making `states_size` dynamic, which `CLAUDE.md` says it exists specifically to
   prevent. That is the trade by design, not an oversight.
+
+- **Randomized block Krylov / block Lanczos in place of block-1 LOBPCG** — the SOTA direction
+  (Tropp, *Randomized block Krylov methods for approximating extreme eigenvalues*, Numer. Math. 150
+  (2022) 217–255; small-block cluster robustness, arXiv:2507.10144). **Rejected, but see the ARPACK
+  note below, which is NOT rejected.**
+
+  *The literature's own precondition fails here.* Small blocks (2–3) help when the extreme eigenvalues
+  are **clustered**; the benefit "diminishes substantially" when they are well separated. Measured
+  relative gap `(λ₁−λ₀)/(λ_max−λ₀)` of the projected `H` on connected subspaces, n=14, dim=4000:
+
+  | case | relgap |
+  | --- | --- |
+  | connected, random field | 2.8e-02 |
+  | connected, no field (symmetric) | 2.7e-02 |
+  | connected, isotropic `Jz=1` | 2.7e-02 |
+
+  Well separated in every case, including the symmetric ones where near-degeneracy was expected.
+
+  *A naive implementation looks fast and is numerically invalid — do not be fooled by it.* An explicit
+  power basis `[V₀, AV₀, …, A^k V₀]` measured 1.83–3.23× against `ground_locg`, but the basis collapses
+  because each column is dominated by `λ_max` and successive columns become parallel:
+
+  | block | steps | columns | numerical rank | cond(K) | E error |
+  | --- | --- | --- | --- | --- | --- |
+  | 2 | 60 | 122 | **11** | 2.1e+72 | 3.0e-03 |
+  | 4 | 40 | 164 | 24 | 3.8e+51 | 1.8e-06 |
+  | 4 | 60 | 244 | **20** | 8.1e+73 | **5.6** |
+
+  QR of a rank-11 matrix padded to 122 columns leaves 111 columns of noise, and Rayleigh–Ritz over
+  that produced an energy off by **5.6** with no error raised. Those speedups measured nothing.
+
+  *Correct block Lanczos (three-term recurrence + full reorthogonalization) loses on cost.*
+  Reorthogonalizing against `k` accumulated vectors is `O(kN)` per step, so total cost is quadratic in
+  the step count — which is exactly the growing-basis Rayleigh–Ritz that `CLAUDE.md` says
+  `ground_locg`'s analytic `eigenpair_2x2`/`eigenpair_3x3` design exists to avoid, "to keep memory down
+  for huge vectors." At n=20, N=16384: 40 steps is 2.77× but only 3.0e-02 accurate; 120 steps is
+  **0.84×** and 200 steps **0.31×**. Memory for the basis alone is `k·N·8` bytes — at the n=28/dim=200k
+  scale (`N_pad = 262144`) a 200-vector basis is **~420 MB**, on top of the ~88 MB of cached
+  `xsources`/`diagonals`.
+
+  **Correction to the above, kept because it is the useful part.** A hand-rolled Lanczos plateauing at
+  3.2e-04 was *my implementation*, not the method. Production ARPACK (`scipy.sparse.linalg.eigsh` on a
+  `LinearOperator` wrapping `apply_h`) reaches **full accuracy** and is sometimes much faster:
+
+  | n | N_pad | `ground_locg` | its iters | ARPACK `ncv=40` | its matvecs | speedup | E err |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 18 | 8,192 | 114.9 ms | 288 | 53.4 ms | 141 | **2.15×** | 5.3e-15 |
+  | 20 | 16,384 | 262.0 ms | 372 | 96.3 ms | 161 | **2.72×** | 7.1e-15 |
+  | 22 | 32,768 | 569.2 ms | 367 | 290.0 ms | 201 | **1.96×** | 2.8e-14 |
+  | 24 | 65,536 | 345.2 ms | 118 | 457.4 ms | 141 | **0.75×** | 1.8e-14 |
+
+  So it is **not** a uniform win: it tracks how many iterations `ground_locg` needs. Where that is high
+  (288–372) ARPACK wins ~2–2.7×; where `ground_locg` converges quickly (118 iterations at n=24) ARPACK
+  loses. ARPACK's matvec count is far more stable (141–201) than `ground_locg`'s (118–372), which is
+  the actual finding: **`ground_locg`'s iteration count is highly variable on connected subspaces**,
+  and that variance — not the per-iteration cost — is the remaining lever.
+
+  Three reasons this was not pursued further, all worth checking before anyone does: ARPACK is host-side
+  and single-threaded, so every matvec crosses the JAX/NumPy boundary (`np.asarray` per call) and it
+  cannot shard — `ground_locg`'s sharding-transparency contract is a documented requirement, not a
+  nicety; `ncv=40` costs 2.6–21 MB here but scales to ~84 MB at dim=200k; and these are single-device
+  CPU timings, where `CLAUDE.md` warns that timings under virtual devices are meaningless and the GPU
+  path is the one that matters. A GPU comparison, and a mesh comparison, would both have to go the same
+  way before this displaced a sharding-transparent solver.
 
 Two claims were also **checked and confirmed correct**, so they need no work:
 
