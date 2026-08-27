@@ -219,18 +219,72 @@ Recorded so these are not mistaken for unexplored options. All measured on this 
   on every newly added state — so single-vector LOBPCG has no direction to escape with. This
   reintroduces the disconnected-component failure `CLAUDE.md` records `_spread_seed` as existing to
   prevent.
+
 - **Jacobi preconditioner on the raw indefinite projected `H`.** `ground_locg(precond=...)` shipped
   and measures 1.79× median on a *shifted* operator, and the diagonal is already computed for free at
   `cache_level[1]=2`. Applied to the unshifted operator it hits `maxiter=1000` at every size and lands
   12–14 Hartree off: the mixed-sign diagonal destroys the descent direction. Consistent with
   `docs/rqutils-precond-request.md` closing that line.
+
 - **Host-side `ints_to_matrix` in the recovery loop.** Rebuilt on the whole subspace every round, so
   it looked like a candidate. Measured **1.4–5.1%** of a solve (2.9 ms vs 201 ms at dim=20000; 42.6 ms
   vs 1262 ms at dim=200000, the shipped `max_dim`). Not worth touching.
+
 - **Fusing `ground_locg`'s per-iteration vector work.** The ~75%-of-iteration bookkeeping looked like
   a fusion opportunity, but the iteration body is already `@jax.jit` with a `lax.while_loop`
   (`ground_locg.py:396,653`), so XLA already fuses what it can. The residual scales linearly in `N`,
   confirming real arithmetic rather than dispatch overhead.
+
+- **Randomized warm start by shifted power iteration.** `k` matvecs of a random vector on `(sI - H)`
+  to hand LOBPCG a better initial direction: **0.41–0.48×**, i.e. 2× slower at every `k` tried (3, 6,
+  10). The diagnostic is the interesting part — the sketched start is *much* closer to the answer and
+  still needs 2.3× more iterations:
+
+  | start | Rayleigh (true −14.36) | residual | iterations |
+  | --- | --- | --- | --- |
+  | random | 0.020 | 5.14 | **77** |
+  | `_spread_seed` | 0.007 | 3.61 | 86 |
+  | shifted-power `k=10` | **−9.36** | **2.98** | **177** |
+  | diagonal-weighted random | −2.19 | 11.23 | 140 |
+
+  Block-size-1 LOBPCG spans only `{x, residual, previous direction}`, so convergence tracks how much
+  remaining error the *residual* can expose, not how close `x` is. Power iteration damps precisely the
+  subdominant components the residual needs. **A better start in the Rayleigh sense is a worse start in
+  the Krylov sense** — which is what `_spread_seed`'s "the point is coverage, not quality" means, and
+  the same mechanism that sinks eigenvector continuation above (a zero-padded eigenvector is the
+  extreme depleted-residual case). Note `_spread_seed` measures within noise of plain
+  `np.random.normal` (86 vs 77), so it is already near-optimal for this solver.
+
+- **Randomized `lambda_max` estimate to enable a valid Jacobi preconditioner.** The premise was that
+  `docs/rqutils-precond-request.md` closed the shift line for want of a *lower* bound on `H`, whereas a
+  positive-definite preconditioner only needs an *upper* bound — which `k` matvecs of power iteration
+  estimate cheaply. Measured **0.29–0.35×**: iterations went 77→258 at n=20. Energies correct
+  (≤1.2e-14), 3× slower. The shift makes `1/(s - diag)` positive everywhere, so the preconditioner is
+  *valid*; it simply is not *helpful* on this operator.
+
+- **A finer `states_size` bucket ladder than the power of two.** `uniquify_states` pads to the next
+  power of two, so **28–50% of every vector is filler** and all ~94 `O(N)` ops per iteration touch it.
+  A quarter-step ladder (next multiple of `2^(k-2)`) cuts waste to 15%. **Warm it measures 1.11× — and
+  that is the misleading number.** Cold, in a fresh process per arm so compilation counts (3 repeats,
+  n=20, 8 rounds, energies identical to 5.3e-15):
+
+  | scheme | shapes | waste | min | vs pow2 |
+  | --- | --- | --- | --- | --- |
+  | **pow2 (current)** | 2 | 28% | **2.038 s** | **1.00×** |
+  | half-step | 2 | 28% | 2.035 s | 1.00× |
+  | quarter-step | 4 | 15% | 2.489 s | **0.82×** |
+  | eighth-step | 6 | 8% | 3.426 s | 0.59× |
+  | tight (no padding) | 8 | 0% | 3.668 s | 0.56× |
+
+  Monotonic degradation in shape count: ~2 extra compiles at ~0.25–0.3 s each against a per-solve
+  saving of only ~10% (waste 28%→15% touches 13% of the vector work, itself ~75% of the solve).
+  Parity arrives at ~24 rounds and asymptotes to 1.04× at 64 — but at the shipped
+  `RecoveryOptions.rounds = 5` (6 solves) the ladder is **0.74×** and tight sizing **0.63×**.
+
+  So **C3's power-of-two default is correct**, for the reason `docs/rqutils-requests.md` already gives:
+  its 1.20× came *from* the bucketing. The padding waste is real and is not addressable by shape
+  tuning — only by making `states_size` dynamic, which `CLAUDE.md` says it exists specifically to
+  prevent. That is the trade by design, not an oversight.
 
 Two claims were also **checked and confirmed correct**, so they need no work:
 
