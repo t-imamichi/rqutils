@@ -31,22 +31,33 @@ def main():
     reference = float(np.linalg.eigvalsh(dense)[0])
     print(f"reference {reference!r}")
 
-    mesh = jax.make_mesh((4,), ("x",), axis_types=(AxisType.Explicit,))
-    with jax.sharding.set_mesh(mesh):
-        operator = jax.device_put(
-            jnp.asarray(dense), NamedSharding(mesh, PartitionSpec(None, None))
-        )
-        xinit = jax.device_put(
-            jnp.asarray(rng.normal(size=dim)), NamedSharding(mesh, PartitionSpec("x"))
-        )
+    start = rng.normal(size=dim)
+    # Sweep mesh size AND both specs. A single 4-device partitioned case would miss the
+    # replicated-input pairing, which is the shape of the `_spread_seed` ShardingTypeError in
+    # `rqutils.sqd`: a replicated predicate meeting a partitioned vector. Ragged splits are NOT
+    # swept because they are unreachable -- explicit sharding rejects `dim % mesh.size != 0` at
+    # `device_put`, before any of this code runs.
+    for num_devices in (1, 2, 4):
+        mesh = jax.make_mesh((num_devices,), ("x",), axis_types=(AxisType.Explicit,))
+        with jax.sharding.set_mesh(mesh):
+            operator = jax.device_put(
+                jnp.asarray(dense), NamedSharding(mesh, PartitionSpec(None, None))
+            )
+            for spec_label, spec in (("part", PartitionSpec("x")), ("repl", PartitionSpec(None))):
+                xinit = jax.device_put(jnp.asarray(start), NamedSharding(mesh, spec))
 
-        def matvec(vec):
-            return jnp.einsum("ij,j->i", operator, vec, out_sharding=PartitionSpec("x"))
+                # Both loop variables bound as defaults, per CLAUDE.md's B023 note: the fix is to
+                # bind, not to restructure the loop.
+                def matvec(vec, mat=operator, out_spec=spec):
+                    return jnp.einsum("ij,j->i", mat, vec, out_sharding=out_spec)
 
-        for label, prefilter in (("plain", None), ("prefiltered", (16, 4))):
-            result = ground_locg(matvec, xinit, prefilter=prefilter)
-            spec = jax.typeof(result[1]).sharding.spec
-            print(f"{label} {float(result[0])!r} {int(result[2])} {bool(result[3])!r} {spec}")
+                for kind, prefilter in (("plain", None), ("prefiltered", (16, 4))):
+                    result = ground_locg(matvec, xinit, prefilter=prefilter)
+                    out_spec = jax.typeof(result[1]).sharding.spec
+                    print(
+                        f"{num_devices}:{spec_label}:{kind} {float(result[0])!r} "
+                        f"{int(result[2])} {bool(result[3])!r} {out_spec}"
+                    )
 
 
 if __name__ == "__main__":

@@ -1040,6 +1040,12 @@ class TestChebyshevPrefilter:
         Asserted on the SPEC, not only the energy: per ``CLAUDE.md`` a replicated run agrees with
         single-device to exactly 0.0, so "correct but silently unsharded" is invisible to a value
         comparison. Subprocessed because the virtual device count must be set before jax initializes.
+
+        Sweeps 1/2/4 devices x partitioned/replicated, because a single partitioned case would miss the
+        replicated-input pairing -- the shape of the ``_spread_seed`` ``ShardingTypeError`` in
+        ``rqutils.sqd``, where a replicated predicate met a partitioned vector. Ragged splits are
+        deliberately absent: explicit sharding rejects ``dim % mesh.size != 0`` at ``device_put``, so
+        they are unreachable here (they are ``sqd``'s concern, where ``uniquify_states`` pads).
         """
         stdout = run_sharded_child("_sharded_prefilter.py", "ground_locg prefilter")
         rows = {}
@@ -1053,12 +1059,25 @@ class TestChebyshevPrefilter:
         # Assert the case set is complete before checking values: a child that died partway would
         # otherwise pass on whatever it managed to print.
         assert reference is not None
-        assert set(rows) == {"plain", "prefiltered"}, f"incomplete child output: {sorted(rows)}"
+        expected = {
+            f"{n}:{spec}:{kind}"
+            for n in (1, 2, 4)
+            for spec in ("part", "repl")
+            for kind in ("plain", "prefiltered")
+        }
+        assert set(rows) == expected, (
+            f"incomplete child output: {sorted(set(expected) - set(rows))}"
+        )
         for label, (energy, iters, converged, spec) in rows.items():
             assert converged == "True", f"{label} did not converge on the mesh"
             assert abs(energy - reference) < 1e-10, f"{label} gave {energy}, expected {reference}"
-            assert spec == "P('x',)", f"{label} lost its sharding: spec is {spec}"
-        assert rows["prefiltered"][1] < rows["plain"][1], (
-            "prefilter did not reduce iterations on the mesh "
-            f"({rows['plain'][1]} -> {rows['prefiltered'][1]})"
-        )
+            want = "P(None,)" if ":repl:" in label else "P('x',)"
+            assert spec == want, f"{label} sharding changed: {spec} (wanted {want})"
+        for n in (1, 2, 4):
+            for spec in ("part", "repl"):
+                plain = rows[f"{n}:{spec}:plain"][1]
+                filtered = rows[f"{n}:{spec}:prefiltered"][1]
+                assert filtered < plain, (
+                    f"prefilter did not reduce iterations at {n} devices/{spec} "
+                    f"({plain} -> {filtered})"
+                )
