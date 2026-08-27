@@ -1,8 +1,12 @@
-# Faster `ground_locg`: remaining candidates after the Chebyshev prefilter
+# Faster `ground_locg`: every candidate after the Chebyshev prefilter, all rejected
 
-**Status: investigation notes, nothing implemented.** Written 2026-08-28 on branch `locg-chebyshev`,
-after `docs/locg-chebyshev-prefilter.md` shipped. Records what a literature search turned up (little),
-what the session's measurements *constrain* (a lot), and the candidates worth trying next.
+**Status: search closed. Nothing implemented, and nothing left to implement.** Written 2026-08-28 on
+branch `locg-chebyshev`, after `docs/locg-chebyshev-prefilter.md` shipped. Records what a literature
+search turned up (little), what the session's measurements *constrain* (a lot), and the four candidates
+that were then built and measured — all of which lost to the shipped prefilter.
+
+Read §1 first: the four constraints are what make this space so narrow, and they explain every rejection
+below.
 
 **Two candidates have since been tested and rejected**, for opposite reasons:
 
@@ -20,9 +24,15 @@ worth ~5% for real plumbing. §5a records the one reusable finding: the filter's
 free stopping signal, and over-filtering is genuinely unstable (growth to 1e+23, a Rayleigh quotient
 excursion to +4.60) — just not in a way that matters, since `ground_locg` repairs it.
 
-That leaves **candidate B (§4) as the only untested option**, and it is a narrow one — it targets a
-plateau the shipped hybrid does not care about. The practical recommendation is to stop here: the
-prefilter's 1.11–3.07× is banked, and six ideas have now been measured and rejected against it.
+**§4, Jackson damping, has also been tested and rejected** — 0.96× median, slower than no filter at all
+in half the configurations, because damping trades away four to five orders of magnitude of the
+amplification that is the prefilter's entire mechanism. Its premise was also wrong: the prefilter applies
+a single `T_degree` and has no expansion coefficients to damp.
+
+**Every candidate in this document has now been measured and rejected.** The prefilter's 1.11–3.07× is
+banked and the search space around it is mapped empty. The recommendation is to stop: further work on
+`ground_locg` should wait for the GPU numbers (`examples/scaling/poc9_prefilter_gpu.py`), which could
+change the cost balance that decides several of these results.
 
 All the rejections carry one methodological warning, hit three times: **timing JAX code outside the jit
 boundary it normally lives inside measures the boundary, not the code.** A host-side Davidson read
@@ -201,19 +211,56 @@ bandwidth-bound streaming, **is not derivable from these numbers** — the same 
 
 ---
 
-## 4. Candidate B (now the leading untested one): Jackson damping on the prefilter's coefficients
+## 4. Candidate B: Jackson damping — **TESTED AND REJECTED**
 
-A per-coefficient multiplier on the Chebyshev expansion, standard in the kernel polynomial method,
-suppressing the Gibbs oscillation at the interval edge.
+The original claim: a per-coefficient multiplier on the Chebyshev expansion, standard in the kernel
+polynomial method, suppressing the Gibbs oscillation at the interval edge — "a few lines inside the
+existing recurrence."
 
-Why it is worth a try: the current filter's lower edge is the running Rayleigh quotient, which creeps
-toward `lambda_0` as it converges — so the edge is exactly where the filter is weakest, and Gibbs
-ringing there is the plausible mechanism behind the measured accuracy plateau at 1e-5 to 1e-7
-(`docs/locg-chebyshev-prefilter.md` §4). It is a few lines inside the existing recurrence.
+**First correction: the premise was wrong. The prefilter has no coefficients to damp.** It applies a
+*single* `T_degree`, taking only the last term of the three-term recurrence. Jackson damping is a
+multiplier `g_k` on an *expansion* `Σ_k c_k T_k`; with no expansion there is nothing to weight. Applying
+it properly means restructuring into a damped step-function expansion — a different filter, not a few
+lines.
 
-Note this only matters if someone wants filtering to converge *on its own*. For the shipped hybrid the
-plateau is irrelevant, since `ground_locg` delivers the last digits. So this is lower value than
-candidate A unless the prefilter is being pushed toward a standalone solver.
+Both the true expansion and a cheaper edge-shift variant were built and measured. **The Gibbs
+oscillation is real** — `|T_16|` inside the band reaches 1.0 at 16 points, so an eigenvalue just inside
+the lower edge is damped only to ~1 — but suppressing it makes things *worse*:
+
+| variant | median | min |
+| --- | --- | --- |
+| **shipped, single `T_16`** | **1.34×** | **1.29×** |
+| edge shift `β = 0.05` | 1.08× | 0.93× |
+| edge shift `β = 0.20` | 1.15× | 1.02× |
+| **Jackson-damped expansion** | **0.96×** | 0.89× |
+
+Jackson damping is slower than *no filter at all* in half the configurations. Energies stayed correct
+(≤5.3e-15), so this is purely a cost result.
+
+**Why, quantified.** Damping smooths the transition, and the amplification outside the band is what the
+prefilter exists for. Comparing the two filters at positions where the ground state sits (`x < -1` is
+outside the band):
+
+| `x` | single `T_16` | Jackson expansion | ratio |
+| --- | --- | --- | --- |
+| −1.50 | 2.44e+06 | 2.41e+02 | 1.0e-04 |
+| −1.20 | 1.06e+04 | 7.19e-01 | 6.8e-05 |
+| −1.05 | 7.71e+01 | 2.34e-03 | 3.0e-05 |
+
+Jackson gives up **four to five orders of magnitude of amplification** to buy a cleaner edge. That is
+the right trade in the kernel polynomial method, whose purpose is estimating a smooth spectral density
+where ringing is the error. It is the wrong trade here: **the ringing is harmless**, because components
+inside the band are already suppressed relative to the ground state's 1e2–1e5 growth, and the growth is
+the entire mechanism.
+
+The transferable point: KPM's Gibbs problem and a prefilter's separation problem pull in opposite
+directions. A technique being standard in one does not make it applicable to the other, and §4's original
+framing — that this was worth trying because the edge is "where the filter is weakest" — inverted the
+objective. The filter is *supposed* to be weak at the edge and strong beyond it.
+
+Note the original section already said this only mattered "if someone wants filtering to converge on its
+own," which the shipped hybrid does not. That caveat was the correct instinct; the measurement confirms
+it and adds the mechanism.
 
 ---
 
