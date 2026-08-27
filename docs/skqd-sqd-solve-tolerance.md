@@ -37,12 +37,11 @@ re-derived per workload before adopting it.
 This is a caller-side decision in `spinchain`, and it must be made **per call site** — the full-basis
 path in `exact.py` needs machine epsilon and must not inherit a loosened default.
 
-**One open lead, in §8.** Chasing the randomized-block-Krylov literature turned up that
-`ground_locg`'s iteration count is highly *variable* on connected subspaces (118–372 across n=18..24)
-where ARPACK's matvec count is stable (141–201) — so ARPACK is 2.0–2.7× faster where `ground_locg`
-iterates a lot and 0.75× where it does not. That variance, not per-iteration cost, is the remaining
-lever on `sqd`. It is recorded in §8 with the three reasons it was not pursued (host-side, unshardable,
-CPU-only timings).
+**On `ground_locg`'s iteration count**, which varies 118–372 on connected subspaces: it is driven by
+the problem's spectral gap (anticorrelation −0.92 over 27 cases), not by solver slack, and every long
+solve converges correctly. It is **not** an available lever; §8 records the ARPACK comparison that
+raised the question and the retraction of the rate law that first appeared to explain it. §4.5 records
+the one genuinely new finding from that investigation: `tol` buys a *relative*, not absolute, accuracy.
 
 ---
 
@@ -220,6 +219,47 @@ So the hazard §4 identifies is real and *worse* than first measured, while the 
 not established. Anyone adopting the speedup must either re-derive the coupling on their own
 subspaces, or treat a changed protected set as acceptable and justify that separately — the carry-over
 set feeds `max_dim` truncation, so it is not obviously benign.
+
+### 4.5 The convergence criterion scales with `|θ|`, so "tol" is not an absolute accuracy
+
+`ground_locg`'s stopping test (`rqutils/ground_locg.py:576-583`) is
+
+```
+reltol   = (‖Ax‖ + |θ|) · N · 10        # N is xcurr.shape[0], the PADDED dimension
+converged = ‖r‖ < tol · reltol   OR   p_is_zero
+```
+
+The `N · 10` factor is a deliberate allowance for rounding accumulated while forming the residual, and
+`|θ|` rather than `+θ` so the sum cannot cancel for a negative-definite ground-state search — both
+documented in place. The consequence is not documented anywhere, and it matters for anyone tuning
+`tol`:
+
+**The achieved absolute residual is proportional to the operator's ground energy.** Verified by shifting
+a real projected `H` by `cI`, which leaves every eigenvector identical and moves `θ` by `c`
+(n=18, `N_pad`=8192, default `tol`):
+
+| shift `c` | θ | iters | true ‖r‖ | ‖r‖/\|θ\| |
+| --- | --- | --- | --- | --- |
+| 0 | −10.766 | 288 | 3.7e-10 | 3.5e-11 |
+| 10 | −0.766 | 319 | 2.5e-11 | 3.2e-11 |
+| 100 | 89.234 | 262 | 3.0e-09 | 3.3e-11 |
+| 1000 | 989.234 | 230 | 3.5e-08 | 3.5e-11 |
+
+The absolute residual moves over **100×** while the ratio to `|θ|` is constant at 3.2–3.5e-11. So `tol`
+buys a *relative* accuracy, and two runs at the same `tol` on operators of different scale converge to
+absolute residuals differing by orders of magnitude.
+
+Three implications:
+
+- **A larger chain converges to a looser absolute residual at the same `tol`**, since `|θ|` grows roughly
+  with the number of sites. The `tau` coupling in §4.3/§4.4 is stated in terms of `|eigvec|` magnitudes,
+  which inherit this scaling — so a `tau` calibrated at one chain length does not transfer to another
+  even with `tol` held fixed.
+- **`N` is the padded dimension**, so the threshold also loosens by the padding factor (2–8% here,
+  up to 50% at an unlucky power-of-two boundary — see the bucket-ladder entry in §8). Harmless, but it
+  means the effective `tol` depends on `states_size` bucketing.
+- **Shifting the operator changes the iteration count too** (288 → 230 here), independently of the
+  eigenvectors. That is a confound for any A/B that shifts `H`, including preconditioner experiments.
 
 ---
 
@@ -421,9 +461,14 @@ Recorded so these are not mistaken for unexplored options. All measured on this 
 
   So it is **not** a uniform win: it tracks how many iterations `ground_locg` needs. Where that is high
   (288–372) ARPACK wins ~2–2.7×; where `ground_locg` converges quickly (118 iterations at n=24) ARPACK
-  loses. ARPACK's matvec count is far more stable (141–201) than `ground_locg`'s (118–372), which is
-  the actual finding: **`ground_locg`'s iteration count is highly variable on connected subspaces**,
-  and that variance — not the per-iteration cost — is the remaining lever.
+  loses. ARPACK's matvec count is far more stable (141–201) than `ground_locg`'s (118–372).
+
+  **Followed up, and it is not a lever — see the retraction below.** The 118–372 spread is the
+  *problem's spectral gap*, not solver slack: all three long solves converge correctly (energies match
+  ARPACK to 1e-14, true relative residuals 6.5e-10 to 2.6e-9, `converged=True`), and iteration count
+  anticorrelates with the relative gap at −0.92 across 27 XXZ cases. There is no inefficiency to
+  recover, so the levers remain the two already documented — the criterion (§3, §4) and the gap
+  (preconditioning, closed in `docs/rqutils-precond-request.md`).
 
   Three reasons this was not pursued further, all worth checking before anyone does: ARPACK is host-side
   and single-threaded, so every matvec crosses the JAX/NumPy boundary (`np.asarray` per call) and it
@@ -432,6 +477,36 @@ Recorded so these are not mistaken for unexplored options. All measured on this 
   CPU timings, where `CLAUDE.md` warns that timings under virtual devices are meaningless and the GPU
   path is the one that matters. A GPU comparison, and a mesh comparison, would both have to go the same
   way before this displaced a sharding-transparent solver.
+
+Two claims measured during this session are **retracted**, recorded so the numbers are not reused:
+
+- **RETRACTED: `iters ≈ 12.8 · relgap^(−0.473)`, "matching LOBPCG theory's −0.5 with 6% median error."**
+  The anticorrelation between iteration count and relative gap is real (−0.92 over 27 XXZ cases: 3
+  sizes × 3 seeds × 3 anisotropies), but **the exponent is not established** and that fit should not be
+  used to predict anything. Refits on the same data:
+
+  | fit | exponent |
+  | --- | --- |
+  | 27 XXZ cases including the n=22 wide-gap point | −0.254 |
+  | 27 XXZ cases excluding it | −0.824 |
+  | independent synthetic sweep (symmetric operator, correct energies) | −0.146 |
+
+  The cause is insufficient dynamic range: the 27 XXZ cases span only **3×** in relgap, so a single
+  wide-range point carries the whole slope and swings it between −0.25 and −0.82. The synthetic sweep
+  spans 63× but its relgap saturates (shrinking the gap also shrinks `λ_max − λ₀`), so its x-axis is
+  compressed too. A proper test needs relgap varied over several decades with the rest held fixed.
+
+  Worse for a strong law, the one wide-range data point **contradicts** it: at n=22 the relative gap is
+  4.0e-05 against n=20's 5.0e-03 — **250× smaller** — and the iteration count is unchanged (367 vs
+  372). Whatever the dependence is, it is much weaker than `relgap^(−1/2)` in that range.
+
+- **RETRACTED: that the synthetic control operator was non-symmetric.** Mid-investigation the synthetic
+  sweep's disagreement was attributed to a non-Hermitian `mv`. It was symmetric — measured
+  `‖M − Mᵀ‖_max` **exactly 0.0** for both spellings tried — and the corrected sweep returns energies
+  accurate to ≤3.6e-15 against ARPACK. The disagreement is the dynamic-range problem above, not a
+  broken operator. (The suspicion arose because `θ` converged *below* the intended `λ₀`; the real reason
+  is that the off-diagonal coupling shifts the true spectrum away from the diagonal values used to
+  construct it, so the intended `λ₀` was never the operator's `λ₀`.)
 
 Two claims were also **checked and confirmed correct**, so they need no work:
 
