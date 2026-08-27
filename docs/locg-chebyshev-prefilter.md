@@ -9,7 +9,9 @@
 **Status.** **Implemented** on branch `locg-chebyshev` as `ground_locg(prefilter=(degree, cycles))`,
 default `None`. 12 tests in `tests/test_ground_locg.py::TestChebyshevPrefilter` plus
 `tests/_sharded_prefilter.py`; suite 549 → 560. In-tree measurement reproduces the prototype: 18/18
-configurations faster, median **1.36×**, range 1.11–3.07×, no regressions. Sharding verified on a
+configurations faster, median **1.36×**, range 1.11–3.07×, no regressions — at `(16, 4)`, which the
+`(degree, cycles)` sweep in §3.1 has since superseded: **use `(32, 2)`**, measured 1.88× median over 27
+configurations at fewer matvecs. Sharding verified on a
 4-device mesh (202 → 51 iterations, spec `P('x',)` preserved, energies agreeing to 1e-13).
 
 Sharding coverage is 1/2/4 devices x partitioned/replicated (12 cases), asserting the output *spec*.
@@ -49,7 +51,9 @@ ground_locg(A, x)                            # unchanged
 ```
 
 `hi` is an upper bound on `λ_max` from 10 steps of randomized power iteration (×1.05 margin).
-`deg = 16`, 4 cycles → **72 matvecs** of prefilter.
+`degree = 32`, 2 cycles → **77 matvecs** of prefilter (`cycles · (degree + 1)` plus ~11 for the
+`lambda_max` estimate). See §3.1 for why this beats the originally-shipped `(16, 4)` and how the two
+knobs differ.
 
 **No prior spectral knowledge is required.** The filter's lower edge is the *current Rayleigh
 quotient*, updated each cycle — this is what production ChFSI does. Using the exact `λ₁` instead is
@@ -78,7 +82,8 @@ This is the one non-obvious fact that makes the approach work, and it is why the
 
 ## 3. Measurement
 
-`deg = 16`, 4 prefilter cycles, `hi` from randomized power iteration. XXZ chains grown to connected
+`degree = 16`, 4 prefilter cycles (the original setting; §3.1 sweeps the surface and recommends
+`(32, 2)`), `hi` from randomized power iteration. XXZ chains grown to connected
 subspaces by one-hop expansion (**not** `rng.choice` — see the tolerance doc §4.4 for why that regime
 is wrong). 3 seeds × 3 anisotropies × 2 sizes:
 
@@ -104,6 +109,49 @@ is wrong). 3 seeds × 3 anisotropies × 2 sizes:
 | 20 | 2 | 1.5 | 91.5 ms | 119 | 46.5 ms | 47 | 1.97× |
 
 **min 1.11×, median 1.38×, max 3.87×, and 0 of 18 cases lose.**
+
+### 3.1 Tuning `(degree, cycles)` — `(16, 4)` is not the best setting
+
+`(16, 4)` was chosen early, before the surface was swept, and it is suboptimal. Across **27**
+configurations (3 sizes n=18/20/22 × 3 seeds × 3 anisotropies; every arm converged, every energy correct
+to <1e-9):
+
+| setting | median | min | max | losses | filter matvecs |
+| --- | --- | --- | --- | --- | --- |
+| `(16, 4)` — originally shipped | 1.41× | 1.08× | 3.25× | 0 | 79 |
+| **`(32, 2)` — recommended** | **1.88×** | **1.25×** | 3.95× | 0 | **77** |
+| `(48, 2)` | 1.79× | 1.14× | 4.17× | 0 | 109 |
+
+`(32, 2)` dominates `(16, 4)` on every axis: higher median, higher floor, and one fewer matvec. Paired
+per-configuration, it is 1.27× median faster and slower in only **2 of 27** cases (worst 0.91×).
+
+**The two knobs are not interchangeable.**
+
+- `degree` sets how sharply **one** cycle separates. Amplification outside the damped band grows like
+  `cosh(degree · arccosh|x|)` — roughly exponential — while costing only `degree` matvecs. High leverage.
+- `cycles` sets how many times the interval re-tightens around the descending Rayleigh quotient. Cycle 1
+  does most of the work (growth factor 1e8–1e12, §5a of `docs/locg-next-candidates.md`), cycle 2 refines
+  once, and past that `θ` is already near `λ₀` so further cycles pay full cost for little separation.
+
+So **raise `degree`, keep `cycles = 2`** — which inverts the intuition behind the original `(16, 4)`.
+
+A narrower sweep (6 configurations) mapped the saturation point: `(64, 2)` reached 2.29× median,
+`(96, 2)` 1.95×, and `(128, 2)` fell to 1.68× with a 1.01× floor. So the useful range is
+**`degree` 32–64**, declining past ~96. Longer solves favour the higher end — the 249- and
+573-iteration cases measured 3.6–5.1× at `degree` 48–96.
+
+Practical recipe:
+
+1. Start at **`(32, 2)`**.
+2. If `ground_locg` runs 200+ iterations unfiltered, try `(48, 2)` or `(64, 2)`.
+3. Do not exceed `degree ≈ 64` or `cycles ≈ 4`.
+4. On the first run of a new problem class, assert the energy against a reference and check `converged`.
+   The filter cannot change the answer — every convergence test reads the true residual — but that is
+   the assertion worth making once.
+
+**Caveat.** All of this is single-device CPU. The ordering could shift on a GPU, where the
+matvec-to-bookkeeping cost ratio differs; `examples/scaling/poc9_prefilter_gpu.py` sweeps this grid for
+exactly that reason.
 
 Correctness, every case: energy agrees with `scipy.sparse.linalg.eigsh(tol=0)` to **1.8e-15–2.8e-14**,
 eigenvector overlap with the unfiltered `ground_locg` result is **1.0000000**, and `converged` is

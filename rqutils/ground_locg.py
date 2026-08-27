@@ -421,11 +421,33 @@ def ground_locg(
             elementwise. **It cannot change the answer, only the path**: every convergence test still
             reads the true residual, and the returned eigenpair is the same one to the tolerance the
             solver was going to reach anyway (measured: eigenvector overlap 1.0000000 against the
-            unfiltered result, energies agreeing with ``eigsh(tol=0)`` to 2.8e-14 across 18
-            configurations). ``(16, 4)`` measured a 1.11-3.87x wall-clock reduction, median 1.38x,
-            with no configuration slower; see ``docs/locg-chebyshev-prefilter.md`` for the
-            measurements, why the filter's lower edge must be the running Rayleigh quotient rather
-            than an accurate :math:`\lambda_1`, and why filtering alone does not converge.
+            unfiltered result, energies agreeing with ``eigsh(tol=0)`` to 2.8e-14).
+
+            **Start with ``(32, 2)``.** Across 27 connected-subspace configurations (3 sizes x 3
+            seeds x 3 anisotropies, every arm converged and correct to <1e-9) it measured a median
+            **1.88x** wall-clock reduction, range 1.25-3.95x, at *fewer* matvecs than the
+            alternatives below. The two knobs are not interchangeable:
+
+            - ``degree`` sets how sharply **one** cycle separates. Amplification outside the damped
+              band grows like :math:`\cosh(\mathrm{degree} \cdot \mathrm{arccosh}|x|)`, i.e.
+              roughly exponentially, while costing only ``degree`` matrix-vector products. This is
+              the high-leverage knob.
+            - ``cycles`` sets how many times the interval re-tightens around the descending Rayleigh
+              quotient. Cycle 1 does most of the work (measured growth factor 1e8-1e12), cycle 2
+              refines once, and past that :math:`\theta` is already near :math:`\lambda_0` so
+              further cycles pay full cost for little separation.
+
+            So **raise ``degree``, keep ``cycles`` at 2**. Measured medians: ``(16, 4)`` 1.41x,
+            ``(32, 2)`` **1.88x**, ``(48, 2)`` 1.79x; on a narrower sweep ``(64, 2)`` reached 2.29x
+            and ``(128, 2)`` fell to 1.68x with a 1.01x floor, so the useful range is
+            ``degree`` 32-64 and performance declines past ~96. Longer solves favour the higher end:
+            the 249- and 573-iteration cases measured 3.6-5.1x at ``degree`` 48-96.
+
+            All figures are single-device CPU; the ordering may differ on a GPU, where the
+            matvec-to-bookkeeping cost ratio differs -- ``examples/scaling/poc9_prefilter_gpu.py``
+            sweeps this grid to settle it. See ``docs/locg-chebyshev-prefilter.md`` for the tables,
+            why the filter's lower edge must be the running Rayleigh quotient rather than an
+            accurate :math:`\lambda_1`, and why filtering alone does not converge.
         debug: If True, additionally return per-iteration diagnostics. Note that the diagnostic
             path uses ``jax.lax.scan`` to collect fixed-size output, and therefore always runs the
             full ``maxiter`` iterations with no early exit; rows past convergence are
