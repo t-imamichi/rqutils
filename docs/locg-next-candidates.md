@@ -4,11 +4,22 @@
 after `docs/locg-chebyshev-prefilter.md` shipped. Records what a literature search turned up (little),
 what the session's measurements *constrain* (a lot), and the candidates worth trying next.
 
-**Candidate A has since been tested and rejected** (§3) — 4–20× slower *and* returning wrong energies.
-Its reasoning was sound and its prediction wrong, so §3 keeps both and names the mechanism: filtering
-the residual destroys the search direction's alignment with the gradient, which is the
-depleted-residual failure this repo has now hit three times in different guises. Candidate B (§4) is the
-leading untested option.
+**Two candidates have since been tested and rejected**, for opposite reasons:
+
+- **§3, filtered residual via `precond`** — 4–20× slower *and* wrong energies. The reasoning was sound
+  and the prediction wrong, so §3 keeps both and names the mechanism: filtering the residual destroys
+  the search direction's alignment with the gradient. That is the depleted-residual failure this repo
+  has now hit three times in different guises.
+- **§3b, Davidson** — *correct* (1e-11 or better) and 1.05–2.62× over baseline, but the shipped
+  Chebyshev prefilter beats it in 3 of 4 cases while needing no basis and no tuning knob. Rejected on
+  cost, not correctness.
+
+Candidate B (§4) is the leading untested option, and it is a narrow one — it targets a plateau the
+shipped hybrid does not care about.
+
+Both rejections carry a methodological warning worth reading before testing anything else: a host-side
+prototype of a device-resident algorithm measures the JAX boundary (2.0× per matvec here), not the
+algorithm. §3b nearly recorded 0.39–0.86× as Davidson's verdict for that reason.
 
 ---
 
@@ -116,6 +127,69 @@ failure mode is worth recognizing rather than re-deriving:
 >   remove more than roughly `d/4` of the iterations to break even.
 
 The cost objection turned out to be irrelevant — the method fails on correctness before cost matters.
+
+---
+
+## 3b. Davidson — **TESTED AND REJECTED**, but on cost grounds, not correctness
+
+Restarted Davidson: expand the subspace with the correction `t = -(diag(A) - θI)^{-1} r`, Rayleigh–Ritz
+over the accumulated basis, restart from the Ritz vector at a fixed basis size.
+
+**It works, which distinguishes it from every other preconditioner tried here.** Energies correct to
+1e-11 or better in all cases. The reason is the shift: Davidson uses `(diag(A) - θI)^{-1}` with `θ` the
+*current* eigenvalue estimate, which is free, where the rejected Jacobi arm used `diag(A)^{-1}`, whose
+mixed signs on an indefinite operator destroy descent (0.29–0.35×). `docs/rqutils-precond-request.md`
+closed the *lower-bound* shift; this one needs no bound at all.
+
+**But it does not beat the shipped prefilter.** Best setting `m=16`, 6 sweeps (connected XXZ):
+
+| n | seed | `ground_locg` | prefilter (16,4) | Davidson m=16 |
+| --- | --- | --- | --- | --- |
+| 18 | 0 | 63.2 ms / 140 mv | **45.9 ms** / 77 mv | 42.5 ms / 96 mv — 1.49× |
+| 18 | 1 | 52.6 ms / 112 mv | **38.7 ms** / 63 mv | 42.2 ms / 96 mv — 1.25× |
+| 20 | 0 | 79.0 ms / 94 mv | **53.3 ms** / 49 mv | 75.1 ms / 96 mv — 1.05× |
+| 20 | 1 | 201.6 ms / 249 mv | 70.9 ms / 67 mv | **76.9 ms** / 96 mv — 2.62× |
+
+Davidson is 1.05–2.62× over baseline, and the prefilter beats it in **3 of 4** cases — while already
+being implemented, tested, and sharding-verified.
+
+Three reasons not to pursue it:
+
+- **The basis size is an unprincipled tuning knob.** `m=16` wins; `m=24` and `m=32` measured
+  0.46–1.54×, frequently *slower than baseline*. Choosing `m` requires knowing the spectrum, which is
+  what is being computed.
+- **It abandons the single-vector design on purpose.** `CLAUDE.md` states `ground_locg` is a
+  block-size-1 specialization with analytic `eigenpair_2x2`/`eigenpair_3x3` "to keep memory down for
+  huge vectors." Davidson holds `V` and `AV`: `2·m·N·8` bytes, so 67 MB at `m=16`, dim=200k, on top of
+  the ~88 MB of cached `xsources`/`diagonals`. Not fatal, but it is exactly the trade that design
+  refused.
+- **The gain is not additive with the prefilter.** Both attack the same quantity — how good the iterate
+  is when Rayleigh–Ritz runs — so they compete rather than compose. The prefilter is the cheaper of the
+  two and needs no basis.
+
+**Two corrections to my own analysis, recorded because both were nearly written up as findings.**
+
+*A host-side implementation measured 0.39–0.86× and almost became the verdict.* Every matvec crossed
+the JAX/NumPy boundary at a measured **2.0×** overhead (0.557 ms device-resident vs 1.111 ms via
+`np.asarray`), and the Rayleigh–Ritz and orthogonalization ran as un-jitted NumPy on `N`-vectors.
+Jitting it moved the result to 1.05–2.62×. This is the same artifact that made the ARPACK comparison in
+`docs/skqd-sqd-solve-tolerance.md` §8 look mixed: **a host-side prototype of a device-resident algorithm
+measures the boundary, not the algorithm.** Re-test only with a jitted, fixed-shape version.
+
+*A claim that Davidson "should fare relatively worse on GPU" was wrong and is withdrawn.* It rested on
+Davidson using more matvecs than the prefilter. Measured, it uses **fewer** — 96 against the
+prefilter's 146 (67 iterations + 79 filter matvecs) — with the same implied `O(N)` work per matvec:
+
+| method | matvecs | wall | ms/matvec | implied `O(N)` ops per matvec |
+| --- | --- | --- | --- | --- |
+| `ground_locg` | 249 | 201.7 ms | 0.810 | ~31 dot-equivalents |
+| prefilter (16,4) | 146 | 81.3 ms | 0.557 | ~18 |
+| Davidson m=16 | 96 | 76.9 ms | 0.801 | ~31 |
+
+The prefilter's advantage is that it is `O(N)`-*light* per matvec, not matvec-light. Whether that
+survives a GPU, where the matvec is a gather-heavy irregular kernel and the `O(N)` work is
+bandwidth-bound streaming, **is not derivable from these numbers** — the same caveat
+`examples/scaling/poc9_prefilter_gpu.py` carries.
 
 ---
 
