@@ -20,6 +20,11 @@ branches from `origin/main`, 144 commits behind `dev` and predating the `dev` ex
 `--extra dev --extra qiskit --extra mpl --extra qutip` or 23 tests **silently skip**, including
 the qiskit reference comparisons this file calls the trustworthy oracle.
 
+**No network access for git in this environment** — `git fetch` fails (`ssh: connect to host
+github.com port 22: Operation not permitted`). `origin/*` refs are whatever the last successful fetch
+left, so `rev-list --left-right --count` can report `0 0` for commits that were never pushed. Merges
+against `origin/dev` use the cached ref; re-fetch from a networked shell before trusting either.
+
 **Check `git rev-list --left-right --count origin/<branch>...HEAD` before amending.** Work happens on
 feature branches (`metal`, not `main`) that get pushed mid-session, so "my commits are still local"
 goes stale within a turn — amend then and you rewrite published history. `git branch -r --contains
@@ -133,6 +138,15 @@ Rules, each of which cost a defect to learn — **evidence in `NOTES.md`**:
   repo does not work, since the venv holds an editable install pointing at the original. `NOTES.md`
   has the mutation-testing recipe; mutate `@jax.jit` code in a **fresh subprocess** or both arms reuse
   one compiled kernel.
+- **Aim a mutant at the layer and branch the test actually exercises.** Two survived this way in one
+  session: a coercion added to `sqd` while the test traced `run_sqd` directly, and a mutation of
+  `vinit_nodiag` when the fixture takes `vinit_from_min_diag`. Both read as missing coverage and were
+  not. Check which branch your fixture reaches *before* concluding anything.
+- **To prove an option is a no-op, compare traced graphs, not energies.** On a well-conditioned
+  fixture a *working* `prefilter=(16, 1)` returns a bit-identical energy to no prefilter at all (only
+  `(32, 2)` moved the last ulp), so "same energy as baseline" is satisfied by both arms and pins
+  nothing. `jax.make_jaxpr` string equality separates them; it caught a `cycles=0`→`1` coercion the
+  energy form missed.
 - **A green suite after reverting a fix means the test is missing, not that the guard is dead.** Some
   guards are only reachable when other defects compound with them. Look for a *more direct* assertion
   (the invariant, off `debug=True` diagnostics) before recording a negative result.
@@ -198,6 +212,11 @@ entry point; `hproj(...)` is the dense/debug path. Two conventions dominate:
   `cache_level` bound via `functools.partial` — it **must** stay static there, since `ground_locg`
   splats `args` positionally and `static_argnames` would never see it.
   `states_size` exists solely to pin array shapes and prevent JIT recompilation.
+
+`sqd` forwards `ground_locg`'s `prefilter` (static, via `run_sqd`'s `static_argnames`) but **not its
+`precond`** — preconditioning `sqd` is a closed investigation (see below). The prefilter's published
+1.88x is `ground_locg`-on-dense-operators; **it is unmeasured through `apply_h`**, so treat it as
+off-by-default plumbing, not a recommended setting.
 
 **`states` must be lex-sorted** — `get_xsource` is a binary search, not a sort. Always required (the
 sort was equally wrong on unsorted input) but previously undocumented; `hproj(unique_states=True)`
