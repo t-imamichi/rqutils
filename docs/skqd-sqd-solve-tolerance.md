@@ -7,6 +7,17 @@ for **no `rqutils` change** — `sqd(tol=...)` already exposes everything needed
 **Date.** 2026-08-27. All figures measured on CPU, float64 (`jax_enable_x64`), against
 `rqutils` on branch `basis_opt`.
 
+> ## ⚠️ Read §4.4 before acting on the `tau` rule
+>
+> Sections 3 and 4 were first measured on subspaces drawn as `rng.choice(2**n, size=dim)`. Under a
+> local Hamiltonian such a subspace is nearly **disconnected**: measured `xsources` density 3.6–6.1%,
+> against **32–44%** for a subspace grown by one-hop expansion, which is what
+> `recovery._expand_once` actually produces.
+>
+> The speedup survives and improves (§4.4). **The `tau ≈ 1e5 · tol` rule does not** — on a connected
+> subspace it leaves a symmetric difference of 1258–2579 states out of ~6800. Treat §4.3's rule as
+> disconfirmed for real subspaces and §4.4 as the operative guidance.
+
 ---
 
 ## 1. Summary
@@ -15,10 +26,13 @@ for **no `rqutils` change** — `sqd(tol=...)` already exposes everything needed
 (~2.2e-16). `spinchain` never overrides it: neither `skqd/sqd_backend.py` nor `exact.py` passes `tol`,
 so every SKQD solve converges ~10 orders tighter than the surrounding algorithm needs.
 
-Loosening it is worth **1.4–1.9×** on the solve. But it is **not** a free win, because the eigenvector's
-small components are what `recovery._carry_over(tau=...)` thresholds, and their noise floor scales
-linearly with `tol`. Adopting the speedup requires moving `tau` with it. The measured rule is
-`tau ≈ 1e5 * tol`.
+Loosening it is worth **1.4–1.9×** on the solve, and **~1.5×** on the connected subspaces a real run
+produces (§4.4). But it is **not** a free win: the eigenvector's small components are what
+`recovery._carry_over(tau=...)` thresholds, and their noise floor scales linearly with `tol`, so
+loosening it perturbs which states recovery protects. On random subspaces `tau ≈ 1e5 · tol` restores
+the reference protected set exactly; **on connected subspaces no multiplier was found that does**, and
+20–38% of a ~6800-state protected set churns (§4.4). The speedup is real; the coupling must be
+re-derived per workload before adopting it.
 
 This is a caller-side decision in `spinchain`, and it must be made **per call site** — the full-basis
 path in `exact.py` needs machine epsilon and must not inherit a loosened default.
@@ -48,6 +62,7 @@ subspace the basis error is 12 Hartree; the difference between an eps solve and 
 ## 3. Measured speedup
 
 Six-round sequence, n=20, dims 2000→2282, `cache_level=(1,2)` (`DiagCache.SPEED`, the default).
+**Random-sample subspaces** — see the banner above and §4.4 for connected-subspace figures.
 
 **The subspace sequence is held fixed across arms** — precomputed once from the reference run — so
 only the tolerance varies. This matters: an earlier uncontrolled version of this experiment let each
@@ -82,6 +97,8 @@ each failed silently — so it is not a target.
 
 ## 4. The blocker: `tol` moves the protected set
 
+### 4.1 The mechanism
+
 `recovery._carry_over(bitstring_matrix, eigvec, tau=options.tau)` keeps states whose `|eigvec|`
 exceeds `tau = 1e-8`. Those surviving states are protected from truncation when `max_dim` is hit.
 
@@ -104,7 +121,7 @@ and the residual noise floor rises above the threshold, so states cross it spuri
 repo repeatedly documents — right number, wrong internals — and it is why the naive version of this
 change is unsafe rather than merely approximate.
 
-### The noise floor is linear in `tol`
+### 4.2 The noise floor is linear in `tol` (random subspaces)
 
 Measured across six orders of magnitude, n=20, dim=2000:
 
@@ -121,7 +138,7 @@ Measured across six orders of magnitude, n=20, dim=2000:
 `sqrt(tol)` — a `sqrt(tol)` rule over-suppresses (it keeps 1–19 states where the reference keeps 1,
 discarding genuinely protected ones at tight `tol`).
 
-### The pairing that preserves the protected set exactly
+### 4.3 The pairing that preserves the protected set (random subspaces)
 
 Reference: `tol=eps`, `tau=1e-8` → 1 protected state. Symmetric difference against that set:
 
@@ -137,13 +154,65 @@ Reference: `tol=eps`, `tau=1e-8` → 1 protected state. Symmetric difference aga
 | 1e-10 | 1e-06 | 24 | 23 | no |
 | **1e-10** | **1e-05** | **1** | **0** | **yes** |
 
-**Rule: `tau ≈ 1e5 · tol`.** It reproduces the reference protected set exactly at both tested
-tolerances. Note the current shipped pairing (`tau=1e-8`, `tol=eps`) has a margin of ~1e8 — far above
+**Rule (random subspaces only — see §4.4): `tau ≈ 1e5 · tol`.** It reproduces the reference
+protected set exactly at both tested tolerances *on this subspace type*. Note the current shipped pairing (`tau=1e-8`, `tol=eps`) has a margin of ~1e8 — far above
 the rule, which is why it is safe today and why nobody had to think about the coupling.
 
-`1e5` is ~400× the measured median floor and ~100× p90, i.e. deliberately conservative. It was
-validated at two `tol` values on one Hamiltonian and one subspace; treat it as a starting point to
-re-validate on real SKQD subspaces, not a derived constant.
+`1e5` is ~400× the median floor *for this subspace type*. That margin does not survive on a
+connected subspace, where the floor constant is 20–40× larger — see §4.4.
+
+### 4.4 On realistic (connected) subspaces the speedup improves and the `tau` rule fails
+
+Everything above used `rng.choice(2**n, size=dim)`. That is the wrong subspace shape. Under a local
+Hamiltonian a uniformly-random set of bitstrings is nearly disconnected — most states have no
+Hamiltonian partner inside the subspace — whereas a real SKQD subspace comes from sampling a physical
+state and is then grown by `recovery._expand_once`. Measured `xsources` density (fraction of entries
+that are not the `-1` absent marker):
+
+| subspace | density |
+| --- | --- |
+| `rng.choice` (used in §3, §4.1–4.3) | 3.6–6.1% |
+| one-hop expansion from a seed | **32–44%** |
+
+A connected subspace of the same dimension also solves ~3× slower (278 ms vs 91 ms at n=20,
+dim=20000), so it is the more demanding regime as well as the more realistic one.
+
+**The speedup holds and improves.** Same fixed-sequence method as §3, six connected subspaces
+grown to dims 3000→22000, n=20:
+
+| solve `tol` | total | speedup | max \|dE\| vs eps |
+| --- | --- | --- | --- |
+| `None` (eps) | 0.863 s | 1.00× | 0.0 |
+| `1e-12` | 0.580 s | **1.49×** | 2.0e-11 |
+| `1e-11` | 0.581 s | **1.49×** | 1.4e-09 |
+| `1e-10` | 0.689 s | 1.25× | 2.2e-07 |
+| `1e-09` | 0.534 s | 1.62× | **1.8e-05** |
+
+Two things to read off. Timing is **non-monotonic** (`1e-10` slower than `1e-11`) — iteration counts
+are not a smooth function of tolerance, so pick a value by measurement, not by interpolation. And the
+energy errors are **~100× larger** than the random-subspace table at the same `tol`: at `1e-9` the
+error is 1.8e-05, which **breaches `RecoveryOptions.tol = 1e-6`**. On realistic subspaces `1e-12` to
+`1e-11` is the usable band, not `1e-9`.
+
+**The `tau` rule fails.** The reference protected set is no longer 1 state but **6779** — a physical
+subspace genuinely spreads amplitude over thousands of states, which is the point of SKQD. And the
+noise-floor constant is 20–40× larger:
+
+| `tol` | median \|v\| | median/`tol` | `tau = 1e5·tol` | protected | symdiff vs reference |
+| --- | --- | --- | --- | --- | --- |
+| `1e-12` | 8.5e-09 | 8466 | 1e-07 | 6817 | **1258** |
+| `1e-11` | 7.6e-08 | 7615 | 1e-06 | 6634 | **2457** |
+| `1e-10` | 4.6e-07 | 4545 | 1e-05 | 4776 | **2579** |
+
+Against §4.3's 200–250 on random subspaces, the floor here is 4500–8500·`tol`, so `1e5` sits only
+12–22× above it rather than ~400×. The symmetric difference is 1258–2579 states out of ~6800 —
+roughly 20–38% of the protected set churns. **No single multiplier was found that reproduces the
+reference set**, and this was not swept exhaustively.
+
+So the hazard §4 identifies is real and *worse* than first measured, while the remedy it proposes is
+not established. Anyone adopting the speedup must either re-derive the coupling on their own
+subspaces, or treat a changed protected set as acceptable and justify that separately — the carry-over
+set feeds `max_dim` truncation, so it is not obviously benign.
 
 ---
 
@@ -180,27 +249,34 @@ into that 1e-6 margin.
    that shape.
 3. **Do not** thread it into `exact._rqutils_ground_state`. Leave that path on the default, and say
    why in a comment pointing at §5.
-4. If `solve_tol` is set, validate the `tau` coupling in `RecoveryOptions.__post_init__`: warn (or
-   raise) when `tau < 1e5 * solve_tol`. The existing `__post_init__` already validates `tol >= 0`
-   and `tau`, so this is one more check in a place that has them.
+4. If `solve_tol` is set, warn in `RecoveryOptions.__post_init__` when `tau < 1e5 * solve_tol` — a
+   necessary condition, **not a sufficient one** (§4.4: it does not restore the protected set on
+   connected subspaces). The existing `__post_init__` already validates `tol >= 0` and `tau`, so this
+   is one more check in a place that has them. Also assert `solve_tol <= 1e-11`: at `1e-9` the energy
+   error reaches 1.8e-05 on connected subspaces, past `RecoveryOptions.tol = 1e-6`.
 5. Leave the default `None`. The speedup is real but the coupling is subtle; make it opt-in.
 
 ---
 
 ## 7. Verification
 
-1. **Fixed-subspace timing.** Reproduce §3 with the subspace sequence precomputed once and reused
-   across arms. Varying subspaces per arm measures trajectory divergence, not tolerance.
-2. **Protected-set equivalence.** For the chosen `(tol, tau)`, assert the set
+1. **Use connected subspaces.** Build them by one-hop expansion from a seed, or from real sampled
+   counts — never `rng.choice(2**n, size=dim)`, which is 3.6–6.1% dense where a real subspace is
+   32–44% (§4.4). Every conclusion about iteration counts, protected sets and energy error differs
+   between the two regimes, several by two orders of magnitude. Assert the density of any fixture used.
+2. **Fixed-subspace timing.** Reproduce §3/§4.4 with the subspace sequence precomputed once and reused
+   across arms. Varying subspaces per arm measures trajectory divergence, not tolerance. Note timing is
+   non-monotonic in `tol`, so do not interpolate between measured points.
+3. **Protected-set equivalence.** For the chosen `(tol, tau)`, assert the set
    `{i : |eigvec[i]| > tau}` equals the set from `(eps, 1e-8)` on the same matrix. This is the
    assertion that would have caught the naive change; §4's table is its expected output.
-3. **End-to-end recovery trajectory.** Run the full recovery loop at both settings with a fixed seed
+4. **End-to-end recovery trajectory.** Run the full recovery loop at both settings with a fixed seed
    and assert the per-round energies and `dim`s match. The energies alone are insufficient — they
    agreed to 1.6e-09 while the trajectory diverged.
-4. **Full-basis guard.** Assert `exact_backend="rqutils"` still passes its own residual check
+5. **Full-basis guard.** Assert `exact_backend="rqutils"` still passes its own residual check
    (`exact.py:133-136`) and that its energy matches the dense/sparse backends to their existing
    tolerance.
-5. **Do not test only at `theta`-like small values.** The `tol=1e-6` cliff (−6.47 vs −14.36, no
+6. **Do not test only at `theta`-like small values.** The `tol=1e-6` cliff (−6.47 vs −14.36, no
    error raised) means a test sweeping tolerances should include a known-bad value and assert the
    energy is rejected, not silently accepted.
 
