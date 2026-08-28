@@ -2,6 +2,10 @@
 
 > ## Disposition (2026-08-28): **confirmed, root-caused, and FIXED at the root**
 >
+> **Reply to the reporter: `docs/rqutils-prefilter-dim2-response.md`** — the explicit answer they
+> asked for in §5 (neither option 1 nor 2; the root fix), plus the two rejected fixes and why the
+> defect was not dim-2-specific.
+>
 > Not option (1) or (2) — the real fix turned out to be four lines, so we took it. Thank you for the
 > report; the reproducer is exact and the `1.887e-16` observation is what made it findable.
 >
