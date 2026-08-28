@@ -273,9 +273,12 @@ _SQRT3 = math.sqrt(3.0)
 # appended when debug=True. Deliberately plain tuple aliases rather than a dataclass: the arity, not
 # the anonymity of the positions, is what a type checker needs to see here, and `ground_locg` is
 # published API that every caller destructures positionally (sqd.py, two scaling POCs, a benchmark
-# under examples/). A caller reading the fifth element must narrow first -- `assert len(result) == 5`
-# -- which is also the only way a checker can tell the debug path was requested, since `debug` is
-# static.
+# under examples/). A caller reading the fifth element must narrow first, `assert len(result) == 5`.
+#
+# `@overload` on `debug: Literal[True]/[False]` would give a checker the arity without narrowing, the
+# way `sqd` does it for `return_eigvec`. Untried here: it is what the `invalid-assignment` ignore in
+# pyproject.toml currently absorbs (19 diagnostics, mostly this destructuring), so it is a real
+# candidate rather than a rejected one.
 _Result = tuple[float, NDArray, int, bool]
 _DebugResult = tuple[float, NDArray, int, bool, dict[str, jax.Array]]
 

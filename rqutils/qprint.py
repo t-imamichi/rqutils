@@ -50,10 +50,8 @@ else:
     type Axes = Any
     type Figure = Any
 
-# The Figure arm must be named here, not added by a later `PrintReturnType |= Figure` under HAS_MPL: a
-# `type` statement is evaluated statically, so the augmented assignment leaves the arm invisible to a
-# checker. Safe either way because the statement is lazy and `Figure` is bound on both branches above
-# -- the real class with matplotlib, `Any` without, which correctly collapses the union to `Any`.
+# Name the Figure arm here rather than appending it under HAS_MPL -- see the optional-dependency rule in
+# CLAUDE.md. `Figure` is bound on both branches above, so the union degrades to `Any` without matplotlib.
 type PrintReturnType = str | Figure
 
 

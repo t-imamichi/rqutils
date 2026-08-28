@@ -61,11 +61,9 @@ class CircuitXZ:
 
 
 type GateSpec = tuple[str, int | Sequence[int]] | tuple[str, int | Sequence[int], Any]
-# The QuantumCircuit arm must be named here, not added by a later `CircuitInput |= QuantumCircuit`
-# under HAS_QISKIT: a `type` statement is evaluated statically, so the augmented assignment leaves the
-# arm invisible to a checker. Lazy evaluation keeps this import-safe without qiskit -- nothing reads
-# `__value__`. `TYPE_CHECKING` is unnecessary because the runtime import above is needed anyway, for
-# the `isinstance` in `to_circuitxz`.
+# Name the QuantumCircuit arm here rather than appending it under HAS_QISKIT -- see the
+# optional-dependency rule in CLAUDE.md. No TYPE_CHECKING guard: `to_circuitxz`'s isinstance needs the
+# runtime import anyway.
 type CircuitInput = CircuitXZ | list[GateSpec] | QuantumCircuit
 
 
