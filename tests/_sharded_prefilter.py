@@ -52,7 +52,14 @@ def main():
                     return jnp.einsum("ij,j->i", mat, vec, out_sharding=out_spec)
 
                 for kind, prefilter in (("plain", None), ("prefiltered", (16, 4))):
-                    result = ground_locg(matvec, xinit, prefilter=prefilter)
+                    # A callable now requires an explicit bound; the dense operator behind this
+                    # matvec supplies a rigorous Gershgorin one.
+                    result = ground_locg(
+                        matvec,
+                        xinit,
+                        prefilter=prefilter,
+                        prefilter_hi=float(np.abs(dense).sum(axis=-1).max()),
+                    )
                     out_spec = jax.typeof(result[1]).sharding.spec
                     print(
                         f"{num_devices}:{spec_label}:{kind} {float(result[0])!r} "

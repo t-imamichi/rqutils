@@ -241,9 +241,17 @@ with the Rayleigh–Ritz step solved analytically (`eigenpair_2x2`, `eigenpair_3
 of via `eigh`, to keep memory down for huge vectors. It is sharding-transparent **only if the `mat`
 callable preserves output sharding** — that contract is why every `apply_*` in `sqd.py` passes
 `out_sharding=jax.typeof(vec).sharding`. It also takes an optional `precond` (`None` | callable) and an optional `prefilter`
-(`None` | `(degree, cycles)` Chebyshev, start at `(32, 2)`; its call site must stay **after** the
-dtype promotion and **before** `body_iter0` — `docs/locg-chebyshev-prefilter.md` has the tables and
-three rejected variants).
+(`None` | `(degree, cycles)` Chebyshev, use `(32, 2)`; its call site must stay **after** the dtype
+promotion and **before** `body_iter0` — `docs/locg-chebyshev-prefilter.md` has the tables).
+
+**`prefilter` needs `prefilter_hi`, a true upper bound on `λ_max`, and there is no way to compute one
+from matvecs.** Kuczyński–Woźniakowski (1992) prove it; a block-diagonal operator with a start vector
+in one block hides the other block entirely. The array path derives Gershgorin `max_i Σ_j |A_ij|`
+automatically; a **callable raises** without it; `sqd` passes `Σ|c_k|`. Don't "fix" a missing bound
+with a power-iteration or Lanczos estimate — that is exactly the defect in
+`docs/rqutils-prefilter-bug.md`, where the estimate returned an **excited** eigenpair with
+`converged=True`. Prefer a loose bound: over-estimating degrades resolution smoothly, under-estimating
+changes the answer.
 
 Every guard in it is load-bearing and was measured; `docs/locg.md` catalogues seven defects (I1–I7)
 that each failed *silently*. **Don't "simplify" the balancing, the re-orthogonalizations, or the

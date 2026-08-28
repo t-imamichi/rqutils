@@ -287,34 +287,19 @@ def normalize(vector: jax.Array, norm: jax.Array | None = None) -> jax.Array:
     return vector / jnp.where(norm == 0.0, 1.0, norm)
 
 
-def _lambda_max_bound(
-    matvec: Callable[..., jax.Array],
-    args: tuple,
-    vector: jax.Array,
-    steps: int = 10,
-    margin: float = 1.05,
-) -> jax.Array:
-    r"""Upper bound on :math:`\lambda_{\max}` from ``steps`` of power iteration, times ``margin``.
+def _gershgorin_bound(mat: jax.Array) -> jax.Array:
+    r"""Rigorous upper bound on :math:`\lambda_{\max}` of a Hermitian array: ``max_i sum_j |A_ij|``.
 
-    Only an *upper* bound is needed, which is why this is cheap where a lower bound on
-    :math:`\lambda_0` is not: power iteration converges to the dominant eigenvalue from below, so the
-    ``margin`` covers the shortfall. ``docs/rqutils-precond-request.md`` closes the shift line for want
-    of a usable lower bound; nothing here needs one.
+    Gershgorin: every eigenvalue lies within :math:`\sum_j |A_{ij}|` of some :math:`A_{ii}`, so this
+    row-magnitude maximum bounds the spectral radius and therefore :math:`\lambda_{\max}`. **Rigorous
+    for every Hermitian input**, needs no iteration, and costs one :math:`O(N^2)` reduction -- measured
+    1.1-2.7x a single matvec at N=512-4096, against the 11 matvecs the power iteration this replaced
+    spent on an estimate that was not a bound at all.
 
-    ``margin`` is a *multiplicative* slack on the magnitude, added as ``|estimate| * (margin - 1)``
-    rather than as ``estimate * margin``, so it widens the interval for either sign -- an operator whose
-    dominant eigenvalue is negative would otherwise have its bound moved the wrong way.
-
-    Preserves sharding by construction: every operation is the caller's ``matvec`` or an elementwise
-    scale, so the result inherits ``vector``'s sharding the same way :func:`normalize` does.
+    Preserves sharding: an elementwise ``abs`` and two reductions, so the scalar result carries no
+    partitioning to conflict with the caller's vector.
     """
-
-    def step(vec, _):
-        return normalize(matvec(vec, *args)), None
-
-    vec = jax.lax.scan(step, normalize(vector), None, length=steps)[0]
-    estimate = jnp.sum(vec.conjugate() * matvec(vec, *args)).real
-    return estimate + jnp.abs(estimate) * (margin - 1.0)
+    return jnp.abs(mat).sum(axis=-1).max()
 
 
 def _chebyshev_prefilter(
@@ -323,8 +308,35 @@ def _chebyshev_prefilter(
     vector: jax.Array,
     degree: int,
     cycles: int,
+    hi: jax.Array | float,
 ) -> jax.Array:
     r"""Damp the unwanted band of the spectrum before the LOBPCG iteration starts.
+
+    ``hi`` MUST BE A TRUE UPPER BOUND ON :math:`\lambda_{\max}`, and is now a required argument
+    because nothing computable from ``matvec`` can guarantee that. It previously came from 10 steps of
+    power iteration, which is wrong twice over: power iteration converges to the eigenvalue of largest
+    *magnitude*, so on a negative-leaning spectrum it returns something near :math:`\lambda_{\min}`
+    and the interval **inverts**; and even with the sign repaired a fixed step count merely
+    under-estimates. The consequence was a silent wrong answer -- the filter damps its own target and
+    the solver returns an *excited* eigenpair with ``converged=True`` (measured: the n=2 Heisenberg
+    chain returned +0.25 for a true -0.75; the bound was invalid in 16 of 25 XXZ configurations, with
+    wrong answers in 2). ``docs/rqutils-prefilter-bug.md`` has the report and the reproduction.
+
+    **No cheap matvec-only upper bound exists.** Kuczynski & Wozniakowski (SIAM J. Matrix Anal. Appl.
+    13(4):1094-1122, 1992) prove that with fewer than :math:`N` matvecs another operator consistent
+    with every observation has an arbitrarily larger :math:`\lambda_{\max}`. Constructively: for
+    block-diagonal :math:`A` and a start vector inside one block, the Krylov space never leaves it --
+    measured, a true 1000.0 against a Lanczos bound of 4.68, and 16 random restarts do not help. The
+    Ritz-plus-residual forms production libraries use (ChASE, EVSL, ChebFD) are *estimates*, not
+    bounds, and they undershoot: EVSL's own ``mu_max + |beta_k s_k|`` measured invalid in 14% of 4000
+    random Hermitian cases. So rigour has to come from the operator's structure -- Gershgorin for an
+    array (:func:`_gershgorin_bound`), :math:`\sum_k |c_k|` for a Pauli sum, which is what
+    :mod:`rqutils.sqd` passes.
+
+    Prefer a loose bound to a tight estimate. Over-estimating costs resolution smoothly (the damping
+    degree needed grows like :math:`\sqrt{\text{width}}`, and measured here the ground-state overlap
+    after filtering falls 0.78 -> 0.018 as ``hi`` goes from 1.6x to 6600x :math:`\lambda_{\max}`),
+    whereas under-estimating flips which eigenvector is amplified most and returns the wrong answer.
 
     Applies :math:`T_{\text{degree}}` of :math:`(A - c)/e` mapping ``[theta, hi]`` onto
     :math:`[-1, 1]`, ``cycles`` times. Eigenvalues inside that band are damped by
@@ -350,7 +362,6 @@ def _chebyshev_prefilter(
     suppresses the unwanted band multiplicatively and leaves the residual rich in the directions
     block-size-1 LOBPCG can actually search.
     """
-    hi = _lambda_max_bound(matvec, args, vector)
 
     def cycle(vec, _):
         theta = jnp.sum(vec.conjugate() * matvec(vec, *args)).real
@@ -380,6 +391,7 @@ def ground_locg(
     vspace: tuple[int, DTypeLike] | None = None,
     precond: Callable[[jax.Array], jax.Array] | None = None,
     prefilter: tuple[int, int] | None = None,
+    prefilter_hi: float | None = None,
     debug: bool = False,
     log_level: int = logging.WARNING,
 ) -> _Result | _DebugResult:
@@ -410,17 +422,30 @@ def ground_locg(
             12-instance XXZ batch, :math:`M^{-1} = \mathrm{diag}(A)^{-1}` gave a median **1.79x**
             reduction in iterations (range 1.29-2.04x, no regressions), at an :math:`O(N)` cost of
             under 1% of an iteration.
+        prefilter_hi: Upper bound on :math:`\lambda_{\max}`, used as the filter's upper interval
+            edge. Ignored unless ``prefilter`` is set. **Required when ``mat`` is a callable** -- there
+            is no fallback, because no matvec-only estimate can be rigorous and the estimate this
+            replaced silently returned excited eigenpairs. When ``mat`` is an array the Gershgorin
+            bound ``max_i sum_j |A_ij|`` is derived automatically, so no caller of the array path is
+            affected. :mod:`rqutils.sqd` passes ``sum|c_k|``, valid because every Pauli string is
+            unitary. Prefer a loose bound: over-estimating costs resolution smoothly, while
+            *under*-estimating changes the answer. See :func:`_chebyshev_prefilter`.
         prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter applied to ``xinit`` before the
             iteration starts, damping the unwanted band of the spectrum so the LOBPCG loop begins
             closer to :math:`v_0`. ``None`` (the default) leaves the traced graph unchanged, so no
             existing caller is affected; it is a static argument, so the branch resolves at trace
-            time. Costs ``cycles * (degree + 1)`` extra matrix-vector products plus ~11 for the
-            :math:`\lambda_{\max}` estimate, and three live vectors -- **no growing basis**, which is
+            time. Costs ``cycles * (degree + 1)`` extra matrix-vector products -- the ~11 for a
+            :math:`\lambda_{\max}` estimate are gone, since ``prefilter_hi`` needs no iteration --
+            and three live vectors: **no growing basis**, which is
             what makes it compatible with this module's single-vector memory budget. Like ``mat`` and
             ``precond`` it is sharding-transparent, since it only calls ``mat`` and scales
-            elementwise. **It cannot change the answer, only the path**: every convergence test still
-            reads the true residual, and the returned eigenpair is the same one to the tolerance the
-            solver was going to reach anyway (measured: eigenvector overlap 1.0000000 against the
+            elementwise. **It cannot change the answer, only the path -- provided ``prefilter_hi``
+            is a true upper bound.** That caveat is load-bearing and was originally missing: the
+            residual test every convergence check reads certifies that *an* eigenpair was found, not
+            that it is the lowest, so a filter that removed the target from the iterate's span
+            returned an excited eigenpair with ``converged=True``
+            (``docs/rqutils-prefilter-bug.md``). With a valid bound the returned eigenpair is the same
+            one to the tolerance the solver was going to reach anyway (measured: eigenvector overlap 1.0000000 against the
             unfiltered result, energies agreeing with ``eigsh(tol=0)`` to 2.8e-14).
 
             **Start with ``(32, 2)``.** Across 27 connected-subspace configurations (3 sizes x 3
@@ -439,8 +464,10 @@ def ground_locg(
 
             So **raise ``degree``, keep ``cycles`` at 2**. Measured medians: ``(16, 4)`` 1.41x,
             ``(32, 2)`` **1.88x**, ``(48, 2)`` 1.79x; on a narrower sweep ``(64, 2)`` reached 2.29x
-            and ``(128, 2)`` fell to 1.68x with a 1.01x floor, so the useful range is
-            ``degree`` 32-64 and performance declines past ~96. Longer solves favour the higher end:
+            and ``(128, 2)`` fell to 1.68x with a 1.01x floor. **Treat the upper half of that range with
+            suspicion**: an independent sweep from the ``spinchain`` side measured ``degree=64`` as
+            the *weakest* arm on every path it tried (median 1.35x through ``sqd``, 0.74-0.80x dense),
+            so ``(32, 2)`` is the only value recommended without qualification. Longer solves favour the higher end:
             the 249- and 573-iteration cases measured 3.6-5.1x at ``degree`` 48-96.
 
             All figures are single-device CPU; the ordering may differ on a GPU, where the
@@ -477,6 +504,7 @@ def ground_locg(
             vspace=vspace,
             precond=precond,
             prefilter=prefilter,
+            prefilter_hi=prefilter_hi,
             debug=debug,
             log_level=log_level,
         )
@@ -487,6 +515,7 @@ def ground_locg(
         tol,
         precond=precond,
         prefilter=prefilter,
+        prefilter_hi=prefilter_hi,
         debug=debug,
         log_level=log_level,
     )
@@ -500,12 +529,18 @@ def _ground_locg_matrix(
     tol: jax.Array | float | None,
     precond: Callable[[jax.Array], jax.Array] | None = None,
     prefilter: tuple[int, int] | None = None,
+    prefilter_hi: jax.Array | float | None = None,
     debug: bool = False,
     log_level: int = logging.WARNING,
 ):
     vspace = None
     if jnp.issubdtype(xinit.dtype, jnp.integer):
         vspace = (mat.shape[1], mat.dtype)
+
+    # The array path can always supply its own rigorous bound, so a caller never has to. Gershgorin
+    # rather than anything iterative: see _chebyshev_prefilter on why no matvec-based estimate is one.
+    if prefilter is not None and prefilter_hi is None:
+        prefilter_hi = _gershgorin_bound(mat)
 
     def matvec(x):
         return jax.lax.dot(
@@ -521,6 +556,7 @@ def _ground_locg_matrix(
         vspace=vspace,
         precond=precond,
         prefilter=prefilter,
+        prefilter_hi=prefilter_hi,
         debug=debug,
         log_level=log_level,
     )
@@ -546,6 +582,7 @@ def _ground_locg_callable(
     vspace: tuple[int, DTypeLike] | None = None,
     precond: Callable[[jax.Array], jax.Array] | None = None,
     prefilter: tuple[int, int] | None = None,
+    prefilter_hi: jax.Array | float | None = None,
     debug: bool = False,
     log_level: int = logging.WARNING,
 ):
@@ -769,7 +806,20 @@ def _ground_locg_callable(
     if prefilter is not None:
         degree, cycles = prefilter
         if degree > 1 and cycles > 0:
-            xinit = _chebyshev_prefilter(matvec, args, xinit, degree, cycles)
+            if prefilter_hi is None:
+                # Deliberately a raise, not a fallback to an iterative estimate: the estimate is what
+                # returned an excited eigenpair with converged=True, and no matvec-only method can be
+                # made rigorous (see _chebyshev_prefilter). Callers holding a Pauli sum have the bound
+                # for free as sum|c_k|, which is what rqutils.sqd passes.
+                raise ValueError(
+                    "prefilter_hi is required when mat is a callable: it must be a true upper bound "
+                    "on lambda_max, and nothing computable from matvec alone can guarantee that. "
+                    "For a Pauli sum, sum(abs(coeffs)) is a valid bound; for an explicit array, pass "
+                    "the array as `mat` and it is derived automatically. A loose bound is safe -- an "
+                    "under-estimate makes the filter damp its own target and silently return an "
+                    "excited eigenpair."
+                )
+            xinit = _chebyshev_prefilter(matvec, args, xinit, degree, cycles, prefilter_hi)
 
     seed, diag0 = body_iter0(xinit)
     # Seed theta with the Rayleigh quotient of xinit so that maxiter=0 returns a meaningful value

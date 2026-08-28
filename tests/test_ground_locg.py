@@ -1011,7 +1011,10 @@ class TestChebyshevPrefilter:
             return float(jnp.sum(vec.conjugate() * (matj @ vec)).real)
 
         before = rayleigh(xinit)
-        after = rayleigh(_chebyshev_prefilter(lambda v: matj @ v, (), xinit, 16, 4))
+        # `hi` is now an explicit argument -- see `_chebyshev_prefilter` on why nothing derivable
+        # from matvec can be a rigorous bound. Gershgorin is what the array path uses.
+        hi = float(np.abs(mat).sum(axis=-1).max())
+        after = rayleigh(_chebyshev_prefilter(lambda v: matj @ v, (), xinit, 16, 4, hi))
         assert after < before, f"filter did not lower the Rayleigh quotient ({before} -> {after})"
         closed = (before - after) / (before - reference)
         assert closed > 0.9, f"filter closed only {closed:.1%} of the gap to lambda_0"
@@ -1033,6 +1036,92 @@ class TestChebyshevPrefilter:
         result = ground_locg(mat, xinit, maxiter=500, prefilter=(16, 4))
         assert bool(result[3]), "complex operator failed to converge with a prefilter"
         assert abs(float(result[0]) - reference) < 1e-10
+
+    def test_negative_leaning_spectrum_finds_the_ground_state(self):
+        """THE REGRESSION FOR THE POWER-ITERATION BOUND, which returned an *excited* eigenpair.
+
+        The n=2 antiferromagnetic Heisenberg chain, ``0.25*(XX + YY + ZZ)``, spectrum
+        ``[-0.75, 0.25, 0.25, 0.25]``. Here ``|lambda_min| > |lambda_max|``, so the power iteration
+        that used to supply ``hi`` converged toward ``lambda_min`` and returned **-0.7125** as an
+        "upper bound on lambda_max" -- below the true ``lambda_max`` of +0.25 and below
+        ``lambda_0`` itself. The interval inverted, the filter damped its own target, and
+        ``ground_locg`` returned **+0.25** with ``converged=True``: a genuine eigenvalue, just not the
+        lowest, and indistinguishable from a correct answer by inspection or by a residual check.
+
+        Built by hand rather than via qiskit so this runs without the optional extra, and pinned as
+        the smallest case that reproduces -- ``docs/rqutils-prefilter-bug.md`` measured the bound
+        invalid in 16 of 25 XXZ configurations but a wrong *answer* in only 2, both at n=2, Bx=0.
+        """
+        pauli_x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+        pauli_y = np.array([[0.0, -1.0j], [1.0j, 0.0]])
+        pauli_z = np.diag([1.0, -1.0]).astype(complex)
+        mat = 0.25 * sum(np.kron(p, p) for p in (pauli_x, pauli_y, pauli_z))
+        assert lowest(mat) == pytest.approx(-0.75), "fixture is no longer the n=2 Heisenberg chain"
+        # The precondition that makes this the failing case: power iteration chases the wrong end.
+        spectrum = np.linalg.eigvalsh(mat)
+        assert abs(spectrum[0]) > abs(spectrum[-1]), (
+            "fixture must lean negative, or the old bound would have been valid by luck"
+        )
+
+        matj = jnp.asarray(mat)
+        # SEED 0 IS LOAD-BEARING, and this is the trap this test nearly fell into. Whether the old
+        # code returned the wrong answer depends on `xinit`: measured against the pre-fix revision,
+        # seeds 0 and 2 returned +0.25 while 1, 3 and 20260828 returned the correct -0.75, even though
+        # the bound was invalid (-0.7125 against a true lambda_max of +0.25) for *every* one of them.
+        # The interval inverts regardless; whether the ground state also lands inside the damped band
+        # is what varies. So an arbitrary seed makes this test pass against the very bug it exists to
+        # catch -- verified by restoring the power iteration and watching a 20260828 arm stay green.
+        xinit = jnp.asarray(np.random.default_rng(0).normal(size=4) + 0j)
+        result = ground_locg(matj, xinit, maxiter=2000, prefilter=(32, 2))
+        assert bool(result[3]), "failed to converge"
+        assert float(result[0]) == pytest.approx(-0.75, abs=1e-10), (
+            f"got {float(result[0])}, expected -0.75 -- an excited eigenpair means `hi` is not a "
+            "true upper bound on lambda_max"
+        )
+
+    def test_callable_without_a_bound_raises_rather_than_guessing(self):
+        """A callable cannot supply ``hi``, and guessing it is what caused the wrong answers.
+
+        No matvec-only method can produce a rigorous upper bound: Kuczynski & Wozniakowski (1992)
+        prove it, and constructively, a block-diagonal operator with a start vector inside one block
+        hides the other block's spectrum from every Krylov method (measured: true 1000.0 against a
+        Lanczos bound of 4.68, unchanged by 16 random restarts). So this raises instead of estimating.
+        The array path is unaffected -- it derives Gershgorin from ``mat`` itself.
+        """
+        rng = np.random.default_rng(20260828)
+        mat = jnp.asarray(herm(32, rng, complex_=False))
+        xinit = jnp.asarray(rng.normal(size=32))
+        with pytest.raises(ValueError, match="prefilter_hi is required"):
+            ground_locg(lambda v: mat @ v, xinit, maxiter=100, prefilter=(16, 2))
+        # Same call with a bound supplied works, so the raise is about the missing bound only.
+        hi = float(np.abs(np.asarray(mat)).sum(axis=-1).max())
+        result = ground_locg(
+            lambda v: mat @ v, xinit, maxiter=500, prefilter=(16, 2), prefilter_hi=hi
+        )
+        assert float(result[0]) == pytest.approx(lowest(np.asarray(mat)), abs=1e-10)
+
+    def test_a_loose_bound_is_safe_and_a_tight_estimate_is_not(self):
+        """The asymmetry that decides the design: over-estimating costs resolution, under damns.
+
+        Sweeping ``hi`` from the rigorous Gershgorin value up by 1000x keeps the answer exact -- the
+        filter only has to move the iterate into the ground state's basin, and LOBPCG finishes. An
+        *under*-estimate inverts which eigenvector is amplified most, which is the reported bug. This
+        is why a provably-loose structural bound is preferred over a tight Krylov estimate.
+        """
+        rng = np.random.default_rng(20260828)
+        mat = self._gapped(96, rng, gap=0.1)
+        matj = jnp.asarray(mat)
+        xinit = jnp.asarray(rng.normal(size=96))
+        reference = lowest(mat)
+        gershgorin = float(np.abs(mat).sum(axis=-1).max())
+        for multiplier in (1.0, 10.0, 1000.0):
+            result = ground_locg(
+                matj, xinit, maxiter=3000, prefilter=(32, 2), prefilter_hi=gershgorin * multiplier
+            )
+            assert bool(result[3]), f"hi={multiplier}x Gershgorin failed to converge"
+            assert float(result[0]) == pytest.approx(reference, abs=1e-9), (
+                f"hi={multiplier}x Gershgorin gave {float(result[0])}, expected {reference}"
+            )
 
     def test_preserves_sharding_on_a_mesh(self):
         """The prefilter must not silently un-shard the vector it returns.

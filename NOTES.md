@@ -82,6 +82,52 @@ failed assert changes nothing, verify each edit landed rather than inferring it 
 mutation-test the *surviving* assertion afterwards. Note `pytest` prints "no tests ran" rather than
 failing when the class path is wrong, so a mis-copied class name looks like a pass.
 
+### No matvec-only upper bound on `λ_max` exists, so the prefilter takes one from structure
+
+2026-08-28, fixing `docs/rqutils-prefilter-bug.md`. `_lambda_max_bound` used 10 power steps, which
+converge to the largest-*magnitude* eigenvalue; on a negative-leaning spectrum that is `λ_min`, the
+Chebyshev interval inverts, and the filter damps its own target — an **excited** eigenpair returned
+with `converged=True` (n=2 Heisenberg: +0.25 for a true −0.75).
+
+Candidates measured before settling on structural bounds:
+
+| bound | XXZ 25 | adversarial | matvec-only |
+| --- | --- | --- | --- |
+| `abs(estimate)` (the report's own fallback) | 21/25 | — | yes |
+| `sqrt` of power iteration on `A²` | 24/25 | — | yes |
+| Lanczos `μ_max + β_k` | **25/25** | **988/1000** | yes |
+| EVSL's `μ_max + |β_k s_k|` | — | **3433/4000** | yes |
+| Gershgorin `max_i Σ_j |A_ij|` | 25/25 | rigorous | no |
+| `Σ|c_k|` for a Pauli sum | 25/25 | rigorous | n/a |
+
+Lanczos looking perfect on the physics cases and failing adversarially is the trap that let the
+original bug ship. **The impossibility is a theorem** — Kuczyński & Woźniakowski, SIAM J. Matrix Anal.
+Appl. 13(4):1094–1122 (1992): with fewer than `N` matvecs another operator consistent with every
+observation has an arbitrarily larger `λ_max`. Constructively, block-diagonal `A` with a start vector
+inside one block gives a true 1000.0 against a Lanczos bound of 4.68, and 16 random restarts do not
+help (200/200 invalid) because they share the invariant subspace. Cauchy interlacing makes the top
+Ritz value a *lower* bound, so no `abs()` converts it.
+
+**Looseness: measure the overlap, not the iteration count.** Iteration counts were identical from 1×
+to 1660× the coefficient sum, which read as "looseness is free" — twice, in two separate measurements.
+It is not: the filtered vector's ground-state overlap falls 0.78 → 0.094 → 0.018 at 1.6× → 415× →
+6600× `λ_max`, matching the `sqrt(width)` law for the degree needed. Iteration counts hid it because
+the prefilter only has to reach the ground state's basin before LOBPCG takes over. Hence `Σ|c_k|`
+(~1.8× loose) rather than a deliberately inflated fallback — but loose still beats tight, since
+over-estimating degrades smoothly while under-estimating changes the answer.
+
+Removing the estimate also removed its ~11 matvecs: the iteration reduction *improved* to a 3.29×
+median from the 1.88× recorded with the unsound bound.
+
+### A regression test for a filter bug needs the seed that fails
+
+Same fix. `test_negative_leaning_spectrum_finds_the_ground_state` first used seed 20260828 and
+**passed against the unfixed code**. The bound is invalid (−0.7125 against a true `λ_max` of +0.25) for
+every seed tried, but whether the ground state also lands inside the damped band is what varies: seeds
+0 and 2 return +0.25, seeds 1, 3 and 20260828 return the correct −0.75. Only a full revert of
+`ground_locg.py` — not a hand-written mutant of the bound — surfaced this, because the mutant fed the
+power iteration a different start vector than the original did.
+
 ### `sqd`'s filler slots are protected by unreachability, not by `_spread_seed`'s mask
 
 Found while pinning `TestSqdPrefilter` (2026-08-28). Removing the `jnp.where(filler, 0, vec)` mask in

@@ -2046,6 +2046,39 @@ class TestSqdPrefilter:
         with pytest.raises((TypeError, ValueError)):
             eigval_of(strings, coeffs, states, prefilter=prefilter)
 
+    def test_negative_leaning_hamiltonian_finds_the_ground_state(self):
+        """The reported bug, through ``sqd`` rather than dense ``ground_locg``.
+
+        ``sqd`` supplies the filter's upper bound as ``sum|c_k|``, which is rigorous because every
+        Pauli string is unitary (``||H|| <= sum|c_k|``) and projecting onto the subspace can only
+        shrink the spectral radius. Before that, ``ground_locg`` estimated it by power iteration,
+        which converges to the eigenvalue of largest *magnitude*: on this antiferromagnetic
+        Heisenberg subspace that is ``lambda_min``, so the interval inverted and ``sqd`` returned
+        **+0.25** against a true **-0.75**, with ``converged=True``.
+
+        The n=2 full basis is the smallest reproducer, and ``|lambda_min| > |lambda_max|`` is the
+        precondition that makes it one -- asserted, since a fixture that stopped leaning negative
+        would silently stop testing this. ``docs/rqutils-prefilter-bug.md`` has the report.
+        """
+        num_qubits = 2
+        strings, coeffs = [], []
+        for pauli in "XYZ":
+            strings.append(pauli * num_qubits)
+            coeffs.append(0.25)
+        states = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=np.uint8)
+        dense = project_dense(strings, np.array(coeffs), states)
+        spectrum = np.linalg.eigvalsh(dense)
+        assert abs(spectrum[0]) > abs(spectrum[-1]), (
+            "fixture must lean negative, or the old power-iteration bound was valid by luck"
+        )
+        reference = lowest_projected(strings, np.array(coeffs), states)
+        assert reference == pytest.approx(-0.75), "fixture is no longer the n=2 Heisenberg chain"
+        got = eigval_of(strings, np.array(coeffs), states, prefilter=(32, 2))
+        assert got == pytest.approx(reference, abs=1e-10), (
+            f"got {got}, expected {reference} -- an excited eigenpair means the bound sqd passes as "
+            "prefilter_hi is not a true upper bound on lambda_max"
+        )
+
     def test_degenerate_prefilter_values_are_a_no_op(self):
         """``degree <= 1`` or ``cycles == 0`` must reach the guard, not divide by zero.
 

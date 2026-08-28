@@ -962,8 +962,26 @@ def run_sqd(
     if log_level <= logging.DEBUG:
         jax.debug.print(f"Starting minimization with cache_level {cache_level}")
 
+    # sum|c_k| is a rigorous upper bound on lambda_max: every Pauli string is unitary, so
+    # ||H|| <= sum|c_k| ||P_k|| = sum|c_k|, and projecting onto the subspace can only shrink the
+    # spectral radius (P H P with P an orthogonal projector). Costs no matvec. `ground_locg` cannot
+    # derive this itself -- it sees only a callable -- and it raises rather than guessing, because the
+    # power-iteration estimate this replaced silently returned excited eigenpairs
+    # (docs/rqutils-prefilter-bug.md).
+    # Gated on the filter actually running, not merely on `prefilter is not None`: `ground_locg`
+    # treats degree<=1 or cycles==0 as a documented no-op, and computing the bound anyway would add
+    # ops to the traced graph for those values and break that contract.
+    _filter_runs = prefilter is not None and prefilter[0] > 1 and prefilter[1] > 0
+    prefilter_hi = jnp.abs(hamiltonian.c).sum() if _filter_runs else None
     eigval, eigvec, _, converged = ground_locg(
-        matvec, vinit, args=args, maxiter=maxiter, tol=tol, prefilter=prefilter, log_level=log_level
+        matvec,
+        vinit,
+        args=args,
+        maxiter=maxiter,
+        tol=tol,
+        prefilter=prefilter,
+        prefilter_hi=prefilter_hi,
+        log_level=log_level,
     )
     result = (eigval,)
     if return_eigvec:

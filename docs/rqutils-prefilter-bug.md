@@ -1,6 +1,51 @@
 # rqutils bug report: `ground_locg`'s Chebyshev prefilter can return an excited state
 
-> ## Disposition (2026-08-28): **confirmed in full, fix in progress**
+> ## Disposition (2026-08-28): **confirmed in full, FIXED**
+>
+> Fixed by deleting `_lambda_max_bound` outright and taking the bound from the operator's structure
+> instead. `_chebyshev_prefilter` now requires `hi`; `ground_locg` gains `prefilter_hi=`, derived
+> automatically as Gershgorin `max_i sum_j |A_ij|` when `mat` is an array and **required** when it is a
+> callable; `sqd` passes `sum|c_k|`. Wrong answers 2/25 -> **0/25**, and the n=2 case returns -0.75 on
+> both entry points. Iteration reduction *improved* to a 3.29x median (from the 1.88x recorded with the
+> unsound bound), since the 11 wasted matvecs are gone too. Suite 581 -> 585.
+>
+> **Breaking change**: `ground_locg(callable, ..., prefilter=...)` now raises without `prefilter_hi`.
+> Deliberately a raise rather than a fallback -- see the impossibility result below. `sqd` callers and
+> array callers are unaffected.
+>
+> ### Where this report's proposed fix was not enough
+>
+> The report's fallback suggestion, `hi = max(estimate, -estimate)`, was measured **invalid in 4 of
+> 25** configurations: fixing the sign leaves a fixed 10-step iteration simply under-converged. A
+> `sqrt`-of-`A^2` variant reached 24/25. Lanczos `mu_max + beta_k` looked perfect on these physics cases
+> (25/25) and fails **12/1000** adversarially -- the same "validated on the easy regime" trap that let
+> the original bug ship.
+>
+> **No matvec-only method can be rigorous, and this is a theorem, not a tuning problem.** Kuczynski &
+> Wozniakowski (SIAM J. Matrix Anal. Appl. 13(4):1094-1122, 1992) prove that with fewer than `N`
+> matvecs another operator consistent with every observation has an arbitrarily larger `lambda_max`.
+> Constructively: for block-diagonal `A` with a start vector inside one block, Krylov never leaves it --
+> measured, a true `lambda_max` of 1000.0 against a Lanczos bound of 4.68, and **16 random restarts do
+> not help** (200/200 still invalid), because the restarts share the invariant subspace. Production
+> libraries (ChASE, EVSL, ChebFD) use Ritz-plus-residual forms and call them *estimates*; EVSL's own
+> `mu_max + |beta_k s_k|` measured invalid in **14% of 4000** random Hermitian cases. Cauchy
+> interlacing makes the top Ritz value a *lower* bound, so no amount of `abs()` can convert it.
+>
+> ### One correction to this report, and one to our own earlier reasoning
+>
+> The report says a looser `hi` "costs no speedup", and our first measurement agreed -- iteration
+> counts were identical from 1x to 1660x the coefficient sum. **Both were reading the wrong quantity.**
+> The filtered vector's ground-state overlap does degrade with looseness (0.78 at 1.6x `lambda_max`,
+> 0.094 at 415x, 0.018 at 6600x), following the `sqrt(width)` law for the degree needed at a target
+> damping. Iteration counts hid it because the prefilter only has to get the iterate into the ground
+> state's basin before LOBPCG takes over. So tightness *does* matter, which is why `sum|c_k|` (~1.8x
+> loose) is preferred over a deliberately inflated fallback -- and why the asymmetry still favours
+> loose over tight: over-estimating degrades smoothly, under-estimating changes the answer.
+>
+> ### `degree=64`
+>
+> Accepted. `ground_locg`'s docstring no longer advertises a "useful range 32-64"; it now records that
+> an independent sweep measured 64 as the weakest arm and recommends only `(32, 2)`.
 >
 > Every claim reproduced against `dev` at `f249ce1` before any code was changed. Nothing in the report
 > needed correction:
