@@ -2,6 +2,11 @@
 
 > ## Disposition (2026-08-28): **confirmed in full, FIXED**
 >
+> **Reply to the reporter, with migration steps: `docs/rqutils-prefilter-bug-response.md`.**
+> It also carries one correction to this report (§4) and a **second, unrelated `sqd` defect**
+> found while validating the fix, which is *not* fixed and still blocks `skqd/sqd_backend.py`
+> (§5).
+>
 > Fixed by deleting `_lambda_max_bound` outright and taking the bound from the operator's structure
 > instead. `_chebyshev_prefilter` now requires `hi`; `ground_locg` gains `prefilter_hi=`, derived
 > automatically as Gershgorin `max_i sum_j |A_ij|` when `mat` is an array and **required** when it is a
