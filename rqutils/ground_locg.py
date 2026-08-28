@@ -225,7 +225,7 @@ Single-vector LOBPCG API
 import logging
 import math
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -287,6 +287,56 @@ def normalize(vector: jax.Array, norm: jax.Array | None = None) -> jax.Array:
     return vector / jnp.where(norm == 0.0, 1.0, norm)
 
 
+def _check_prefilter(prefilter: Any) -> None:
+    """Raise unless ``prefilter`` is None or a ``(degree, cycles)`` pair of non-negative ints.
+
+    Lives here rather than in :mod:`rqutils.sqd` because this module owns the gate the check exists
+    to compensate for: :func:`_chebyshev_prefilter` runs only ``if degree > 1 and cycles > 0``, an
+    equality-style
+    branch with an implicit ``else``, so an out-of-range value is **absorbed into a silent no-op**
+    rather than reported: measured, ``(2, -1)``, ``(-4, 2)`` and ``(True, 2)`` all returned the exact
+    unfiltered energy at zero speedup, which reads as "the prefilter does not help on my problem".
+    That misdiagnosis is the one thing this option cannot afford, because its docstring tells callers
+    to A/B it on their own subspaces. Malformed *types* were no better: ``(2,)``, ``"32,2"`` and ``32``
+    reached ``ground_locg``'s tuple unpack and surfaced its ``ValueError``/``TypeError`` from inside a
+    public entry point.
+
+    ``bool`` is rejected for the reason :func:`rqutils.sqd._check_cache_level` gives -- it is an
+    ``int`` subclass, so ``(True, 2)`` would otherwise pass as ``(1, 2)``, i.e. as a documented no-op.
+
+    The **intentional** no-ops stay legal: ``degree <= 1`` or ``cycles == 0`` is how a caller disables
+    the filter without restructuring a sweep, and ``TestChebyshevPrefilter`` pins that contract. Only
+    negative values, non-ints and wrong shapes are errors -- a distinction only expressible here,
+    since that single ``degree > 1 and cycles > 0`` test cannot make it.
+
+    Args:
+        prefilter: The caller's value, unvalidated.
+
+    Raises:
+        TypeError: If it is not None or a length-2 sequence of ints.
+        ValueError: If either entry is negative.
+    """
+    if prefilter is None:
+        return
+    try:
+        degree, cycles = prefilter
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"`prefilter` must be None or a (degree, cycles) pair of ints, got {prefilter!r}"
+        ) from exc
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (degree, cycles)):
+        raise TypeError(
+            f"`prefilter` must be None or a (degree, cycles) pair of ints, got {prefilter!r}"
+        )
+    if degree < 0 or cycles < 0:
+        raise ValueError(
+            f"`prefilter` is {prefilter!r}, but both entries must be non-negative. A negative value "
+            "is silently absorbed as a no-op by the filter's `degree > 1 and cycles > 0` gate, so it "
+            "returns the unfiltered energy at zero speedup rather than reporting anything. To disable "
+            "the filter deliberately, pass None (or degree<=1 / cycles=0, which stay legal)."
+        )
+
+
 def _gershgorin_bound(mat: jax.Array) -> jax.Array:
     r"""Rigorous upper bound on :math:`\lambda_{\max}` of a Hermitian array: ``max_i sum_j |A_ij|``.
 
@@ -322,21 +372,15 @@ def _chebyshev_prefilter(
     chain returned +0.25 for a true -0.75; the bound was invalid in 16 of 25 XXZ configurations, with
     wrong answers in 2). ``docs/rqutils-prefilter-bug.md`` has the report and the reproduction.
 
-    **No cheap matvec-only upper bound exists.** Kuczynski & Wozniakowski (SIAM J. Matrix Anal. Appl.
-    13(4):1094-1122, 1992) prove that with fewer than :math:`N` matvecs another operator consistent
-    with every observation has an arbitrarily larger :math:`\lambda_{\max}`. Constructively: for
-    block-diagonal :math:`A` and a start vector inside one block, the Krylov space never leaves it --
-    measured, a true 1000.0 against a Lanczos bound of 4.68, and 16 random restarts do not help. The
-    Ritz-plus-residual forms production libraries use (ChASE, EVSL, ChebFD) are *estimates*, not
-    bounds, and they undershoot: EVSL's own ``mu_max + |beta_k s_k|`` measured invalid in 14% of 4000
-    random Hermitian cases. So rigour has to come from the operator's structure -- Gershgorin for an
-    array (:func:`_gershgorin_bound`), :math:`\sum_k |c_k|` for a Pauli sum, which is what
-    :mod:`rqutils.sqd` passes.
+    **No cheap matvec-only upper bound exists** -- a theorem, not a tuning problem (Kuczynski &
+    Wozniakowski, SIAM J. Matrix Anal. Appl. 13(4):1094-1122, 1992). So rigour has to come from the
+    operator's structure: Gershgorin for an array (:func:`_gershgorin_bound`),
+    :math:`\sum_k |c_k|` for a Pauli sum, which is what :mod:`rqutils.sqd` passes. ``NOTES.md`` has
+    the measured candidate table, the adversarial construction, and why the Ritz-plus-residual forms
+    production libraries use are estimates rather than bounds.
 
-    Prefer a loose bound to a tight estimate. Over-estimating costs resolution smoothly (the damping
-    degree needed grows like :math:`\sqrt{\text{width}}`, and measured here the ground-state overlap
-    after filtering falls 0.78 -> 0.018 as ``hi`` goes from 1.6x to 6600x :math:`\lambda_{\max}`),
-    whereas under-estimating flips which eigenvector is amplified most and returns the wrong answer.
+    Prefer a loose bound to a tight estimate: over-estimating costs resolution smoothly, while
+    under-estimating flips which eigenvector is amplified most and returns the wrong answer.
 
     Applies :math:`T_{\text{degree}}` of :math:`(A - c)/e` mapping ``[theta, hi]`` onto
     :math:`[-1, 1]`, ``cycles`` times. Eigenvalues inside that band are damped by
@@ -494,6 +538,7 @@ def ground_locg(
             vector space cannot be inferred from a callable, and without this the one-hot
             construction would fail with an opaque "NoneType is not subscriptable".
     """
+    _check_prefilter(prefilter)
     if callable(mat):
         return _ground_locg_callable(
             mat,
@@ -539,7 +584,10 @@ def _ground_locg_matrix(
 
     # The array path can always supply its own rigorous bound, so a caller never has to. Gershgorin
     # rather than anything iterative: see _chebyshev_prefilter on why no matvec-based estimate is one.
-    if prefilter is not None and prefilter_hi is None:
+    # Gated on the filter actually running, matching `run_sqd`: `degree <= 1` or `cycles == 0` is a
+    # documented no-op, and computing an O(N^2) reduction for those values put it in the traced graph
+    # anyway -- measured +6.1% on a 2048-dim solve with `prefilter=(16, 0)`.
+    if prefilter is not None and prefilter[0] > 1 and prefilter[1] > 0 and prefilter_hi is None:
         prefilter_hi = _gershgorin_bound(mat)
 
     def matvec(x):

@@ -1037,6 +1037,49 @@ class TestChebyshevPrefilter:
         assert bool(result[3]), "complex operator failed to converge with a prefilter"
         assert abs(float(result[0]) - reference) < 1e-10
 
+    @pytest.mark.parametrize("prefilter", [(2, -1), (-4, 2), (True, 2), (1.5, 2), (2,), "32,2", 32])
+    def test_malformed_values_raise_here_too_not_only_through_sqd(self, prefilter):
+        """Validation belongs to the module that owns the gate, which is this one.
+
+        ``_check_prefilter`` used to live in :mod:`rqutils.sqd`, so ``sqd(prefilter=(2, -1))`` raised
+        while ``ground_locg(prefilter=(2, -1))`` -- the *published* entry point, and the one whose
+        docstring tells callers to A/B the option -- absorbed it as a silent no-op returning the
+        unfiltered energy at zero speedup. Measured before the move: all four of ``(1.5, 2)``,
+        ``(-4, 2)``, ``(True, 2)`` and ``(2, -1)`` were silently accepted here, and the string and int
+        forms leaked the internal tuple-unpack ``ValueError``/``TypeError`` out of a public entry point.
+        """
+        rng = np.random.default_rng(20260828)
+        mat = jnp.asarray(herm(16, rng, complex_=False))
+        xinit = jnp.asarray(rng.normal(size=16))
+        with pytest.raises((TypeError, ValueError)):
+            ground_locg(mat, xinit, maxiter=10, prefilter=prefilter)
+
+    def test_degenerate_values_add_nothing_to_the_array_path_graph(self):
+        """A documented no-op must not pull the Gershgorin reduction into the traced graph.
+
+        The array path derives ``prefilter_hi`` itself, and gated only on ``prefilter is not None`` it
+        computed that O(N^2) reduction even for ``degree <= 1`` / ``cycles == 0`` -- values the filter
+        then ignores. Measured +6.1% on a 2048-dim solve with ``prefilter=(16, 0)``, and it contradicted
+        the no-op contract ``run_sqd`` already honoured with the tighter gate.
+        """
+        rng = np.random.default_rng(20260828)
+        mat = jnp.asarray(herm(32, rng, complex_=False))
+        xinit = jnp.asarray(rng.normal(size=32))
+
+        def trace(**kwargs):
+            return str(
+                jax.make_jaxpr(lambda m, v: ground_locg(m, v, maxiter=5, **kwargs))(mat, xinit)
+            )
+
+        unfiltered = trace()
+        for prefilter in [(1, 4), (16, 0), (0, 0)]:
+            assert trace(prefilter=prefilter) == unfiltered, (
+                f"prefilter={prefilter} is degenerate but changed the array path's graph"
+            )
+        assert trace(prefilter=(16, 2)) != unfiltered, (
+            "prefilter=(16, 2) left the graph unchanged, so the filter is not reaching the solver"
+        )
+
     def test_negative_leaning_spectrum_finds_the_ground_state(self):
         """THE REGRESSION FOR THE POWER-ITERATION BOUND, which returned an *excited* eigenpair.
 
@@ -1082,11 +1125,9 @@ class TestChebyshevPrefilter:
     def test_callable_without_a_bound_raises_rather_than_guessing(self):
         """A callable cannot supply ``hi``, and guessing it is what caused the wrong answers.
 
-        No matvec-only method can produce a rigorous upper bound: Kuczynski & Wozniakowski (1992)
-        prove it, and constructively, a block-diagonal operator with a start vector inside one block
-        hides the other block's spectrum from every Krylov method (measured: true 1000.0 against a
-        Lanczos bound of 4.68, unchanged by 16 random restarts). So this raises instead of estimating.
-        The array path is unaffected -- it derives Gershgorin from ``mat`` itself.
+        No matvec-only method can produce a rigorous upper bound -- see :func:`_chebyshev_prefilter`
+        for the theorem and ``NOTES.md`` for the adversarial construction -- so this raises instead of
+        estimating. The array path is unaffected: it derives Gershgorin from ``mat`` itself.
         """
         rng = np.random.default_rng(20260828)
         mat = jnp.asarray(herm(32, rng, complex_=False))

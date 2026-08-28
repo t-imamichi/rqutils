@@ -131,6 +131,39 @@ Pinned by `test_sqd.py::TestConvergenceIsReported::test_near_degenerate_subspace
 with the 37 basis states written out as integers. A seed-based redraw does **not** work: a nearby seed
 measured a relative gap of 8.7e-03, too well-gapped to reproduce the raise.
 
+### Indexing a *sharded* array to read one element emits an `all-gather` of the whole vector
+
+2026-08-28, found by a cleanup review of the `vinit_from_min_diag` fix. Writing the sign weight as
+`seed.at[imin].add(jnp.sign(seed[imin]))` is correct arithmetic but reads one element out of a
+partitioned array. Measured on a 4-device mesh with `PartitionSpec('x')`:
+
+| form | `all-gather` | `dynamic-slice` | HLO lines |
+| --- | --- | --- | --- |
+| `seed[imin]` indexed | **3** | 5 | 70 |
+| elementwise mask | **0** | 3 | 57 |
+
+An `all-gather` materializes the entire `states_size` vector on every device — at `_MAX_STATES`
+(2³¹−1) that is precisely the full-vector collective `ground_locg`'s single-vector memory budget
+exists to avoid. End to end through `run_sqd` on a 4-device mesh: 27 → 24 all-gathers.
+
+The fix is a `broadcasted_iota` mask and an elementwise `where`, bit-identical at every `imin` tried.
+**Whole-suite A/B: 20.4 s indexed vs 20.1 s masked** — no cost. Beware when measuring this: switching
+the form invalidates the compilation cache, and a cold run measured 125 s against a warm 20 s, which
+reads as a catastrophic regression and is not one. A/B both arms warm.
+
+### Validation belongs to the module that owns the gate
+
+Same review. `_check_prefilter` lived in `rqutils/sqd.py`, so `sqd(prefilter=(2, -1))` raised while
+`ground_locg(prefilter=(2, -1))` — the *published* entry point, and the one whose docstring tells
+callers to A/B the option — absorbed it. Measured: `(1.5, 2)`, `(-4, 2)`, `(True, 2)` and `(2, -1)` all
+silently no-op'd there, and `"32,2"` / `32` leaked the internal tuple-unpack error out of a public
+entry point. Moved to `ground_locg.py`, which owns the `degree > 1 and cycles > 0` gate the check
+compensates for; `sqd.py` imports it, matching the existing dependency direction.
+
+The array path's auto-derived bound had the same asymmetry: gated only on `prefilter is not None`, it
+computed the O(N²) Gershgorin reduction even for the degenerate no-ops, measured **+6.1%** on a
+2048-dim solve at `prefilter=(16, 0)`. Both paths now use the same tighter predicate.
+
 ### `vinit_from_min_diag`'s weight must carry the seed's sign, or it cancels it
 
 2026-08-28, found while validating the prefilter fix against sampled `Bx = 0` subspaces, and

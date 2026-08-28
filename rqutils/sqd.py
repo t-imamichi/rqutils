@@ -190,7 +190,7 @@ from jax.sharding import PartitionSpec, get_abstract_mesh
 from numpy.typing import DTypeLike, NDArray
 from scipy.sparse import coo_array, csr_array
 
-from rqutils.ground_locg import ground_locg
+from rqutils.ground_locg import _check_prefilter, ground_locg
 from rqutils.paulis.symplectic import PauliSumXZ
 
 LOG = logging.getLogger(__name__)
@@ -306,55 +306,6 @@ def _check_cache_level(cache_level: Any) -> None:
             "1=cache sign bits, 2=cache diagonals) must be 0, 1 or 2. Note the two axes are not "
             "interchangeable: caching source indices is near-free to enable and very expensive to "
             "disable, so a transposed pair is legal but runs 7.2-10.9x slower."
-        )
-
-
-def _check_prefilter(prefilter: Any) -> None:
-    """Raise unless ``prefilter`` is None or a ``(degree, cycles)`` pair of non-negative ints.
-
-    Same reason :func:`_check_cache_level` exists, and the same failure shape.
-    :mod:`rqutils.ground_locg` gates the filter on ``if degree > 1 and cycles > 0``, an equality-style
-    branch with an implicit ``else``, so an out-of-range value is **absorbed into a silent no-op**
-    rather than reported: measured, ``(2, -1)``, ``(-4, 2)`` and ``(True, 2)`` all returned the exact
-    unfiltered energy at zero speedup, which reads as "the prefilter does not help on my problem".
-    That misdiagnosis is the one thing this option cannot afford, because its docstring tells callers
-    to A/B it on their own subspaces. Malformed *types* were no better: ``(2,)``, ``"32,2"`` and ``32``
-    reached ``ground_locg``'s tuple unpack and surfaced its ``ValueError``/``TypeError`` from inside a
-    public entry point.
-
-    ``bool`` is rejected for the reason :func:`_check_cache_level` gives -- it is an ``int`` subclass,
-    so ``(True, 2)`` would otherwise pass as ``(1, 2)``, i.e. as a documented no-op.
-
-    The **intentional** no-ops stay legal: ``degree <= 1`` or ``cycles == 0`` is how a caller disables
-    the filter without restructuring a sweep, and :mod:`rqutils.ground_locg` pins that contract. Only
-    negative values, non-ints and wrong shapes are errors -- a distinction only expressible here,
-    since that single ``degree > 1 and cycles > 0`` test cannot make it.
-
-    Args:
-        prefilter: The caller's value, unvalidated.
-
-    Raises:
-        TypeError: If it is not None or a length-2 sequence of ints.
-        ValueError: If either entry is negative.
-    """
-    if prefilter is None:
-        return
-    try:
-        degree, cycles = prefilter
-    except (TypeError, ValueError) as exc:
-        raise TypeError(
-            f"`prefilter` must be None or a (degree, cycles) pair of ints, got {prefilter!r}"
-        ) from exc
-    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (degree, cycles)):
-        raise TypeError(
-            f"`prefilter` must be None or a (degree, cycles) pair of ints, got {prefilter!r}"
-        )
-    if degree < 0 or cycles < 0:
-        raise ValueError(
-            f"`prefilter` is {prefilter!r}, but both entries must be non-negative. A negative value "
-            "is silently absorbed as a no-op by the filter's `degree > 1 and cycles > 0` gate, so it "
-            "returns the unfiltered energy at zero speedup rather than reporting anything. To disable "
-            "the filter deliberately, pass None (or degree<=1 / cycles=0, which stay legal)."
         )
 
 
@@ -500,7 +451,7 @@ def sqd(
             :func:`rqutils.ground_locg.ground_locg` -- see its docstring for the semantics, the cost,
             the accuracy guarantee and the knob-choosing guidance. ``None`` (the default) leaves the
             traced graph unchanged, so no existing caller is affected; it is static here, as it is
-            there. Validated by :func:`_check_prefilter`, which rejects the malformed values the
+            there. Validated by :func:`rqutils.ground_locg._check_prefilter`, which rejects the malformed values the
             filter's own gate would absorb as a silent no-op.
 
             **Its measured speedups were not taken on this path.** Every figure in
@@ -527,7 +478,7 @@ def sqd(
         ValueError: If ``states_size`` is smaller than ``states.shape[0]``, or if it exceeds
             :math:`2^{31} - 1`, the ceiling imposed by the int32 indices used for subspace positions
             (beyond it an index wraps negative and the subspace is silently permuted); or if either
-            ``prefilter`` entry is negative -- see :func:`_check_prefilter`, which explains why a
+            ``prefilter`` entry is negative -- see :func:`rqutils.ground_locg._check_prefilter`, which explains why a
             negative value would otherwise be absorbed as a silent no-op.
         TypeError: If ``cache_level`` is not a pair of ints, or ``prefilter`` is neither None nor a
             ``(degree, cycles)`` pair of ints.
@@ -929,20 +880,12 @@ def run_sqd(
         # underneath rather than returning a bare one-hot.
         #
         # THE WEIGHT CARRIES THE SEED'S OWN SIGN, and that is what stops it cancelling. A plain
-        # `.add(1.0)` subtracts when the seed component is negative, and `_spread_seed`'s hash maps
-        # index 0 to *exactly* -1.0 at every `states_size` (the Murmur mixer fixes 0, and the affine
-        # map sends that to -1.0), so `argmin(diagonal) == 0` cancelled the component to exactly zero.
-        # ground_locg's documented non-vanishing-overlap precondition was then violated at the one
-        # index the heuristic had just declared most important: measured, a 2-state subspace of the
-        # Bx=0 n=4 Heisenberg chain returned -0.25 against a true -0.75, converged=True in 0
-        # iterations, because the operator is diagonal there and the surviving component is already an
-        # eigenvector. 1 in 18 randomly sampled Bx=0 subspaces at n=4-8 hit it.
-        #
-        # Exact cancellation is only reachable at index 0, but *near*-cancellation is not: 511 of
-        # 2**20 indices carry a seed within 1e-3 of -1.0, and each would lose all but a thousandth of
-        # this component. So the fix is structural rather than a special case on index 0. With
-        # copysign the update always reinforces, giving |vinit[imin]| in [1, 2) whatever the seed --
-        # dominant as intended, and never smaller than the bare one-hot would have been.
+        # `.add(1.0)` subtracts where the seed component is negative, and `_spread_seed` maps index 0
+        # to *exactly* -1.0, so `argmin(diagonal) == 0` zeroed the component at the very index this
+        # heuristic had declared most important -- sqd then returned a wrong eigenvalue with
+        # converged=True. Structural rather than a special case on index 0, because near-cancellation
+        # is reachable at many indices; the sign form bounds |vinit[imin]| into [1, 2) for any seed.
+        # `NOTES.md` has the measurements.
         #
         # A pure one-hot cannot leave its own connected component: Krylov iteration only ever
         # reaches states linked to the seed by a nonzero matrix element, so if the projected
@@ -960,18 +903,21 @@ def run_sqd(
         # because nothing in the suite runs a mesh; `XLA_FLAGS=--xla_force_host_platform_device_count`
         # reproduces it on CPU, which is what examples/scaling/poc7_sharding.py does.
         seed = _spread_seed(states_size, states_u, hamiltonian.c.dtype, sharding)
-        # jnp.sign, not jnp.copysign: the seed is complex whenever `hamiltonian.c` is (an odd Y count
-        # folds an `i` in), and copysign rejects complex input. sign(z) = z/|z| keeps the phase, so the
-        # update reinforces rather than rotating.
+        # Elementwise under a mask rather than `seed.at[imin].add(...)`, which is the same arithmetic
+        # but reads one element out of a *sharded* array: measured on a 4-device mesh, indexing emitted
+        # 3 `all-gather`s to fetch that scalar, materializing the whole `states_size` vector on every
+        # device. At this module's sizes (`_MAX_STATES` is 2**31 - 1) that is exactly the full-vector
+        # collective `ground_locg`'s single-vector memory budget exists to avoid. The mask form emits
+        # none, and is bit-identical (verified at several `imin`).
         #
-        # The sign(0) == 0 branch is defence in depth and is **currently unreachable**: the mixer is a
-        # bijection on uint32, so exactly one index maps to the hash that yields a 0.0 seed, and that
-        # index is 3906290832 -- above the `_MAX_STATES` ceiling of 2**31 - 1 that both entry points
-        # enforce. Kept because it is one cheap line and the alternative is a silent zero weight if the
-        # mixer constants or the ceiling ever change; do not read a surviving mutant here as dead code.
-        direction = jnp.sign(seed[imin])
-        direction = jnp.where(direction == 0, 1.0, direction)
-        return seed.at[imin].add(direction, out_sharding=sharding)
+        # jnp.sign, not jnp.copysign: the seed is complex whenever `hamiltonian.c` is, and copysign
+        # rejects complex input. sign(z) = z/|z| keeps the phase, so the update reinforces.
+        # The zero branch is unreachable below the `_MAX_STATES` ceiling -- `NOTES.md` records why it
+        # stays, so do not read a surviving mutant here as dead code.
+        sign = jnp.sign(seed)
+        direction = jnp.where(sign == 0, 1.0, sign)
+        selected = jax.lax.broadcasted_iota(imin.dtype, (states_size,), 0, out_sharding=sharding)
+        return seed + jnp.where(selected == imin, direction, jnp.zeros_like(seed))
 
     def vinit_nodiag():
         # No diagonal to rank states by, so the spread seed is all there is. A one-hot here is not
@@ -991,17 +937,13 @@ def run_sqd(
     if log_level <= logging.DEBUG:
         jax.debug.print(f"Starting minimization with cache_level {cache_level}")
 
-    # sum|c_k| is a rigorous upper bound on lambda_max: every Pauli string is unitary, so
-    # ||H|| <= sum|c_k| ||P_k|| = sum|c_k|, and projecting onto the subspace can only shrink the
-    # spectral radius (P H P with P an orthogonal projector). Costs no matvec. `ground_locg` cannot
-    # derive this itself -- it sees only a callable -- and it raises rather than guessing, because the
-    # power-iteration estimate this replaced silently returned excited eigenpairs
-    # (docs/rqutils-prefilter-bug.md).
-    # Gated on the filter actually running, not merely on `prefilter is not None`: `ground_locg`
-    # treats degree<=1 or cycles==0 as a documented no-op, and computing the bound anyway would add
-    # ops to the traced graph for those values and break that contract.
-    _filter_runs = prefilter is not None and prefilter[0] > 1 and prefilter[1] > 0
-    prefilter_hi = jnp.abs(hamiltonian.c).sum() if _filter_runs else None
+    # sum|c_k| bounds lambda_max rigorously -- every Pauli string is unitary, and projecting onto the
+    # subspace only shrinks the spectral radius -- and costs no matvec. `ground_locg` cannot derive it
+    # from a callable, and raises rather than guessing (docs/rqutils-prefilter-bug.md). Gated on the
+    # filter actually running, since degree<=1 or cycles==0 is a documented no-op and computing the
+    # bound anyway would add ops to the traced graph for those values.
+    filter_runs = prefilter is not None and prefilter[0] > 1 and prefilter[1] > 0
+    prefilter_hi = jnp.abs(hamiltonian.c).sum() if filter_runs else None
     eigval, eigvec, _, converged = ground_locg(
         matvec,
         vinit,

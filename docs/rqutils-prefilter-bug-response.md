@@ -9,9 +9,11 @@ number in the report reproduced: n=2 Heisenberg returning `+0.25` for `-0.75`, t
 16/25 configurations, wrong answers in 2/25, the coefficient-sum bound valid 25/25. Nothing in it
 needed correction.
 
-Two things you should read before re-enabling the wiring: the callable path is a **breaking change**
-(§2), and we found a **second, unrelated defect in `sqd`** that also fires in your `skqd` regime and is
-*not* fixed (§5). That one still blocks `sqd_backend.py`.
+Two things you should read before re-enabling the wiring. The callable path is a **breaking change**
+(§2) — though it does not affect your `sqd()` call sites. And we found a **second, unrelated defect in
+`sqd`** while validating against your `skqd` regime, which affected every `sqd` call and not just
+prefiltered ones; that is **also fixed** (§5). **Nothing is left blocked: both `exact.py` and
+`skqd/sqd_backend.py` are safe to re-enable.**
 
 ---
 
@@ -121,7 +123,8 @@ prefiltered ones, on every revision that has `_spread_seed`.
 
 
 Found while validating this fix against your `skqd` regime (sampled subspaces, `Bx = 0`). It is
-**unrelated to the prefilter** and is *not* fixed by `568b173`. Reproducer:
+**unrelated to the prefilter** — it predates it, and `568b173` did not address it; the fix is
+`5170290`, described at the end of this section. Reproducer, against a tree without that commit:
 
 ```python
 import numpy as np, jax

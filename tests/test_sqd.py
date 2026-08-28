@@ -809,16 +809,12 @@ class TestSqdInitialVector:
 class TestSqdMinDiagWeightCancellation:
     """``vinit_from_min_diag``'s weight must reinforce the spread seed, never cancel it.
 
-    The heuristic adds weight at ``argmin(diagonal)`` on top of ``_spread_seed``. It used to add a
-    bare ``+1.0``, which *subtracts* wherever the seed component is negative -- and ``_spread_seed``'s
-    Murmur-style mixer maps index 0 to **exactly -1.0** at every ``states_size`` (the mixer fixes 0,
-    and ``mixed * 2/2**32 - 1`` sends that to -1.0). So ``argmin(diagonal) == 0`` cancelled the
-    component to exactly zero, violating ``ground_locg``'s non-vanishing-overlap precondition at
-    precisely the index the heuristic had just declared the best guess available.
-
-    Exact cancellation is reachable only at index 0, but near-cancellation is not: 511 of ``2**20``
-    indices carry a seed within 1e-3 of -1.0. That is why the fix is ``jnp.sign``-based rather than a
-    special case on index 0, and why this class asserts the invariant as well as the symptom.
+    A bare ``+1.0`` subtracts where the seed component is negative, and ``_spread_seed`` maps index 0
+    to exactly -1.0 -- so ``argmin(diagonal) == 0`` zeroed the component at the very index the
+    heuristic had just declared the best guess available. Near-cancellation at other indices is what
+    makes the fix structural rather than a special case on index 0, and why this class asserts the
+    invariant as well as the symptom. ``NOTES.md`` has the measurements. Each test names its own
+    defect.
     """
 
     def test_two_state_diagonal_subspace(self):
@@ -1962,9 +1958,7 @@ class TestShardedSqdPrefilter:
 
     ``tests/_sharded_prefilter.py`` already covers the prefilter on a mesh, but only through
     ``ground_locg`` with a dense ``einsum`` matvec on an unpadded power-of-two vector.
-    ``docs/locg-chebyshev-prefilter.md`` states the gap and defers it here -- *"Ragged mesh splits are
-    not swept because they are unreachable: explicit sharding rejects ``dim % mesh.size != 0`` at
-    ``device_put``. That is ``sqd``'s concern, where ``uniquify_states`` pads to a power of two."*
+    ``docs/locg-chebyshev-prefilter.md`` states that gap and defers it here.
 
     So this covers the one configuration only reachable through ``sqd``: a **padded** subspace whose
     filler slots are masked to zero, partitioned across a mesh, driven through ``apply_h``'s
@@ -2000,16 +1994,17 @@ class TestShardedSqdPrefilter:
         expected_energies = sorted(
             (devices, *level) for devices in (1, 2, 4) for level in CACHE_LEVELS
         )
-        assert sorted(energies) == expected_energies, (
-            f"expected {len(expected_energies)} energy cases, got {sorted(energies)} -- the child did "
-            f"not run the full grid:\n{stdout[-2000:]}"
-        )
         expected_specs = sorted(
             (devices, label) for devices in (1, 2, 4) for label in ("part", "repl")
         )
-        assert sorted(specs) == expected_specs, (
-            f"expected {len(expected_specs)} spec cases, got {sorted(specs)}:\n{stdout[-2000:]}"
-        )
+        for name, got, want in (
+            ("energy", sorted(energies), expected_energies),
+            ("spec", sorted(specs), expected_specs),
+        ):
+            assert got == want, (
+                f"child did not run the full {name} grid: got {got}, expected {want}\n"
+                f"{stdout[-2000:]}"
+            )
 
         for key, (single, sharded) in sorted(energies.items()):
             assert single == pytest.approx(sharded, abs=1e-12), (

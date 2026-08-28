@@ -6,6 +6,33 @@
 
 **Date.** 2026-08-27, CPU, float64 (`jax_enable_x64`), branch `dev`.
 
+> **SUPERSEDED IN PART (2026-08-28) — read this before trusting anything below about `hi`.**
+>
+> `_lambda_max_bound` **is deleted.** Its 10-step power iteration converged to the largest-*magnitude*
+> eigenvalue, so on a negative-leaning spectrum the filter interval inverted and `ground_locg` returned
+> an **excited** eigenpair with `converged=True`. Report and reproduction:
+> `docs/rqutils-prefilter-bug.md`; reply and migration: `docs/rqutils-prefilter-bug-response.md`.
+>
+> What that changes in the text below:
+>
+> * Every mention of `hi` coming from power iteration with a ×1.05 margin (§2 line 56, §3 line 89,
+>   §5 lines 188 and 201) describes **deleted** code. `hi` is now the required `prefilter_hi` argument:
+>   Gershgorin `max_i Σ_j |A_ij|` derived automatically for an array, `Σ|c_k|` passed by `sqd`, and a
+>   **raise** for an opaque callable. No matvec-only estimate can be rigorous — a theorem, not a
+>   tuning problem.
+> * The **77 matvecs** figure (§2) no longer includes "~11 for the `λ_max` estimate"; the bound costs
+>   no matvec at all.
+> * **The §3/§3.1 measurements were taken with the unsound bound.** They remain valid as relative
+>   comparisons, but the headline improved once the estimate's matvecs were gone: **3.29× median**
+>   against the 1.88× recorded here.
+> * The recommended range **`degree` 32–64 (§3.1, §4) is narrowed to `(32, 2)` only.** An independent
+>   sweep measured `degree=64` as the *weakest* arm (0.74–0.80× dense).
+> * §4 item 4's "The filter cannot change the answer — every convergence test reads the true residual"
+>   is **the exact claim the bug report demolished**: the residual test certifies that *an* eigenpair
+>   was found, not the lowest one. It holds only when `prefilter_hi` is a valid bound.
+>
+> The sharding deferral in the paragraph below is now **closed** — see the note there.
+
 **Status.** **Implemented** on branch `locg-chebyshev` as `ground_locg(prefilter=(degree, cycles))`,
 default `None`. 12 tests in `tests/test_ground_locg.py::TestChebyshevPrefilter` plus
 `tests/_sharded_prefilter.py`; suite 549 → 560. In-tree measurement reproduces the prototype: 18/18
