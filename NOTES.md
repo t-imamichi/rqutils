@@ -588,6 +588,65 @@ now caught.
 `get_xsource` no longer contributes — it is a binary search into the already-sorted list, not a sort
 of a stacked `2N` array.
 
+## Prefilter vs precond: use the prefilter, and do not combine them
+
+2026-08-28, prompted by "is there an opportunity for precond to improve `locg`?". Answered by
+measurement rather than by re-reading the closed record below; the conclusion **agrees** with it and
+adds two things it does not contain. One Hamiltonian family (XXZ, `Bx = 0.5`), sampled subspaces,
+single-device CPU, best-of-3 warm.
+
+**The recommendation is the prefilter, and the deciding factor is the precondition, not the margin.**
+`precond` needs positive-definiteness, hence a shift `sqd` cannot produce — that is the structural
+blocker recorded below. The prefilter needs only an upper bound on `λ_max`, which `sqd` has free as
+`Σ|c_k|`. Wall-clock on the *shifted* operator, where `precond` is at its best, `ground_locg` dense:
+
+| n | dim | plain | precond | prefilter | both |
+| --- | --- | --- | --- | --- | --- |
+| 16 | 1975 | 262.7 ms | 187.1 | **105.3** | 179.3 |
+| 16 | 1970 | 155.8 | 105.9 | **61.5** | 78.3 |
+| 18 | 3971 | 566.9 | 397.3 | **239.0** | 290.5 |
+| 18 | 3965 | 1206.6 | 828.8 | **261.2** | 352.6 |
+
+Prefilter wins 4/4 even where `precond` is legal.
+
+**They anti-compose, robustly, and this is the finding worth keeping.** Adding `precond` to a
+prefiltered run *halves* the gain from `(32, 2)` up. On the shifted n=18 dim-3965 instance, gains over
+plain:
+
+| prefilter | filter only | filter + precond |
+| --- | --- | --- |
+| (16, 2) | 2.19x | 2.77x — precond helps |
+| (32, 2) | **11.27x** | 6.04x |
+| (48, 2) | **18.78x** | 9.94x |
+| (64, 2) | **28.17x** | 13.00x |
+
+Only at low degree does `precond` add anything. No verified mechanism — the plausible one, that a
+diagonal rescale partly undoes the residual enrichment `_chebyshev_prefilter`'s docstring describes, is
+**speculation and was not tested**. Don't record it as established.
+
+**Quote the end-to-end number, not the iteration count.** Three measures of the same prefilter benefit,
+each shrinking as it gets closer to what a caller experiences:
+
+| measure | median |
+| --- | --- |
+| iteration counts, dense `ground_locg` | 5.02x |
+| wall-clock, dense `ground_locg` | 2.43x |
+| **wall-clock through `sqd()`** | **1.49x** (min 1.15x, max 1.70x, 6 instances) |
+
+The prefilter costs `cycles·(degree+1)` ≈ 66 matvecs up front, and `apply_h`'s sparse matvec is cheap,
+so those cost proportionally more than on a dense operator. This is exactly the matvec-to-bookkeeping
+ratio `docs/locg-chebyshev-prefilter.md` names as the genuinely uncertain quantity, and the end-to-end
+figure lands **below** the 1.88x that doc measured on dense `ground_locg` — which is why `sqd`'s
+docstring tells callers to A/B on their own subspaces rather than trusting the published figure. Every
+arm was correct to <1e-9 against `eigsh(tol=0)`.
+
+**A measurement trap hit twice here.** `tests/conftest.py`'s `project_dense` builds the *full* `2^n`
+operator before slicing, so it cannot reach n=16 (68 GB) — an attempt to reproduce the 1.79x figure with
+it died with no useful error. Use `hproj` for anything past n≈12. Separately, a first pass on small
+dense chains measured 1.05x median *with a regression* and looked like a refutation of the shipped
+`precond`; the documented instances are **sampled subspaces at n=16-18, dim 2000-4000**, where the same
+code reproduces 2.76x median with 0 regressions. The fixture family, not the code, was wrong.
+
 ## Preconditioners and subspace selection: a closed investigation
 
 Full record in `docs/rqutils-precond-request.md` and `docs/sdp-lower-bound.md`. Summarized here
