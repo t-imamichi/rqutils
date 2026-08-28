@@ -82,6 +82,25 @@ failed assert changes nothing, verify each edit landed rather than inferring it 
 mutation-test the *surviving* assertion afterwards. Note `pytest` prints "no tests ran" rather than
 failing when the class path is wrong, so a mis-copied class name looks like a pass.
 
+### The prefilter's only `sqd`-specific sharding case: padded subspace meets partitioned vector
+
+2026-08-28. `tests/_sharded_prefilter.py` covers the prefilter on a mesh, but only through
+`ground_locg` with a dense `einsum` matvec on an unpadded power-of-two vector —
+`docs/locg-chebyshev-prefilter.md` said so and deferred the rest to `sqd`. That deferral is now closed
+by `tests/_sharded_sqd_prefilter.py`.
+
+What is only reachable through `sqd`: a **padded** subspace whose filler slots are masked to zero,
+partitioned across a mesh, driven through `apply_h`'s gather-heavy irregular kernel rather than a dense
+matmul — and the filter calls that matvec `cycles * (degree + 1)` times before the solver's first
+iteration, so a fault there gets far more exposure than one LOBPCG step gives it. 37 genuine states pad
+to 64, which 2 and 4 both divide; that arrangement cannot occur in the `ground_locg` harness.
+
+**Value agreement proves nothing here.** All 18 energy cases agree to 4e-16 or better regardless of
+whether partitioning survives, so the child also prints the prefilter's output spec and the test
+asserts `filtered_spec == vinit_spec`, plus that the partitioned arm really is `P('x',)` — without that
+last guard a harness that quietly stopped partitioning would pass. Both guards are mutation-verified
+(a `jax.reshard(out, P(None))` in the filter; a harness that never partitions).
+
 ### A `maxiter=1000` non-convergence usually means a small gap, not a bad subspace
 
 2026-08-28. Two of ~300 random stress fixtures raised `RuntimeError: LOBPCG did not converge`, which

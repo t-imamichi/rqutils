@@ -17,7 +17,10 @@ configurations at fewer matvecs. Sharding verified on a
 Sharding coverage is 1/2/4 devices x partitioned/replicated (12 cases), asserting the output *spec*.
 Ragged mesh splits are **not** swept because they are unreachable: explicit sharding rejects
 `dim % mesh.size != 0` at `device_put`, before `ground_locg` runs. That is `sqd`'s concern, where
-`uniquify_states` pads to a power of two.
+`uniquify_states` pads to a power of two — **now covered** by
+`tests/_sharded_sqd_prefilter.py` / `test_sqd.py::TestShardedSqdPrefilter` (2026-08-28): the padded
+subspace and `apply_h`'s gather-heavy matvec on a mesh, swept over 1/2/4 devices x all six
+`cache_level`s, asserting the prefilter's output *spec* as well as the energy.
 
 **Still not the default**, and §5 item 4 stands: every figure here is single-device CPU.
 `examples/scaling/poc9_prefilter_gpu.py` exists to settle the GPU question in one run on a CUDA box --

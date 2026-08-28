@@ -1957,6 +1957,78 @@ class TestComplexCoefficientsAcrossCacheLevels:
             )
 
 
+class TestShardedSqdPrefilter:
+    """``sqd(prefilter=...)`` must agree sharded and single-device, and keep the vector partitioned.
+
+    ``tests/_sharded_prefilter.py`` already covers the prefilter on a mesh, but only through
+    ``ground_locg`` with a dense ``einsum`` matvec on an unpadded power-of-two vector.
+    ``docs/locg-chebyshev-prefilter.md`` states the gap and defers it here -- *"Ragged mesh splits are
+    not swept because they are unreachable: explicit sharding rejects ``dim % mesh.size != 0`` at
+    ``device_put``. That is ``sqd``'s concern, where ``uniquify_states`` pads to a power of two."*
+
+    So this covers the one configuration only reachable through ``sqd``: a **padded** subspace whose
+    filler slots are masked to zero, partitioned across a mesh, driven through ``apply_h``'s
+    gather-heavy irregular kernel instead of a dense matmul. The filter calls that matvec
+    ``cycles * (degree + 1)`` times before the solver's first iteration, so a sharding fault there gets
+    far more exposure than one LOBPCG step would give it.
+
+    Swept over all six ``cache_level`` values, not sampled: ``cache_level`` selects which kernel the
+    filter calls, and ``TestShardedCacheLevels`` records two sharding bugs that lived in the three
+    ``cache_level[0] == 0`` cells where one representative cell reported success.
+
+    **Asserts the spec, not only the energy.** Measured, all 18 energy cases agree to 4e-16 or better
+    whether or not partitioning survives -- per ``CLAUDE.md`` a replicated run agrees with
+    single-device to exactly 0.0, so "correct but silently unsharded" is invisible to value
+    comparison. The child therefore also prints the prefilter's output sharding.
+    """
+
+    def test_every_cache_level_agrees_sharded_and_single_device(self):
+        stdout = run_sharded_child("_sharded_sqd_prefilter.py", "sqd prefilter")
+
+        energies = {}
+        specs = {}
+        for line in stdout.strip().splitlines():
+            parts = line.split()
+            if parts[:1] == ["energy"] and len(parts) == 6:
+                key = (int(parts[1]), int(parts[2]), int(parts[3]))
+                energies[key] = (float(parts[4]), float(parts[5]))
+            elif parts[:1] == ["spec"] and len(parts) == 5:
+                specs[(int(parts[1]), parts[2])] = (parts[3], parts[4])
+
+        # Assert both case sets are complete before checking values: a child that died partway would
+        # otherwise pass on whatever it managed to print.
+        expected_energies = sorted(
+            (devices, *level) for devices in (1, 2, 4) for level in CACHE_LEVELS
+        )
+        assert sorted(energies) == expected_energies, (
+            f"expected {len(expected_energies)} energy cases, got {sorted(energies)} -- the child did "
+            f"not run the full grid:\n{stdout[-2000:]}"
+        )
+        expected_specs = sorted(
+            (devices, label) for devices in (1, 2, 4) for label in ("part", "repl")
+        )
+        assert sorted(specs) == expected_specs, (
+            f"expected {len(expected_specs)} spec cases, got {sorted(specs)}:\n{stdout[-2000:]}"
+        )
+
+        for key, (single, sharded) in sorted(energies.items()):
+            assert single == pytest.approx(sharded, abs=1e-12), (
+                f"devices={key[0]} cache_level={key[1:]}: sharded {sharded} disagrees with "
+                f"single-device {single}"
+            )
+        for (devices, label), (vinit_spec, filtered_spec) in sorted(specs.items()):
+            assert filtered_spec == vinit_spec, (
+                f"devices={devices} {label}: the prefilter returned {filtered_spec} for a "
+                f"{vinit_spec} input -- it is not sharding-transparent"
+            )
+        # And the partitioned arm must actually be partitioned, or the check above is vacuous.
+        for devices in (2, 4):
+            assert specs[(devices, "part")][1] == "P('x',)", (
+                f"devices={devices}: the partitioned arm came back "
+                f"{specs[(devices, 'part')][1]}, so nothing was sharded and this test proves nothing"
+            )
+
+
 class TestShardedCacheLevels:
     """Every ``cache_level`` must give the same answer sharded as single-device.
 
