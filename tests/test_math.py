@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import scipy.linalg as sla
-from conftest import herm
+from conftest import assert_type_checks, herm
 
 import rqutils.math as rm
 
@@ -239,9 +239,9 @@ class TestSymmetryValidation:
         rng = np.random.default_rng(20260804)
         mat = herm(3, rng)
         with pytest.raises(TypeError, match="positional"):
-            rm.matrix_exp(mat, True)  # ty: ignore[too-many-positional-arguments]
+            rm.matrix_exp(mat, True)
         with pytest.raises(TypeError, match="positional"):
-            rm.matrix_angle(mat, True)  # ty: ignore[too-many-positional-arguments]
+            rm.matrix_angle(mat, True)
 
     def test_matrix_ufunc_flags_are_keyword_only(self):
         rng = np.random.default_rng(20260804)
@@ -333,3 +333,53 @@ class TestMatrixUfunc:
     def test_bad_shapes_raise(self, bad, match):
         with pytest.raises(np.linalg.LinAlgError, match=match):
             rm.matrix_exp(bad)
+
+
+class TestWithDiagonalsReturnType:
+    """``matrix_exp``/``matrix_angle`` declared ``-> NDArray`` while forwarding ``with_diagonals``.
+
+    Both wrappers pass ``with_diagonals`` through to :func:`matrix_ufunc`, which returns
+    ``(result, diagonals)`` when it is set -- so the declared ``NDArray`` was simply wrong, and a caller
+    trusting it got a 2-tuple with no warning from a checker. Measured before the fix:
+    ``type(matrix_exp(m, with_diagonals=True))`` is ``tuple``, length 2, against a declared ``NDArray``.
+
+    Fixed with ``@overload`` on ``with_diagonals: Literal[...]`` rather than by widening the return to a
+    union, so the common call keeps its precise ``NDArray`` and only the opt-in arm sees the tuple.
+    """
+
+    def test_both_arms_return_what_they_declare(self):
+        """Runtime shapes only, so this passes against the wrong annotation too -- deliberately.
+
+        The defect was annotation-only, so nothing at runtime can detect it; this pins that the shapes
+        the overloads promise are the shapes actually returned, and
+        ``test_overload_arms_are_checkable`` is what fails against the pre-fix declaration.
+        """
+        mat = np.diag([1.0, 2.0, 0.5])
+        for func in (rm.matrix_exp, rm.matrix_angle):
+            plain = func(mat)
+            assert not isinstance(plain, tuple), f"{func.__name__} without with_diagonals"
+            pair = func(mat, with_diagonals=True)
+            assert isinstance(pair, tuple) and len(pair) == 2, f"{func.__name__} with_diagonals"
+            # The first element must match the plain call exactly -- the flag adds, never alters.
+            np.testing.assert_allclose(np.asarray(pair[0]), np.asarray(plain), atol=0, rtol=0)
+
+    def test_with_diagonals_true_is_declared_a_tuple(self):
+        """Assert the *declared type*, because unpacking alone cannot detect the defect.
+
+        ``res, diag = matrix_exp(m, with_diagonals=True)`` type-checks even against the pre-fix
+        ``-> NDArray``, since an ndarray is iterable -- verified, it reports "All checks passed!". The
+        symptom is the declared type: ``ndarray[_AnyShape, dtype[Unknown]]`` before, versus
+        ``tuple[NDArray, NDArray]`` after. So this asserts a `.index` attribute that exists on a tuple
+        and not on an ndarray, which is the smallest thing that separates the two.
+        """
+        assert_type_checks(
+            "import numpy as np\n"
+            "from rqutils.math import matrix_exp\n"
+            "m = np.diag([1.0, 2.0])\n"
+            "arr = matrix_exp(m)\n"
+            "_ = arr.shape\n"
+            "pair = matrix_exp(m, with_diagonals=True)\n"
+            "_ = pair.index\n",
+            "matrix_exp's with_diagonals overloads",
+            rules=("unresolved-attribute", "not-iterable"),
+        )

@@ -62,13 +62,18 @@ exclude = ["**/*.ipynb"]
 # defect hiding behind them (a `None` angle reaching arithmetic in `conftest.gate_unitary`, and
 # `QPrintBase._process` annotated `list[list[Term]]` while returning `list[Term]`). Before adding a
 # rule here, count the diagnostics -- `ty check -c 'rules.X="error"'` -- and read them.
-# `invalid-return-type` is the next candidate: 7 sites, of which `math.py`'s two are the same
-# `with_diagonals` union that the @overload pattern fixes. That pattern has now retired
-# `invalid-assignment` too -- overloading `ground_locg` on `debug: Literal[...]` took 19 diagnostics to
-# 1, and the last was a test asserting a read-only property raises (per-line ignore there).
+# Six rules retired so far, four remain. The @overload-on-`Literal` pattern did most of it: `sqd`
+# (`return_eigvec`), `ground_locg` (`debug`), `matrix_exp`/`matrix_angle` (`with_diagonals`) -- each a
+# runtime flag that picks the return shape. `not-subscriptable` was removed as dead config, zero
+# findings.
+#
+# What remains, library-side, is 35 findings dominated by one root cause that no annotation fixes: a
+# `@jax.jit` function's parameters are converted *before* the body runs, so `x: int` genuinely has a
+# `.dtype` by the time it is read (13 of the 35). Those need jax to ship stubs, not local work. The
+# tractable remainder is narrowing gaps at `ArrayLike.shape` and the `svsim.to_circuitxz` isinstance
+# branch -- see `docs/typing-notes.md`.
 unresolved-attribute = "ignore"
 no-matching-overload = "ignore"
 invalid-argument-type = "ignore"
 invalid-return-type = "ignore"
-not-subscriptable = "ignore"
 

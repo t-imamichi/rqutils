@@ -18,6 +18,7 @@ Math API
 import enum
 from collections.abc import Callable
 from types import ModuleType
+from typing import Literal, overload
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -152,17 +153,77 @@ def matrix_ufunc(
     return op_mat
 
 
+@overload
+def matrix_exp(
+    mat: ArrayLike,
+    *,
+    hermitian: int | bool | Symmetry = ...,
+    with_diagonals: Literal[False] = ...,
+    npmod: ModuleType = ...,
+) -> NDArray: ...
+
+
+@overload
+def matrix_exp(
+    mat: ArrayLike,
+    *,
+    hermitian: int | bool | Symmetry = ...,
+    with_diagonals: Literal[True],
+    npmod: ModuleType = ...,
+) -> tuple[NDArray, NDArray]: ...
+
+
+@overload
+def matrix_exp(
+    mat: ArrayLike,
+    *,
+    hermitian: int | bool | Symmetry = ...,
+    with_diagonals: bool = ...,
+    npmod: ModuleType = ...,
+) -> NDArray | tuple[NDArray, NDArray]: ...
+
+
 def matrix_exp(
     mat: ArrayLike,
     *,
     hermitian: int | bool | Symmetry = Symmetry.GENERAL,
     with_diagonals: bool = False,
     npmod: ModuleType = np,
-) -> NDArray:
+) -> NDArray | tuple[NDArray, NDArray]:
     """`matrix_ufunc(exp, ...)`"""
     return matrix_ufunc(
         npmod.exp, mat, hermitian=hermitian, with_diagonals=with_diagonals, npmod=npmod
     )
+
+
+@overload
+def matrix_angle(
+    mat: ArrayLike,
+    *,
+    hermitian: int | bool | Symmetry = ...,
+    with_diagonals: Literal[False] = ...,
+    npmod: ModuleType = ...,
+) -> NDArray: ...
+
+
+@overload
+def matrix_angle(
+    mat: ArrayLike,
+    *,
+    hermitian: int | bool | Symmetry = ...,
+    with_diagonals: Literal[True],
+    npmod: ModuleType = ...,
+) -> tuple[NDArray, NDArray]: ...
+
+
+@overload
+def matrix_angle(
+    mat: ArrayLike,
+    *,
+    hermitian: int | bool | Symmetry = ...,
+    with_diagonals: bool = ...,
+    npmod: ModuleType = ...,
+) -> NDArray | tuple[NDArray, NDArray]: ...
 
 
 def matrix_angle(
@@ -171,7 +232,7 @@ def matrix_angle(
     hermitian: int | bool | Symmetry = Symmetry.GENERAL,
     with_diagonals: bool = False,
     npmod: ModuleType = np,
-) -> NDArray:
+) -> NDArray | tuple[NDArray, NDArray]:
     """`matrix_ufunc(angle, ...)`"""
     return matrix_ufunc(
         npmod.angle, mat, hermitian=hermitian, with_diagonals=with_diagonals, npmod=npmod
