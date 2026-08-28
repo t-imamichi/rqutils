@@ -21,6 +21,7 @@ agree on structure (same term count, same signs, same numbers) even though they 
 
 import numpy as np
 import pytest
+from conftest import assert_imports_without, assert_type_checks
 
 import rqutils.qprint as q
 
@@ -326,3 +327,51 @@ class TestUnsupportedInput:
     def test_unsupported_type_raises(self):
         with pytest.raises(NotImplementedError, match="qprint not implemented"):
             q.qprint("not an array", output="text")
+
+
+class TestPrintReturnTypeIsCheckable:
+    """``PrintReturnType``'s ``Figure`` arm must be visible to a static type checker.
+
+    Same defect as ``sqd.HamiltonianInput`` and ``svsim.CircuitInput``: the arm was added by
+    ``PrintReturnType |= Figure`` under ``HAS_MPL``, invisible to a checker, so a caller annotating
+    against ``qprint(..., output='mpl')``'s documented return could not accept it.
+
+    ``Figure`` is bound on **both** branches of the ``HAS_MPL`` guard -- the real class with
+    matplotlib, ``Any`` without -- so naming it unconditionally in the ``type`` statement is safe and
+    collapses the union to ``Any`` when matplotlib is absent, which is the pre-existing convention for
+    this module's optional types. See ``conftest.assert_type_checks`` for why this shells out to ``ty``.
+    """
+
+    def test_figure_is_an_accepted_arm(self):
+        pytest.importorskip("matplotlib")
+        assert_type_checks(
+            "from matplotlib.figure import Figure\n"
+            "from rqutils.qprint import PrintReturnType\n"
+            "def take(x: PrintReturnType) -> None: ...\n"
+            "take('some latex')\n"
+            "take(Figure())\n",
+            "qprint.PrintReturnType",
+        )
+
+    def test_module_works_without_matplotlib(self):
+        """Naming ``Figure`` in the alias must not make matplotlib a hard dependency.
+
+        Exercises the two renderings that do not need it, and asserts ``output='mpl'`` still raises
+        ``RuntimeError`` rather than failing at import -- this module's documented contract for an
+        absent optional dependency.
+        """
+        assert_imports_without(
+            "rqutils.qprint",
+            ["matplotlib", "qutip"],
+            "import numpy as np\n"
+            "assert m.HAS_MPL is False\n"
+            "vec = np.array([1.0, 0.0])\n"
+            "assert '|0>' in repr(m.qprint(vec, output='text'))\n"
+            "assert isinstance(m.qprint(vec, output='latex'), str)\n"
+            "try:\n"
+            "    m.qprint(vec, output='mpl')\n"
+            "except RuntimeError:\n"
+            "    pass\n"
+            "else:\n"
+            "    raise AssertionError('output=mpl must raise RuntimeError without matplotlib')\n",
+        )

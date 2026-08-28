@@ -321,10 +321,26 @@ static — a traced loop index cannot subscript a static dimension tuple
 `tests/test_paulis_general.py::TestNpmodParity` pins it, including under `jax.jit`.
 
 **Optional dependencies** — uniform `try: import X / except ImportError: HAS_X = False / else:
-HAS_X = True` at module top, every use guarded by `HAS_X and isinstance(...)`. Type aliases are
-conditionally widened (`CircuitInput |= QuantumCircuit`), and the runtime path raises a `RuntimeError`
-rather than failing at import. `numpy`, `scipy`, `h5py`, and **`jax`** are hard dependencies
-(`pyscipopt` is not — it is only on the stale `product` branch).
+HAS_X = True` at module top, every use guarded by `HAS_X and isinstance(...)`, and the runtime path
+raises a `RuntimeError` rather than failing at import. `numpy`, `scipy`, `h5py`, and **`jax`** are hard
+dependencies (`pyscipopt` is not — it is only on the stale `product` branch).
+
+**A type alias must name every arm in its `type` statement — never widen one afterwards with
+`X |= OptionalType` under a `HAS_*` guard.** A `type` statement is evaluated *statically*, so the
+augmented assignment mutates only the runtime object and the added arm is invisible to a type checker
+whether or not the optional package is installed. All three aliases had this (`sqd.HamiltonianInput`,
+`svsim.CircuitInput`, `qprint.PrintReturnType`); every correct `sqd(SparsePauliOp, ...)` call was an
+`invalid-argument-type` error for a downstream caller who type-checks. Naming the arm unconditionally is
+safe because a `type` statement is **lazy** — nothing reads `__value__`, so an annotation-only import is
+never resolved at runtime. Import that arm under `TYPE_CHECKING` if it is not already needed at runtime
+(`sqd`), and leave the existing runtime import alone if it is (`svsim` needs it for an `isinstance`).
+
+Note **this repo cannot see that defect itself**: `invalid-argument-type` is `ignore` in
+`[tool.ty.rules]`, so `ty check` passes against the broken form. The three regression tests re-enable
+the rule per-invocation via `ty check -c` (`conftest.assert_type_checks`), and pin the
+without-the-package import too (`conftest.assert_imports_without`). Two traps if you write another:
+`ty` silently checks **nothing** for a file outside the project root, and it resolves an alias to an
+opaque `TypeAliasType` without evaluating its value, so no runtime assertion can pin this.
 
 **Don't index a sharded array to read one element.** `seed.at[i].add(f(seed[i]))` is correct
 arithmetic but emits an `all-gather` per read — measured 3 on a 4-device mesh, each materializing the

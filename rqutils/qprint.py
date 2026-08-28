@@ -37,7 +37,6 @@ else:
 import rqutils.paulis.general as pmatrix
 from rqutils._types import MatrixDimension
 
-type PrintReturnType = str
 if HAS_MPL:
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
@@ -47,11 +46,15 @@ if HAS_MPL:
         "module://matplotlib_inline.backend_inline",
         "nbAgg",
     }
-
-    PrintReturnType |= Figure
 else:
     type Axes = Any
     type Figure = Any
+
+# The Figure arm must be named here, not added by a later `PrintReturnType |= Figure` under HAS_MPL: a
+# `type` statement is evaluated statically, so the augmented assignment leaves the arm invisible to a
+# checker. Safe either way because the statement is lazy and `Figure` is bound on both branches above
+# -- the real class with matplotlib, `Any` without, which correctly collapses the union to `Any`.
+type PrintReturnType = str | Figure
 
 
 def qprint(

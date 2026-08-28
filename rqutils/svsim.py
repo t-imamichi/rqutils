@@ -61,9 +61,12 @@ class CircuitXZ:
 
 
 type GateSpec = tuple[str, int | Sequence[int]] | tuple[str, int | Sequence[int], Any]
-type CircuitInput = CircuitXZ | list[GateSpec]
-if HAS_QISKIT:
-    CircuitInput |= QuantumCircuit
+# The QuantumCircuit arm must be named here, not added by a later `CircuitInput |= QuantumCircuit`
+# under HAS_QISKIT: a `type` statement is evaluated statically, so the augmented assignment leaves the
+# arm invisible to a checker. Lazy evaluation keeps this import-safe without qiskit -- nothing reads
+# `__value__`. `TYPE_CHECKING` is unnecessary because the runtime import above is needed anyway, for
+# the `isinstance` in `to_circuitxz`.
+type CircuitInput = CircuitXZ | list[GateSpec] | QuantumCircuit
 
 
 # name -> (x bit, z bit, takes an angle). The supported gate set in one place: which gates exist,

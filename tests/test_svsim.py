@@ -23,7 +23,14 @@ irreducible ``exp(i*pi/4)`` -- see :meth:`TestCz.test_cz_matches_up_to_global_ph
 
 import numpy as np
 import pytest
-from conftest import gate_unitary, phaseless_distance, run_sharded_child, simulate_dense
+from conftest import (
+    assert_imports_without,
+    assert_type_checks,
+    gate_unitary,
+    phaseless_distance,
+    run_sharded_child,
+    simulate_dense,
+)
 
 from rqutils.svsim import CircuitXZ, svsim, to_circuitxz
 
@@ -502,3 +509,40 @@ class TestShardedOutput:
         assert seen["explicit_replicated"][1] == "P(None,)", seen["explicit_replicated"]
         for label in self.EXPECTED_CASES - {"explicit_replicated"}:
             assert seen[label][1] == "P('x',)", f"{label} was not partitioned: {seen[label][1]}"
+
+
+class TestCircuitInputIsCheckable:
+    """``CircuitInput``'s ``QuantumCircuit`` arm must be visible to a static type checker.
+
+    Same defect as ``sqd.HamiltonianInput`` and ``qprint.PrintReturnType``: the arm was added by
+    ``CircuitInput |= QuantumCircuit`` under ``HAS_QISKIT``, which a checker never executes, so
+    ``to_circuitxz(QuantumCircuit(...))`` -- the documented primary input -- was an
+    ``invalid-argument-type`` error for a caller who type-checks.
+
+    Unlike ``sqd``, the qiskit import here is **not** under ``TYPE_CHECKING``: it is needed at runtime
+    for the ``isinstance`` in ``to_circuitxz``, so naming the arm in the ``type`` statement was the
+    whole fix. See ``conftest.assert_type_checks`` for why this shells out to ``ty``.
+    """
+
+    def test_quantumcircuit_is_an_accepted_arm(self):
+        pytest.importorskip("qiskit")
+        assert_type_checks(
+            "from qiskit.circuit import QuantumCircuit\n"
+            "from rqutils.svsim import CircuitInput\n"
+            "def take(c: CircuitInput) -> None: ...\n"
+            "take(QuantumCircuit(2))\n",
+            "svsim.CircuitInput",
+        )
+
+    def test_module_imports_and_runs_without_qiskit(self):
+        """Naming ``QuantumCircuit`` in the alias must not make qiskit a hard dependency.
+
+        Also exercises the gate-spec path, since an alias that forced ``__value__`` would raise
+        ``NameError`` at annotation time and take ``to_circuitxz`` with it.
+        """
+        assert_imports_without(
+            "rqutils.svsim",
+            ["qiskit"],
+            "assert m.HAS_QISKIT is False\n"
+            "assert m.to_circuitxz([('rx', 0, 0.3), ('rzz', [0, 1], 0.5)]).num_qubits == 2\n",
+        )

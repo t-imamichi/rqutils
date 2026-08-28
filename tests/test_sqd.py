@@ -20,16 +20,14 @@ initial-vector bugs affected all six kernels identically, so a consistency-only 
 passed while every kernel returned the same wrong number.
 """
 
-import pathlib
-import shutil
-import subprocess
-import sys
 import warnings
 
 import jax
 import numpy as np
 import pytest
 from conftest import (
+    assert_imports_without,
+    assert_type_checks,
     collapsing_states,
     lowest_projected,
     project_dense,
@@ -2377,79 +2375,31 @@ class TestHamiltonianInputIsCheckable:
     statement -- which a checker never executes, so the arm was invisible **whether or not qiskit was
     installed** and every correct ``sqd(SparsePauliOp, ...)`` call was an ``invalid-argument-type``
     error downstream (reported from `spinchain`, on calls that were right and documented as supported).
+    ``svsim.CircuitInput`` and ``qprint.PrintReturnType`` had the same defect and are fixed alongside.
 
-    Two things make this test non-obvious, and both are why it shells out to ``ty``:
-
-    - The defect is invisible to the interpreter, so a runtime assertion on the alias passes against
-      both shapes and pins nothing.
-    - This repo sets ``invalid-argument-type = "ignore"``, so the probe must re-enable that one rule via
-      ``-c`` or the check passes against the bug.
-
-    Verified against the pre-fix alias: this test fails there and passes with the unified statement.
+    See ``conftest.assert_type_checks`` for why this shells out to ``ty`` and what makes it easy to
+    turn into a silent no-op.
     """
 
-    PROBE = """
-from qiskit.quantum_info import SparsePauliOp
-from rqutils.sqd import HamiltonianInput
-
-def take(h: HamiltonianInput) -> None: ...
-
-take(SparsePauliOp.from_list([("IIZZ", 0.5)]))
-"""
-
-    def test_sparsepauliop_is_an_accepted_arm(self, tmp_path):
+    def test_sparsepauliop_is_an_accepted_arm(self):
         pytest.importorskip("qiskit")
-        ty = shutil.which("ty")
-        if ty is None:
-            pytest.skip("ty is not installed (it is in the `dev` extra)")
-        # Inside the project tree: ty resolves configuration and first-party imports from the
-        # project root, and silently checks nothing for a file outside it.
-        probe = pathlib.Path(__file__).parent / "_probe_hamiltonian_input.py"
-        probe.write_text(self.PROBE)
-        try:
-            proc = subprocess.run(
-                [ty, "check", "-c", 'rules.invalid-argument-type="error"', str(probe)],
-                capture_output=True,
-                text=True,
-                # A non-zero exit is the thing under test, so never raise on it.
-                check=False,
-                cwd=pathlib.Path(__file__).parent.parent,
-            )
-        finally:
-            probe.unlink()
-        assert proc.returncode == 0, (
-            "passing a SparsePauliOp to a HamiltonianInput parameter must type-check:\n"
-            f"{proc.stdout}\n{proc.stderr}"
+        assert_type_checks(
+            "from qiskit.quantum_info import SparsePauliOp\n"
+            "from rqutils.sqd import HamiltonianInput\n"
+            "def take(h: HamiltonianInput) -> None: ...\n"
+            'take(SparsePauliOp.from_list([("IIZZ", 0.5)]))\n',
+            "sqd.HamiltonianInput",
         )
 
     def test_module_imports_without_qiskit(self):
         """The ``TYPE_CHECKING``-only qiskit import must not become a runtime dependency.
 
-        The risk the unified ``type`` statement takes on: it names ``SparsePauliOp`` while importing it
-        only for the checker, which is safe solely because the statement is lazy and nothing reads
+        The risk this alias takes on: it names ``SparsePauliOp`` while importing it only for the
+        checker, which is safe solely because a ``type`` statement is lazy and nothing reads
         ``__value__``. That "nothing" is the kind of claim that rots, so it is pinned.
-
-        Subprocessed with an import hook, since qiskit is installed in this venv and cannot be hidden
-        in-process once ``rqutils.sqd`` is imported.
         """
-        script = """
-import sys
-class Block:
-    def find_spec(self, name, path=None, target=None):
-        if name == "qiskit" or name.startswith("qiskit."):
-            raise ImportError("blocked")
-sys.meta_path.insert(0, Block())
-import rqutils.sqd as m
-assert type(m.HamiltonianInput).__name__ == "TypeAliasType", type(m.HamiltonianInput)
-print("OK")
-"""
-        proc = subprocess.run(
-            [sys.executable, "-c", script],
-            capture_output=True,
-            text=True,
-            check=False,
-            cwd=pathlib.Path(__file__).parent.parent,
-        )
-        assert proc.returncode == 0 and "OK" in proc.stdout, (
-            f"rqutils.sqd must import without qiskit:\n{proc.stdout}\n{proc.stderr}"
+        assert_imports_without(
+            "rqutils.sqd",
+            ["qiskit"],
+            'assert type(m.HamiltonianInput).__name__ == "TypeAliasType"\n',
         )

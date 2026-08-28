@@ -21,6 +21,7 @@ Please keep new fixtures as plain functions taking ``rng``.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import numpy as np
+import pytest
 
 
 def herm(n, rng, complex_=True):
@@ -286,3 +288,95 @@ def run_sharded_child(script_name, subject, num_devices=4):
     )
     assert proc.returncode == 0, f"sharded {subject} raised:\n{proc.stderr[-3000:]}"
     return proc.stdout
+
+
+def assert_type_checks(probe_source, subject, rules=("invalid-argument-type",)):
+    """Assert ``ty`` accepts ``probe_source``, with ``rules`` forced to error.
+
+    For the optional-dependency type-alias defect: ``type X = A | B`` followed by ``X |= C`` under a
+    ``HAS_*`` guard leaves the ``C`` arm invisible to a checker, because a ``type`` statement is
+    evaluated statically and the augmented assignment only mutates the runtime object. Three modules
+    had it (``sqd``, ``svsim``, ``qprint``).
+
+    Two reasons this shells out rather than asserting at runtime, both of which silently turn the test
+    into a no-op if missed:
+
+    - The defect is invisible to the interpreter. A runtime assertion on the alias object passes
+      against the broken and fixed shapes alike.
+    - This repo sets the relevant rules to ``ignore`` in ``pyproject.toml`` (numpy/JAX stub noise), so
+      they must be re-enabled per-invocation via ``-c`` or the check passes against the bug.
+
+    The probe is written inside the project tree because ``ty`` resolves configuration and first-party
+    imports from the project root and silently checks **nothing** for a file outside it -- a probe in
+    ``/tmp`` reports "All checks passed!" even for a blatant type error.
+
+    Args:
+        probe_source: Python source for the probe module.
+        subject: Named in the failure message, e.g. ``"svsim.CircuitInput"``.
+        rules: ``ty`` rule names to force to ``error`` for this invocation.
+
+    Returns:
+        None. Skips if ``ty`` is not installed (it is in the ``dev`` extra).
+    """
+    ty = shutil.which("ty")
+    if ty is None:
+        pytest.skip("ty is not installed (it is in the `dev` extra)")
+    here = os.path.dirname(os.path.abspath(__file__))
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".py", prefix="_probe_", dir=here, delete=False
+    ) as handle:
+        handle.write(probe_source)
+        probe = handle.name
+    args = [ty, "check"]
+    for rule in rules:
+        args += ["-c", f'rules.{rule}="error"']
+    try:
+        proc = subprocess.run(
+            args + [probe],
+            capture_output=True,
+            text=True,
+            # A non-zero exit is the thing under test, so never raise on it.
+            check=False,
+            cwd=os.path.dirname(here),
+        )
+    finally:
+        os.unlink(probe)
+    assert proc.returncode == 0, (
+        f"{subject} must accept its optional-dependency arm:\n{proc.stdout}\n{proc.stderr}"
+    )
+
+
+def assert_imports_without(module, blocked, extra_source=""):
+    """Assert ``module`` imports in a subprocess where ``blocked`` top-level packages are unavailable.
+
+    The companion risk to :func:`assert_type_checks`: naming an optional type in a ``type`` statement
+    is only safe because the statement is lazy, so the annotation-only import is never resolved.
+    "Nothing reads ``__value__``" is the kind of claim that rots, so it is pinned.
+
+    Subprocessed with an import hook rather than monkeypatched, since these packages are installed in
+    this venv and cannot be hidden in-process once the module under test has been imported.
+
+    Args:
+        module: Dotted module name to import, e.g. ``"rqutils.svsim"``.
+        blocked: Top-level package names to make unimportable.
+        extra_source: Optional extra statements run after the import, to exercise a runtime path.
+    """
+    script = (
+        "import sys\n"
+        "class Block:\n"
+        "    def find_spec(self, name, path=None, target=None):\n"
+        f"        if name.split('.')[0] in {tuple(blocked)!r}:\n"
+        "            raise ImportError('blocked for test')\n"
+        "sys.meta_path.insert(0, Block())\n"
+        f"import {module} as m\n" + extra_source + "\nprint('OK')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+    assert proc.returncode == 0 and "OK" in proc.stdout, (
+        f"{module} must import without {', '.join(blocked)}:\n{proc.stdout}\n{proc.stderr}"
+    )

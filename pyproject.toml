@@ -62,8 +62,11 @@ invalid-argument-type = "ignore"
 invalid-return-type = "ignore"
 not-subscriptable = "ignore"
 unsupported-operator = "ignore"
-# `type X = A | B` followed by `X |= C` under a HAS_* guard is the library's documented pattern for
-# optional dependencies (see CLAUDE.md); ty reads the augmented assignment as rebinding the alias.
+# Destructuring `ground_locg`'s variable-arity return (4 elements, 5 with debug=True, which a checker
+# cannot follow since `debug` is static), plus dtype-generic reassignments the numpy stubs reject.
+# No longer about optional-dependency type aliases: `type X = A | B` followed by `X |= C` under a
+# HAS_* guard is gone from the library -- it left the `C` arm invisible to checkers, so all three
+# aliases now name every arm in the `type` statement (see `sqd.HamiltonianInput`).
 invalid-assignment = "ignore"
 # mpi4py is imported by examples/ but declared nowhere -- install it manually for the
 # multi-process path. Optional at runtime, so an unresolved import here is expected.
