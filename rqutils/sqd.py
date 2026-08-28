@@ -181,7 +181,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from numbers import Number
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -199,13 +199,14 @@ LOG = logging.getLogger(__name__)
 # sqd() and hproj() so an overflow raises instead of silently permuting the subspace.
 _MAX_STATES = 2**31 - 1
 
-type HamiltonianInput = PauliSumXZ | tuple[Sequence[str], Sequence[Number]]
-try:
+if TYPE_CHECKING:
     from qiskit.quantum_info import SparsePauliOp
 
-    HamiltonianInput |= SparsePauliOp
-except ImportError:
-    pass
+# All three arms must be named here, not added by a later `HamiltonianInput |= SparsePauliOp`: a `type`
+# statement is evaluated statically, so the augmented assignment leaves the arm invisible to a checker.
+# Safe without a runtime branch because the statement is lazy -- nothing reads `__value__`, so the
+# TYPE_CHECKING-only import is never resolved. Both pinned by TestHamiltonianInputIsCheckable.
+type HamiltonianInput = PauliSumXZ | tuple[Sequence[str], Sequence[Number]] | SparsePauliOp
 type Vector = np.ndarray[tuple[int], np.dtype[np.inexact]]
 type StateList = np.ndarray[tuple[int, int], np.dtype[np.uint8]]
 
@@ -471,6 +472,21 @@ def sqd(
         Calculated ground state energy, or a tuple of energy, ground state vector, and sorted
         uniquified states (if return_eigvec=True). The returned states are the genuine unique rows
         only, never the filler slots, so their count can be below ``states_size``.
+
+        **On a degenerate ground eigenvalue the eigenvector is one arbitrary member of the eigenspace,
+        and nothing in the return marks that case.** The eigenvalue is still correct. Anything not
+        basis-independent -- per-site occupancies from :math:`|v_i|^2`, say -- therefore gets an
+        arbitrary member's value rather than the eigenspace average. Detection needs a second opinion
+        (``eigvalsh`` on :func:`hproj`, or a deflate-and-resolve); the solver cannot report it, since
+        the Rayleigh-Ritz 3x3 spans the search basis :math:`\{x, y, p\}` and its spacing reflects that
+        basis, not the multiplicity -- measured 2.0, not 0, on a 2-fold degenerate operator.
+
+        **Which member is returned is deterministic in the arguments** and may be relied on across
+        runs and processes at a fixed rqutils version: the start vector is a fixed hash of the subspace
+        index (:func:`_spread_seed`), with no PRNG key and no host-order dependence. It is **not**
+        stable across versions -- a change to the seed, the prefilter default or the iteration moves
+        it, and none of those is treated as breaking. Pin the version rather than fingerprinting the
+        vector.
 
     Raises:
         RuntimeError: If LOBPCG does not converge within ``maxiter``. Previously the convergence flag
