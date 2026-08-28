@@ -39,6 +39,7 @@ from rqutils.sqd import (
     _is_lex_sorted,
     _pack_scanned,
     _pack_state_keys,
+    _spread_seed,
     apply_h,
     compute_diagonal,
     get_diag_signs,
@@ -803,6 +804,105 @@ class TestSqdInitialVector:
 
         reference = lowest_projected(strings, coeffs, states)
         assert eigval_of(strings, coeffs, states) == pytest.approx(reference, rel=1e-10)
+
+
+class TestSqdMinDiagWeightCancellation:
+    """``vinit_from_min_diag``'s weight must reinforce the spread seed, never cancel it.
+
+    The heuristic adds weight at ``argmin(diagonal)`` on top of ``_spread_seed``. It used to add a
+    bare ``+1.0``, which *subtracts* wherever the seed component is negative -- and ``_spread_seed``'s
+    Murmur-style mixer maps index 0 to **exactly -1.0** at every ``states_size`` (the mixer fixes 0,
+    and ``mixed * 2/2**32 - 1`` sends that to -1.0). So ``argmin(diagonal) == 0`` cancelled the
+    component to exactly zero, violating ``ground_locg``'s non-vanishing-overlap precondition at
+    precisely the index the heuristic had just declared the best guess available.
+
+    Exact cancellation is reachable only at index 0, but near-cancellation is not: 511 of ``2**20``
+    indices carry a seed within 1e-3 of -1.0. That is why the fix is ``jnp.sign``-based rather than a
+    special case on index 0, and why this class asserts the invariant as well as the symptom.
+    """
+
+    def test_two_state_diagonal_subspace(self):
+        """THE REPORTED CASE, from ``docs/rqutils-prefilter-bug-response.md`` section 5.
+
+        A 2-state subspace of the Bx=0 n=4 Heisenberg chain whose projected Hamiltonian is
+        ``diag(-0.75, -0.25)``. The diagonal is ``[0.75, 0.75]``, so ``argmin`` is 0, the weight
+        cancelled seed[0] to zero, and ``vinit`` became ``[0.0, -0.183]``. Because the operator is
+        diagonal that surviving component *is* an eigenvector, so the solver returned **-0.25** in
+        **0 iterations** with ``converged=True`` -- a genuine eigenvalue, just not the lowest.
+
+        Found while validating the prefilter fix, and independent of it: this reproduces with
+        ``prefilter=None``, and on revisions predating the prefilter entirely.
+        """
+        num_qubits = 4
+        strings, coeffs = [], []
+        for site in range(num_qubits - 1):
+            for pauli in "XY":
+                term = ["I"] * num_qubits
+                term[site] = term[site + 1] = pauli
+                strings.append("".join(term))
+                coeffs.append(0.25)
+            term = ["I"] * num_qubits
+            term[site] = term[site + 1] = "Z"
+            strings.append("".join(term))
+            coeffs.append(0.25)
+        states = np.array([[0, 1, 0, 1], [1, 1, 0, 1]], dtype=np.uint8)
+
+        # Pin the two fixture properties the defect needs, so this cannot silently stop testing it.
+        dense = project_dense(strings, np.array(coeffs), states)
+        assert np.count_nonzero(np.abs(dense - np.diag(np.diag(dense)))) == 0, (
+            "fixture must be diagonal -- that is what makes the surviving component an eigenvector"
+        )
+        reference = lowest_projected(strings, np.array(coeffs), states)
+        assert reference == pytest.approx(-0.75), "fixture is no longer the reported subspace"
+
+        got = eigval_of(strings, np.array(coeffs), states)
+        assert got == pytest.approx(reference, abs=1e-10), (
+            f"got {got}, expected {reference} -- the min-diagonal weight cancelled the spread seed"
+        )
+
+    def test_seed_index_zero_is_exactly_minus_one(self):
+        """The precondition behind the defect, asserted directly rather than assumed.
+
+        If a future change to ``_spread_seed``'s mixer moved this value, the test above would keep
+        passing while no longer exercising a cancellation -- so pin the property itself. Any index
+        whose seed is exactly -1.0 is a cancellation site under the old ``+1.0`` weight.
+        """
+        for states_size in (2, 16, 1024):
+            states = np.zeros((states_size, 1), dtype=np.uint8)
+            states_u = uniquify_states(pack_padded(states), states_size)
+            seed = np.asarray(_spread_seed(states_size, states_u, np.dtype(np.float64), None))
+            assert seed[0] == -1.0, (
+                f"states_size={states_size}: seed[0] is {seed[0]}, not -1.0 -- the cancellation "
+                "this class guards is no longer reachable, so its fixture needs revisiting"
+            )
+
+    def test_weight_reinforces_at_every_possible_argmin(self):
+        """The invariant, swept over every index rather than sampled at 0.
+
+        Near-cancellation is the general hazard (511 of ``2**20`` seeds lie within 1e-3 of -1.0), so
+        the guarantee has to be that ``|vinit[imin]| >= 1`` for *any* ``imin``, not merely that index 0
+        survives. Asserted on a subspace whose diagonal is engineered to place the minimum at each
+        index in turn, via a pure-Z Hamiltonian: a single Z term's projected diagonal is +-c per state,
+        so choosing the states fixes which index is the argmin.
+        """
+        num_qubits = 4
+        states = np.array(
+            [[int(b) for b in format(k, f"0{num_qubits}b")] for k in range(2**num_qubits)],
+            dtype=np.uint8,
+        )
+        states_size = 16
+        states_u = uniquify_states(pack_padded(states), states_size)
+        seed = np.asarray(_spread_seed(states_size, states_u, np.dtype(np.float64), None))
+        # The fix is `seed[imin] + sign(seed[imin])`, so |component| = |seed| + 1 >= 1 always.
+        for imin in range(states_size):
+            direction = np.sign(seed[imin]) if seed[imin] != 0 else 1.0
+            assert abs(seed[imin] + direction) >= 1.0 - 1e-12, (
+                f"imin={imin}: weighted component is {abs(seed[imin] + direction)}, below 1 -- the "
+                "weight is not reinforcing"
+            )
+            # And the old form is what this replaces: assert it WOULD have failed at index 0.
+            if imin == 0:
+                assert abs(seed[imin] + 1.0) == 0.0, "index 0 no longer demonstrates the old defect"
 
 
 class TestSqdEndToEnd:

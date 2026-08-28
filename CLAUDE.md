@@ -231,6 +231,12 @@ skips its `np.unique` and so can violate it. Two paths selected statically on wi
 `B ≤ 8` bytes, explicit lexicographic search beyond — a **correctness** boundary, not a performance
 one.
 
+**`vinit_from_min_diag`'s added weight must carry the seed component's own sign.** A bare `+1.0`
+subtracts where the seed is negative, and `_spread_seed` maps index 0 to *exactly* −1.0 at every
+`states_size`, so `argmin(diagonal) == 0` cancelled it to zero and `sqd` returned a wrong eigenvalue
+with `converged=True` (`NOTES.md`). Don't replace `jnp.sign` with `copysign` — the seed is complex
+whenever the coefficients are.
+
 **`run_sqd`'s initial vector is a deterministic pseudo-random spread (`_spread_seed`), not a one-hot.**
 Don't "simplify" it back — a one-hot cannot leave its connected component, so a subspace whose
 Hamiltonian splits into disconnected blocks silently returned that block's minimum with

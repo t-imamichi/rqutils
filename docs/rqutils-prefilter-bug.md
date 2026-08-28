@@ -3,9 +3,9 @@
 > ## Disposition (2026-08-28): **confirmed in full, FIXED**
 >
 > **Reply to the reporter, with migration steps: `docs/rqutils-prefilter-bug-response.md`.**
-> It also carries one correction to this report (§4) and a **second, unrelated `sqd` defect**
-> found while validating the fix, which is *not* fixed and still blocks `skqd/sqd_backend.py`
-> (§5).
+> It also carries one correction to this report (§4) and a **second, unrelated `sqd` defect** found
+> while validating the fix — the min-diagonal weight cancelling the spread seed, which affected every
+> `sqd` call and not just prefiltered ones. That is **also fixed** (§5); nothing is left blocked.
 >
 > Fixed by deleting `_lambda_max_bound` outright and taking the bound from the operator's structure
 > instead. `_chebyshev_prefilter` now requires `hi`; `ground_locg` gains `prefilter_hi=`, derived

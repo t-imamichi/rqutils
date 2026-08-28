@@ -923,6 +923,22 @@ def run_sqd(
         # keeping it dominant preserves this heuristic's fast convergence -- but add the spread seed
         # underneath rather than returning a bare one-hot.
         #
+        # THE WEIGHT CARRIES THE SEED'S OWN SIGN, and that is what stops it cancelling. A plain
+        # `.add(1.0)` subtracts when the seed component is negative, and `_spread_seed`'s hash maps
+        # index 0 to *exactly* -1.0 at every `states_size` (the Murmur mixer fixes 0, and the affine
+        # map sends that to -1.0), so `argmin(diagonal) == 0` cancelled the component to exactly zero.
+        # ground_locg's documented non-vanishing-overlap precondition was then violated at the one
+        # index the heuristic had just declared most important: measured, a 2-state subspace of the
+        # Bx=0 n=4 Heisenberg chain returned -0.25 against a true -0.75, converged=True in 0
+        # iterations, because the operator is diagonal there and the surviving component is already an
+        # eigenvector. 1 in 18 randomly sampled Bx=0 subspaces at n=4-8 hit it.
+        #
+        # Exact cancellation is only reachable at index 0, but *near*-cancellation is not: 511 of
+        # 2**20 indices carry a seed within 1e-3 of -1.0, and each would lose all but a thousandth of
+        # this component. So the fix is structural rather than a special case on index 0. With
+        # copysign the update always reinforces, giving |vinit[imin]| in [1, 2) whatever the seed --
+        # dominant as intended, and never smaller than the bare one-hot would have been.
+        #
         # A pure one-hot cannot leave its own connected component: Krylov iteration only ever
         # reaches states linked to the seed by a nonzero matrix element, so if the projected
         # Hamiltonian splits into disconnected blocks (routine for a sampled subspace, where whole
@@ -938,11 +954,19 @@ def run_sqd(
         # multi-device mesh -- not subtly, but before the solver is ever reached. It went unnoticed
         # because nothing in the suite runs a mesh; `XLA_FLAGS=--xla_force_host_platform_device_count`
         # reproduces it on CPU, which is what examples/scaling/poc7_sharding.py does.
-        return (
-            _spread_seed(states_size, states_u, hamiltonian.c.dtype, sharding)
-            .at[imin]
-            .add(1.0, out_sharding=sharding)
-        )
+        seed = _spread_seed(states_size, states_u, hamiltonian.c.dtype, sharding)
+        # jnp.sign, not jnp.copysign: the seed is complex whenever `hamiltonian.c` is (an odd Y count
+        # folds an `i` in), and copysign rejects complex input. sign(z) = z/|z| keeps the phase, so the
+        # update reinforces rather than rotating.
+        #
+        # The sign(0) == 0 branch is defence in depth and is **currently unreachable**: the mixer is a
+        # bijection on uint32, so exactly one index maps to the hash that yields a 0.0 seed, and that
+        # index is 3906290832 -- above the `_MAX_STATES` ceiling of 2**31 - 1 that both entry points
+        # enforce. Kept because it is one cheap line and the alternative is a silent zero weight if the
+        # mixer constants or the ceiling ever change; do not read a surviving mutant here as dead code.
+        direction = jnp.sign(seed[imin])
+        direction = jnp.where(direction == 0, 1.0, direction)
+        return seed.at[imin].add(direction, out_sharding=sharding)
 
     def vinit_nodiag():
         # No diagonal to rank states by, so the spread seed is all there is. A one-hot here is not

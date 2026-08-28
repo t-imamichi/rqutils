@@ -82,6 +82,36 @@ failed assert changes nothing, verify each edit landed rather than inferring it 
 mutation-test the *surviving* assertion afterwards. Note `pytest` prints "no tests ran" rather than
 failing when the class path is wrong, so a mis-copied class name looks like a pass.
 
+### `vinit_from_min_diag`'s weight must carry the seed's sign, or it cancels it
+
+2026-08-28, found while validating the prefilter fix against sampled `Bx = 0` subspaces, and
+**independent of the prefilter** — it affected every `sqd` call on every revision that has
+`_spread_seed`.
+
+The heuristic added a bare `+1.0` at `argmin(diagonal)` on top of the spread seed. That *subtracts*
+wherever the seed component is negative, and `_spread_seed`'s Murmur-style mixer maps index 0 to
+**exactly −1.0** at every `states_size` (the mixer fixes 0; `mixed * 2/2**32 − 1` sends that to −1.0).
+So `argmin(diagonal) == 0` zeroed the component at precisely the index the heuristic had just declared
+the best available guess, violating `ground_locg`'s non-vanishing-overlap precondition.
+
+Measured: a 2-state subspace of the `Bx = 0` n=4 Heisenberg chain returns **−0.25 against a true
+−0.75**, `converged=True` in **0 iterations** — the projected operator is `diag(−0.75, −0.25)`, so the
+surviving component is already an eigenvector. 1 in 18 randomly sampled `Bx = 0` subspaces at n=4–8 hit
+it; 0 of 676 after the fix.
+
+Fixed as `seed.at[imin].add(jnp.sign(seed[imin]))`, so the update reinforces and `|vinit[imin]|` lands
+in `[1, 2)` for any seed. `jnp.sign` not `copysign` — the seed is complex whenever `hamiltonian.c` is.
+
+**Why structural rather than a special case on index 0:** exact cancellation is only reachable there,
+but **511 of `2**20` indices carry a seed within 1e-3 of −1.0**, each of which would lose all but a
+thousandth of the component. That is a slow-convergence or wrong-answer risk nothing would have
+attributed to this line.
+
+The `sign(0) == 0` fallback is **unreachable, and provably so**: the mixer is a bijection on uint32, so
+exactly one index yields a 0.0 seed, and it is **3906290832** — above the `_MAX_STATES` ceiling of
+`2**31 − 1` that both entry points enforce. A mutant removing it survives; that is not dead code, it is
+a guard whose reachability the ceiling currently forecloses.
+
 ### No matvec-only upper bound on `λ_max` exists, so the prefilter takes one from structure
 
 2026-08-28, fixing `docs/rqutils-prefilter-bug.md`. `_lambda_max_bound` used 10 power steps, which

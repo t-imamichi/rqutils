@@ -113,7 +113,12 @@ the flat region. Don't pad it by orders of magnitude. The asymmetry still favour
 over-estimating degrades smoothly, under-estimating changes the answer — so a deliberately generous
 bound is safe, just not a wildly generous one.
 
-## 5. **Still broken, and it blocks `sqd_backend.py`: a second defect in `sqd`'s initial vector**
+## 5. A second defect in `sqd`'s initial vector — found here, **now also fixed**
+
+**Update: fixed. `skqd/sqd_backend.py` is no longer blocked.** Both paths are safe to re-enable.
+Left in place below as the record of what it was, since it affected every `sqd` call and not just
+prefiltered ones, on every revision that has `_spread_seed`.
+
 
 Found while validating this fix against your `skqd` regime (sampled subspaces, `Bx = 0`). It is
 **unrelated to the prefilter** and is *not* fixed by `568b173`. Reproducer:
@@ -153,11 +158,20 @@ degenerate-diagonal subspaces — exactly what `skqd/sqd_backend.py::ground_stat
 where you have no independent oracle. Measured 1 in 18 random sampled subspaces of `Bx = 0` Heisenberg
 at n = 4–8.
 
-**We have not fixed this** — it is outside the reported bug and touches `run_sqd`'s initial-vector
-construction, which carries its own history (`_spread_seed` exists because one-hot seeds could not
-leave a disconnected component). File it as a separate report if you want it prioritised, or treat this
-section as that report. Until it is fixed, `exact.py` is safe to re-enable but
-`skqd/sqd_backend.py` is not, for a reason that has nothing to do with the prefilter.
+**The fix**: the weight now carries the seed component's own sign, so it reinforces instead of
+subtracting — `seed.at[imin].add(jnp.sign(seed[imin]))`, giving `|vinit[imin]|` in `[1, 2)` whatever the
+seed. `jnp.sign` rather than `copysign` because the seed is complex whenever the coefficients are.
+
+Structural rather than a special case on index 0, deliberately: exact cancellation is only reachable
+there, but **511 of `2**20` indices carry a seed within 1e-3 of −1.0**, and each of those would have
+lost all but a thousandth of the component — a slow-convergence or wrong-answer risk that no test would
+have attributed to this. After the fix, **0 of 676** randomly sampled subspaces are wrong (previously 1
+in 18 on the `Bx = 0` family), and the reported 2-state case returns `-0.75`.
+
+Three regression tests in `TestSqdMinDiagWeightCancellation`, verified against the restored `+1.0`. Two
+pin the *preconditions* rather than the symptom — that `seed[0]` is exactly −1.0, and that
+`|seed[i] + sign(seed[i])| >= 1` for every `i` — because the symptom test alone would keep passing if a
+future change to the mixer moved the cancellation site somewhere the fixture does not reach.
 
 ## 6. Accepted: `degree=64`
 
