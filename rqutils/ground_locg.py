@@ -194,6 +194,25 @@ Iteration
 Every division by a norm in this module is guarded, so a zero or degenerate input yields a
 well-defined result instead of ``NaN``.
 
+Chebyshev prefilter
+===================
+
+:func:`ground_locg` takes an optional ``prefilter=(degree, cycles)`` that applies a Chebyshev
+polynomial filter to the initial vector before the iteration starts, damping the band
+:math:`[\theta, \lambda_{\max}]` by :math:`1/T_{\mathrm{degree}}` so the ground direction comes out
+amplified relative to everything else. The technique is Chebyshev-filtered subspace iteration
+(ChFSI), standard in large-scale electronic-structure codes[3][4]; what is used here is the
+single-vector, prefilter-then-LOBPCG specialization rather than a construction from those papers,
+which filter a whole subspace inside a self-consistent loop.
+
+Two properties are load-bearing and neither is inherited from the references. The filter's lower edge
+is the *current Rayleigh quotient*, re-read each cycle, not an estimate of :math:`\lambda_1` -- an
+accurate :math:`\lambda_1` measured faster on a comfortable gap and silently wrong on a tight one.
+And the upper edge ``prefilter_hi`` must be a true bound on :math:`\lambda_{\max}`, which no
+matvec-based iteration can supply; a power-iteration estimate returned an *excited* eigenpair with
+``converged=True``. :func:`_chebyshev_prefilter` records both measurements, and
+``docs/locg-chebyshev-prefilter.md`` has the tuning tables.
+
 Distributed arrays
 ==================
 
@@ -211,6 +230,13 @@ References
 
 [2]: J. Kopp, *Efficient numerical diagonalization of hermitian 3 x 3 matrices*,
 Int. J. Mod. Phys. C. **19**, 523 (2008).
+
+[3]: A. S. Banerjee, L. Lin, W. Hu, C. Yang, J. E. Pask, *Chebyshev polynomial filtered subspace
+iteration in the discontinuous Galerkin method for large-scale electronic structure calculations*,
+J. Chem. Phys. **145**, 154101 (2016).
+
+[4]: Y. Zhou, Y. Saad, M. L. Tiago, J. R. Chelikowsky, *Self-consistent-field calculations using
+Chebyshev-filtered subspace iteration*, J. Comput. Phys. **219**, 172 (2006).
 
 Single-vector LOBPCG API
 ========================
