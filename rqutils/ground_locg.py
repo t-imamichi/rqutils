@@ -688,11 +688,8 @@ def _ground_locg_callable(
         # sas whose row/col 1 vanish and, for a positive-definite operator, spuriously selects that
         # null direction: theta collapses towards 0 instead of reporting rho, the true answer.
         #
-        # `r_is_zero` feeds both the sas[1, 1] masking above and `converged` in the returned state, so
-        # it must read the RAW residual. A removed `precond` option once transformed the search
-        # direction here; if one is ever reintroduced, it must not touch this guard -- a nonzero
-        # residual lying near M^-1's small-singular-value direction would report convergence early.
-        # `NOTES.md` records why `precond` was removed rather than kept.
+        # `norm_r` is bound because `r_is_zero` feeds both the sas[1, 1] mask below and `converged` in
+        # the returned state; a preconditioner must never be routed through it (`NOTES.md`).
         norm_r = jnp.linalg.norm(rcurr)
         r_is_zero = norm_r == 0.0
         tmp_p = normalize(rcurr, norm_r)

@@ -249,9 +249,10 @@ Hamiltonian splits into disconnected blocks silently returned that block's minim
 with the Rayleigh–Ritz step solved analytically (`eigenpair_2x2`, `eigenpair_3x3` via Cardano) instead
 of via `eigh`, to keep memory down for huge vectors. It is sharding-transparent **only if the `mat`
 callable preserves output sharding** — that contract is why every `apply_*` in `sqd.py` passes
-`out_sharding=jax.typeof(vec).sharding`. It also takes an optional `precond` (`None` | callable) and an optional `prefilter`
-(`None` | `(degree, cycles)` Chebyshev, use `(32, 2)`; its call site must stay **after** the dtype
-promotion and **before** `body_iter0` — `docs/locg-chebyshev-prefilter.md` has the tables).
+`out_sharding=jax.typeof(vec).sharding`. It also takes an optional `prefilter` (`None` |
+`(degree, cycles)` Chebyshev, use `(32, 2)`; its call site must stay **after** the dtype promotion and
+**before** `body_iter0` — `docs/locg-chebyshev-prefilter.md` has the tables). **There is no `precond`
+argument** — it was removed 2026-08-28; see below.
 
 **`prefilter` needs `prefilter_hi`, a true upper bound on `λ_max`, and there is no way to compute one
 from matvecs.** Kuczyński–Woźniakowski (1992) prove it; a block-diagonal operator with a start vector
@@ -393,11 +394,14 @@ both belong in it.
 
 ## Closed investigations — don't reopen without reading the record
 
-- **Preconditioning `sqd` is closed.** `ground_locg(precond=...)` shipped and measures 1.79× median on
-  a *shifted* operator, but `sqd` solves the raw indefinite projected `H` and six routes to a usable
-  shift were measured and rejected — including a level-1 SDP bound that is valid, tightest-available,
-  and still matched by a free `O(N)` diagonal bound. The blocking argument is structural: no bound on
-  `H`, however tight, can reach the shift the 1.79× used. `docs/rqutils-precond-request.md`,
+- **Preconditioning `sqd` is closed, and `precond` has been deleted** (2026-08-28). It shipped and
+  measured 1.79–2.76× median on a *shifted* operator, but `sqd` solves the raw indefinite projected
+  `H`, where literal Jacobi **fails to converge**; six routes to a usable shift were measured and
+  rejected — including a level-1 SDP bound that is valid, tightest-available, and still matched by a
+  free `O(N)` diagonal bound. The blocking argument is structural: no bound on `H`, however tight, can
+  reach the shift those figures used. The two-level/deflation candidate the record called "untried" was
+  then tried and **rejected** (0.68–0.98×, `docs/deflation-preconditioner.md`), so the line is fully
+  closed. `docs/rqutils-precond-request.md`,
   `docs/sdp-lower-bound.md`, summary in `NOTES.md`.
 - **Subspace selection by weight shell + diagonal ranking was measured, then rejected** (2026-08-25) —
   sound results against a *uniform random* baseline, which is not what a real SQD workflow produces.
