@@ -588,6 +588,41 @@ now caught.
 `get_xsource` no longer contributes — it is a binary search into the already-sorted list, not a sort
 of a stacked `2N` array.
 
+## `precond` was removed; `sqd` defaults to `prefilter=(32, 2)`
+
+2026-08-28, acting on the comparison below.
+
+**`sqd(prefilter=...)` now defaults to `(32, 2)`** — 1.49× median end-to-end wall clock (min 1.15×,
+max 1.70×, 6 sampled XXZ subspaces at n=14–18), every arm correct to <1e-9. `sqd` supplies the required
+`Σ|c_k|` bound itself, so the option costs the caller nothing and there is no bound to get wrong. Pass
+`None` to restore the old graph exactly. `ground_locg`'s own default stays `None` — it cannot derive a
+bound from an opaque callable.
+
+An unplanned benefit: the near-degenerate subspace that motivated the "raise `maxiter` first" error
+message **converges within the default cap** with the filter on (4.4e-16 at `maxiter=1000`, against a
+`RuntimeError` without it). `test_near_degenerate_subspace_needs_maxiter_above_the_default` now pins
+`prefilter=None` explicitly, or it would assert nothing.
+
+**`ground_locg(precond=...)` is deleted**, with its 6 tests and
+`examples/scaling/poc10_deflation_precond.py`. Not because it did not work — on a *positive-definite*
+operator it measured 2.76× median with 0 regressions, better than the 1.79× on record. It is deleted
+because **no `sqd` caller can use it**: `sqd` solves the raw indefinite projected `H` (~50% of diagonal
+entries ≤ 0), Jacobi needs positive-definiteness, and the shift required to get one is the closed
+investigation below. Measured on the raw operator, literal Jacobi does not merely regress — it **fails
+to converge at all** (8000-iteration cap, wrong answer, 3/3 sizes); `|diag|⁻¹` regresses to 0.20–0.37×.
+So a "fall back to `precond` when no bound is available" convenience would have turned a clean
+`ValueError` into a silent wrong answer.
+
+What the deletion left behind: `body_iter1` still splits the raw residual from the search direction,
+and that split is still load-bearing — `r_is_zero` feeds both the `sas[1, 1]` mask and `converged`, so a
+reintroduced preconditioner must not touch it. The comment there says so. `docs/deflation-preconditioner.md`
+keeps the deflation verdict (0.68–0.98×, 8/8 losses) with all its tables; only the script is gone, and
+it is recoverable from `26a9b7b`.
+
+**If preconditioning is ever reconsidered:** the one route that works from `sqd` is shift-by-the-free-
+`O(N)`-bound then Jacobi, measured 1.45× median with energies exact to 4.4e-15. It is *dominated* by the
+prefilter's 1.49× and requires `sqd` to transform the operator, so it was not pursued.
+
 ## Prefilter vs precond: use the prefilter, and do not combine them
 
 2026-08-28, prompted by "is there an opportunity for precond to improve `locg`?". Answered by

@@ -262,12 +262,16 @@ with a power-iteration or Lanczos estimate — that is exactly the defect in
 `converged=True`. Prefer a loose bound: over-estimating degrades resolution smoothly, under-estimating
 changes the answer.
 
-**Prefer `prefilter` over `precond`, and never both.** `precond` needs positive-definiteness, hence a
-shift `sqd` cannot produce; `prefilter` needs only an upper bound on `λ_max`, free as `Σ|c_k|`.
-Measured, the prefilter also wins on wall-clock 4/4 *on a shifted operator*, where `precond` is legal
-and at its best — and adding `precond` to a prefiltered run **halves** the gain from `(32, 2)` up.
-Quote the end-to-end figure: **1.49× median through `sqd()`**, against 2.43× dense wall-clock and 5.02×
-counting iterations (`NOTES.md`).
+**`precond` is gone** (2026-08-28), with its tests and `examples/scaling/poc10_deflation_precond.py`.
+It worked — 2.76× median on a *positive-definite* operator — but no `sqd` caller can reach that: `sqd`
+solves the raw indefinite projected `H`, and on it literal Jacobi **fails to converge** (8000-iteration
+cap, wrong answer). Don't reintroduce it as a fallback for a missing `prefilter_hi`; that trades a clean
+`ValueError` for a silent wrong answer. `NOTES.md` has the measurements and the one route that would
+work (shift-then-Jacobi, 1.45×, dominated by the prefilter).
+
+**`sqd` defaults to `prefilter=(32, 2)`** — 1.49× median end-to-end (min 1.15×), and `sqd` derives the
+required bound itself. Quote *that* figure, not the 2.43× dense wall-clock or the 5.02× iteration count.
+`ground_locg` still defaults to `None`, since it cannot derive a bound from a callable.
 
 **A validator belongs in the module that owns the gate it compensates for.** `_check_prefilter` lives
 here, not in `sqd.py`, because `_chebyshev_prefilter`'s `degree > 1 and cycles > 0` is what silently

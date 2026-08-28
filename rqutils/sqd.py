@@ -394,7 +394,7 @@ def sqd(
     cache_level: tuple[int, int] = (1, 0),
     maxiter: int = 1000,
     tol: float | None = None,
-    prefilter: tuple[int, int] | None = None,
+    prefilter: tuple[int, int] | None = (32, 2),
 ) -> float | tuple[float, Vector, StateList]:
     r"""Perform a sample-based quantum diagonalization of the Hamiltonian.
 
@@ -447,20 +447,25 @@ def sqd(
             the machine epsilon of the operator dtype.
         cache_level: Switches for caching the results of source indices and sign bits / diagonals.
             See the module documentation for the detailed discussion of the resource tradeoff involved.
-        prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter, forwarded verbatim to
-            :func:`rqutils.ground_locg.ground_locg` -- see its docstring for the semantics, the cost,
-            the accuracy guarantee and the knob-choosing guidance. ``None`` (the default) leaves the
-            traced graph unchanged, so no existing caller is affected; it is static here, as it is
-            there. Validated by :func:`rqutils.ground_locg._check_prefilter`, which rejects the malformed values the
-            filter's own gate would absorb as a silent no-op.
+        prefilter: ``(degree, cycles)`` Chebyshev prefilter, forwarded verbatim to
+            :func:`rqutils.ground_locg.ground_locg` -- see its docstring for the semantics, the cost
+            and the knob-choosing guidance. Validated by
+            :func:`rqutils.ground_locg._check_prefilter`, which rejects the malformed values the
+            filter's own gate would absorb as a silent no-op. Static, so the branch resolves at trace
+            time; ``None`` disables it and restores the pre-2026-08-28 graph exactly.
 
-            **Its measured speedups were not taken on this path.** Every figure in
-            ``docs/locg-chebyshev-prefilter.md`` (median 1.88x at ``(32, 2)``) comes from
-            ``ground_locg`` driven with *dense* operators, whereas here the matvec is
-            :func:`apply_h`, a gather-heavy irregular kernel whose cost is dominated by
-            ``cache_level`` -- a different point on the matvec-to-bookkeeping ratio that doc names as
-            the genuinely uncertain quantity. A/B whole ``sqd`` calls on your own subspaces before
-            adopting it.
+            **``(32, 2)`` is the default**, measured end-to-end through ``sqd`` at a **1.49x median**
+            wall-clock reduction (range 1.15-1.70x, 6 sampled XXZ subspaces at n=14-18, dim
+            978-3982, every arm correct to <1e-9 against ``eigsh(tol=0)``). ``sqd`` supplies the
+            filter's required upper bound itself as :math:`\sum_k |c_k|`, so the option costs the
+            caller nothing to use and there is no bound to get wrong.
+
+            That 1.49x is **below** the 1.88x median ``docs/locg-chebyshev-prefilter.md`` measured on
+            dense ``ground_locg``, and the gap is the point: the filter spends
+            ``cycles * (degree + 1)`` matvecs up front, and :func:`apply_h`'s sparse gather-heavy
+            kernel is cheap enough that those cost proportionally more here. Counting *iterations*
+            instead would report 5.02x -- the wrong unit for a caller. Pass ``None`` if your subspaces
+            do not benefit; A/B rather than assuming, since all figures are single-device CPU.
 
     Returns:
         Calculated ground state energy, or a tuple of energy, ground state vector, and sorted
@@ -765,7 +770,7 @@ def run_sqd(
     cache_level: tuple[int, int] = (1, 0),
     maxiter: int = 1000,
     tol: float | None = None,
-    prefilter: tuple[int, int] | None = None,
+    prefilter: tuple[int, int] | None = (32, 2),
     log_level: int = logging.INFO,
 ) -> tuple[float, bool] | tuple[float, jax.Array, jax.Array, int, bool]:
     """JIT-compiled part of the SQD function.

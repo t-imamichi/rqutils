@@ -1416,9 +1416,13 @@ class TestConvergenceIsReported:
             "maxiter -- this test is no longer exercising a near-degenerate subspace"
         )
 
+        # prefilter=None explicitly: `(32, 2)` is the default now and *resolves* this case within the
+        # default cap (measured, converged to 4.4e-16 at maxiter=1000), which is a real bonus of the
+        # default change but would make this test assert nothing. The diagnosis being pinned here is
+        # about the unfiltered solver's convergence, so pin the unfiltered path.
         with pytest.raises(RuntimeError, match="did not converge"):
-            eigval_of(strings, coeffs, states, maxiter=1000)
-        got = eigval_of(strings, coeffs, states, maxiter=4000)
+            eigval_of(strings, coeffs, states, maxiter=1000, prefilter=None)
+        got = eigval_of(strings, coeffs, states, maxiter=4000, prefilter=None)
         assert got == pytest.approx(float(spectrum[0]), abs=1e-10), (
             f"got {got}, expected {spectrum[0]} with a generous maxiter"
         )
@@ -2110,18 +2114,31 @@ class TestSqdPrefilter:
     ``sqd``'s ``prefilter`` docstring.
     """
 
-    def test_none_is_bit_identical_to_omitting_it(self):
-        """The default must not perturb the existing result at all, not merely agree to a tolerance."""
+    def test_the_default_is_32_2_and_disabling_it_agrees(self):
+        """``(32, 2)`` is the default; ``None`` must reach the same answer, not a bit-identical one.
+
+        Inverted when the default changed (2026-08-28). Bit-identity is the wrong assertion in this
+        direction: the filter moves the starting vector, so the two arms take different paths and land
+        on the same eigenpair to the solver's tolerance rather than to the last ulp. What *is* still
+        exact is that omitting the argument equals passing the default explicitly.
+        """
         rng = np.random.default_rng(20260828)
         num_qubits = 5
         strings = real_pauli_strings(num_qubits, 7, rng)
         coeffs = rng.normal(size=len(strings))
         states = unique_states(24, num_qubits, rng)
+        reference = lowest_projected(strings, coeffs, states)
+
         omitted = sqd((strings, list(coeffs)), states)
-        explicit = sqd((strings, list(coeffs)), states, prefilter=None)
-        assert float(omitted[0]) == float(explicit[0]), "energy must be bit-identical"
+        explicit = sqd((strings, list(coeffs)), states, prefilter=(32, 2))
+        assert float(omitted[0]) == float(explicit[0]), (
+            "omitting `prefilter` must equal passing the default explicitly, bit for bit"
+        )
         assert np.array_equal(omitted[1], explicit[1]), "eigenvector must be bit-identical"
-        assert np.array_equal(omitted[2], explicit[2]), "returned basis must be identical"
+
+        disabled = sqd((strings, list(coeffs)), states, prefilter=None)
+        assert float(disabled[0]) == pytest.approx(reference, rel=1e-10)
+        assert float(omitted[0]) == pytest.approx(reference, rel=1e-10)
 
     def test_prefilter_none_adds_no_traced_argument(self):
         """A traced tuple would recompile per value and defeat the trace-time branch.
@@ -2130,9 +2147,11 @@ class TestSqdPrefilter:
         itself is not jitted, so making the jaxpr comparison there would prove nothing about where
         the staticness actually has to hold.
         """
-        unfiltered = run_sqd_jaxpr(np.random.default_rng(20260828))
-        assert run_sqd_jaxpr(np.random.default_rng(20260828), prefilter=None) == unfiltered, (
-            "prefilter=None changed the traced graph, so it is not resolving at trace time"
+        # The baseline is `prefilter=None`, stated explicitly: `(32, 2)` is the default now, so a bare
+        # call traces *with* the filter and would compare the wrong pair.
+        unfiltered = run_sqd_jaxpr(np.random.default_rng(20260828), prefilter=None)
+        assert run_sqd_jaxpr(np.random.default_rng(20260828), prefilter=(1, 4)) == unfiltered, (
+            "a degenerate prefilter changed the traced graph, so it is not resolving at trace time"
         )
         # The converse: a real value must reach the graph. Without this, a `prefilter` silently
         # dropped on the way to `ground_locg` would pass the equality above for the wrong reason --
@@ -2140,6 +2159,10 @@ class TestSqdPrefilter:
         assert run_sqd_jaxpr(np.random.default_rng(20260828), prefilter=(16, 2)) != unfiltered, (
             "prefilter=(16, 2) left the traced graph unchanged, so it is not reaching ground_locg"
         )
+        # And the default really is (32, 2): omitting the argument must match passing it.
+        assert run_sqd_jaxpr(np.random.default_rng(20260828)) == run_sqd_jaxpr(
+            np.random.default_rng(20260828), prefilter=(32, 2)
+        ), "omitting `prefilter` did not trace as the documented (32, 2) default"
 
     @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
     def test_agrees_with_reference_across_every_kernel(self, cache_level):
@@ -2335,7 +2358,7 @@ class TestSqdPrefilter:
         genuine filter and cannot distinguish one from a no-op. Verified against a mutant that
         coerces ``cycles=0`` to ``1`` in ``sqd``: the energy form passed, this form fails.
         """
-        unfiltered = run_sqd_jaxpr(np.random.default_rng(20260828))
+        unfiltered = run_sqd_jaxpr(np.random.default_rng(20260828), prefilter=None)
         for prefilter in [(1, 4), (16, 0), (0, 0)]:
             got = run_sqd_jaxpr(np.random.default_rng(20260828), prefilter=prefilter)
             assert got == unfiltered, (

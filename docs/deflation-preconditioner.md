@@ -2,7 +2,9 @@
 
 **Status: measured 2026-08-28, rejected. 0.68–0.98× wall clock, 8/8 losses at the two smaller coarse
 sizes, and it *increases* iteration count in every single configuration.** Harness:
-`examples/scaling/poc10_deflation_precond.py`. CPU-only, see §5.
+`examples/scaling/poc10_deflation_precond.py` — **deleted 2026-08-28** along with
+`ground_locg`'s `precond` argument, which it depended on. Recover it from `26a9b7b` if the
+measurement ever needs re-running; every number below was taken with it. CPU-only, see §5.
 
 This was the last untried deterministic candidate. `docs/rqutils-precond-request.md:697` named it — "a
 two-level / deflation preconditioner exploiting the near-block structure of a sampled 1D chain" — and

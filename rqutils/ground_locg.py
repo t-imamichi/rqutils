@@ -433,7 +433,6 @@ def ground_locg(
     maxiter: int = 1000,
     tol: float | None = None,
     vspace: tuple[int, DTypeLike] | None = None,
-    precond: Callable[[jax.Array], jax.Array] | None = None,
     prefilter: tuple[int, int] | None = None,
     prefilter_hi: float | None = None,
     debug: bool = False,
@@ -455,17 +454,6 @@ def ground_locg(
         tol: Convergence condition. If None, the machine epsilon of the operator dtype is used.
         vspace: Specification (dimension, dtype) of the vector space. Required only when ``mat`` is
             a callable and ``xinit`` is an integer.
-        precond: Optional approximate inverse :math:`M^{-1}`, applied to the residual where the search
-            direction is formed -- the "P" in LOBPCG. ``None`` (the default) is the identity path and
-            leaves the traced graph unchanged, so no existing caller is affected; it is a static
-            argument, so the branch resolves at trace time. **The callable must preserve its input's
-            sharding in the output**, the same contract ``mat`` carries above; a Jacobi preconditioner
-            is an elementwise multiply, which does so for free. It must not be relied on to change the
-            answer -- only the path: every convergence test still reads the **true** residual, so a
-            preconditioner that shrinks a direction cannot make the routine stop early. Measured on a
-            12-instance XXZ batch, :math:`M^{-1} = \mathrm{diag}(A)^{-1}` gave a median **1.79x**
-            reduction in iterations (range 1.29-2.04x, no regressions), at an :math:`O(N)` cost of
-            under 1% of an iteration.
         prefilter_hi: Upper bound on :math:`\lambda_{\max}`, used as the filter's upper interval
             edge. Ignored unless ``prefilter`` is set. **Required when ``mat`` is a callable** -- there
             is no fallback, because no matvec-only estimate can be rigorous and the estimate this
@@ -482,7 +470,7 @@ def ground_locg(
             :math:`\lambda_{\max}` estimate are gone, since ``prefilter_hi`` needs no iteration --
             and three live vectors: **no growing basis**, which is
             what makes it compatible with this module's single-vector memory budget. Like ``mat`` and
-            ``precond`` it is sharding-transparent, since it only calls ``mat`` and scales
+            ``mat`` it is sharding-transparent, since it only calls ``mat`` and scales
             elementwise. **It cannot change the answer, only the path -- provided ``prefilter_hi``
             is a true upper bound.** That caveat is load-bearing and was originally missing: the
             residual test every convergence check reads certifies that *an* eigenpair was found, not
@@ -547,7 +535,6 @@ def ground_locg(
             maxiter,
             tol,
             vspace=vspace,
-            precond=precond,
             prefilter=prefilter,
             prefilter_hi=prefilter_hi,
             debug=debug,
@@ -558,7 +545,6 @@ def ground_locg(
         xinit,
         maxiter,
         tol,
-        precond=precond,
         prefilter=prefilter,
         prefilter_hi=prefilter_hi,
         debug=debug,
@@ -566,13 +552,12 @@ def ground_locg(
     )
 
 
-@jax.jit(static_argnames=["maxiter", "precond", "prefilter", "debug", "log_level"])
+@jax.jit(static_argnames=["maxiter", "prefilter", "debug", "log_level"])
 def _ground_locg_matrix(
     mat: jax.Array,
     xinit: jax.Array,
     maxiter: int,
     tol: jax.Array | float | None,
-    precond: Callable[[jax.Array], jax.Array] | None = None,
     prefilter: tuple[int, int] | None = None,
     prefilter_hi: jax.Array | float | None = None,
     debug: bool = False,
@@ -602,7 +587,6 @@ def _ground_locg_matrix(
         maxiter,
         tol,
         vspace=vspace,
-        precond=precond,
         prefilter=prefilter,
         prefilter_hi=prefilter_hi,
         debug=debug,
@@ -615,7 +599,6 @@ def _ground_locg_matrix(
         "matvec",
         "maxiter",
         "vspace",
-        "precond",
         "prefilter",
         "debug",
         "log_level",
@@ -628,7 +611,6 @@ def _ground_locg_callable(
     maxiter: int,
     tol: jax.Array | float | None,
     vspace: tuple[int, DTypeLike] | None = None,
-    precond: Callable[[jax.Array], jax.Array] | None = None,
     prefilter: tuple[int, int] | None = None,
     prefilter_hi: jax.Array | float | None = None,
     debug: bool = False,
@@ -706,19 +688,14 @@ def _ground_locg_callable(
         # sas whose row/col 1 vanish and, for a positive-definite operator, spuriously selects that
         # null direction: theta collapses towards 0 instead of reporting rho, the true answer.
         #
-        # The guard reads the RAW residual and the search direction reads the preconditioned one.
-        # These were one quantity before `precond` existed, and splitting them is mandatory, not
-        # stylistic: `r_is_zero` feeds both the sas[1, 1] masking above and `converged` in the
-        # returned state, so routing it through M^-1 would change what counts as a stationary point.
-        # A nonzero residual lying near M^-1's small-singular-value direction would then report
-        # convergence early. Only the direction is preconditioned.
+        # `r_is_zero` feeds both the sas[1, 1] masking above and `converged` in the returned state, so
+        # it must read the RAW residual. A removed `precond` option once transformed the search
+        # direction here; if one is ever reintroduced, it must not touch this guard -- a nonzero
+        # residual lying near M^-1's small-singular-value direction would report convergence early.
+        # `NOTES.md` records why `precond` was removed rather than kept.
         norm_r = jnp.linalg.norm(rcurr)
         r_is_zero = norm_r == 0.0
-        if precond is None:
-            tmp_p = normalize(rcurr, norm_r)
-        else:
-            rprec = precond(rcurr)
-            tmp_p = normalize(rprec, jnp.linalg.norm(rprec))
+        tmp_p = normalize(rcurr, norm_r)
         # Reuse Ax from body_iter0 rather than recomputing it inside compute_sas.
         sas = compute_sas((xcurr, tmp_p), (axcurr, matvec(tmp_p, *args)))
         # Lift the p diagonal out of contention, serving the same purpose as body()'s mask on
@@ -767,10 +744,7 @@ def _ground_locg_callable(
         # a short one scales sas[2, 2] by |tmp_p|^2, a spuriously low diagonal that gets selected in
         # place of the true minimizer under a large positive shift.
         #
-        # Preconditioning applies here, where the search direction is formed, and nowhere else -- the
-        # convergence test below reads `rnext` and must stay on the true residual.
-        rdir = rcurr if precond is None else precond(rcurr)
-        tmp_p, norm_p = _project_out((xcurr, ycurr), rdir)
+        tmp_p, norm_p = _project_out((xcurr, ycurr), rcurr)
         p_is_zero = norm_p == 0.0
         tmp_p = normalize(tmp_p, norm_p)
         # Projected eigensolve. xcurr is the previous iteration's xnext, so its image is already
