@@ -50,28 +50,11 @@ exclude = [".venv", "*.ipynb"]
 exclude = ["**/*.ipynb"]
 
 [tool.ty.rules]
-# JAX ships almost no type information and `jax.jit` converts arguments before a function body runs,
-# so ty cannot see that a Python int reaching an `x.dtype` is an Array by then. numpy's stubs are
-# stricter than this library's dtype-generic `npmod` convention allows: every `ArrayLike.shape` and
-# every `einsum`/`prod` overload reads as an error. These were reviewed individually -- the
-# structural findings they hid (a None subscript, a missing tuple element, a Number-ABC default)
-# are fixed in the code; what remains is tool limitation, not defect. Revisit when JAX ships stubs.
-#
-# Keep this list as short as the code allows: `unresolved-import`, `unsupported-operator` and
-# `not-iterable` were all retired by fixing their few real sites, and two of the three had a genuine
-# defect hiding behind them (a `None` angle reaching arithmetic in `conftest.gate_unitary`, and
-# `QPrintBase._process` annotated `list[list[Term]]` while returning `list[Term]`). Before adding a
-# rule here, count the diagnostics -- `ty check -c 'rules.X="error"'` -- and read them.
-# Six rules retired so far, four remain. The @overload-on-`Literal` pattern did most of it: `sqd`
-# (`return_eigvec`), `ground_locg` (`debug`), `matrix_exp`/`matrix_angle` (`with_diagonals`) -- each a
-# runtime flag that picks the return shape. `not-subscriptable` was removed as dead config, zero
-# findings.
-#
-# What remains, library-side, is 35 findings dominated by one root cause that no annotation fixes: a
-# `@jax.jit` function's parameters are converted *before* the body runs, so `x: int` genuinely has a
-# `.dtype` by the time it is read (13 of the 35). Those need jax to ship stubs, not local work. The
-# tractable remainder is narrowing gaps at `ArrayLike.shape` and the `svsim.to_circuitxz` isinstance
-# branch -- see `docs/typing-notes.md`.
+# JAX ships almost no type information, and `jax.jit` converts arguments before the body runs, so a
+# parameter annotated `int` really does have a `.dtype` when read. numpy's stubs are also stricter than
+# the dtype-generic `npmod` convention allows. Tool limitation, not defect -- revisit when JAX ships
+# stubs. Six sibling rules were retired by fixing their sites; `docs/typing-notes.md` has the survey,
+# the per-rule counts, and which remaining findings are worth acting on.
 unresolved-attribute = "ignore"
 no-matching-overload = "ignore"
 invalid-argument-type = "ignore"
