@@ -201,9 +201,13 @@ Chebyshev prefilter
 polynomial filter to the initial vector before the iteration starts, damping the band
 :math:`[\theta, \lambda_{\max}]` by :math:`1/T_{\mathrm{degree}}` so the ground direction comes out
 amplified relative to everything else. The technique is Chebyshev-filtered subspace iteration
-(ChFSI), standard in large-scale electronic-structure codes[3][4]; what is used here is the
+(ChFSI), standard in large-scale electronic-structure codes[3][4][5]; what is used here is the
 single-vector, prefilter-then-LOBPCG specialization rather than a construction from those papers,
-which filter a whole subspace inside a self-consistent loop.
+which filter a whole subspace inside a self-consistent loop. In particular the two-level
+complementary-subspace method of [5] is **not** implemented here and would not fit: it filters a
+subspace and solves its complement, against this module's three-vector memory budget. A two-level
+*preconditioner* was separately measured and rejected (0.68-0.98x, ``docs/deflation-preconditioner.md``)
+-- it improved conditioning without opening the gap, which is what the iteration count tracks.
 
 Two properties are load-bearing and neither is inherited from the references. The filter's lower edge
 is the *current Rayleigh quotient*, re-read each cycle, not an estimate of :math:`\lambda_1` -- an
@@ -237,6 +241,11 @@ J. Chem. Phys. **145**, 154101 (2016).
 
 [4]: Y. Zhou, Y. Saad, M. L. Tiago, J. R. Chelikowsky, *Self-consistent-field calculations using
 Chebyshev-filtered subspace iteration*, J. Comput. Phys. **219**, 172 (2006).
+
+[5]: A. S. Banerjee, L. Lin, P. Suryanarayana, C. Yang, J. E. Pask, *Two-level Chebyshev filter based
+complementary subspace method*, J. Chem. Theory Comput. **14**, 2930 (2018). The provenance
+``docs/locg-chebyshev-prefilter.md`` cites; used in production in DFT-FE. Its two-level
+complementary-subspace split is **not** what this module does -- see the note below.
 
 Single-vector LOBPCG API
 ========================
