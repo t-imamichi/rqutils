@@ -1135,3 +1135,44 @@ class TestChebyshevPrefilter:
                     f"prefilter did not reduce iterations at {n} devices/{spec} "
                     f"({plain} -> {filtered})"
                 )
+
+
+class TestIntegerXinitRange:
+    """An out-of-range integer ``xinit`` must raise, not return a converged ``0.0``.
+
+    An integer ``xinit`` selects a one-hot via ``iota == xinit``, so an out-of-range index matches
+    nothing and the "one-hot" is the **zero vector**. Every downstream guard then behaves correctly and
+    compounds: the Rayleigh quotient is 0/0-guarded to 0.0, the residual is zero, and the
+    exhausted-search guard reports convergence. Measured ``ground_locg(A, 16)`` on a 16-dimensional
+    operator returning ``+0.0`` for a true ``-1.5`` -- the natural typo for a caller reading the second
+    argument as a dimension.
+
+    Negative indices are included: ``iota`` is non-negative, so ``-1`` matches nothing rather than
+    counting from the end.
+    """
+
+    def test_out_of_range_integer_xinit_raises(self):
+        mat = jnp.array(np.diag([1.5, 0.5, -0.5, -1.5]))
+        for xinit in [4, 5, 99, -1]:
+            with pytest.raises(ValueError, match="out of range"):
+                ground_locg(mat, xinit)
+
+    def test_out_of_range_integer_xinit_raises_for_callable(self):
+        mat = jnp.array(np.diag([1.5, 0.5, -0.5, -1.5]))
+        with pytest.raises(ValueError, match="out of range"):
+            ground_locg(lambda vec: mat @ vec, 9, vspace=(4, jnp.float64))
+
+    def test_in_range_integer_xinit_still_selects_that_one_hot(self):
+        """The guard must not disturb the valid indices, including the boundary ones.
+
+        On a diagonal operator every one-hot *is* an exact eigenvector, so each index returns its own
+        diagonal entry at ``niter=0`` -- which is also why this fixture cannot be used to test the
+        iteration itself.
+        """
+        diag = [1.5, 0.5, -0.5, -1.5]
+        mat = jnp.array(np.diag(diag))
+        for xinit, expected in enumerate(diag):
+            eigval = ground_locg(mat, xinit)[0]
+            assert float(eigval) == pytest.approx(expected, abs=1e-12), (
+                f"xinit={xinit} must select the one-hot with diagonal {expected}"
+            )

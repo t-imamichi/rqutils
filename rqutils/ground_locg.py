@@ -551,8 +551,23 @@ def ground_locg(
         ValueError: If ``xinit`` is an integer and ``mat`` is a callable but ``vspace`` is None. The
             vector space cannot be inferred from a callable, and without this the one-hot
             construction would fail with an opaque "NoneType is not subscriptable".
+
+            Also if an integer ``xinit`` is out of range (negative included). The one-hot is built as
+            ``iota == xinit``, so such an index matches nothing and yields the **zero vector**, from
+            which the solver returns ``0.0`` with ``converged=True`` -- measured ``xinit=16`` on a
+            dimension-16 operator whose true minimum was -1.5.
     """
     _check_prefilter(prefilter)
+    # Host-side: inside jit the index is traced and cannot raise. Negative is equally wrong -- iota is
+    # non-negative, so it matches nothing rather than counting from the end.
+    if isinstance(xinit, int):
+        dim = vspace[0] if vspace is not None else (mat.shape[1] if not callable(mat) else None)
+        if dim is not None and not 0 <= xinit < dim:
+            raise ValueError(
+                f"integer xinit {xinit} is out of range for a vector space of dimension {dim}; it "
+                "selects a one-hot vector, so an out-of-range index yields the zero vector and a "
+                "converged 0.0 rather than an error"
+            )
     if callable(mat):
         return _ground_locg_callable(
             mat,
