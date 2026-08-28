@@ -621,7 +621,8 @@ class TestDataclass:
     def test_is_frozen(self):
         hamiltonian = PauliSumXZ.from_paulisum((["XX"], [1.0]))
         with pytest.raises((AttributeError, TypeError)):
-            hamiltonian.num_qubits = 5
+            # The rejected assignment is the assertion; ty is right that it cannot succeed.
+            hamiltonian.num_qubits = 5  # ty: ignore[invalid-assignment]
 
     def test_is_a_valid_jax_pytree(self):
         """Registered via ``register_dataclass``, so it can cross a ``jit`` boundary.

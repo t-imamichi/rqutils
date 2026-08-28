@@ -260,7 +260,7 @@ Single-vector LOBPCG API
 import logging
 import math
 from collections.abc import Callable
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
@@ -462,6 +462,73 @@ def _chebyshev_prefilter(
         return normalize(jax.lax.scan(term, (vec, first), None, length=degree - 1)[0][1]), None
 
     return jax.lax.scan(cycle, normalize(vector), None, length=cycles)[0]
+
+
+# Overloads so a caller destructuring the 4-tuple does not have to narrow on `len(result) == 5` first.
+# Annotation only: the implementation signature below is unchanged and is the one sphinx documents.
+# `debug` stays positional-or-keyword here (unlike `sqd`'s keyword-only block), so the overloads repeat
+# the full positional order -- `examples/scaling/poc6_mixed_precision.py` and the benchmark pass
+# `maxiter` positionally. A `bool` that is not a literal still matches the `bool` overload and gets the
+# union, which is what a runtime-computed flag needs.
+@overload
+def ground_locg(
+    mat: Callable[[jax.Array], jax.Array] | jax.Array,
+    xinit: jax.Array | int,
+    args: tuple = ...,
+    maxiter: int = ...,
+    tol: float | None = ...,
+    vspace: tuple[int, DTypeLike] | None = ...,
+    prefilter: tuple[int, int] | None = ...,
+    prefilter_hi: float | None = ...,
+    debug: Literal[False] = ...,
+    log_level: int = ...,
+) -> _Result: ...
+
+
+@overload
+def ground_locg(
+    mat: Callable[[jax.Array], jax.Array] | jax.Array,
+    xinit: jax.Array | int,
+    args: tuple = ...,
+    maxiter: int = ...,
+    tol: float | None = ...,
+    vspace: tuple[int, DTypeLike] | None = ...,
+    prefilter: tuple[int, int] | None = ...,
+    prefilter_hi: float | None = ...,
+    *,
+    debug: Literal[True],
+    log_level: int = ...,
+) -> _DebugResult: ...
+
+
+@overload
+def ground_locg(
+    mat: Callable[[jax.Array], jax.Array] | jax.Array,
+    xinit: jax.Array | int,
+    args: tuple,
+    maxiter: int,
+    tol: float | None,
+    vspace: tuple[int, DTypeLike] | None,
+    prefilter: tuple[int, int] | None,
+    prefilter_hi: float | None,
+    debug: Literal[True],
+    log_level: int = ...,
+) -> _DebugResult: ...
+
+
+@overload
+def ground_locg(
+    mat: Callable[[jax.Array], jax.Array] | jax.Array,
+    xinit: jax.Array | int,
+    args: tuple = ...,
+    maxiter: int = ...,
+    tol: float | None = ...,
+    vspace: tuple[int, DTypeLike] | None = ...,
+    prefilter: tuple[int, int] | None = ...,
+    prefilter_hi: float | None = ...,
+    debug: bool = ...,
+    log_level: int = ...,
+) -> _Result | _DebugResult: ...
 
 
 def ground_locg(

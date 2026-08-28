@@ -137,9 +137,12 @@ def do_svsim(
 
     dim = 2**circuit.num_qubits
 
+    # A separate name rather than rebinding `initial_state`: the parameter is declared as the int index
+    # *or* the vector, and reassigning the vector onto it makes the declared type wrong from here down.
+    state_vector = initial_state
     if len(initial_state.shape) == 0:
         one_hot_indices = jnp.arange(dim, dtype=np.int64, out_sharding=out_sharding)
-        initial_state = (one_hot_indices == initial_state).astype(np.complex128)
+        state_vector = (one_hot_indices == initial_state).astype(np.complex128)
 
     def apply_gate(state, gate):
         # Build the index iota inside the body, not once outside it. Closing over it instead makes
@@ -163,7 +166,7 @@ def do_svsim(
         out = jax.lax.cond(gate.cos == 0.0, lambda: out, lambda: out + gate.cos * state)
         return out, None
 
-    return jax.lax.scan(apply_gate, initial_state, circuit)[0]
+    return jax.lax.scan(apply_gate, state_vector, circuit)[0]
 
 
 def to_circuitxz(circuit: CircuitInput) -> CircuitXZ:

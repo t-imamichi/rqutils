@@ -10,13 +10,14 @@ That audit's closing warning shapes the design here:
 So targeted per-branch tests are the backbone and randomized sweeps are a supplement.
 """
 
+import inspect
 import warnings
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from conftest import herm, lowest, rel_resid, run_sharded_child, symmetrize
+from conftest import assert_type_checks, herm, lowest, rel_resid, run_sharded_child, symmetrize
 
 from rqutils.ground_locg import (
     _chebyshev_prefilter,
@@ -1176,3 +1177,65 @@ class TestIntegerXinitRange:
             assert float(eigval) == pytest.approx(expected, abs=1e-12), (
                 f"xinit={xinit} must select the one-hot with diagonal {expected}"
             )
+
+
+class TestDebugOverloadIsCheckable:
+    """A caller must be able to destructure either arity without narrowing first.
+
+    ``ground_locg`` returns 4 elements, or 5 with ``debug=True``. Because ``debug`` is a plain ``bool``,
+    the declared return was the full union and every ``eigval, eigvec, niter, conv = ground_locg(...)``
+    read as unpacking a 5-tuple -- 19 ``invalid-assignment`` diagnostics across the tree, which is what
+    that rule's now-removed global ignore was absorbing.
+
+    ``@overload`` on ``debug: Literal[False]/[True]`` resolves it. Four overloads rather than two,
+    because ``debug`` is positional-or-keyword here (unlike ``sqd``'s keyword-only block): one for the
+    keyword form, one for the all-positional form that ``examples/scaling/poc6_mixed_precision.py``
+    uses, and a ``bool`` fallback so a *runtime-computed* flag still gets the union and still requires
+    narrowing. That last one is the case an overload set can easily break.
+
+    Annotation only -- ``test_overloads_do_not_change_behavior`` pins the runtime side.
+    """
+
+    def test_both_arities_destructure_without_narrowing(self):
+        assert_type_checks(
+            "import jax.numpy as jnp\n"
+            "from rqutils.ground_locg import ground_locg\n"
+            "A = jnp.eye(4)\n"
+            "v = jnp.ones(4)\n"
+            "eigval, eigvec, niter, conv = ground_locg(A, v)\n"
+            "e2, v2, n2, c2, dbg = ground_locg(A, v, debug=True)\n"
+            "_ = dbg['theta']\n"
+            "e3, v3, n3, c3, d3 = ground_locg(A, v, (), 200, None, None, None, None, True)\n"
+            "flag = bool(niter > 0)\n"
+            "res = ground_locg(A, v, debug=flag)\n"
+            "assert len(res) in (4, 5)\n",
+            "ground_locg's debug overloads",
+            rules=("invalid-assignment", "not-iterable"),
+        )
+
+    def test_overloads_do_not_change_behavior(self):
+        """Every calling convention keeps its exact runtime arity, value and signature.
+
+        Overloads are erased at runtime, but a mistake in the set (a missing default, a stray
+        keyword-only marker) shows up as a ``TypeError`` on a call that used to work. The
+        all-positional and runtime-flag arms are the ones at risk.
+        """
+        rng = np.random.default_rng(11)
+        dim = 24
+        basis, _ = np.linalg.qr(rng.standard_normal((dim, dim)))
+        mat = basis @ np.diag(np.linspace(-2.0, 3.0, dim)) @ basis.T
+        mat = jnp.array((mat + mat.T) / 2)
+        vec = jnp.array(rng.standard_normal(dim))
+
+        assert len(ground_locg(mat, vec)) == 4
+        assert len(ground_locg(mat, vec, debug=False)) == 4
+        assert len(ground_locg(mat, vec, debug=True)) == 5
+        # All-positional through debug, as the scaling POCs call it.
+        assert len(ground_locg(mat, vec, (), 200, None, None, None, None, True)) == 5
+        # A bool that is not a literal must still reach the debug path.
+        assert len(ground_locg(mat, vec, debug=bool(dim > 0))) == 5
+
+        eigval = float(ground_locg(mat, vec)[0])
+        assert eigval == pytest.approx(-2.0, abs=1e-9), eigval
+        # inspect must still report the implementation, not an overload stub.
+        assert "log_level" in str(inspect.signature(ground_locg))

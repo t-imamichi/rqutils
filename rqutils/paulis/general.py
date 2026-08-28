@@ -347,8 +347,9 @@ def labels(
     """
     dim = normalize_dim(dim)
 
-    if symbol is None or isinstance(symbol, str):
-        symbol = (symbol,) * len(dim)
+    # A separate name rather than rebinding `symbol`: the parameter accepts a scalar or a per-subsystem
+    # sequence, and broadcasting the scalar onto it makes the declared type wrong from here down.
+    symbols = (symbol,) * len(dim) if symbol is None or isinstance(symbol, str) else symbol
 
     # Normalization affixes. Folded into the construction below -- the prefix into the seed and the
     # suffix into the last subsystem's per-label list -- rather than applied as two extra whole-array
@@ -373,7 +374,7 @@ def labels(
 
     out = np.array(pre, dtype=str)
 
-    for isub, (pauli_dim, sym) in enumerate(zip(dim, symbol)):
+    for isub, (pauli_dim, sym) in enumerate(zip(dim, symbols)):
         if delimiter and len(out.shape) > 0:
             out = np.char.add(out, np.full(out.shape, delimiter))
 

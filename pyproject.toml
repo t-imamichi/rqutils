@@ -63,16 +63,12 @@ exclude = ["**/*.ipynb"]
 # `QPrintBase._process` annotated `list[list[Term]]` while returning `list[Term]`). Before adding a
 # rule here, count the diagnostics -- `ty check -c 'rules.X="error"'` -- and read them.
 # `invalid-return-type` is the next candidate: 7 sites, of which `math.py`'s two are the same
-# `with_diagonals` union that `sqd`'s @overload pattern fixes.
+# `with_diagonals` union that the @overload pattern fixes. That pattern has now retired
+# `invalid-assignment` too -- overloading `ground_locg` on `debug: Literal[...]` took 19 diagnostics to
+# 1, and the last was a test asserting a read-only property raises (per-line ignore there).
 unresolved-attribute = "ignore"
 no-matching-overload = "ignore"
 invalid-argument-type = "ignore"
 invalid-return-type = "ignore"
 not-subscriptable = "ignore"
-# Destructuring `ground_locg`'s variable-arity return (4 elements, 5 with debug=True, which a checker
-# cannot follow since `debug` is static), plus dtype-generic reassignments the numpy stubs reject.
-# No longer about optional-dependency type aliases: `type X = A | B` followed by `X |= C` under a
-# HAS_* guard is gone from the library -- it left the `C` arm invisible to checkers, so all three
-# aliases now name every arm in the `type` statement (see `sqd.HamiltonianInput`).
-invalid-assignment = "ignore"
 
