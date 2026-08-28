@@ -82,6 +82,36 @@ failed assert changes nothing, verify each edit landed rather than inferring it 
 mutation-test the *surviving* assertion afterwards. Note `pytest` prints "no tests ran" rather than
 failing when the class path is wrong, so a mis-copied class name looks like a pass.
 
+### A `maxiter=1000` non-convergence usually means a small gap, not a bad subspace
+
+2026-08-28. Two of ~300 random stress fixtures raised `RuntimeError: LOBPCG did not converge`, which
+read as a defect. It is not one, and the distinction is worth keeping because the error message's own
+advice ("check that the subspace is well conditioned") pointed the wrong way.
+
+The fixture: 4 Pauli terms over 6 qubits, 37-state subspace, **relative gap 5.5e-04** — the three
+lowest excited states degenerate to 4e-16, sitting 3.2e-03 above the ground state. LOBPCG's
+*eigenvalue* converges quadratically while its *eigenvector* converges at a rate set by the gap, so:
+
+| iteration | `theta` error | residual | converged |
+| --- | --- | --- | --- |
+| 100 | 7.6e-05 | 2.1e-03 | no |
+| 500 | **4.9e-12** | 6.9e-07 | no |
+| 999 | **4.4e-16** | 2.4e-11 | no |
+| 1091 | 4.4e-16 | 8.6e-14 | **yes** |
+
+So the answer was already at machine precision by iteration ~500 and the residual test only cleared at
+**1091**, just past the default cap. `maxiter=2000` returns it, correct to 4.4e-16. `scipy.eigsh(tol=0)`
+agrees. The rate law predicts ~491 iterations from `ln(1e10) / (2*sqrt(relgap))`, same order as
+observed (block-size-1 is slower than that two-sided bound).
+
+**Rare rather than systematic:** 0 of 140 further random subspaces failed at the default, *including 18
+with a relative gap below 1e-4*. So don't raise the default cap on the strength of this — raise
+`maxiter` at the call site. The message now says so.
+
+Pinned by `test_sqd.py::TestConvergenceIsReported::test_near_degenerate_subspace_needs_maxiter_above_the_default`,
+with the 37 basis states written out as integers. A seed-based redraw does **not** work: a nearby seed
+measured a relative gap of 8.7e-03, too well-gapped to reproduce the raise.
+
 ### `vinit_from_min_diag`'s weight must carry the seed's sign, or it cancels it
 
 2026-08-28, found while validating the prefilter fix against sampled `Bx = 0` subspaces, and

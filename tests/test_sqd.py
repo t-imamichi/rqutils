@@ -1352,6 +1352,81 @@ class TestConvergenceIsReported:
         expected = lowest_projected(strings, coeffs, states)
         assert abs(got - expected) < 1e-6
 
+    def test_near_degenerate_subspace_needs_maxiter_above_the_default(self):
+        """A `maxiter=1000` non-convergence can mean a small gap, NOT an ill-conditioned subspace.
+
+        This 37-state subspace has a relative gap of 5.5e-04 -- its three lowest excited states are
+        degenerate to 4e-16 and sit 3.2e-03 above the ground state. LOBPCG's eigenvalue converges
+        quadratically while its eigenvector converges at a rate set by the gap, so measured here
+        ``theta`` is already correct to 4.4e-16 by iteration 500, and the *residual* only crosses the
+        threshold at iteration **1091** -- just past the default cap. So the default raises and
+        ``maxiter=2000`` returns an answer accurate to 4.4e-16.
+
+        Pinned because the raise is easy to misread as a defect (it was, in this repo's own stress
+        testing) and because the error message's advice matters: raising ``maxiter`` is the first
+        thing to try, not inspecting the subspace. Rare rather than systematic -- 0 of 140 further
+        random subspaces failed at the default, including 18 with a relative gap below 1e-4.
+        """
+        strings = ["XIXZXX", "IIXZIZ", "YXYXII", "XZXXZZ"]
+        coeffs = np.array([2.107755, 0.453263, 0.410334, 1.867813])
+        # The 37 basis states written out as integers rather than redrawn from a seed: a random draw
+        # gives whatever gap it gives (a nearby seed measured 8.7e-03, too large to reproduce this),
+        # and CLAUDE.md's rule is that a fixture picked for a specific pathology must keep it.
+        basis = [
+            0,
+            1,
+            2,
+            4,
+            5,
+            6,
+            9,
+            10,
+            12,
+            14,
+            15,
+            16,
+            19,
+            23,
+            24,
+            25,
+            31,
+            32,
+            33,
+            34,
+            37,
+            38,
+            40,
+            41,
+            42,
+            44,
+            45,
+            46,
+            47,
+            48,
+            49,
+            50,
+            55,
+            56,
+            59,
+            60,
+            61,
+        ]
+        states = np.array([[int(b) for b in format(k, "06b")] for k in basis], dtype=np.uint8)
+
+        spectrum = np.linalg.eigvalsh(project_dense(strings, coeffs, states))
+        relgap = (spectrum[1] - spectrum[0]) / (spectrum[-1] - spectrum[0])
+        assert relgap < 5e-3, (
+            f"fixture's relative gap is {relgap:.2e}, too large to need more than the default "
+            "maxiter -- this test is no longer exercising a near-degenerate subspace"
+        )
+
+        with pytest.raises(RuntimeError, match="did not converge"):
+            eigval_of(strings, coeffs, states, maxiter=1000)
+        got = eigval_of(strings, coeffs, states, maxiter=4000)
+        assert got == pytest.approx(float(spectrum[0]), abs=1e-10), (
+            f"got {got}, expected {spectrum[0]} with a generous maxiter"
+        )
+
     def test_a_generous_maxiter_is_accepted(self):
         rng = np.random.default_rng(20260825)
         strings = real_pauli_strings(6, 8, rng)

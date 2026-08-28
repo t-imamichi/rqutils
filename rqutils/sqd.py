@@ -607,8 +607,13 @@ def sqd(
         raise RuntimeError(
             f"LOBPCG did not converge in maxiter={maxiter} iterations (tol={tol!r}). The value it "
             f"reached, {eigval!r}, is a variational upper bound rather than the ground energy -- "
-            "finite and plausible, which is why this raises instead of returning it. Raise `maxiter`, "
-            "loosen `tol`, or check that the subspace is well conditioned."
+            "finite and plausible, which is why this raises instead of returning it. Raise `maxiter` "
+            "first: a near-degenerate ground state converges in the eigenVALUE long before the "
+            "residual test is satisfied, so this often means the default cap was simply too low "
+            "rather than that anything is wrong. Measured on a 37-state subspace with a relative gap "
+            "of 5.5e-04, theta was already correct to 4e-16 by iteration 500 while the residual only "
+            "crossed the threshold at 1091. Loosening `tol` is the other lever; a genuinely "
+            "ill-conditioned subspace is the rarer cause."
         )
     if return_eigvec:
         eigvec, states_u, subspace_dim = result[1:-1]
