@@ -368,6 +368,24 @@ constraint over narrating the code — if a comment restates what the next line 
 Long explanations belong in the docstring (user-facing) or `NOTES.md` (evidence, measurements,
 post-mortems), not inline.
 
+**A comment must earn its length; length alone is not the test.** Ask what a reader loses if it is
+deleted. A block that records a measured defect earns any length — `sqd.py`'s 27 lines over one
+statement carry four silent-wrong-answer failures with their measured values, and deleting them removes
+the only thing stopping recurrence. A block that re-explains what a `docs/` file or `NOTES.md` already
+says earns nothing at any length. Measured 2026-08-29: 41 blocks in `rqutils/` and `tests/` are longer
+than the code beneath them, and the ones inspected were all the first kind. **Do not trim by ratio.**
+
+Two failure modes to check for instead, both of which produced real bloat here:
+
+- **Editing by appending.** Revisiting a comment and adding a paragraph instead of rewriting the
+  existing one. `[tool.ty.rules]`'s comment reached 22 lines over 4 lines of config across three
+  visits, with the same `jax.jit` explanation stated twice in one block.
+- **Restating a document that already exists.** Before writing an inline block, check whether the
+  content belongs in — or is already in — `NOTES.md` or `docs/`. That same comment duplicated
+  `docs/typing-notes.md` in full.
+
+The same applies to a rule stated near-identically in two places: prefer one statement plus a pointer.
+
 **Docstrings feed the published API reference.** Every module opens with a raw docstring that is a full
 reST document: over/underlined title, `.. currentmodule::`, prose with `.. math::` derivations of the
 normalization conventions, and an explicit API section (`.. autofunction::` / `.. autoclass::` /
