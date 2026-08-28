@@ -332,7 +332,7 @@ class QPrintBase(ABC):
 
         return fig
 
-    def _process(self) -> tuple[int, str, str, list[list[Term]]]:
+    def _process(self) -> tuple[int, str, str, list[Term]]:
         """Compose a list of QPrintTerms."""
         # Amplitude format template
         amp_template = f"{{:{self.amp_format}}}"

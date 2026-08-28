@@ -181,7 +181,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from numbers import Number
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 import jax
 import jax.numpy as jnp
@@ -384,6 +384,38 @@ def _check_states_shape(states: Any, num_qubits: int) -> StateList:
             "subspace. Also check for a transposed array or a mismatched Hamiltonian."
         )
     return states
+
+
+# Overloads so a caller destructuring the 3-tuple does not have to narrow first. `return_eigvec` is a
+# plain bool, so without these the declared return is the full union and every
+# `eigval, eigvec, subdims = sqd(...)` reads as unpacking a `float`. Annotation only -- the
+# implementation signature below is unchanged, and sphinx documents that one.
+@overload
+def sqd(
+    hamiltonian: HamiltonianInput,
+    states: StateList,
+    *,
+    states_size: int | None = ...,
+    return_eigvec: Literal[True] = ...,
+    cache_level: tuple[int, int] = ...,
+    maxiter: int = ...,
+    tol: float | None = ...,
+    prefilter: tuple[int, int] | None = ...,
+) -> tuple[float, Vector, StateList]: ...
+
+
+@overload
+def sqd(
+    hamiltonian: HamiltonianInput,
+    states: StateList,
+    *,
+    states_size: int | None = ...,
+    return_eigvec: Literal[False],
+    cache_level: tuple[int, int] = ...,
+    maxiter: int = ...,
+    tol: float | None = ...,
+    prefilter: tuple[int, int] | None = ...,
+) -> float: ...
 
 
 def sqd(

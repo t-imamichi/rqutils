@@ -26,14 +26,16 @@ jax.config.update("jax_enable_x64", True)
 import numpy as np
 from jax.sharding import AxisType, PartitionSpec
 
-from rqutils.svsim import svsim
+from rqutils.svsim import GateSpec, svsim
 
 NUM_QUBITS, MESH_SIZE = 6, 4
 
 
-def base_circuit() -> list:
+def base_circuit() -> list[GateSpec]:
     """A circuit touching every supported gate, so one sweep covers the whole gate set."""
-    circuit = [("ry", q, 0.3 * (q + 1)) for q in range(NUM_QUBITS)]
+    # Annotated, or the first comprehension pins the element type to the 3-tuple shape it happens to
+    # build and the heterogeneous `+=` below reads as a type error.
+    circuit: list[GateSpec] = [("ry", q, 0.3 * (q + 1)) for q in range(NUM_QUBITS)]
     circuit += [("rzz", (q, q + 1), 0.2) for q in range(NUM_QUBITS - 1)]
     circuit += [("x", 0), ("y", 1), ("z", 2), ("rx", 3, 0.4), ("rz", 4, 0.5)]
     return circuit

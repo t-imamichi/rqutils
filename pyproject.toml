@@ -56,23 +56,23 @@ exclude = ["**/*.ipynb"]
 # every `einsum`/`prod` overload reads as an error. These were reviewed individually -- the
 # structural findings they hid (a None subscript, a missing tuple element, a Number-ABC default)
 # are fixed in the code; what remains is tool limitation, not defect. Revisit when JAX ships stubs.
+#
+# Keep this list as short as the code allows: `unresolved-import`, `unsupported-operator` and
+# `not-iterable` were all retired by fixing their few real sites, and two of the three had a genuine
+# defect hiding behind them (a `None` angle reaching arithmetic in `conftest.gate_unitary`, and
+# `QPrintBase._process` annotated `list[list[Term]]` while returning `list[Term]`). Before adding a
+# rule here, count the diagnostics -- `ty check -c 'rules.X="error"'` -- and read them.
+# `invalid-return-type` is the next candidate: 7 sites, of which `math.py`'s two are the same
+# `with_diagonals` union that `sqd`'s @overload pattern fixes.
 unresolved-attribute = "ignore"
 no-matching-overload = "ignore"
 invalid-argument-type = "ignore"
 invalid-return-type = "ignore"
 not-subscriptable = "ignore"
-unsupported-operator = "ignore"
 # Destructuring `ground_locg`'s variable-arity return (4 elements, 5 with debug=True, which a checker
 # cannot follow since `debug` is static), plus dtype-generic reassignments the numpy stubs reject.
 # No longer about optional-dependency type aliases: `type X = A | B` followed by `X |= C` under a
 # HAS_* guard is gone from the library -- it left the `C` arm invisible to checkers, so all three
 # aliases now name every arm in the `type` statement (see `sqd.HamiltonianInput`).
 invalid-assignment = "ignore"
-# mpi4py is imported by examples/ but declared nowhere -- install it manually for the
-# multi-process path. Optional at runtime, so an unresolved import here is expected.
-unresolved-import = "ignore"
-# Unpacking a value whose declared type is a union of scalar and sequence (qprint's terms list,
-# sqd's variable-length return tuple). The runtime shapes are correct; the annotations are looser
-# than the code. Tightening them is a worthwhile separate change, not a lint fix.
-not-iterable = "ignore"
 

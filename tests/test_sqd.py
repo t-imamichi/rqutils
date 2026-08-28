@@ -437,7 +437,7 @@ class TestKeywordOnlyEntryPoints:
     def test_sqd_rejects_a_third_positional_argument(self):
         states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
         with pytest.raises(TypeError, match="positional"):
-            sqd((["ZI"], [1.0]), states, True)  # ty: ignore[too-many-positional-arguments]
+            sqd((["ZI"], [1.0]), states, True)
 
     def test_hproj_rejects_a_third_positional_argument(self):
         states = np.array([[0, 1], [1, 0]], dtype=np.uint8)

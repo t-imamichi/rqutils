@@ -102,6 +102,15 @@ allows. Those were triaged individually rather than blanket-disabled — prefer 
 in the code over widening the ignore list. Pre-commit runs only whitespace/EOF/YAML/large-file
 hooks; it does not run ruff or ty.
 
+**A global ignore hides real defects; prefer a per-line `# ty: ignore[rule]`.** Three rules were
+retired by fixing their few real sites, and two of the three had a genuine bug behind them — a `None`
+angle reaching `angle / 2.0` in `conftest.gate_unitary`, and `QPrintBase._process` annotated
+`list[list[Term]]` while returning a flat `list[Term]`. Count first: `ty check -c 'rules.X="error"'`
+per rule, then read the diagnostics rather than the count. The two patterns that did the work are a
+per-line suppression where the stub is genuinely wrong (`math.py`'s `1.0j * mat`) and `@overload` where
+a runtime flag picks the return shape (`sqd`'s `return_eigvec`). `invalid-return-type` is the next
+candidate at 7 sites; `invalid-argument-type` (96) is the one to leave alone.
+
 New scripts under `examples/` trip rules the existing tree does not: **B023** (a `lambda` in a `for`
 loop capturing the loop variable — endemic to benchmark harnesses passing thunks to a timer; fix by
 binding as a default arg, `lambda vec=vec: ...`, not by restructuring the loop) and **E402** (imports

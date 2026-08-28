@@ -137,7 +137,8 @@ def matrix_ufunc(
     if hermitian in (1, True):
         eigvals, eigcols = npmod.linalg.eigh(mat)
     elif hermitian == -1:
-        eigvals, eigcols = npmod.linalg.eigh(1.0j * mat)
+        # numpy's stubs have no complex * ArrayLike overload; correct under the npmod convention.
+        eigvals, eigcols = npmod.linalg.eigh(1.0j * mat)  # ty: ignore[unsupported-operator]
         eigvals = -1.0j * eigvals
     else:
         eigvals, eigcols = npmod.linalg.eig(mat)

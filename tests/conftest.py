@@ -159,6 +159,10 @@ def gate_unitary(name, qubits, num_qubits, angle=None):
         operator = np.kron(operator, factor)
     if name in ("x", "y", "z"):
         return operator
+    if angle is None:
+        # Otherwise this is a `TypeError: unsupported operand type(s) for /: 'NoneType' and 'float'`
+        # from inside the arithmetic, which does not say which gate spec was malformed.
+        raise ValueError(f"gate {name} is parameterized and requires an angle")
     identity = np.eye(2**num_qubits, dtype=np.complex128)
     return np.cos(angle / 2.0) * identity - 1.0j * np.sin(angle / 2.0) * operator
 

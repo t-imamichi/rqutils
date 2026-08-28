@@ -94,7 +94,8 @@ logger.info("Verified GHZ state: amplitudes %s", np.asarray(amplitudes))
 # Write the output
 if options.gpus == "mpi":
     # Writing array shards from multiple processes requires synchronization. Output path
-    from mpi4py import MPI
+    # mpi4py is deliberately undeclared -- install it manually for the multi-process path.
+    from mpi4py import MPI  # ty: ignore[unresolved-import]
 
     if (proc_id := jax.process_index()) == 0:
         # Head process creates the file and defines the dataset
