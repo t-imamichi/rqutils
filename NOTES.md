@@ -588,6 +588,40 @@ now caught.
 `get_xsource` no longer contributes — it is a binary search into the already-sorted list, not a sort
 of a stacked `2N` array.
 
+### A rounding-floor residual is not zero, and `== 0.0` is the wrong guard
+
+2026-08-28, from `docs/rqutils-prefilter-dim2-request.md`. `body_iter1` formed its search direction as a
+bare `normalize(rcurr, norm_r)`. An `xinit` that *is* an eigenvector in floating point leaves a residual
+at the **rounding floor** — 3.1e-16 on `[[2.9, 1], [1, 2.9]]` — so the `norm_r == 0.0` guard missed it,
+the division amplified pure noise until `tmp_p` came back **parallel to `xcurr`**, and `sas` degenerated
+to `[[1.9, -1.9], [-1.9, 4.8]]` whose lowest eigenvalue is **0.96** against a true **1.9**. Iteration 0
+still had theta correct with `converged=False`; iteration 1 destroyed it.
+
+**Two plausible fixes measured and rejected, in order:**
+
+1. **Masking `sas[1, 1]`** — the guard that already existed. It *fires correctly*
+   (`sas[1, 1] = 4.8 = 2|rho| + 1`) and is still insufficient: the surviving off-diagonal keeps coupling
+   `x` to the noise. Lifting a diagonal only works when the off-diagonals are already negligible, which
+   is exactly what a parallel `tmp_p` breaks.
+2. **A scale-relative residual floor**, `eps * dim * max(|rho|, 1)`. Fixed all 42 cells of the reporter's
+   sweep, then **failed a cell that previously passed**: `|r| = 8.07e-16` against a floor of `7.99e-16`.
+   A 1% margin deciding correctness. Loosening it pins `theta = rho` when the iterate is not an
+   eigenvector — measured, that returned 0.96 *silently*, strictly worse than the reported raise.
+
+**The fix needs no threshold**: `_project_out((xcurr,), rcurr)`, which `body()` has always used and
+`body_iter1` was missing. It renormalizes, subtracts the basis again, and returns *exactly* zero when the
+norm collapses below 0.99 — "this direction was rounding noise" expressed structurally rather than as a
+tolerance. Also drops a redundant norm reduction.
+
+**The defect was not dim-2-specific**, contrary to the report's framing: any near-exact-eigenvector
+`xinit` hits it at any dimension (verified 0/120 failures across dims 2–40 after the fix, real and
+complex). dim 2 is only where `sqd`'s prefilter lands on the eigenvector routinely.
+
+**A test-isolation trap worth keeping.** The anti-vacuity arm — "a genuine direction must survive" —
+cannot isolate `body_iter1`. `maxiter=0` returns `rho_init` and skips the step; at `maxiter=1` `body()`
+recovers whatever `body_iter1` discarded. So a mutant zeroing `tmp_p` unconditionally survives that
+class and is caught by `TestDtypes` instead. The test says so rather than implying coverage it lacks.
+
 ## `precond` was removed; `sqd` defaults to `prefilter=(32, 2)`
 
 2026-08-28, acting on the comparison below.

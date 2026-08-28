@@ -651,6 +651,98 @@ class TestZeroResidualAfterSeedStep:
         assert np.asarray(eigvec) == pytest.approx(expected)
 
 
+class TestExactEigenvectorStart:
+    """An ``xinit`` that already *is* an eigenvector must report its Rayleigh quotient.
+
+    ``body_iter1`` formed its search direction as a bare ``normalize(rcurr, norm_r)``, which divides by
+    the residual norm however small it is. An ``xinit`` that is an eigenvector in floating point leaves
+    a residual at the **rounding floor**, not exactly zero -- 3.1e-16 on the 2x2 below -- so dividing by
+    it amplified pure noise until ``tmp_p`` came back parallel to ``xcurr``. ``sas`` then degenerated to
+    ``[[1.9, -1.9], [-1.9, 4.8]]``, whose lowest eigenvalue is **0.96** for a true **1.9**, and the
+    solve never recovered: ``converged=False`` at every ``maxiter``.
+
+    Reported from the ``spinchain`` side as a ``sqd`` dim-2 bug
+    (``docs/rqutils-prefilter-dim2-request.md``); the fault is here, and ``sqd`` only supplied the input
+    that exposed it -- with ``prefilter`` on, a 2-dimensional iterate lands on the eigenvector routinely.
+
+    Two rejected fixes are worth recording, because both look right:
+
+    * **Masking ``sas[1, 1]``** (the pre-existing ``r_is_zero`` path) fires correctly and is still
+      insufficient -- the surviving *off-diagonal* keeps coupling ``x`` to the noise.
+    * **A scale-relative residual threshold** decides correctness on a 1% margin: measured
+      ``|r| = 8.07e-16`` against a floor of ``7.99e-16`` on a neighbouring instance, and a looser floor
+      pins ``theta = rho`` when the iterate is *not* an eigenvector (measured, that returned 0.96).
+
+    The fix reuses ``_project_out``, which ``body()`` has always used and which needs no threshold: it
+    renormalizes, subtracts again, and returns exactly zero when the norm collapses below 0.99.
+    """
+
+    def test_ground_eigenvector_start_reports_its_own_eigenvalue(self):
+        """The reported 2x2, exercised through ``ground_locg`` directly."""
+        mat = np.array([[2.9, 1.0], [1.0, 2.9]])
+        eigvec = np.linalg.eigh(mat)[1][:, 0]
+        result = ground_locg(jnp.asarray(mat), jnp.asarray(eigvec), maxiter=1000)
+        assert bool(result[3]), "an exact eigenvector start must converge, not exhaust maxiter"
+        assert float(result[0]) == pytest.approx(1.9, abs=1e-12), (
+            f"got {float(result[0])}, expected 1.9 -- a normalized rounding-floor residual has "
+            "degenerated the projected matrix"
+        )
+
+    @pytest.mark.parametrize("shift", [0.0, -0.1, 1.0, 2.0, 10.0])
+    def test_the_failure_was_not_a_sign_test(self, shift):
+        """Swept over the identity shift, which moves the spectrum without moving the eigenvectors.
+
+        The report read the trigger as ``lambda_0 > 0.45 * width``; a scale-relative threshold fix
+        reproduced that boundary and then failed at ``shift=-0.1`` instead, which is what showed the
+        threshold to be the wrong mechanism rather than merely mistuned. Every shift must pass.
+        """
+        mat = np.array([[2.9, 1.0], [1.0, 2.9]]) + shift * np.eye(2)
+        reference = float(np.linalg.eigvalsh(mat)[0])
+        eigvec = np.linalg.eigh(mat)[1][:, 0]
+        result = ground_locg(jnp.asarray(mat), jnp.asarray(eigvec), maxiter=1000)
+        assert bool(result[3]), f"shift={shift} failed to converge from an eigenvector start"
+        assert float(result[0]) == pytest.approx(reference, abs=1e-10)
+
+    def test_a_genuine_search_direction_still_survives(self):
+        """The anti-vacuity arm: zeroing must not swallow a real residual.
+
+        Deliberately an end-to-end assertion rather than one isolating ``body_iter1``. Neither cap
+        isolates it: ``maxiter=0`` returns ``rho_init`` and skips the step, while at ``maxiter=1``
+        ``body()`` recovers whatever ``body_iter1`` discarded. A mutant zeroing ``tmp_p``
+        unconditionally therefore survives *this class* and is caught by ``TestDtypes`` instead --
+        recorded so the survival is not read as a coverage gap here.
+        """
+        rng = np.random.default_rng(20260828)
+        mat = herm(48, rng, complex_=False)
+        matj = jnp.asarray(mat)
+        xinit = jnp.asarray(rng.normal(size=48))
+        rho = float(jnp.sum(xinit * (matj @ xinit)) / jnp.sum(xinit * xinit))
+        result = ground_locg(matj, xinit, maxiter=2000)
+        assert bool(result[3])
+        assert float(result[0]) == pytest.approx(lowest(mat), abs=1e-10)
+        assert float(result[0]) < rho - 1e-6, "theta never moved off the initial Rayleigh quotient"
+
+    def test_every_dimension_and_both_eigenvector_signs(self):
+        """Not dim-2-specific: any exact-eigenvector start hit this, at any size.
+
+        The report scoped the trigger to ``dim == 2`` because that is where ``sqd``'s filter lands on
+        the eigenvector; the underlying defect has no dimension dependence.
+        """
+        rng = np.random.default_rng(20260828)
+        for dim in (2, 3, 5, 16, 64):
+            for complex_ in (False, True):
+                mat = herm(dim, rng, complex_=complex_)
+                eigvec = np.linalg.eigh(mat)[1][:, 0]
+                for sign in (1.0, -1.0):
+                    result = ground_locg(jnp.asarray(mat), jnp.asarray(sign * eigvec), maxiter=2000)
+                    assert bool(result[3]), (
+                        f"dim={dim} complex={complex_} sign={sign}: no convergence"
+                    )
+                    assert float(result[0]) == pytest.approx(lowest(mat), abs=1e-9), (
+                        f"dim={dim} complex={complex_} sign={sign}: got {float(result[0])}"
+                    )
+
+
 class TestChebyshevPrefilter:
     """``prefilter`` damps the unwanted band of the spectrum before the iteration starts.
 

@@ -688,11 +688,25 @@ def _ground_locg_callable(
         # sas whose row/col 1 vanish and, for a positive-definite operator, spuriously selects that
         # null direction: theta collapses towards 0 instead of reporting rho, the true answer.
         #
-        # `norm_r` is bound because `r_is_zero` feeds both the sas[1, 1] mask below and `converged` in
-        # the returned state; a preconditioner must never be routed through it (`NOTES.md`).
-        norm_r = jnp.linalg.norm(rcurr)
-        r_is_zero = norm_r == 0.0
-        tmp_p = normalize(rcurr, norm_r)
+        # `_project_out` rather than a bare `normalize(rcurr)`, which is what `body()` has always
+        # used and what this step was missing. A bare normalize divides by the residual norm however
+        # small it is: an `xinit` that *is* an eigenvector in floating point leaves a residual at the
+        # rounding floor (measured 3.1e-16 on the 2x2 `[[2.9, 1], [1, 2.9]]`), and dividing by that
+        # amplifies pure noise until `tmp_p` comes back **parallel to `xcurr`**. `sas` then degenerates
+        # -- measured `[[1.9, -1.9], [-1.9, 4.8]]`, whose lowest eigenvalue is 0.96 for a true 1.9 --
+        # and the caller saw a `RuntimeError` naming `maxiter` on a problem solved in one iteration
+        # (`docs/rqutils-prefilter-dim2-request.md`).
+        #
+        # Masking `sas[1, 1]` alone does NOT fix it: the mask fired correctly and the surviving
+        # off-diagonal still coupled `x` to the noise. Nor does a scale-relative residual threshold --
+        # measured, `|r| = 8.07e-16` against a floor of `7.99e-16` on a neighbouring instance, i.e. a
+        # 1% margin deciding correctness, and a looser floor pins `theta = rho` when the iterate is
+        # *not* an eigenvector. `_project_out` needs no threshold: it renormalizes, subtracts again,
+        # and returns exactly zero when the norm collapses below 0.99, which is precisely "this
+        # direction was rounding noise". It also returns the norm, so no separate reduction is needed.
+        tmp_p, norm_p = _project_out((xcurr,), rcurr)
+        r_is_zero = norm_p == 0.0
+        tmp_p = normalize(tmp_p, norm_p)
         # Reuse Ax from body_iter0 rather than recomputing it inside compute_sas.
         sas = compute_sas((xcurr, tmp_p), (axcurr, matvec(tmp_p, *args)))
         # Lift the p diagonal out of contention, serving the same purpose as body()'s mask on
