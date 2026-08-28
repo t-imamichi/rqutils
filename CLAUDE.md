@@ -138,6 +138,9 @@ Rules, each of which cost a defect to learn — **evidence in `NOTES.md`**:
   repo does not work, since the venv holds an editable install pointing at the original. `NOTES.md`
   has the mutation-testing recipe; mutate `@jax.jit` code in a **fresh subprocess** or both arms reuse
   one compiled kernel.
+- **Undo a mutation with `cp` from your own backup, never `git checkout <file>`.** The file usually
+  holds unrelated uncommitted work; a checkout discards all of it and the suite passes either way, so
+  nothing flags it. `NOTES.md`'s recipe says to copy first — the restore step is the half that matters.
 - **Aim a mutant at the layer and branch the test actually exercises.** Two survived this way in one
   session: a coercion added to `sqd` while the test traced `run_sqd` directly, and a mutation of
   `vinit_nodiag` when the fixture takes `vinit_from_min_diag`. Both read as missing coverage and were
@@ -259,6 +262,11 @@ with a power-iteration or Lanczos estimate — that is exactly the defect in
 `converged=True`. Prefer a loose bound: over-estimating degrades resolution smoothly, under-estimating
 changes the answer.
 
+**A validator belongs in the module that owns the gate it compensates for.** `_check_prefilter` lives
+here, not in `sqd.py`, because `_chebyshev_prefilter`'s `degree > 1 and cycles > 0` is what silently
+absorbs a malformed value; `sqd.py` imports it. Sited wrongly, the *published* entry point is the
+unguarded one.
+
 Every guard in it is load-bearing and was measured; `docs/locg.md` catalogues seven defects (I1–I7)
 that each failed *silently*. **Don't "simplify" the balancing, the re-orthogonalizations, or the
 zero-direction masks**, don't unify `body_iter1`'s exclusion bound with `body()`'s, and don't
@@ -306,6 +314,12 @@ conditionally widened (`CircuitInput |= QuantumCircuit`), and the runtime path r
 rather than failing at import. `numpy`, `scipy`, `h5py`, and **`jax`** are hard dependencies
 (`pyscipopt` is not — it is only on the stale `product` branch).
 
+**Don't index a sharded array to read one element.** `seed.at[i].add(f(seed[i]))` is correct
+arithmetic but emits an `all-gather` per read — measured 3 on a 4-device mesh, each materializing the
+whole vector on every device, which is what `ground_locg`'s single-vector budget exists to avoid. Use a
+`broadcasted_iota` mask and an elementwise `where` instead; bit-identical, no collective. Check with
+`.lower(...).compile().as_text().count("all-gather")`, not by reading the source.
+
 **Sharding is implicit** — the library reads `jax.sharding.get_abstract_mesh()`; it is the *caller's*
 job to set the mesh. The examples establish the expected pattern: a single axis named `'x'` with
 `AxisType.Explicit`, plus `jax.config.update('jax_enable_x64', True)` (without x64 you silently get
@@ -336,8 +350,10 @@ raise you document (`NOTES.md`).
 
 **When measuring: use `eigvalsh` or sparse `eigsh(k=1)`, never `eigh`** (77 s vs 0.02 s at the sizes
 here), **A/B whole calls against a worktree of the pre-change revision** rather than timing a predicate
-in isolation, and **verify the referent of a cross-reference, not just that it resolves**. All three
-with numbers in `NOTES.md`.
+in isolation, **A/B both arms warm** — changing a traced expression invalidates the compilation cache,
+and one cold run measured 125 s against a warm 20 s, which reads as a catastrophic regression and is
+not one — and **verify the referent of a cross-reference, not just that it resolves**. All four with
+numbers in `NOTES.md`.
 
 ## Known rough edges
 
