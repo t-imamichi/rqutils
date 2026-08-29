@@ -43,7 +43,7 @@ Every number below is measured **in this tree**, single laptop CPU, `jax_enable_
 
 ## 1. The batched entry point exists, and it does not help
 
-`sqd.py:1486` already expresses all six `cache_level` strategies as one `jax.lax.scan` over the X
+`sqd.py:1548` already expresses all six `cache_level` strategies as one `jax.lax.scan` over the X
 groups. Your ask — "accepts a stack of X-signatures and resolves all of their destination index arrays
 in one traversal" — is that scan with a different leading axis. There is no new capability to add, so we
 measured the thing itself rather than building a wrapper for it.
