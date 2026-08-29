@@ -196,9 +196,10 @@ of 13. Cost then scales as `ceil((n+1)/64)` words, i.e. **logarithmically in pac
 | 127 | 16 | 2 | 75.8 ms | 9.8 ms | **7.71x** |
 | 200 | 26 | 4 | 126.9 ms | 17.6 ms | **7.22x** |
 
-Read the range as **~3.6-7.7x across n=64-200**: a repeat of the same A/B on this machine read
-3.56x / 4.40x / 5.41x / 6.48x / 7.08x, so the per-row values move by ~15% run to run while the trend
-does not. The `B <= 8` rows are the control -- that path is not touched, and it reads 0.95-1.06x.
+Read the range as **~3.6-7.7x across n=64-200**, not as five point estimates: a repeat of the same A/B
+on this machine read 3.56x / 4.40x / 5.41x / 6.48x / 7.08x, so the per-row values move by ~15% run to
+run while the trend does not. (§5.2's table is much steadier at <=3.4%; the reason is given there.) The
+`B <= 8` rows are the control -- that path is not touched, and it reads 0.95-1.06x.
 
 The speedup **grows with n**, which is the point: the "after" column is flat at ~9.7 ms from n=64 to
 n=127 while "before" grows 37 -> 76 ms, because everything from `B = 9` to `B = 16` is two words and
@@ -274,6 +275,13 @@ A/B against the pre-change module, N = 220k **including duplicates**, output ide
 | 100 | 13 | 13 | 2 | 158.4 ms | 43.2 ms | **3.67x** |
 | 127 | 16 | 16 | 2 | 204.6 ms | 43.7 ms | **4.68x** |
 | 200 | 26 | 26 | 4 | 286.1 ms | 58.5 ms | **4.89x** |
+
+These figures are stable, unlike §5.1's. Across five runs the worst per-row spread is **3.4%** (n=30:
+1.74-1.80x; n=100: 3.66-3.72x; n=200: 4.77-4.89x), so the column can be read as point estimates rather
+than as a band. The difference from §5.1 is structural, not luck: `uniquify_states` is dominated by one
+large `lax.sort`, a single long-running kernel whose cost barely moves, whereas §5.1's wide path is a
+`lax.scan` of ~20 short steps (`ceil(log2 N) + 1`) and short kernels are much more exposed to
+scheduling jitter on a laptop.
 
 **This one helps you today.** Unlike §5.1, which only touches `B > 8`, the key count drops at every
 width — including n=30, where it is worth **1.79x**.
