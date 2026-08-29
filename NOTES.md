@@ -1771,6 +1771,61 @@ rule carries over: **raise, do not clamp**, since an undersized capacity drops s
 So the routing is not a blocker on either path. What remains unbuilt is the JAX composition itself, and
 it cannot be validated on this hardware.
 
+
+### 1D XXZ is the case that decides it: prefix hashing fails at exactly `d`, and range splitting fails on the *targets* (2026-08-30)
+
+The hash-partitioning entry above used synthetic fixtures. Re-run on a real 1D XXZ subspace — built the
+way SQD gets one, a Krylov expansion from |Néel⟩ under the nearest-neighbour hop graph, so it lives in
+one magnetization sector and stays *local* rather than spread over the weight shell. **Both alternatives
+to whole-key hashing fail, and one fails completely.**
+
+**Prefix hashing measures exactly `d`.** At n=30, N=200k, 12 prefix bits:
+
+| scheme | d=4 | d=16 | d=64 | d=256 |
+| --- | --- | --- | --- | --- |
+| prefix-hash | **4.00×** | **16.00×** | **64.00×** | **256.00×** |
+| whole-key hash | 1.00× | 1.02× | 1.04× | 1.11× |
+
+Imbalance equal to `d` at every device count means **one shard holds the entire subspace and the other
+`d-1` hold nothing** — not degradation, complete failure. The cause is **1 distinct prefix**, and it is
+an artifact of the packing width rather than the physics: `B = ceil(31/8) = 4` bytes leaves **33 leading
+zero bits** in the uint64 key, so the top 12 bits are constant *by construction*. At n=60 and n=100 there
+are 312 and 280 distinct prefixes and imbalance is still **2.05–118.98×**, because a
+magnetization-conserving Krylov subspace concentrates near Néel and even the non-pad high bits barely
+vary.
+
+**Range splitting looked competitive and is not — measuring it on the states hides the failure.**
+Splitters derived from the state list balance *that list* by construction (1.00–1.85× measured), but
+**what gets routed is the targets `S ^ X`**. At n=60, d=64, per XXZ hop:
+
+| hop | hit rate | range-split | whole-key hash |
+| --- | --- | --- | --- |
+| (45, 46) | 18.4% | 1.01× | 1.05× |
+| (29, 30) | 18.5% | 2.48× | 1.03× |
+| (15, 16) | 18.3% | 7.90× | 1.04× |
+| (0, 1) | 18.4% | **13.68×** | 1.05× |
+| (59, 0) | 18.5% | **14.95×** | 1.04× |
+
+The failure is **hop-dependent**: swapping *high-order* bits moves a key far in lex order, piling targets
+into few range buckets, while a swap deep in the string barely moves it. **XXZ has a hop on every bond,
+so the worst case is always present** in the J-fold sweep.
+
+**And splitters go stale where a hash cannot.** A real SQD run grows the subspace during configuration
+recovery, so the set the splitters were derived from is not the set later queried. Splitters from half the
+subspace applied to the full set: **32.51×**, against whole-key hashing's **1.04×**. A hash of the key
+does not depend on the population at all, which is the property that matters here.
+
+**Verified exact on XXZ across every X group.** n=60, J=61 groups, K=60, N=80,000, d=64: **61 groups, 0
+mismatches**, hit rates spanning **2.2%–100.0%** (the 100% group is the one where the subspace is closed
+under that hop), imbalance **1.04×–1.10×** throughout, 64× fewer state rows per device. The
+100%-hit-rate group matters — it is the degenerate case where every target is present, and the routing
+handles it at the same imbalance.
+
+**So the design choice is settled by physics, not preference.** On the Hamiltonian this library is most
+often pointed at, prefix hashing is unusable and range splitting is unusable; whole-key hashing is
+1.03–1.11× everywhere and invariant to hop, to `d`, and to the subspace growing. `poc12` now carries the
+XXZ fixture and asserts exactness over all 60 hops.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is

@@ -285,9 +285,12 @@ fine. Wietek & Läuchli (*Phys. Rev. E* **98**, 033309) solve it with **hash own
 search**: no distribution metadata, `N/d` rows searched per rank, one `Alltoallv`. All three ingredients
 verified in JAX (`shard_map` + `all_to_all` + local `searchsorted`), and a prototype is **bit-identical
 to `get_xsource`** at 16× less per-device memory with zero all-gathers. **Hash the whole key, not the
-prefix as published** — a banded subspace (excitations confined to low qubits) has *one* distinct prefix
-and collapses to **16.00× imbalance at d=16**, the same low-entropy-high-bits failure `poc11` recorded
-for range splitting. Whole-key hashing measures 1.01–1.14× on uniform, fixed-weight, banded and
+prefix as published, and not a range split** — on a real **1D XXZ** Krylov subspace prefix hashing
+measures **exactly `d`** (one shard holds everything; at n=30 the packing leaves 33 leading zero bits so
+the prefix is constant *by construction*), and range splitting balances the *states* while failing on the
+**targets** `S ^ X` at up to **14.95×** — hop-dependent, worst when the hop touches high-order bits, and
+**32.51×** once splitters go stale as configuration recovery grows the subspace. Whole-key hashing is
+1.03–1.11× everywhere, verified exact over all 61 XXZ X groups at hit rates 2.2–100%. Whole-key hashing measures 1.01–1.14× on uniform, fixed-weight, banded and
 Zipf-sampled fixtures, and its residual imbalance is Poisson in `N/d` (checked against balls-in-bins),
 so keep `N/d` ≳ 1000. It costs the free local sort — each shard needs its own — which is `poc11`'s
 phase 3, run once at setup. The variable-count routing has a primitive — `jax.lax.ragged_all_to_all`,
