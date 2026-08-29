@@ -262,9 +262,18 @@ def _check_xcache_groups(xcache_groups: Any, cache_level: tuple[int, int], num_g
     """Raise unless ``xcache_groups`` is ``None`` or a group count legal for ``cache_level``.
 
     ``xcache_groups`` caches the source indices of the first ``J'`` X groups and recomputes the rest,
-    which is a memory-for-speed dial between the two settings of ``cache_level[0]``. Those two are
-    ``4 * J * N`` bytes and nothing, and at n=100 that gap is "does not fit" against "60x slower"
-    (measured 59.8x at N=200k, J=16; see ``NOTES.md``), so the intermediate values are the point.
+    a memory-for-speed dial between the two settings of ``cache_level[0]``. The cache array is
+    ``4 * J' * states_size`` bytes and the uncached groups measured **59.8x** slower per matvec at
+    n=100, N=200k, J=16 (``NOTES.md``), so the intermediate values exist to buy back memory without
+    paying that whole factor.
+
+    **How much it is worth depends on ``K``, the number of Z signatures per X group, and that is a
+    property of the Hamiltonian rather than of the subspace.** On 1D Heisenberg at n=100 (``J = 101``,
+    ``K = 100``) the source cache is 404 bytes per state slot against ``diag_signs``' 1313, so it is
+    22% of the ``(1, 0)`` footprint and 5-8% of ``(1, 1)``'s -- the *diagonal* axis is the expensive
+    one there, and ``cache_level[1]`` the larger lever. At small ``K`` the proportions reverse and this
+    dial is the dominant one. See "Measured on a real n=100 Hamiltonian" in ``NOTES.md`` before sizing
+    anything from ``4 * J * N`` alone.
 
     Three ways a bad value would otherwise pass silently:
 
@@ -527,13 +536,31 @@ def sqd(
         cache_level: Switches for caching the results of source indices and sign bits / diagonals.
             See the module documentation for the detailed discussion of the resource tradeoff involved.
         xcache_groups: Number of X groups whose source indices to cache, or ``None`` (default) for all
-            of them. A memory-for-speed dial between the two settings of ``cache_level[0]``, which are
-            ``4 * J * N`` bytes and nothing: at n=100 that gap is "does not fit" against "60x slower",
-            so the values in between are the useful ones. Requires ``cache_level[0] == 1``; ``None``
-            and the full group count give the same answer, but only ``None`` traces the single-arm
-            graph. Memory is linear in the count, so ``floor(budget / (4 * N))`` picks the largest
-            cache that fits a budget -- size it that way and *measure* the speed, because the time
-            does not follow a linear model closely enough to promise (17.5% off at the midpoint).
+            of them. A memory-for-speed dial between the two settings of ``cache_level[0]``: the cache
+            array is ``4 * J' * states_size`` bytes, and the groups left out of it are searched inside
+            every matvec, measured **59.8x** slower per matvec at n=100. Requires
+            ``cache_level[0] == 1``. ``None`` and the full group count give the same answer, but only
+            ``None`` traces the single-arm graph.
+
+            **Two things to know before reaching for it.** Dropping groups shrinks the cache array
+            linearly, but it does *not* shrink the footprint by as much: everything else -- the state
+            list and the solver's vectors -- stays. On 1D Heisenberg at n=100 (``J = 101``,
+            ``K = 100``, ``N = 24M``) the whole ``(1, 0)`` footprint measures 16.5 GB of which the
+            cache is 13.6 GB, so ``xcache_groups=0`` saves 12.4 GB rather than "everything"; at
+            ``cache_level[1] == 1`` the same 12.4 GB is only 20% of a 60.6 GB footprint, because at
+            high ``K`` the *diagonal* arrays dominate and ``cache_level[1]`` is the larger lever.
+
+            And an intermediate count can **raise** peak memory rather than lower it: the split runs
+            two matvec kernels instead of one, and below a break-even in ``J`` the second kernel's
+            intermediates cost more than the cache saves. Measured at ``J = 16``, ``N = 28k``: 9.0 MB
+            for the full cache against 10.4 MB at ``J' = 8``. ``xcache_groups=0`` always saves (that
+            arm is single-kernel); intermediate values pay off once ``4 * J * states_size`` is large
+            next to one kernel's working set, which is the regime this exists for.
+
+            ``floor(budget / (4 * states_size))`` sizes the *cache* to a budget exactly. Size it that
+            way and then **measure** both peak memory and speed: the time does not follow a linear
+            model closely enough to promise (17.5% off at the midpoint), and neither does the peak.
+            ``NOTES.md`` has the measurements.
         prefilter: ``(degree, cycles)`` Chebyshev prefilter, forwarded verbatim to
             :func:`rqutils.ground_locg.ground_locg` -- see its docstring for the semantics, the cost
             and the knob-choosing guidance. Validated by
