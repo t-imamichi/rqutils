@@ -576,6 +576,18 @@ def sqd(
             kernel -- 707 ms to compile, then ~16 ms -- while 37 rounds to 40 and compiles afresh).
             The padding is not observable in the result: filler slots are excluded from the
             projection and trimmed from the returned basis.
+
+            **At large subspace dimensions, size this by hand.** The power-of-two default inflates
+            *every* per-slot term at once -- states, the solver's vectors and every cache -- by up to
+            2x, and how much depends on where ``states.shape[0]`` falls: 4.9% at N=1M, 39.8% at
+            N=24M, 82.0% at N=144k. The default is right at small dimensions, where a compilation is
+            most of a solve (97% of a cold solve at N=2000), and a finer bucket there measured **57%
+            slower** over a growing sweep. But compile time is roughly fixed while the waste is a
+            fraction, so past N ~ 1e5 the trade inverts: rounding to a multiple of the largest power
+            of two at or below ``N/8`` measured **one extra compilation and no measurable time**
+            (5.09 s against 5.10 s over five growing dimensions at n=20) while cutting waste from
+            62.4% to 3.3%. At N=24M with ``cache_level=(0, 2)`` that is **7.7 GB**. See ``NOTES.md``,
+            "``states_size``'s power-of-two padding".
         return_eigvec: Whether to return the eigenvector (coefficients and unique state bitstrings).
         maxiter: Maximum LOBPCG iterations. **Non-convergence now raises** rather than returning
             the iteration cap's best guess -- see ``Raises``.

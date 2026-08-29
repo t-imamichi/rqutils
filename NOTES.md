@@ -1367,6 +1367,80 @@ data-dependent. `NOTES.md` already records the converse trap (a *broken* arm fla
 by doing less work); this is the same lesson from the other side — an unrealistically *dense* fixture
 punishes the arm that depends on sparsity.
 
+
+### `states_size`'s power-of-two padding: the default is right at small `N` and wastes GBs at large `N` (2026-08-30)
+
+`states_size` rounds up to the next power of two, which inflates **every** per-slot term at once --
+states, the solver's vectors, and every cache. `NOTES.md` above notes the 40% at N=24M in passing. The
+question is whether a finer bucket is better; the answer is regime-dependent, and the existing default is
+correct for the regime it was measured in.
+
+**The default is deliberate and measured, not crude rounding.** SQD's normal access pattern is growing,
+all-distinct dimensions (one per Krylov rung plus one per configuration-recovery round), so no two calls
+share a size and an exact `states_size` retraces the solver every call. Power-of-two bucketing collapses
+that to `O(log N)` traces -- measured 1.25× over five dimensions 60..260 at n=10 and 1.43× over five
+rungs at n=13. `sqd`'s docstring already offers the escape hatch: *"Pass `states.shape[0]` for no padding
+at all."* So no capability is missing.
+
+**But the trade inverts with `N`, because a compile is a fixed cost and the waste is a fraction.**
+Compile is ~0.4 s regardless of size; its share of a cold solve at n=20:
+
+| `N` | cold | warm | compile share |
+| --- | --- | --- | --- |
+| 2,000 | 0.47 s | 0.01 s | **97.3%** |
+| 8,000 | 0.45 s | 0.06 s | 86.8% |
+| 30,000 | 0.98 s | 0.62 s | 37.5% |
+| 150,000 | 1.19 s | 0.78 s | **34.7%** |
+
+So bucket *count* dominates while solves are fast, and *waste* dominates once they are not.
+
+**Measured both regimes against a `pow2/8` policy** -- round up to a multiple of the largest power of two
+at or below `N/8`, capping waste near 12.5% instead of 100%. Real `sqd` sweeps over growing, all-distinct
+dimensions:
+
+| regime | policy | distinct sizes | waste | sweep |
+| --- | --- | --- | --- | --- |
+| n=12, dims 60..860 | `pow2` | 5 | 39.8% | **2.20 s** |
+| n=12, dims 60..860 | `pow2/8` | 9 | 4.8% | 3.45 s (**+57%**) |
+| n=20, dims 21k..144k | `pow2` | 4 | **62.4%** | 5.10 s |
+| n=20, dims 21k..144k | `pow2/8` | 5 | **3.3%** | **5.09 s** |
+
+At small dimensions the finer bucket costs 57% wall clock -- the coalescing is real and the default wins.
+At large dimensions it costs **one extra compilation and zero measurable time** (5.09 against 5.10 s is
+noise) while cutting waste from 62.4% to 3.3%.
+
+**The waste is data-dependent, not monotonic in `N`** -- `pow2` is free when `N` lands just below a power
+of two and costs up to 2× when it lands just above:
+
+| `N` | `pow2` waste | `pow2/8` waste | GB saved at 920 B/slot |
+| --- | --- | --- | --- |
+| 10,000 | 63.8% | 2.4% | 0.01 |
+| 144,000 | 82.0% | 2.4% | 0.11 |
+| 1,000,000 | 4.9% | 4.9% | 0.00 |
+| **24,000,000** | **39.8%** | **4.9%** | **7.72** |
+| 2^28 | 0.0% | 0.0% | 0.00 |
+
+So there is no single figure for what this costs; it depends on where `N` falls. At N=24M and
+`cache_level=(0, 2)` it is **7.7 GB**, and a caller can be unlucky at any size.
+
+**Mesh divisibility survives, by construction.** `sqd` rounds `states_size` up to a multiple of
+`mesh.size`. A `pow2/8` bucket is a multiple of a power of two at or above `N/16`, hence divisible by
+every smaller power of two, so any realistic mesh divides it exactly -- verified at N=144k, 24M and 2^28
+for meshes 2/4/8/16/64. No interaction.
+
+**Recommendation: do not change the default; document the large-`N` case.** The default is correct where
+it was measured and a caller with growing small dimensions would regress by 57%. What is missing is not a
+parameter -- `states_size` is already public and overridable -- but the *knowledge* that at large `N` the
+padding is worth sizing by hand, and that the penalty depends on where `N` falls relative to a power of
+two. A caller at N=24M passing `states_size=25_165_824` saves 7.7 GB at `(0, 2)` for one extra
+compilation. **If a default ever changes, make it size-dependent** (power-of-two below ~10^5, finer
+above) rather than replacing one fixed rule with another, since both regimes are measured and they
+disagree.
+
+**Caveats.** One laptop CPU, n=12 and n=20, dimensions to 144k; the large-`N` rows in the waste table are
+arithmetic on the measured 920 B/slot, not runs. The crossover was located by compile-share, not by
+bisecting sweeps, so ~10^5 is an order of magnitude rather than a boundary.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is
