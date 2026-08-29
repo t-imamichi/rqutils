@@ -665,6 +665,56 @@ does transfer though, and it is the one above: for a matrix-free matvec *"the me
 worker process should be the guiding principle"*, because runtime depends only weakly on the lookup
 scheme. For calibration, their state of the art is 46 spins on ~256 nodes at 512 GiB each.
 
+### Deriving the pre-filter capacity, and why the check must be separate from it (2026-08-29)
+
+The `cap` hazard blocked the whole pre-filter family: `jnp.nonzero(mask, size=cap)` needs a static size,
+and an undersized one drops hits with **no error**. Both halves of the fix were built and measured, and
+they are **not** the same mechanism.
+
+**An analytic bound does not exist.** `candidates = hits + FP`, and the FP tail is beautifully tight — a
+6-sigma binomial bound is within **0.1-6%** of the mean at these sizes, because `Binomial(N, p)`
+concentrates hard. But it needs `hits`, which is the unknown being computed, and `hits` can legitimately
+be `N` (a subspace closed under the hop has a 100% hit rate for that hop). So any bound not derived from
+the data collapses to `cap = N`, which is correct and worthless.
+
+**The overflow check is free; deriving the cap is not.** The check is `mask.sum()`, and the mask is
+already computed:
+
+| variant | time | vs baseline | overhead |
+| --- | --- | --- | --- |
+| baseline `searchsorted` | 67.2 ms | 1.00× | — |
+| BF, cap given, no check | 24.8 ms | 2.70× | — |
+| BF, cap given, **with check** | 24.8 ms | 2.71× | **-0.3%** (noise) |
+| BF, cap **derived** + check | 31.7 ms | 2.12× | +27.6% |
+
+Counting costs **0.04 ms** on top of the mask at N=4M. The 27.6% is not the sum — it is the *second
+pass*, since deriving runs the mask once to count and again to search.
+
+**So derive once per sweep, not per group — the naive version is slower than no filter at all.** Over a
+J=16 sweep at N=4M:
+
+| strategy | time | vs baseline |
+| --- | --- | --- |
+| 16 plain searches | 1083.8 ms | 1.00× |
+| derive per group | 2403.8 ms | **0.45×** |
+| derive once, check every group, retry on overflow | 518.5 ms | **2.09×** |
+
+Per-group derivation loses because each distinct `cap` is a separate `jit` compilation. Deriving once
+from the first group and letting the check catch a later miss is **4.64× better** and equally exact:
+worst case is one extra kernel for the offending group, never a wrong answer.
+
+**The retry path is verified, not assumed.** On a fixture mixing a dense half (closed under bit-0 flips)
+with a sparse half, group 0 derives a 65,536 cap and group 1 needs 519,752 candidates: the check fires,
+re-runs at 524,288, and the result is exact. Power-of-two rounding keeps the compilation count bounded —
+a 16-group sweep on a uniform subspace hits **one** cap value.
+
+Two behaviours to preserve in any implementation:
+
+- **Raise, do not clamp.** An undersized explicit `cap` must raise — including off-by-one (55,347 against
+  55,348 candidates) — and the message should name the deficit and the sufficient value.
+- **`cap = N` is the safe degenerate case.** On a hop-closed subspace the derived cap clamps to `N`, the
+  filter stops paying, and the answer stays correct. Verified: 2,000,000 of 2,000,000 candidates, exact.
+
 ### Partial-J plus a Bloom filter: the two compose, and the filter helps at every setting (2026-08-29)
 
 The two ideas above are complementary — cache the `J'` groups that fit, BF-filter the recompute for the
