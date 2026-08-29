@@ -145,6 +145,11 @@ larger effect than the :math:`4 J N` bytes it reclaims -- measured end-to-end at
 returning the same energy. Prefer ``cache_level[0] = 1`` unless the memory genuinely will not fit; the
 diagonal axis is where the real memory-versus-speed judgement lies.
 
+When it will not fit, ``xcache_groups`` caches ``J'`` of the ``J`` X groups instead of all or none --
+see :func:`sqd`. Two caveats measured after it shipped: an intermediate ``J'`` can *raise* peak memory,
+since the split runs two matvec kernels, and on a Hamiltonian with many Z signatures per X group the
+diagonal arrays dominate so ``cache_level[1]`` is the larger lever. ``NOTES.md`` has both.
+
 Distributed arrays and scaling limits
 =====================================
 
