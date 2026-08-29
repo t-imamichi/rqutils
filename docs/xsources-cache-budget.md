@@ -213,6 +213,13 @@ filter is strictly additive on top and can follow once the capacity policy is se
 
 - **No GPU measurement.** All of the above is one laptop CPU. A GPU gather is better optimized relative to
   its sort, so the filter's advantage may compress.
+- **The filter shrinks the per-device cache; it does not make the subspace distributable.**
+  `jnp.nonzero`'s compaction does *not* shard — it needs a `cumsum` over the masked axis, and on a
+  partitioned mask that raises. It works here only because `get_xsource` already requires a **replicated**
+  `states` (a partitioned one fails on the baseline), so the mask is replicated by construction. Verified
+  under a 4-device mesh: zero collectives, output spec identical to the baseline, exact. But `states`
+  still costs `13 * N` bytes on every device — 27.9 GB per device at N=2^31 — which is a separate ceiling
+  no filter can touch.
 - **Nothing measured through a full `sqd()` solve.** These are matvec and setup-path figures. The
   composition into a solve is inferred from the module docstring's 66–97% setup share, not measured.
 - **The linear model is not reliable enough to promise a runtime.**

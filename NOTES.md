@@ -665,6 +665,51 @@ does transfer though, and it is the one above: for a matrix-free matvec *"the me
 worker process should be the guiding principle"*, because runtime depends only weakly on the lookup
 scheme. For calibration, their state of the art is 46 spins on ~256 nodes at 512 GiB each.
 
+### `jnp.nonzero` does not shard, and it does not matter — the mask is already replicated (2026-08-29)
+
+The pre-filter's compaction is `jnp.nonzero(mask, size=cap)`, and the open question was whether it shards.
+**It does not.** On a partitioned mask it raises `ShardingTypeError`: *"The input should be fully
+replicated when axis is not specified to cumsum."*
+
+The failure is structural, not a JAX gap. Compaction means "move element `i` to position `rank(i)`", and
+`rank(i)` depends on every element before it — which lives on another device. Tested per ingredient on a
+`P('x')` mask at N=1M:
+
+| operation | partitioned mask |
+| --- | --- |
+| `mask.sum()` (the overflow check) | **OK**, 2 collectives |
+| `jnp.where` (elementwise) | **OK**, 0 collectives |
+| `jnp.cumsum` | `ShardingTypeError` |
+| `jnp.argsort` | `ShardingTypeError` |
+| `jax.lax.top_k` | `ShardingTypeError` |
+
+Everything that *reorders or compacts* along the sharded axis fails; only elementwise ops and reductions
+survive. Note the **free overflow check shards even though the compaction does not**, so the safety
+mechanism is not the constrained part.
+
+**This does not block the filter, because `get_xsource` already requires a replicated `states`.** A
+partitioned `[N, B]` state array fails on the *baseline*, before any filter is involved — `ValueError:
+Unmapped values passed to vmap cannot be sharded along the mesh axis you are vmapping over`. The library
+knows this: `_spread_seed`'s comment (`sqd.py:788-790`) says `run_sqd` reshards `states_u` only inside
+`if cache_level[0] == 1`, "because the uncached branch still needs the replicated array for the
+`get_xsource` searches". So on the path the filter accelerates, the mask derived from those states is
+replicated by construction and `cumsum` is satisfied.
+
+Verified end-to-end under a 4-device mesh with states, targets and filter replicated — the sharding
+`get_xsource` actually runs under:
+
+| | baseline | BF-filtered |
+| --- | --- | --- |
+| `all-gather` / `all-reduce` / `collective-permute` / `all-to-all` | 0 / 0 / 0 / 0 | **0 / 0 / 0 / 0** |
+| output spec | `P(None,)` | `P(None,)` |
+| exact | — | **yes** |
+
+So the filter is usable on the multi-device path. What it does **not** do is lift the replication
+requirement: `states` still costs `13 * N` bytes on *every* device (27.9 GB per device at N=2^31), which
+is a separate ceiling from the `xsources` cache the filter exists to shrink, and one no filter can touch.
+The honest scope is "the filter shrinks the per-device cache", not "the filter makes the subspace
+distributable".
+
 ### Deriving the pre-filter capacity, and why the check must be separate from it (2026-08-29)
 
 The `cap` hazard blocked the whole pre-filter family: `jnp.nonzero(mask, size=cap)` needs a static size,
