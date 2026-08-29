@@ -258,6 +258,49 @@ def _check_array_role(name: str, array: Any) -> None:
         )
 
 
+def _check_xcache_groups(xcache_groups: Any, cache_level: tuple[int, int], num_groups: int) -> None:
+    """Raise unless ``xcache_groups`` is ``None`` or a group count legal for ``cache_level``.
+
+    ``xcache_groups`` caches the source indices of the first ``J'`` X groups and recomputes the rest,
+    which is a memory-for-speed dial between the two settings of ``cache_level[0]``. Those two are
+    ``4 * J * N`` bytes and nothing, and at n=100 that gap is "does not fit" against "60x slower"
+    (measured 59.8x at N=200k, J=16; see ``NOTES.md``), so the intermediate values are the point.
+
+    Three ways a bad value would otherwise pass silently:
+
+    * with ``cache_level[0] == 0`` there is no cache to make partial, so any value is a no-op that
+      *reads* as "partial caching does not help on my problem" -- the misdiagnosis an A/B-able option
+      cannot afford. Rejected rather than ignored.
+    * out of range, it would clamp: ``J' > J`` behaves as ``J`` and a negative as ``0``, both
+      returning the right answer at the wrong cost.
+    * ``True``/``False`` would slice as ``1``/``0`` through Python's bool-is-int rule, so ``True``
+      would cache exactly one group -- mirroring the keyword-only change that fixed the same hazard
+      for ``states_size``.
+
+    ``None`` means "follow ``cache_level``" and is the only value that reproduces the pre-existing
+    graph exactly; ``xcache_groups == num_groups`` is equivalent but traces as the partial path.
+    """
+    if xcache_groups is None:
+        return
+    if isinstance(xcache_groups, bool) or not isinstance(xcache_groups, int):
+        raise TypeError(
+            f"`xcache_groups` must be None or an int in [0, {num_groups}], got {xcache_groups!r}"
+        )
+    if cache_level[0] != 1:
+        raise ValueError(
+            f"`xcache_groups` is {xcache_groups} but `cache_level` is {cache_level}: there is no "
+            "source-index cache to make partial when the first digit is 0. Either set "
+            "`cache_level=(1, ...)` to enable caching, or drop `xcache_groups`."
+        )
+    if not 0 <= xcache_groups <= num_groups:
+        raise ValueError(
+            f"`xcache_groups` is {xcache_groups}, but this Hamiltonian has {num_groups} X groups, so "
+            f"it must be in [0, {num_groups}]. Out of range it would clamp rather than raise: a "
+            "larger value caches everything and a negative caches nothing, both returning the right "
+            "answer at the wrong cost."
+        )
+
+
 def _check_cache_level(cache_level: Any) -> None:
     """Raise unless ``cache_level`` is one of the six ``(source_indices, diagonals)`` pairs.
 
@@ -398,6 +441,7 @@ def sqd(
     states_size: int | None = ...,
     return_eigvec: Literal[True] = ...,
     cache_level: tuple[int, int] = ...,
+    xcache_groups: int | None = ...,
     maxiter: int = ...,
     tol: float | None = ...,
     prefilter: tuple[int, int] | None = ...,
@@ -412,6 +456,7 @@ def sqd(
     states_size: int | None = ...,
     return_eigvec: Literal[False],
     cache_level: tuple[int, int] = ...,
+    xcache_groups: int | None = ...,
     maxiter: int = ...,
     tol: float | None = ...,
     prefilter: tuple[int, int] | None = ...,
@@ -425,6 +470,7 @@ def sqd(
     states_size: int | None = None,
     return_eigvec: bool = True,
     cache_level: tuple[int, int] = (1, 0),
+    xcache_groups: int | None = None,
     maxiter: int = 1000,
     tol: float | None = None,
     prefilter: tuple[int, int] | None = (32, 2),
@@ -480,6 +526,14 @@ def sqd(
             the machine epsilon of the operator dtype.
         cache_level: Switches for caching the results of source indices and sign bits / diagonals.
             See the module documentation for the detailed discussion of the resource tradeoff involved.
+        xcache_groups: Number of X groups whose source indices to cache, or ``None`` (default) for all
+            of them. A memory-for-speed dial between the two settings of ``cache_level[0]``, which are
+            ``4 * J * N`` bytes and nothing: at n=100 that gap is "does not fit" against "60x slower",
+            so the values in between are the useful ones. Requires ``cache_level[0] == 1``; ``None``
+            and the full group count give the same answer, but only ``None`` traces the single-arm
+            graph. Memory is linear in the count, so ``floor(budget / (4 * N))`` picks the largest
+            cache that fits a budget -- size it that way and *measure* the speed, because the time
+            does not follow a linear model closely enough to promise (17.5% off at the midpoint).
         prefilter: ``(degree, cycles)`` Chebyshev prefilter, forwarded verbatim to
             :func:`rqutils.ground_locg.ground_locg` -- see its docstring for the semantics, the cost
             and the knob-choosing guidance. Validated by
@@ -593,6 +647,7 @@ def sqd(
         states_size,
         return_eigvec,
         cache_level,
+        xcache_groups=xcache_groups,
         maxiter=maxiter,
         tol=tol,
         prefilter=prefilter,
@@ -805,6 +860,7 @@ def _spread_seed(
         "states_size",
         "return_eigvec",
         "cache_level",
+        "xcache_groups",
         "maxiter",
         "prefilter",
         "log_level",
@@ -816,6 +872,7 @@ def run_sqd(
     states_size: int,
     return_eigvec: bool,
     cache_level: tuple[int, int] = (1, 0),
+    xcache_groups: int | None = None,
     maxiter: int = 1000,
     tol: float | None = None,
     prefilter: tuple[int, int] | None = (32, 2),
@@ -843,6 +900,7 @@ def run_sqd(
     # trace rather than once per call. `sqd` validates too; this covers the direct callers, which are
     # the six examples/scaling scripts -- i.e. the ones most likely to pass an experimental value.
     _check_cache_level(cache_level)
+    _check_xcache_groups(xcache_groups, cache_level, hamiltonian.x.shape[0])
     _check_prefilter(prefilter)
     sharding = None
     if not (mesh := get_abstract_mesh()).empty:
@@ -853,15 +911,28 @@ def run_sqd(
 
     states_u = uniquify_states(states_p, states_size)
 
+    # `xcache_groups` splits the X groups in two: the first `ncached` get precomputed source indices,
+    # the rest keep their raw signatures and are searched inside every matvec. `None` means "all",
+    # which is the pre-existing behaviour and the only value that traces the single-arm graph.
+    njgroups = hamiltonian.x.shape[0]
+    ncached = njgroups if xcache_groups is None else xcache_groups
+    partial_xcache = cache_level[0] == 1 and ncached < njgroups
+
     if cache_level[0] == 1:
         if log_level <= logging.DEBUG:
-            jax.debug.print("Precomputing xsources")
+            jax.debug.print("Precomputing xsources for {n} of {j} X groups", n=ncached, j=njgroups)
 
-        xsources = jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, hamiltonian.x)[
-            1
-        ]
-        if sharding:
-            # We will not be performing sorts on states any more - shard the array
+        xsources = jax.lax.scan(
+            lambda _, x: (None, get_xsource(x, states_u)), None, hamiltonian.x[:ncached]
+        )[1]
+        if sharding and not partial_xcache:
+            # We will not be performing sorts on states any more - shard the array.
+            #
+            # Skipped when the cache is partial: the uncached groups still search `states_u` inside
+            # every matvec, and `get_xsource` requires it **replicated** -- a partitioned `[N, B]`
+            # fails outright ("Unmapped values passed to vmap cannot be sharded along the mesh axis
+            # you are vmapping over"). Resharding here would turn a memory dial into a crash on any
+            # mesh, which is why the condition is `not partial_xcache`.
             if log_level <= logging.DEBUG:
                 jax.debug.print("Sharding states array")
 
@@ -901,14 +972,50 @@ def run_sqd(
     else:
         diagonal_arg = diagonals
     scanned = _pack_scanned(cache_level, xgroup, diagonal_arg, hamiltonian.c)
+    # A partial cache needs a *second* scanned tuple: the cached and uncached groups carry different
+    # X arrays (int32 indices against uint8 signatures), so they cannot share one leading axis. The
+    # matvec becomes the sum of two kernels, one per arm -- verified exact against the single-arm form
+    # for all six cache_levels at every J' (tests/test_sqd.py::TestPartialXCache).
+    #
+    # The diagonal axis is sliced identically in both arms and is orthogonal to the split: it is
+    # indexed by X group, so group k's diagonal data travels with whichever arm holds group k.
+    scanned_tail = None
+    if partial_xcache:
+        scanned = _pack_scanned(
+            cache_level, xgroup, diagonal_arg[:ncached], hamiltonian.c[:ncached]
+        )
+        scanned_tail = _pack_scanned(
+            (0, cache_level[1]),
+            hamiltonian.x[ncached:],
+            diagonal_arg[ncached:],
+            hamiltonian.c[ncached:],
+        )
     # (1, 2) reads neither signature array, so it needs no states at all -- which is what lets the
     # caller drop S entirely under the most aggressive caching (see the module docstring).
-    needs_states = cache_level[0] == 0 or cache_level[1] == 0
+    # `partial_xcache` forces states back on: the uncached arm searches them every matvec.
+    needs_states = cache_level[0] == 0 or cache_level[1] == 0 or partial_xcache
     # cache_level is bound here rather than passed through args: ground_locg splats args
     # positionally (matvec(vec, *args)), so a static_argnames entry would never see it and the
     # tuple would be traced -- retracing the kernel on every matvec call in the solver loop.
-    matvec = functools.partial(_apply_h_kernel, cache_level=cache_level)
-    args = (scanned, states_u if needs_states else None)
+    if partial_xcache:
+        # Both arms' cache_levels are bound statically for the same reason, and the two kernels are
+        # summed rather than fused: see the `scanned_tail` comment above. `args` gains the tail tuple,
+        # so it stays traced data while both cache_levels stay static.
+        def matvec(  # type: ignore[misc]
+            vec: jax.Array,
+            scanned: tuple,
+            states: StateList | None,
+            scanned_tail: tuple,
+            _head: tuple[int, int] = cache_level,
+            _tail: tuple[int, int] = (0, cache_level[1]),
+        ) -> jax.Array:
+            head = _apply_h_kernel(vec, scanned, states, cache_level=_head)
+            return head + _apply_h_kernel(vec, scanned_tail, states, cache_level=_tail)
+
+        args = (scanned, states_u, scanned_tail)
+    else:
+        matvec = functools.partial(_apply_h_kernel, cache_level=cache_level)
+        args = (scanned, states_u if needs_states else None)
 
     def vinit_from_min_diag():
         if cache_level[1] == 2:
