@@ -278,6 +278,17 @@ off-by-default plumbing, not a recommended setting. Malformed values are rejecte
 `_check_prefilter`, since the filter's own `degree > 1 and cycles > 0` gate would absorb them as a
 silent no-op.
 
+**`states` must be replicated today, but that is not fundamental** (investigated 2026-08-30). The
+`13 * N` per-device cost is 27.9 GB at `N = 2^31` and is the one term the `(0,0)` floor cannot shed.
+What fails on a partitioned `[N, B]` is only `searchsorted` — `bitwise_xor` and `_pack_state_keys` shard
+fine. Wietek & Läuchli (*Phys. Rev. E* **98**, 033309) solve it with **hash-by-prefix ownership plus a
+local binary search**: no distribution metadata, `N/d` rows searched per rank, one `Alltoallv`. All three
+ingredients verified in JAX (`shard_map` + `all_to_all` + local `searchsorted`), and a minimal prototype
+is **bit-identical to `get_xsource`** at 4.0× less per-device memory with zero all-gathers. **Viable only
+at `cache_level[0] = 1`** — the routing is then paid `J` times per solve, not `J × niter`. Do **not** cite
+DanceQ as precedent: its closed-form index map needs a *complete* symmetry sector, which a sampled
+subspace is not. A project, not a patch; `NOTES.md` has the cost table and what is unbuilt.
+
 **`states` must be lex-sorted** — `get_xsource` is a binary search, not a sort. Always required (the
 sort was equally wrong on unsorted input) but previously undocumented; `hproj(unique_states=True)`
 skips its `np.unique` and so can violate it. Two paths selected statically on width: `uint64` keys for
