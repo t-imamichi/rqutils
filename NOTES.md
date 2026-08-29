@@ -588,6 +588,34 @@ now caught.
 `get_xsource` no longer contributes — it is a binary search into the already-sorted list, not a sort
 of a stacked `2N` array.
 
+### Replacing that sort out-of-core: prototyped and rejected (2026-08-29)
+
+The sort is still the ceiling, and the obvious move is `poc9_ooc_uniquify.py`'s chunk-sort-and-merge,
+which bounds the working set by a chosen chunk size rather than by `N`. That POC bails out at `B > 8`
+("no uint64 equivalence available"), so it never covered `n = 100`. `_pack_state_words` removes that
+obstacle — wide rows pack into `ceil(B/8)` uint64 columns, and a structured-dtype view makes
+`np.unique` / `np.union1d` lexicographic over them with no row comparator — so the wide case was built
+and measured. **It loses on both axes it exists to win.** At n=100, B=13, N=8M host-side:
+
+| approach | time | peak RSS |
+| --- | --- | --- |
+| `np.unique(rows, axis=0)` (incumbent shape) | 7.3 s | **365 MB** |
+| word-packed `np.unique` | **4.9 s** | 1655 MB |
+| chunked sort + merge tree on words | 31.3 s | 1048 MB |
+
+4.3× slower and 2.9× more peak memory than plain `np.unique`. Output verified identical in all arms.
+
+The reason is worth keeping, because it is the same fact that makes the *in-JAX* fix a good trade and
+this one a bad trade: **packing widens the data.** `8*ceil(B/8) - B` bytes per row — +7 at n=64
+(B=9→16), +3 at n=100, free at n=127. Speed bought with memory is right for the JAX sort, whose own
+working set dominates, and exactly wrong for a design whose entire purpose is bounding memory. Do not
+read the shipped `uniquify_states` change as a step toward an out-of-core one; they pull opposite ways.
+
+Two things the POC's own docstring already says, confirmed here and worth not rediscovering: chunking
+removes the single-device *sort* but **distributes nothing** (sequential merge, full result on one
+host), and a real multi-node uniquify needs a range-partitioned shuffle, for which chunk-local sorting
+is the per-node kernel and not the algorithm. That shuffle is untried.
+
 ### A rounding-floor residual is not zero, and `== 0.0` is the wrong guard
 
 2026-08-28, from `docs/rqutils-prefilter-dim2-request.md`. `body_iter1` formed its search direction as a

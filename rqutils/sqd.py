@@ -1047,6 +1047,13 @@ def uniquify_states(states_p: StateList, states_size: int) -> StateList:
     # ceil(B/8) words makes it 2, and the permutation is identical because `_pack_state_words` is
     # order-preserving. Measured 1.79x at n=30 through 5.06x at n=127 (N=200k); this sort dominates
     # the function, which in turn measured 14-27x `get_xsource` at every width.
+    #
+    # This trades memory for speed: the words are an extra `[N, ceil(B/8)]` uint64 buffer, and packing
+    # rounds B up to a multiple of 8, so it widens the data by `8*ceil(B/8) - B` bytes per row. Worst
+    # case is n=64 (B=9 -> 16 bytes, +7/row); n=127 (B=16) is free. Measured 1.09-1.69x compiled temp
+    # bytes at N=1M. Negligible at the sizes here (0.07-0.17 GB at N=24M) but 6-15 GB at the 2^31
+    # ceiling, so it is the wrong trade for an out-of-core design, whose whole point is bounding
+    # memory -- see NOTES.md for the chunked-merge prototype this ruled out.
     words = _pack_state_words(states_p)
     iota = jax.lax.broadcasted_iota(np.int32, (states_p.shape[0],), 0)
     perm = jax.lax.sort((*words.T, iota), dimension=0, num_keys=words.shape[1])[-1]
