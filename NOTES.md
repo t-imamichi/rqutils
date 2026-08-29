@@ -1564,6 +1564,95 @@ SQD Hamiltonians; the *direction* is a property of the algorithms (CG versus ste
 `ground_locg`'s own primitives, not a patched `ground_locg`, so it shares the primitives but not the
 prefilter or the `body_iter0` seeding. Vector counts at `2^31` are arithmetic on measured B/slot.
 
+
+### Distributing `states` is feasible: hash-by-prefix ownership plus a local search (2026-08-30)
+
+The `13 * N` replicated state list is the one term the `(0, 0)` floor cannot shed — 27.9 GB **per
+device** at `N = 2^31` — and `sqd.py:1042` records it as a hard requirement: a partitioned `[N, B]`
+"fails outright". Investigated with a breaking change permitted. **It is not a wall, and the literature
+has the established solution.**
+
+**What actually fails is narrower than "states must be replicated."** Per ingredient, on a `P('x', None)`
+state array under a 4-device mesh:
+
+| operation | partitioned |
+| --- | --- |
+| `bitwise_xor` (build `S ^ X`) | **OK**, `P('x', None)` |
+| `_pack_state_keys` | **OK**, `P('x',)` |
+| `jnp.searchsorted(keys, targets)` | **fails** — "Unmapped values passed to vmap cannot be sharded" |
+| `keys[pos]` gather | fixable with `out_sharding=` |
+
+The *targets* shard fine. What fails is that a binary search needs the whole sorted haystack visible to
+every query. That is a data dependency, not a JAX gap — and it is only unavoidable **given a
+range-agnostic partition**.
+
+**The established scheme is Wietek & Läuchli**, *Phys. Rev. E* **98**, 033309 (2018), described in
+`awietek.github.io/assets/pdf/thesis_awietek.pdf` §3.3. Split each basis state into **prefix** and
+**postfix** bits; states sharing a prefix live on one rank; **a hash of the prefix bits gives the owning
+rank**, so — quoting — *"we also don't have to store any information about their distribution. This
+information is all encoded in the hash function."* Within a rank states stay lexicographically ordered,
+so the local lookup is still a binary search, over `N/d` rows. The matvec buffers `(target, coefficient)`
+pairs locally, does one **`MPI_Alltoallv`**, then each rank searches its own list.
+
+**Hashing rather than range-partitioning, deliberately.** `poc11_range_partition.py` builds ordered
+buckets from data-derived splitters, which is the natural fit here and keeps each shard sorted for free.
+But the paper warns against exactly that: a random distribution *"reduces load balance problems
+significantly since the communication structure is randomized. This is in stark contrast to distributing
+the basis states in a linear fashion,"* where single processes take a multiple of the workload. Range
+splitters are the linear case.
+
+**Not applicable: DanceQ's approach.** `arxiv.org/abs/2407.14591` reaches 46 spins over ~256 nodes and
+120 TiB with *"thread-local lookup tables for fast and synchronization-free state-to-index mapping"* —
+no routing at all. That works because its basis is a **complete** U(1) particle-number sector, so
+state → index is a closed-form combinatorial map (enumerative encoding, Cover 1973). **rqutils' subspace
+is an arbitrary sampled set**, for which no such formula exists — which is why `get_xsource` searches in
+the first place. The distinction is structural; do not cite DanceQ as evidence that this is easy.
+
+**All three ingredients work in JAX**, verified on a 4-device mesh: prefix-hash ownership is elementwise
+(`P('x',)`, balance 1011/1041/1016/1028 over 4096), `jax.lax.all_to_all` composes inside
+`jax.shard_map`, and — the load-bearing one — **`jnp.searchsorted` against the local slice inside
+`shard_map` works**, which is what removes the replicated haystack.
+
+**A minimal end-to-end version is exact.** Range-partitioned variant at n=30, N=2564, d=4, hit rate
+40.4%: **bit-identical to `get_xsource`** (1036 hits both, `np.array_equal` True), load imbalance
+**1.02×**, and a **4.0× per-device** reduction in the state array. The JAX form compiled to **zero
+`all-gather` / `all-reduce` / `collective-permute`** and 18 `all-to-all`.
+
+**The cost is traffic, and it composes the right way — but only at `cache_level[0] = 1`.** Routing a
+target and its answer is ~12 B/target (8 out as a uint64 key, 4 back as an int32 index), asymptotically
+in `d`. At `N = 2^31`, n=100:
+
+| `d` | states/device | routed per group/device |
+| --- | --- | --- |
+| 4 | **6.98 GB** (from 27.9) | 6.44 GB |
+| 16 | 1.74 GB | 1.61 GB |
+| 64 | 0.44 GB | 0.40 GB |
+| 256 | 0.11 GB | 0.10 GB |
+
+**The multiplier is `J`, not `J × niter`** — `get_xsource` runs once per solve in the precompute at
+`cache_level[0] = 1` (`sqd.py:1008`), not inside the matvec. So at `d = 4` it is ~650 GB routed **once**
+against 20.9 GB/device of permanent residency reclaimed, and it lands on the precompute this session
+measured at only 4.5–8.4% of a solve. At `cache_level[0] = 0` the recompute *is* per matvec and the
+traffic becomes ~84 TB per solve at `d=4` — unusable. **So this is only viable together with the source
+cache**, which is the opposite of the Bloom filter's constraint and worth stating plainly.
+
+**Why it composes where the filter did not:** the target is paid **once per solve**, not once per
+matvec. That is the same "how many times is it paid" question, and here the answer is favourable.
+
+**What is not done.** No hash-partitioned variant was built (the exact prototype range-partitions, which
+the paper says will imbalance on real data — the measured 1.02× is on an evenly-split *sorted* array and
+says nothing about a real subspace). Nothing measured on real interconnect; virtual devices make timings
+meaningless per `CLAUDE.md`, so **no speed claim is made**. `uniquify_states`' sort is a separate
+blocker with its own partial answer in `poc11_range_partition.py` (2.19–1.74×, zero collectives, but
+splitter selection is host-side numpy and reassembly into the `[states_size, B]` contract is
+unimplemented). And the diagonal builders need `popcount(S[i] & z)`, i.e. the state *bits* — those shard
+elementwise, but that was not verified end-to-end here.
+
+**Verdict: the only lever left that moves the ceiling, and the first one this session that survives
+scrutiny.** It converts a hard 27.9 GB/device wall into `27.9/d`. It is also much larger than anything
+else attempted here — a new partitioning contract, a routed `get_xsource`, and `uniquify_states`
+rebuilt on POC 11 — so it is a project, not a patch.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is
