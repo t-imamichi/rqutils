@@ -329,6 +329,41 @@ class TestGetXsource:
 class TestUniquifyStates:
     """``uniquify_states`` sorts, deduplicates, and pads to a fixed size with 255 fillers."""
 
+    def test_wide_rows_sort_on_every_word_not_just_the_first(self):
+        """Defect: output not lex-sorted when rows share their leading uint64 word.
+
+        The lexsort runs on ``ceil(B/8)`` packed words with ``num_keys`` equal to the word count. Drop
+        it to 1 and only the most significant word orders the rows, so any group sharing that word
+        comes back in arbitrary order. Nothing raises: the array is still the right shape, still
+        contains every unique row, and still has its fillers in place -- but it is no longer sorted,
+        which silently breaks the precondition ``get_xsource``'s binary search depends on.
+
+        Existing coverage misses this because most fixtures vary the leading bytes, and a group has to
+        share an entire 8-byte word before ``num_keys=1`` can reorder anything. At ``B = 13`` (the
+        n=100 width) the first word holds byte 0 alone, so rows agreeing on byte 0 are exactly such a
+        group.
+
+        Asserting sortedness directly rather than comparing against a reference: this is the invariant
+        the downstream search needs, and it is the thing that goes wrong.
+        """
+        nbytes = 13  # the n=100 packed width: two words, first holding byte 0 only
+        # Four rows sharing byte 0 (hence the whole first word) and differing only in the last byte,
+        # deliberately supplied out of order.
+        rows = np.zeros((4, nbytes), dtype=np.uint8)
+        rows[:, 0] = 1
+        rows[:, nbytes - 1] = [9, 3, 7, 1]
+        got = np.asarray(uniquify_states(rows, rows.shape[0]))
+
+        assert sorted(int(r[nbytes - 1]) for r in got) == [1, 3, 7, 9], (
+            f"every input row must survive, got {[int(r[nbytes - 1]) for r in got]}"
+        )
+        tails = [int(r[nbytes - 1]) for r in got]
+        assert tails == sorted(tails), (
+            f"output must be lex-sorted, got trailing bytes {tails} -- the lexsort is not keyed on "
+            "every packed word, so rows sharing the leading word come back unordered and "
+            "get_xsource's binary search sees unsorted input"
+        )
+
     def test_dedupes_and_marks_fillers(self):
         """Filler slots must be detectable via ``states_u[:, 0] >> 7``.
 
