@@ -709,6 +709,45 @@ That is the blocking issue, not the memory. And these are single-signature measu
 built once per subspace and reused across all `J` groups, so a J-fold sweep should do better than the
 per-call figures here, but that is unmeasured.
 
+### Binary fuse filters: better query, unaffordable construction (2026-08-29)
+
+`arxiv.org/abs/2201.01174`. Within **13%** of the storage lower bound against Bloom's 44%, and a query
+is a fixed **3 gathers + 2 XORs + 1 compare** regardless of the false-positive rate, where Bloom needs
+`k = -log2(p)` hashes. Implemented the 3-wise variant (host-side construction, `jit`ed query) and
+verified it against the paper: **1.130n array, 9.04 bits/key, measured FP 0.389% against the 2^-8 =
+0.391% theory, no false negatives.**
+
+**The query is better than Bloom's, as advertised:**
+
+| filter | memory | measured FP | speedup | exact? |
+| --- | --- | --- | --- | --- |
+| Bloom, k=7 | 4.8 MB | 1.02% | 2.76× | yes |
+| **binary fuse, 8-bit** | **4.5 MB** | **0.388%** | **3.62×** | **yes** |
+
+n=30, N=4M, hit rate 0.372%. Better speedup at a *lower* FP rate and slightly less memory — 22% less
+than Bloom at equal FP, and the mask itself is only 11% of the filtered search. Everything the paper
+claims held up.
+
+**Construction is what kills it.** The peeling step is a sequential graph algorithm — pop a singleton
+slot, remove its key, decrement three counters, and any counter reaching 1 becomes a new singleton — so
+the dependency is data-carried and the trip count data-dependent. Measured **~2.4 us/key**, flat in N,
+projecting to **~60 s at N=24M**. The entire `J = 50` `get_xsource` precompute it would accelerate costs
+**~3.4 s**, so the build is ~18× more expensive than the work it saves.
+
+**And it does not vectorize.** The obvious fix — peel all current singletons per round instead of one at
+a time — degenerates. Measured at n=20k: round 1 peels 4612 of 20000, but by round 10 it is 160 per round
+and by round 30 it is ~80, so peeling 20k keys needs *thousands* of `O(cap)` rounds and runs slower than
+the sequential version. This is intrinsic, not a bug in the rounds: at 1.125n the hypergraph sits
+deliberately near the peelability threshold, which is precisely what buys the 13% space overhead, and
+being near the threshold means few singletons exist at any moment. **The space efficiency and the
+sequential construction are the same design choice.**
+
+So the verdict is the reverse of the usual one: the filter is better than Bloom on every axis that
+matters at query time, and unusable because of a one-off cost. It would need a C or numba peeling loop
+(the reference implementation is C) to be worth considering, and even then it inherits the `cap` problem
+that blocks the whole pre-filter family. Bloom stays the better candidate here purely because its build
+is one vectorized `np.bitwise_or.at` with no loop and no failure mode.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is
