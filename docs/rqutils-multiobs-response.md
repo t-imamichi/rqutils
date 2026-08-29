@@ -1,16 +1,17 @@
-# Response: the batched gather is declined on evidence, and the cost is not what the report thinks
+# Response: the batched gather is declined on evidence, and the scalable win is elsewhere
 
 Reply to `docs/rqutils-multiobs-request.md`, from the `rqutils` side. Branch `dev`, version still
-`0.2.0` (unreleased). **No code has changed.** This is a findings document: three of the four things
-you asked about are answered with measurements, and there is a counter-proposal that is measured but
-not committed.
+`0.2.0` (unreleased). **No code has changed.** This is a findings document: the three things you asked
+about are answered with measurements, and there are two counter-proposals that are measured but not
+committed — one of which scales past 32 qubits and one of which does not.
 
 | # | Ask | Outcome |
 | --- | --- | --- |
 | 1 | An entry point taking a **stack** of X-signatures | **Declined — it already exists.** `_apply_h_kernel` is a `lax.scan` over stacked signatures. Measured that form directly: **~1.0x**. |
 | 2 | Whether the **weight-2 case admits a closed form** | **Declined — the premise is false.** `S ^ X` is *not* a local permutation. Measured below. |
 | 3 | Whether the gather can be **shared rather than batched** | **Answered, and it reframes the problem.** The gather is latency-bound on a `log2(N)` dependent-load chain, not miss-bound across operators. Nothing shareable. |
-| — | (not asked) | **Counter-proposal:** a membership pre-filter measures **2.66–4.09x** in JAX under `jit`, sharded and exact. It has one blocking design problem. See §5. |
+| — | (not asked) | **Counter-proposal, scalable:** comparing `uint64` **words** instead of bytes measures **4–7.5x** at n=64–200 and removes an ~8x cliff at the `B > 8` boundary. See §5.1. |
+| — | (not asked) | **Counter-proposal, `n <= 32` only:** a rank-select index measures **22–58x**, emits no sort, and shards — but is Hilbert-space-indexed and dies at n~34. See §5.2. |
 
 **Thank you for the `vmap` measurement and for the framing of the status block.** "Treat the *what we
 would like* section as a question, not a specification" is what made this productive: the specification
@@ -138,73 +139,143 @@ The `jnp.vdot` comparison is right as written (0.089 GiB / 3.3 ms = 27.1 GiB/s f
 array), but "over the same array" is worth making explicit — a two-operand `vdot` would read 54 GiB/s
 and someone rebuilding the check could land on either. It does not affect the ~70x conclusion.
 
-## 5. Counter-proposal, measured but not committed: a membership pre-filter
+## 5. Counter-proposals, measured but not committed
 
-The one thing that does work follows directly from §3. If the cost is `log2(N)` serialized loads per
-target, the win is not making the search faster — it is **not running it**. On a realistic SQD subspace
-almost every search finds nothing:
+Two, and the **order matters**: the first scales to any qubit count, the second is capped at
+`n <= 32` and is offered only because it is large where it applies. If you have a long-term target
+past ~32 qubits, read §5.1 and treat §5.2 as a footnote.
 
-| N | subspace density | hit rate |
+### 5.1 Compare `uint64` words, not bytes — the scalable one
+
+**This addresses a different bottleneck than your report describes, and at your stated qubit counts it
+is the one that matters.** `get_xsource` has two paths, chosen statically on packed width: `B <= 8`
+packs each row into a `uint64` key and uses `jnp.searchsorted`; `B > 8` falls back to an explicit
+row-wise lexicographic binary search. Your n=30 case (`B = 4`) is on the fast path. The fast path
+survives to **n = 60** (`B = 8`). Above that the fallback takes over, and it is far more expensive per
+state:
+
+| n | B | path | ns/state |
+| --- | --- | --- | --- |
+| 30 | 4 | `uint64` | 22 |
+| 60 | 8 | `uint64` | 15 |
+| 64 | 9 | **lexicographic** | **122** |
+| 100 | 13 | **lexicographic** | **189** |
+
+An **~8x cliff** at the boundary. The cause is that the fallback compares rows one **byte** at a time,
+so a level of the binary search costs `O(B)` byte comparisons — 13 of them at n=100.
+
+The fix is to compare `uint64` **words**: 13 bytes is 2 words, so a level costs 2 comparisons instead
+of 13. Cost then scales as `ceil((n+1)/64)` words, i.e. **logarithmically in packed width**, with no
+`2^n` term. Measured against the current implementation, N = 300k, all outputs **bit-identical**:
+
+| n | B | words | current | multi-word | speedup |
+| --- | --- | --- | --- | --- | --- |
+| 64 | 9 | 2 | 46.4 ms | 9.6 ms | **4.85x** |
+| 80 | 11 | 2 | 56.8 ms | 13.6 ms | **4.18x** |
+| 100 | 13 | 2 | 69.1 ms | 15.4 ms | **4.50x** |
+| 127 | 16 | 2 | 99.4 ms | 13.9 ms | **7.14x** |
+| 200 | 26 | 4 | 151.0 ms | 22.8 ms | **6.63x** |
+
+Run-to-run spread on this machine is ~1.5x on the absolute times, so treat the speedup column as
+**4–7.5x across n=64–200** rather than as five point estimates: a repeat run of the same sweep read
+4.88x / 5.60x / 4.65x / 7.08x / 7.56x. The direction and rough magnitude are stable; individual cells
+are not.
+
+We stress-tested the obvious objection — that a *real* subspace shares long prefixes, so a leading-word
+discriminator would be less effective than on random rows. It is, and the technique survives it:
+
+| n=100 fixture | first word unique | current | multi-word | speedup |
+| --- | --- | --- | --- | --- |
+| uniform random rows | 100.0% | 72.5 ms | 9.8 ms | **7.37x** |
+| Hamming weight 50 + 1-hop closure | **37.0%** | 76.6 ms | 13.2 ms | **5.80x** |
+
+Prefix sharing cuts the leading word's discriminating power from 100% to 37%, and the speedup only
+falls from 7.4x to 5.8x — the second word resolves the remainder, and 2 word-comparisons still beat 13
+byte-comparisons.
+
+This is the one idea in this document with no exponential term. It is also the smallest change: it
+replaces the comparison inside an existing loop and touches neither the API nor the `B <= 8` path.
+Note the `B <= 8` boundary is a **correctness** limit for the single-`uint64` key (a wider row would
+alias); a multi-word key has no such limit, so this generalizes the fast path rather than adding a
+third one.
+
+### 5.2 A rank-select index — large, but capped at `n <= 32`
+
+**Only read this if n <= 32 is a regime you care about.** It is the largest speedup we measured and it
+is architecturally the cleanest, but it is fundamentally not scalable, so we lead with §5.1.
+
+A bitmap over all `2^n` basis states plus a per-word cumulative popcount returns the *position* of a
+state in **two loads and one `popcount`** — there is no search at all. Measured against the current
+`uint64` path, 16 operators per fixture, N ~ 4M, all outputs **bit-identical**:
+
+| fixture | hit rate | baseline | rank-select | speedup |
+| --- | --- | --- | --- | --- |
+| uniform random | 0.37% | 1607 ms | 71.7 ms | **22.4x** |
+| clustered (1-hop closed) | 6.77% | 1556 ms | 70.1 ms | **22.2x** |
+| dense low block | 36.8% | 1581 ms | 27.4 ms | **57.7x** |
+
+Note it *improves* with hit rate, unlike a pre-filter: cost is independent of whether the state exists.
+Properties that make it attractive where it fits:
+
+- **It emits no sort.** The lowered HLO contains **0** `sort` ops against the baseline's **117**. It
+  therefore does not reintroduce what `23fb226` removed, and the `2^31` ceiling's structural cause is
+  absent from it.
+- **It shards.** On a 4-device mesh with partitioned targets the output stays `P('x')` with **zero**
+  `all-gather`/`all-reduce`, using this library's existing `.at[...].get(out_sharding=...)` convention.
+  (Without `out_sharding` it raises `ShardingTypeError`, as the gather's sharding cannot be inferred.)
+- **Build is cheaper than one search** — 0.37–0.91x the cost of a single `searchsorted`, paid once and
+  amortized over all 87 operators.
+- It makes the **lex-sortedness precondition irrelevant**, since nothing is searched.
+
+**Why it is capped.** Memory is `2^n / 4` bytes — it indexes the *Hilbert space*, not the subspace:
+
+| n | 30 | 32 | 34 | 36 | 40 | 100 |
+| --- | --- | --- | --- | --- | --- | --- |
+| memory | 0.27 GB | 1.07 GB | 4.29 GB | 17.2 GB | 275 GB | 3e29 bytes |
+
+So it is viable to n=32, borderline at n=34, and impossible beyond. The same wall applies to the two
+weaker variants we measured on the way — a membership bitmap pre-filter (`2^n / 8` bytes, 2.66–4.09x by
+skipping the search for the >99% of targets that cannot hit) and a direct index array (`2^n * 4` bytes,
+69x). All three are Hilbert-space-indexed and all three die at n ~ 34.
+
+If it were ever wanted, it would have to be an `n`-gated strategy alongside the existing paths, not a
+replacement — a new required input (`num_qubits`) and a precomputed structure threaded through
+`cache_level`. The pre-filter variant additionally has a **silent-wrong-answer** hazard we would not
+ship: its compaction needs a static `cap`, an undersized `cap` drops hits with no error (883 returned
+against 884 true candidates), and there is no provable bound below `N` — a subspace closed under a hop
+has a 100% hit rate for that hop. `cap = N` is safe and recovers the baseline exactly.
+
+### 5.3 What we tried from the literature and rejected
+
+Recorded so none of it is re-attempted. Every row measured in this tree.
+
+| approach | source | result |
 | --- | --- | --- |
-| 1M | 0.09% of `2^30` | 0.09% |
-| 4M | 0.37% of `2^30` | 0.37% |
+| Interpolation search (one linear model) | Interpolation-search literature; `O(log log N)` on uniform keys | **0.91–0.99x.** Sound in principle — subspace keys are a near-uniform sample, so one linear model predicts position to within ~1244 rows at N=4M, cutting 22 levels to 14. But a hand-rolled `lax.scan` loop gives back more than the levels save. |
+| Level reduction generally | — | **Ceiling is 1.77x.** `searchsorted` into 4096 elements vs 4M is only 1.77x faster, so cutting levels cannot pay much; the small array simply fits in cache. |
+| Top-k-bit bucketing | Radix/learned-index style | **0.31–0.51x.** Cut the chain from 22 levels to 8 and ran **2–3x slower**. |
+| Batched sort of all targets | Selected-CI literature ("sorting-based paradigm", residue arrays) | **0.41x.** The `argsort` of 16N keys alone (429 ms) costs more than all 16 independent searches (296 ms). |
+| Hash table / tree replacement | — | Not measured here, and the selected-CI literature reports it directly: search trees and hash tables were *"found for the most part to be not competitive in any of our tests"* against cache-efficient sorted-array methods. |
 
-Over 99% of targets pay 22 serialized loads to discover that `S[i] ^ X` is absent. A bitmap indexed by
-state value answers that in **one** load. The bitmap is built once from `states` and reused across every
-operator, so its cost amortizes exactly the way you hoped the gather would.
-
-Measured **in JAX under `jit`**, 8 operators per fixture, `nsig` drawn at random, **all outputs
-bit-identical to `get_xsource`**:
-
-| fixture | N | hit rate | baseline | pre-filtered | speedup |
-| --- | --- | --- | --- | --- | --- |
-| uniform random | 2.0M | 0.19% | 409 ms | 100 ms | **4.09x** |
-| clustered (1-hop closed) | 1.9M | 6.60% | 388 ms | 146 ms | **2.66x** |
-
-A 16-operator sweep at N=4M reads **4.24x** with the per-operator counting pass included. Speedup
-degrades monotonically with hit rate and **break-even is ~50%**, above which plain `searchsorted` wins:
-
-| hit rate | 0.2% | 5.2% | 25.1% | 50.1% | 100% |
-| --- | --- | --- | --- | --- | --- |
-| speedup | 5.52x | 3.08x | 1.71x | 1.01x | 0.82x |
-
-Three implementation notes, since the JAX details are where this nearly died:
-
-- **Masking alone is 1.00x.** The win requires *compaction* — `jnp.nonzero(present, size=cap)` — so the
-  search runs on `cap` elements instead of `N`. Simply masking the result still executes the full search.
-- **`cap` must be static, but bucketing it to the next power of two collapses the recompilations.** All
-  16 operators in the sweep landed in one bucket: **one compilation**.
-- **It shards, and it does not reintroduce a sort.** Under a 4-device mesh (`--xla_force_host_platform_device_count=4`)
-  the pre-filter emits **zero** `all-gather` and `all-reduce`, and produces identical output sharding to
-  the flat path. The lowered HLO contains 117 `sort` ops — but so does the **unmodified baseline**
-  (also 117): those come from `jnp.searchsorted`'s own lowering in this JAX version, not from `nonzero`.
-  We flag this because a raw sort count here looks alarming against `23fb226`'s history and is not.
-  Note `states` must stay **replicated** (`sqd.py:790`); sharding `keys` makes even the baseline
-  `jnp.searchsorted` raise.
-
-### Why this is not committed: `cap` has no safe static bound
-
-**An undersized `cap` silently drops hits.** With a true candidate count of 884, `cap=883` returns a
-wrong answer — 883 hits, no error, no warning. And there is no provable bound below `N`: a subspace
-closed under a hop has a **100%** hit rate for that hop, and in general the hit rate tracks subspace
-density (25% density measured 25.3% hits). `cap = N` is safe and recovers the baseline exactly.
-
-So `cap` has to be derived from the data by a counting pass (cheap — ~1% of the search) and threaded as
-a static argument. That is what we measured, and it works. But it makes this a two-step call whose
-correctness depends on a parameter a caller could hardcode, and this library's failure history is
-specifically silent wrong answers — `docs/locg.md`'s I1–I7, and a `vinit` sign error that returned a
-wrong eigenvalue with `converged=True`. **We are not shipping a 4x speedup whose misuse is a silent
-wrong answer** until the cap is either derived internally or the truncation is made to raise.
-
-Secondary limit: the bitmap is `2^n / 8` bytes — 134 MB at n=30, **137 GB at n=40**. It needs an `n`
-ceiling, or a hashed Bloom filter. False positives are safe here (they cost a wasted search, never a
-wrong answer); false negatives are not, which is why the exact bitmap was measured rather than a Bloom.
+The selected-CI comparison is worth stating explicitly, because that field has worked at 100+ orbitals
+for decades and its problem looks like this one. Its **residue-array / dynamic-bit-masking** technique
+does not transfer: it exists to *discover* which determinant pairs are connected when the excitation is
+unknown, and solves that in `O(N log N)` by masking and sorting. `get_xsource` is **given** `X`, so
+there is nothing to discover and a direct search is already the right shape. That asymmetry is also why
+their sorting-based paradigm loses here, and why `23fb226`'s removal of the old sort was correct.
 
 ## 6. What we are not claiming
 
 - **No GPU measurement.** All of the above is one laptop CPU. The gather is better optimized on GPU and
   `23fb226`'s own CPU-to-GH200 ratio compressed from 12–25x to 5.15x, so the §5 figures should be
   assumed optimistic until measured there. This is the largest open risk.
+- **§5.1's fixtures are synthetic.** The n=64–200 rows are generated, not sampled from a real circuit
+  at those sizes. We did test the adversarial structure (weight-50 plus 1-hop closure, which drops the
+  leading word's discriminating power to 37%) and the win held at 5.80x, but a real sampled subspace at
+  n=100 may differ again.
+- **The n>60 path is otherwise unexercised here.** No test in this repo runs a subspace at n=100;
+  `TestInt32Ceiling` bounds `N`, not `n`. Before §5.1 ships, the `B > 8` path needs coverage at those
+  widths — including the `_pack_state_keys` boundary at exactly `B = 8` and `B = 9`.
 - **Nothing measured through `apply_h` or `_expval_kernel`.** §1–§5 exercise `get_xsource` in isolation.
   Your 105 s at dim 24M is an end-to-end figure; we have not shown what fraction of it §5 would remove.
 - **No commitment to implement.** §5 is a candidate with a blocking design problem, not a plan.
@@ -224,6 +295,12 @@ lever — and that better *selection* of subspace strings is the remaining line 
 more valuable per dimension and multi-observable evaluation gets more central, not less. That would
 change this request's priority without changing anything in it. Tell us if that happens.
 
+**Tell us your target qubit count.** It changes which of §5.1 and §5.2 is worth building, and they are
+not substitutes: §5.2 is 22–58x and dies at n~34; §5.1 is 4–7x and has no ceiling. If you are heading
+past 60 qubits, §5.1 is the only one of the two that will still exist there, and it addresses a cliff
+(~8x at the `B > 8` boundary) that your n=30 numbers cannot see at all — everything in your report is
+measured on the fast path. We would rather know that before choosing.
+
 ## 8. Reproducing
 
 Everything in §1–§5 needs **only `rqutils` and 64-bit jax** — no `spinchain`, no samples file. Prefix any
@@ -242,8 +319,15 @@ repro with `jax.config.update("jax_enable_x64", True)`.
 - **breakdown and ns/level (§3):** time `_pack_state_keys`, the XOR, and a `searchsorted` with both key
   arrays precomputed, against whole `get_xsource`. Then sweep N over 250k–16M and divide ns/target by
   `log2(N)`.
-- **pre-filter (§5):** build `bm` as a `2^n / 8` uint8 bitmap with
-  `np.bitwise_or.at(bm, keys >> 3, 1 << (keys & 7))`; in the kernel test the bit, `jnp.nonzero(present,
-  size=cap, fill_value=0)`, `searchsorted` the compacted targets, and scatter back with `-1` elsewhere.
-  Verify against `get_xsource` — and verify the truncation failure explicitly by passing
-  `cap = true_count - 1`.
+- **multi-word compare (§5.1):** build `[N, B]` uint8 rows at the target `n` (`B = ceil((n+1)/8)`,
+  pad bit clear, `np.unique(rows, axis=0)` for lex-sorted uniqueness). Repack each row into
+  `ceil(B/8)` big-endian `uint64` words, left-padding the most significant word. Replace the byte-wise
+  `_row_less_than` with a word-wise lexicographic compare (`lt |= eq & (a < b); eq &= (a == b)` over
+  words) and keep the rest of the scan identical. Compare against `get_xsource` on the same input. For
+  the adversarial fixture, draw fixed-Hamming-weight integers and close them under one bit flip.
+- **rank-select (§5.2):** bitmap of `2^n` bits in `uint64` words via
+  `np.bitwise_or.at(bm, keys >> 6, np.uint64(1) << (keys & 63))`, plus an exclusive prefix sum of
+  `np.bitwise_count(bm)`. Lookup is `pc[w] + popcount(word & ((1 << b) - 1))` gated on the bit being
+  set. Use `.at[w].get(out_sharding=jax.typeof(tk).sharding)` for both gathers or it raises under a
+  mesh. The pre-filter variant additionally needs `jnp.nonzero(present, size=cap, fill_value=0)`;
+  verify its truncation failure explicitly by passing `cap = true_count - 1`.
