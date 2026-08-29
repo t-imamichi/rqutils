@@ -506,6 +506,16 @@ both belong in it.
 - **Subspace selection by weight shell + diagonal ranking was measured, then rejected** (2026-08-25) —
   sound results against a *uniform random* baseline, which is not what a real SQD workflow produces.
   Do not build on it.
+- **Reduced precision in `ground_locg` is closed, both variants** (2026-08-30). *Arithmetic* in f32
+  with f64 storage is `poc6_mixed_precision.py`, rejected in `docs/scaling-pocs.md` §6 (1.17–1.30× at
+  fixed iterations, **0.42× end-to-end**, three of four converged solves hitting `maxiter`; re-verified
+  2026-08-30). *Storage* of a carried vector at f32 — a distinct, memory-motivated proposal the POC does
+  not cover — is closed by one measurement: rounding `ax` to f32 raises the residual floor to 6.8e-7,
+  **3.1e6× the f64 `tol`**, so the convergence test becomes unsatisfiable. The cause is catastrophic
+  cancellation in `r = Ax - θx` (`ax` is `O(‖A‖)`, `r` is `O(1e-9)`), not a tunable tolerance. Storing
+  `r` alone is harmless but worth only 4 B/slot. **The `(0,0)` floor is 120 B/slot — 258 GB at `2^31` —
+  and that is the honest single-device ceiling**; lowering it needs a solver with fewer carried `O(N)`
+  vectors, not a dtype change. `NOTES.md`.
 - **The Bloom pre-filter for `get_xsource` is closed** (2026-08-30). Six prototypes measured it
   thoroughly and every mechanic was settled — capacity policy, sharding, hoisted precompute,
   composition with `xcache_groups` — and it is still not worth building, for two structural reasons.
