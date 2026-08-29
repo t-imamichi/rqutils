@@ -670,6 +670,36 @@ does transfer though, and it is the one above: for a matrix-free matvec *"the me
 worker process should be the guiding principle"*, because runtime depends only weakly on the lookup
 scheme. For calibration, their state of the art is 46 spins on ~256 nodes at 512 GiB each.
 
+### `xcache_groups`: an intermediate count can *raise* peak memory (2026-08-29)
+
+Shipped in `ae4bdee`. The cache array shrinks linearly in `J'` — that part is exact arithmetic,
+`4 * J' * states_size` — but **peak memory does not**, because a partial cache runs two matvec kernels
+instead of one and the second one's intermediates are not free.
+
+Measured from XLA's `memory_analysis().temp_size_in_bytes` at `J = 16`, `N = 28344`,
+`states_size = 32768`:
+
+| `J'` | cache array | XLA peak | vs full |
+| --- | --- | --- | --- |
+| `None` (full) | 2.1 MB | 9.0 MB | 1.00x |
+| 0 | 0 MB | **7.7 MB** | 0.86x |
+| 4 | 0.5 MB | 9.8 MB | 1.09x |
+| 8 | 1.0 MB | **10.4 MB** | **1.15x** |
+| 12 | 1.6 MB | 10.9 MB | 1.20x |
+
+So at this `J` every intermediate value *costs* peak memory while appearing to save cache. `J' = 0`
+always saves, because that arm is single-kernel with no tail tuple.
+
+The crossover is in `J`, since the cache scales with `J` while one kernel's working set does not. Sweeping
+at fixed `N = 28k`: at `J = 16` the full cache is 2.1 MB of a 9.0 MB peak and `J' = J/2` costs 1.3 MB
+net; at `J = 48` the cache is 6.3 MB of 13.2 MB and `J' = J/2` saves 0.8 MB; at `J = 48, N = 114k` it is
+25.2 MB of 53.0 MB and saves 3.1 MB. **Use the dial when the cache is a large fraction of the
+footprint** — which is the condition `docs/scaling-pocs.md` §2 already gates the whole idea on, and is
+why the guidance survives even though the naive "memory is linear in `J'`" framing does not.
+
+Both docstrings state this. Recorded here because the measurement is what makes it a rule rather than a
+caveat, and because the formula is so clean that a reader will otherwise trust it.
+
 ### Measured on a real n=100 Hamiltonian: the diagonal axis dominates, not the source cache (2026-08-29)
 
 Every memory figure in the sections below was derived at **K=1** — one Z signature per X group — because
