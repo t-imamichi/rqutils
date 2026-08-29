@@ -215,10 +215,17 @@ entry point; `hproj(...)` is the dense/debug path. Two conventions dominate:
   same bit unconditionally, so the two are aligned by construction — this used to be an opt-in
   `add_padding` flag, and the two sides disagreeing is how `hproj` shipped broken. Filler slots from
   uniquification are `255`, detected via `states_u[:, 0] >> 7`.
-- `cache_level=(source_indices, diagonals)` selects among six matvec strategies. Only the *diagonal*
-  axis is a genuine memory-for-speed trade; the source-index axis is near-free to enable and very
-  expensive to disable — **prefer `cache_level[0] = 1`** (`get_xsource` setup is 66–97% of a solve; see
-  `NOTES.md`). They are one kernel indexed by that 2×3 grid, reached two ways. The **public `apply_h`
+- `cache_level=(source_indices, diagonals)` selects among six matvec strategies. The source-index axis
+  is near-free to enable and very expensive to disable — **prefer `cache_level[0] = 1`** (`get_xsource`
+  setup is 66–97% of a solve; see `NOTES.md`). **`xcache_groups=J'` makes that axis a dial** rather than
+  a switch, caching `J'` of the `J` X groups; `None` (the default) is byte-identical to before. Two
+  things measured after it shipped, both in `NOTES.md`: an *intermediate* `J'` can **raise** peak memory
+  (two kernels instead of one — 9.0 MB against 10.4 MB at `J=16`), and on a real high-`K` Hamiltonian the
+  **diagonal** axis is the bigger lever anyway (`diag_signs` is 1313 B/slot against the source cache's
+  404 at `J=101, K=100`, so `(0, 0)` measures 4.0 GB against `(1, 1)`'s 60.6 GB). Do not size memory from
+  `4 * J * N` alone.
+
+  The six strategies are one kernel indexed by that 2×3 grid, reached two ways. The **public `apply_h`
   is keyword-only**: name the arrays you have and the strategy follows (see "Known rough edges" for the
   break this was). Internally `run_sqd` calls the private `_apply_h_kernel` with an assembled tuple and
   `cache_level` bound via `functools.partial` — it **must** stay static there, since `ground_locg`

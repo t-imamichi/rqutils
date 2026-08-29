@@ -24,7 +24,9 @@ that work.
 ## Summary — 18 open items, plus one intentional design decision
 
 **Tier 1 and Tier 2 are done** (branch `worktree-gotchas-tier12`, 511 tests passing from a 437
-baseline, three linters clean). Each fix was written test-first and its commit is linked below. Two
+baseline, three linters clean), with one narrow opt-in exception: item 7 is reopened at
+`num_qubits == 1` by `sqd(packed=True)`, detailed after the table. Each fix was written test-first
+and its commit is linked below. Two
 outcomes were not what the list predicted, and are recorded as such rather than reshaped to fit:
 
 * **Item 9 is not a defect.** Measured: `sqd` returns the identical energy for sorted and unsorted
@@ -65,7 +67,7 @@ gotchas earlier breaking changes had already removed.
 | **4** | 2 | `cache_level` digits unvalidated | `(2,0)` silently acts as `(0,0)`; `(1,5)` → `UnboundLocalError`; transposition costs **7.2–10.9×** | two keyword-only enums | small | ✅ **fixed** (`b561bc4`) |
 | **5** | 2 | `PauliSumXZ.arrays` is a bare 3-tuple | `z, x, c = ham.arrays` type-checks and swaps X/Z | `NamedTuple` | ~free | ✅ **fixed** (`8d8fbcc`) |
 | **6** | 2 | `apply_h` accepts arrays under the wrong *name* | mispairing closed, misnaming not | `NewType` per array role | medium | ⚠️ **partly fixed** (`95fea5a`) — dtype closes cross-kind misnaming; same-kind swap open |
-| **7** | 2 | `pack_states` not idempotent; width never cross-checked | double-packing yields a different subspace | raise on `shape[1] != num_qubits` | 1 check | ✅ **fixed** (`8d8fbcc`) |
+| **7** | 2 | `pack_states` not idempotent; width never cross-checked | double-packing yields a different subspace | raise on `shape[1] != num_qubits` | 1 check | ✅ **fixed** (`8d8fbcc`), narrowly reopened by `sqd(packed=True)` — see below |
 | **8** | 2 | `matrix_ufunc(hermitian=...)` positional tri-state, silent `else` | `hermitian=1` on non-Hermitian input returns a *different* operator's spectrum (error > 1.0) | keyword-only + `Symmetry` enum | medium | ✅ **fixed** (`9b0a7f3`) |
 | **9** | 2 | lex-sortedness required everywhere, enforced on one path | `states` means two different things in sibling functions | `UniqueSortedStates` type from `prepare_states()` | medium | ❌ **not a defect** (`4e0cdaf`) — `sqd` sorts internally; the opt-in path already raised |
 | **10** | 2 | public helpers bypass entry-point guards | int32 iota reached "with neither entry-point guard in the chain" | underscore them, or accept wrapper types only | medium | ⚠️ **partly fixed** (`1d76725`) — rank checked; sortedness structurally uncheckable |
@@ -531,3 +533,32 @@ are required.
 
 Items **7** and **14** are one-line checks with good severity-to-effort ratios and could ride along
 with the first three.
+
+## Item 7, reopened at exactly one qubit count by `sqd(packed=True)`
+
+`sqd` gained a `packed=True` flag so a caller holding `pack_states`' output can hand it over instead of
+expanding it 8x (`8630c76`). The width cross-check that closed item 7 still runs — under `packed=True` it
+simply expects `ceil((num_qubits + 1) / 8)` columns instead of `num_qubits`, plus a `uint8` check.
+
+**At `num_qubits == 1` the two widths coincide, so the check cannot discriminate.** Unpacked `[[0], [1]]`
+and packed `[[0], [64]]` are both `(2, 1)` uint8. Measured: passing the unpacked array with `packed=True`
+returns **`+1.0` where the truth is `-1.0`**, silently, because the unpacked array is a *legal* packed
+array meaning a different state.
+
+Three things bound the exposure, which is why this is recorded rather than treated as a regression:
+
+* **Only `num_qubits == 1`.** Every other count is rejected on width.
+* **Only one direction.** A packed array with the flag *omitted* is still caught by `pack_states`' binary
+  check, since packed bytes exceed 1 — that is item 1's guard doing the work.
+* **Only under an explicit opt-in.** The default path is unchanged and still rejects packed input
+  outright.
+
+It is a flag rather than shape inference *because* of this: the widths are undecidable at `n=1`, so
+inference would be strictly worse — it would have to guess. Pinned by
+`tests/test_sqd.py::TestPackedStatesInput::test_single_qubit_is_the_one_width_the_flag_cannot_check`,
+which asserts the wrong answer is still `+1.0` so that a future change to the ambiguity is noticed.
+
+The structural fix consistent with this document's premise would be a `PackedStates` wrapper type
+returned by `pack_states`, making the two forms distinct at the type level rather than the shape level.
+Not done: it would touch every `states` parameter in the module, and at `n=1` the hazard is not reachable
+by any realistic caller.
