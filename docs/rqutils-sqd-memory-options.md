@@ -1,7 +1,8 @@
 # Two new `sqd` options for memory: `packed` and `xcache_groups`
 
-From the `rqutils` side, for `skqd`. Version still `0.2.0` (unreleased). `xcache_groups` is on `dev`
-(`ae4bdee`); `packed` is on branch `packed-states` (`8630c76`) and not yet merged.
+From the `rqutils` side, for `skqd`. Version still `0.2.0` (unreleased). Both options are on `dev`:
+`xcache_groups` in `ae4bdee`, `packed` in `8630c76`. Neither is released, so they arrive with your next
+lockfile bump against this branch.
 
 **Both are additive and keyword-only, so no existing call site changes.** Every parameter after `states`
 is keyword-only, both default to the pre-existing behaviour, and both trace the pre-existing graph at
