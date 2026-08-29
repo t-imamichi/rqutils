@@ -326,6 +326,106 @@ class TestGetXsource:
         )
 
 
+class TestPackedStatesInput:
+    """``sqd(packed=True)`` takes ``pack_states``' output directly, skipping an 8x round trip.
+
+    Unpacked states are one byte per qubit against ``ceil((n + 1) / 8)`` packed, and both arrays are
+    live during the pack, so a caller already holding the packed form was paying an 8x expansion plus a
+    transient peak for nothing. Nothing internal changes -- ``run_sqd`` has always taken the packed
+    form -- so what these pin is the *boundary*.
+    """
+
+    def test_packed_and_unpacked_agree_on_everything_returned(self):
+        """Defect: a boundary that accepts packed input but reports a different subspace.
+
+        All three return values must match, not just the eigenvalue: the eigenvector is indexed by
+        basis position, and the basis itself is unpacked with a qubit count that used to come from
+        ``states.shape[1]`` -- the *packed* width when the caller passes packed states, which would
+        unpack to the wrong number of qubits while still returning a plausible array.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        rng = np.random.default_rng(21)
+        num_qubits = 20
+        labels = ["".join(rng.choice(list("IXYZ"), size=num_qubits)) for _ in range(8)]
+        hamiltonian = PauliSumXZ.from_paulisum((labels, rng.normal(size=len(labels)).tolist()))
+        states = np.unique(rng.integers(0, 2, size=(4000, num_qubits), dtype=np.uint8), axis=0)
+        packed = PauliSumXZ.pack_states(states)
+        assert packed.shape[1] < states.shape[1], "fixture must actually be narrower when packed"
+
+        val_u, vec_u, basis_u = sqd(hamiltonian, states)
+        val_p, vec_p, basis_p = sqd(hamiltonian, packed, packed=True)
+
+        assert val_p == pytest.approx(val_u, abs=1e-12)
+        assert np.array_equal(vec_p, vec_u), (
+            "eigenvectors differ, so the bases are not the same order"
+        )
+        assert np.array_equal(basis_p, basis_u), "returned bases differ"
+        assert basis_p.shape[1] == num_qubits, (
+            f"the returned basis must be unpacked to {num_qubits} qubits regardless of the input "
+            f"form, got width {basis_p.shape[1]} -- the unpack took its qubit count from the packed "
+            f"width"
+        )
+
+    def test_mismatched_flag_is_rejected_on_width(self):
+        """Each form must be rejected under the wrong flag, at every width where it can be."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        rng = np.random.default_rng(22)
+        num_qubits = 12
+        hamiltonian = PauliSumXZ.from_paulisum((["Z" * num_qubits], [1.0]))
+        states = np.unique(rng.integers(0, 2, size=(30, num_qubits), dtype=np.uint8), axis=0)
+        packed = PauliSumXZ.pack_states(states)
+
+        with pytest.raises(ValueError, match="packed=True"):
+            sqd(hamiltonian, states, packed=True, return_eigvec=False)
+        with pytest.raises(ValueError, match="unpacked"):
+            sqd(hamiltonian, packed, return_eigvec=False)
+        with pytest.raises(ValueError, match="must be uint8"):
+            sqd(hamiltonian, packed.astype(np.uint16), packed=True, return_eigvec=False)
+
+    def test_single_qubit_is_the_one_width_the_flag_cannot_check(self):
+        """Defect the flag exists for: at ``num_qubits == 1`` the two widths coincide.
+
+        Unpacked ``[[0], [1]]`` and packed ``[[0], [64]]`` are both ``(2, 1)`` uint8, so no shape
+        inference can tell them apart -- which is why this is a declared flag and not sniffed. Measured:
+        passing the unpacked array with ``packed=True`` returns ``+1.0`` where the truth is ``-1.0``,
+        silently, because the unpacked array is a *legal* packed array meaning something else.
+
+        The reverse direction is closed by ``pack_states``' binary check, so only this one needs the
+        caller's word. Pinned rather than fixed: there is nothing to fix, and a reader who assumes the
+        widths are always distinguishable would drop the flag in favour of inference.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((["Z"], [1.0]))
+        unpacked = np.array([[0], [1]], dtype=np.uint8)
+        packed = PauliSumXZ.pack_states(unpacked)
+        assert unpacked.shape == packed.shape, "the premise: both forms are the same shape at n=1"
+
+        truth = sqd(hamiltonian, unpacked, return_eigvec=False)
+        assert truth == pytest.approx(-1.0, abs=1e-12)
+        assert sqd(hamiltonian, packed, packed=True, return_eigvec=False) == pytest.approx(
+            -1.0, abs=1e-12
+        )
+        # The undetectable misuse, recorded so nobody replaces the flag with a width check.
+        assert sqd(hamiltonian, unpacked, packed=True, return_eigvec=False) == pytest.approx(
+            1.0, abs=1e-12
+        ), (
+            "if this stops being +1.0 the n=1 ambiguity has changed and the docstring needs revisiting"
+        )
+
+    def test_hproj_still_requires_unpacked(self):
+        """``hproj`` is deliberately not given the flag: its own preconditions are unpacked-only."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((["ZZII"], [1.0]))
+        states = np.array([[0, 0, 0, 0], [0, 0, 0, 1], [1, 1, 0, 0]], dtype=np.uint8)
+        packed = PauliSumXZ.pack_states(states)
+        with pytest.raises(ValueError, match="unpacked"):
+            hproj(hamiltonian, packed)
+
+
 class TestPartialXCache:
     """``xcache_groups`` caches the first J' X groups and recomputes the rest.
 

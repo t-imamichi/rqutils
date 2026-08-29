@@ -386,8 +386,8 @@ def _check_zsignatures_rank(zsignatures: Any) -> None:
         )
 
 
-def _check_states_shape(states: Any, num_qubits: int) -> StateList:
-    """Raise unless ``states`` is ``(subspace_dim, num_qubits)``.
+def _check_states_shape(states: Any, num_qubits: int, packed: bool = False) -> StateList:
+    """Raise unless ``states`` is ``(subspace_dim, num_qubits)``, or packed-width when ``packed``.
 
     One ``O(1)`` look at a shape, shared by :func:`sqd` and :func:`hproj` so the two cannot drift.
     It closes three distinct mistakes that all used to produce a plausible finite answer:
@@ -405,6 +405,15 @@ def _check_states_shape(states: Any, num_qubits: int) -> StateList:
     byte wide, so a 1-qubit Hamiltonian would accept it -- the shape genuinely matches. What catches
     that is :meth:`PauliSumXZ.pack_states`' binary check, since packed bytes exceed 1.
 
+    ``packed=True`` expects ``ceil((num_qubits + 1) / 8)`` columns instead, for a caller handing over
+    :meth:`PauliSumXZ.pack_states`' own output. It is a **declaration, not a shape inference**, and
+    that is not merely stylistic: at ``num_qubits == 1`` both widths are 1, so the shapes are
+    genuinely undecidable and the flag is the only discriminator. Measured there --
+    ``sqd(unpacked, packed=True)`` returns ``+1.0`` where the truth is ``-1.0``, silently, because an
+    unpacked ``[[0], [1]]`` is a legal *packed* array meaning something else. The reverse direction
+    (packed array, flag omitted) is caught by :meth:`PauliSumXZ.pack_states`' binary check, since
+    packed bytes exceed 1. So the flag closes the one direction nothing else can.
+
     Coerces with :func:`numpy.asarray` and returns the result, rather than only inspecting: both
     entry points document ``states`` as passable "as an array of integers or booleans", and
     :func:`hproj` accepted a list of lists. Reading ``.ndim`` off the raw argument would narrow that
@@ -415,18 +424,34 @@ def _check_states_shape(states: Any, num_qubits: int) -> StateList:
     Args:
         states: The caller's states, as anything :func:`numpy.asarray` accepts.
         num_qubits: The Hamiltonian's qubit count.
+        packed: Whether ``states`` is already bit-packed, so the expected width is
+            ``ceil((num_qubits + 1) / 8)`` rather than ``num_qubits``.
 
     Returns:
         ``states`` as an array, for the caller to use in place of its argument.
 
     Raises:
-        ValueError: If ``states`` is not 2-D, or its second axis is not ``num_qubits``.
+        ValueError: If ``states`` is not 2-D, or its second axis is not the expected width.
     """
     states = np.asarray(states)
     if states.ndim != 2:
         raise ValueError(
             f"`states` must be 2-D with shape (subspace_dim, num_qubits), got shape {states.shape}"
         )
+    if packed:
+        width = -(-(num_qubits + 1) // 8)
+        if states.shape[1] != width:
+            raise ValueError(
+                f"`states` has {states.shape[1]} columns but `packed=True` with "
+                f"{num_qubits} qubits expects {width} (= ceil(({num_qubits} + 1) / 8)). Pass the "
+                "output of `PauliSumXZ.pack_states`, or drop `packed=True` for unpacked states."
+            )
+        if states.dtype != np.uint8:
+            raise ValueError(
+                f"packed `states` must be uint8, got {states.dtype}. `PauliSumXZ.pack_states` "
+                "returns uint8; a wider dtype means the array is not its output."
+            )
+        return states
     if states.shape[1] != num_qubits:
         raise ValueError(
             f"`states` has {states.shape[1]} columns but the Hamiltonian has {num_qubits} qubits; "
@@ -449,6 +474,7 @@ def sqd(
     *,
     states_size: int | None = ...,
     return_eigvec: Literal[True] = ...,
+    packed: bool = ...,
     cache_level: tuple[int, int] = ...,
     xcache_groups: int | None = ...,
     maxiter: int = ...,
@@ -464,6 +490,7 @@ def sqd(
     *,
     states_size: int | None = ...,
     return_eigvec: Literal[False],
+    packed: bool = ...,
     cache_level: tuple[int, int] = ...,
     xcache_groups: int | None = ...,
     maxiter: int = ...,
@@ -478,6 +505,7 @@ def sqd(
     *,
     states_size: int | None = None,
     return_eigvec: bool = True,
+    packed: bool = False,
     cache_level: tuple[int, int] = (1, 0),
     xcache_groups: int | None = None,
     maxiter: int = 1000,
@@ -533,6 +561,21 @@ def sqd(
             the iteration cap's best guess -- see ``Raises``.
         tol: Convergence tolerance passed to :func:`rqutils.ground_locg.ground_locg`. ``None`` uses
             the machine epsilon of the operator dtype.
+        packed: Whether ``states`` is already bit-packed, i.e. the output of
+            :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states`. Default ``False``, which takes
+            the unpacked ``(subspace_dim, num_qubits)`` form and packs it internally.
+
+            Set it when you already hold the packed array, to skip an 8x round trip: unpacked states
+            are one byte per qubit against ``ceil((num_qubits + 1) / 8)`` bytes packed -- 2.40 GB
+            against 0.31 GB at ``num_qubits=100``, ``subspace_dim=24M`` -- and both arrays are live
+            at once during the pack, so the transient peak is their sum. This changes nothing inside:
+            the packed form is what the solver has always used, and the returned basis is unpacked
+            either way.
+
+            It is a declaration, and a wrong one is not always caught. At ``num_qubits == 1`` the two
+            widths coincide, so passing unpacked states with ``packed=True`` silently returns a
+            different eigenvalue; every other qubit count is rejected on width. Pass the flag only for
+            an array that came from ``pack_states``.
         cache_level: Switches for caching the results of source indices and sign bits / diagonals.
             See the module documentation for the detailed discussion of the resource tradeoff involved.
         xcache_groups: Number of X groups whose source indices to cache, or ``None`` (default) for all
@@ -644,13 +687,19 @@ def sqd(
         )
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
-    states = _check_states_shape(states, hamiltonian.num_qubits)
+    states = _check_states_shape(states, hamiltonian.num_qubits, packed)
 
     if not (mesh := get_abstract_mesh()).empty and (resid := states_size % mesh.size) != 0:
         LOG.debug("Adjusting states_size to make the array divisible by %d", mesh.size)
         states_size += mesh.size - resid
 
-    states_p = PauliSumXZ.pack_states(states)
+    # `packed=True` hands over `pack_states`' own output, so skip the pack rather than repeat it --
+    # it is not idempotent, and a second pass reads each byte as one bit. The saving is the caller's:
+    # unpacked `[N, num_qubits]` is ~7.7x the packed width at n=100, and both arrays are live at once
+    # during the pack, so a caller already holding the packed form was paying an 8x expansion plus a
+    # transient peak (2.40 GB against 0.31 GB at n=100, N=24M) for nothing. Nothing downstream
+    # changes: `run_sqd` has always taken the packed form.
+    states_p = states if packed else PauliSumXZ.pack_states(states)
     # Pad the *input* up to states_size too, not just the internal arrays. states_p is a traced
     # argument of run_sqd, so its leading dimension is part of the jit cache key: leaving it at the
     # raw input length retraces the whole solver on every distinct len(states), which is precisely
@@ -703,7 +752,9 @@ def sqd(
         )
     if return_eigvec:
         eigvec, states_u, subspace_dim = result[1:-1]
-        basis_states = PauliSumXZ.unpack_states(states_u[:subspace_dim], states.shape[1])
+        # `hamiltonian.num_qubits`, not `states.shape[1]`: the latter is the *packed* width when the
+        # caller passed `packed=True`, which would unpack to the wrong qubit count.
+        basis_states = PauliSumXZ.unpack_states(states_u[:subspace_dim], hamiltonian.num_qubits)
         return (eigval, np.array(eigvec[:subspace_dim]), basis_states)
     return eigval
 
