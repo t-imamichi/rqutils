@@ -665,6 +665,47 @@ does transfer though, and it is the one above: for a matrix-free matvec *"the me
 worker process should be the guiding principle"*, because runtime depends only weakly on the lookup
 scheme. For calibration, their state of the art is 46 spins on ~256 nodes at 512 GiB each.
 
+### A Bloom filter for *input* dedup: better-targeted, still loses to `np.unique` (2026-08-29)
+
+The narrowest and best-aimed version of the filter idea: `sqd` receives raw measured bitstrings with
+duplicates and dedupes them inside `uniquify_states`' lexsort. Use a filter for that dedup instead.
+
+**The duplicate rate makes this worth measuring.** Simulated Zipf-ish shot sampling, which is what a real
+SQD workflow produces:
+
+| n | support | shots | unique | duplicate rate | shots/unique |
+| --- | --- | --- | --- | --- | --- |
+| 30 | 50,000 | 2M | 47,995 | **97.6%** | 41.7 |
+| 30 | 500,000 | 2M | 180,692 | **91.0%** | 11.1 |
+
+So the array `sqd` pads to `states_size` and lexsorts is 11-42x larger than the unique set it produces.
+
+**The error direction is also favourable, which is the interesting part.** For dedup a false positive
+means "I think I have seen this" → the state is *dropped*. That loses a genuine basis vector, which is
+**variationally safe**: a smaller subspace gives a *higher* energy, never a wrong one. Contrast the
+pre-filter case, where an FP costs a wasted search and exactness is recovered — here exactness is lost,
+but the loss is bounded and in a known direction.
+
+**It still loses, for three reasons, and the third is the one that matters.**
+
+| variant | vs `np.unique` | genuine states lost |
+| --- | --- | --- |
+| BF dedup replacing `np.unique` | **0.64-0.79x** | 0.28-0.31% |
+| BF pre-reduce, then `np.unique` | **0.63-0.72x** | 0.30-0.31% |
+| chunked `np.unique` + `union1d` (exact, no filter) | **0.77x** | 0 |
+
+1. **The dedup is inherently sequential.** "Have I seen `x`?" depends on every earlier insertion, so it
+   cannot be vectorized over the array. A blocked version tests a block then inserts it, so duplicates
+   *within* a block survive — measured 106,455 kept for 47,848 distinct.
+2. **`np.unique` on `uint64` is a radix sort**: one pass, fully vectorized C. Hard to beat from numpy.
+3. **`get_xsource` needs lex-sorted *and* unique input, so the sort is mandatory regardless.** That makes
+   the filter *extra* work rather than replacement work — the honest comparison is `BF + np.unique`
+   against `np.unique`, which it loses on both time and exactness.
+
+Worth keeping as the general lesson: a filter can only replace a sort when nothing downstream needs
+**order**. Here `get_xsource` binary-searches the result, so order is not optional, and every
+approximate-set structure loses by construction.
+
 ### Using a Bloom filter as the subspace *definition*: sound, and it loses past n~70 (2026-08-29)
 
 A sharper version of the filter idea: stop treating false positives as wasted work and **accept them into
