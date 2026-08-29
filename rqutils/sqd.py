@@ -1151,30 +1151,64 @@ def _is_lex_sorted(states: NDArray[np.uint8]) -> bool:
     return bool(np.all(lhs[rows, first] < rhs[rows, first]))
 
 
-def _row_less_than(rows: jax.Array, targets: jax.Array) -> jax.Array:
-    """Elementwise lexicographic `rows[i] < targets[i]` over uint8 rows, MSB-first.
+def _pack_state_words(states: StateList) -> jax.Array:
+    """Pack `[N, B]` uint8 rows into `[N, ceil(B/8)]` uint64 words, preserving lex order.
 
-    The first differing byte decides, so mask each byte position by "all higher bytes equal" and
-    take any hit. Written without a loop carry so it stays one fused expression per search step.
+    The wide counterpart to :func:`_pack_state_keys`, which is limited to a single word. Words are
+    big-endian, MSW-first, and the most significant word is left-padded with zero bytes, so word-wise
+    lexicographic order matches byte-wise row order exactly.
 
-    The prefix-AND is accumulated in uint8, not bool: `jnp.cumprod` rejects a bool accumulator and
-    promotes to int64 under `jax_enable_x64`, materializing the `[N, B]` mask at 8 bytes per element
-    where 1 suffices. That is a dtype decision fixed before HLO, so XLA cannot undo it -- measured
-    192 MB of transients versus 23 MB at N=1M, B=12, and 1.53x on the J-fold precompute this path
-    feeds. Pin `dtype=` explicitly; the promotion comes back without it.
+    Leading-padding is chosen so that ``nwords == 1`` reproduces :func:`_pack_state_keys` bit for bit,
+    which is what lets the two paths be compared directly. It is *not* required for correctness:
+    trailing-padding is also order-preserving, since appending a constant number of zero bytes is a
+    left-shift by ``8 * pad`` and a constant left-shift is monotonic. Verified exhaustively at
+    ``B = 3`` and over 20000 random pairs at ``B = 9``; a mutation to the other end leaves the whole
+    suite green, so do not read the choice as load-bearing.
+
+    Returns:
+        Shape ``[N, ceil(B/8)]`` uint64. ``B <= 8`` yields one column, identical in value to
+        :func:`_pack_state_keys`' output.
     """
-    eq_prefix = jnp.cumprod(
-        jnp.concatenate(
-            [
-                jnp.ones((rows.shape[0], 1), jnp.uint8),
-                (rows[:, :-1] == targets[:, :-1]).astype(jnp.uint8),
-            ],
-            axis=1,
-        ),
-        axis=1,
-        dtype=jnp.uint8,
-    ).astype(bool)
-    return jnp.any(jnp.logical_and(eq_prefix, rows < targets), axis=1)
+    nbytes = states.shape[1]
+    nwords = -(-nbytes // 8)
+    pad = nwords * 8 - nbytes
+    padded = (
+        states
+        if not pad
+        else jnp.concatenate([jnp.zeros((states.shape[0], pad), dtype=jnp.uint8), states], axis=1)
+    )
+    shifts = jnp.asarray([8 * (7 - i) for i in range(8)], dtype=jnp.uint64)
+    words = [
+        jnp.sum(padded[:, w * 8 : (w + 1) * 8].astype(jnp.uint64) << shifts, axis=1)
+        for w in range(nwords)
+    ]
+    return jnp.stack(words, axis=1)
+
+
+def _word_less_than(rows: jax.Array, targets: jax.Array) -> jax.Array:
+    """Elementwise lexicographic `rows[i] < targets[i]` over uint64 words, MSW-first.
+
+    Lexicographic row order, but on packed words: a search level costs ``ceil(B/8)`` comparisons
+    instead of ``B``. At n=100 (``B = 13``) that is 2 rather than 13, measured 3.6-7.7x on the whole
+    search across n=64..200 and bit-identical to the byte-wise form it replaced.
+
+    The unrolled Python loop is deliberate: ``nwords`` is static, and a `lax` loop would need a
+    traced index into a static shape.
+
+    Accumulating ``lt``/``eq`` in bool is safe here, but do not reintroduce a ``jnp.cumprod`` prefix
+    over the word axis to "vectorize" it. The byte-wise predecessor this replaced did exactly that and
+    had to pin ``dtype=jnp.uint8``: `cumprod` rejects a bool accumulator and promotes to int64,
+    materializing the ``[N, B]`` mask at 8 bytes per element where 1 suffices -- measured 192 MB of
+    transients against 23 MB at N=1M, B=12, and 1.53x on the J-fold precompute this path feeds. Two
+    or four scalar comparisons need no prefix at all.
+    """
+    lt = jnp.zeros(targets.shape[0], dtype=bool)
+    eq = jnp.ones(targets.shape[0], dtype=bool)
+    for w in range(rows.shape[1]):
+        a, b = rows[:, w], targets[:, w]
+        lt = jnp.logical_or(lt, jnp.logical_and(eq, a < b))
+        eq = jnp.logical_and(eq, a == b)
+    return lt
 
 
 @jax.jit
@@ -1220,10 +1254,17 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
     never depended on it -- the `2N` ceiling, shardability and runtime each justify it alone.
 
     Two paths, selected statically on width. `B <= 8` packs each row into a `uint64` and uses
-    `jnp.searchsorted` directly; wider inputs fall back to an explicit lexicographic binary search
-    (measured 3.0-3.7x rather than 12-25x, so the fast path is worth keeping separate). The
-    boundary is a correctness limit, not a tuning parameter: at `B > 8` a `uint64` key would silently
+    `jnp.searchsorted` directly; wider inputs fall back to an explicit binary search over the rows
+    packed into `ceil(B/8)` `uint64` words (:func:`_pack_state_words`), MSW-first. The boundary is a
+    correctness limit, not a tuning parameter: at `B > 8` a *single* `uint64` key would silently
     truncate the row and alias distinct states onto one key.
+
+    The wide path used to compare rows one **byte** at a time, which cost `O(B)` comparisons per
+    search level and made this path scale poorly in `n`: measured **~8x per state** across the
+    boundary (15 ns/state at n=60 against 189 at n=100, N=300k). Comparing words instead makes a
+    level cost `ceil((n+1)/64)` comparisons -- 2 rather than 13 at n=100 -- so cost is logarithmic in
+    packed width. Measured **3.6-7.7x** on the whole search across n=64..200, bit-identical to the
+    byte-wise form at every width, and the `B <= 8` path is untouched (0.83-1.18x, i.e. noise).
 
     Returns `-1` at every position whose source is absent. Note the previous implementation returned
     *assorted* negative values there (it computed `I[k+1] - N` unconditionally) rather than exactly
@@ -1247,12 +1288,19 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
         pos = jnp.minimum(pos, size - 1)
         found = keys[pos] == target_keys
     else:
-        # Explicit binary search on the rows themselves. Invariant: lo is the count of rows strictly
-        # less than the target, so after ceil(log2(N)) + 1 halvings lo is the insertion point.
+        # Explicit binary search, on uint64 words rather than uint8 bytes: a level costs ceil(B/8)
+        # comparisons instead of B (2 rather than 13 at n=100), and the packing is one pass. The
+        # word form is what makes this path affordable past n=60 -- the byte form measured an ~8x
+        # per-state cliff across the B > 8 boundary (15 ns/state at n=60, 189 at n=100).
+        # Invariant unchanged: lo is the count of rows strictly less than the target, so after
+        # ceil(log2(N)) + 1 halvings lo is the insertion point.
+        swords = _pack_state_words(states)
+        twords = _pack_state_words(targets)
+
         def step(carry, _):
             lo, hi = carry
             mid = (lo + hi) // 2
-            go_right = _row_less_than(states[jnp.minimum(mid, size - 1)], targets)
+            go_right = _word_less_than(swords[jnp.minimum(mid, size - 1)], twords)
             return (jnp.where(go_right, mid + 1, lo), jnp.where(go_right, hi, mid)), None
 
         nsteps = int(np.ceil(np.log2(max(size, 2)))) + 1
@@ -1260,7 +1308,7 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
         hi = jnp.full(size, size, dtype=jnp.int32)
         (lo, _), _ = jax.lax.scan(step, (lo, hi), None, length=nsteps)
         pos = jnp.minimum(lo, size - 1)
-        found = jnp.all(states[pos] == targets, axis=1)
+        found = jnp.all(swords[pos] == twords, axis=1)
 
     xsource = jnp.where(found, pos, invalid).astype(np.int32)
     if not (mesh := get_abstract_mesh()).empty:

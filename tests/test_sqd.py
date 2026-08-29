@@ -273,6 +273,58 @@ class TestGetXsource:
         got = np.asarray(get_xsource(hamiltonian.x[0], states_u))
         assert got[0] < 0, f"absent source must be negative, got {got[0]}"
 
+    def test_wide_rows_compare_most_significant_word_first(self):
+        """Defect: word significance reversed on the ``B > 8`` path, giving a *permutation*.
+
+        The wide path packs rows into ``ceil(B/8)`` uint64 words and compares them MSW-first. If the
+        word loop runs LSW-first the search still terminates and still returns in-range indices, so
+        the result is a plausible permutation rather than an error --  the same silent shape as the
+        byte-order defect ``test_matches_dense_partner_map_across_byte_widths`` covers.
+
+        That test does **not** catch this: its fixture concentrates variation in the trailing bytes,
+        so the leading word rarely decides a comparison and MSW-first and LSW-first agree. This one
+        forces disagreement. At ``B = 9`` the padding puts byte 0 alone in word 1 and bytes 1..8 in
+        word 2, so a pair differing in *both* -- with byte 0 saying "less" and the tail saying
+        "greater" -- is ordered one way by MSW-first and the other by LSW-first. Only MSW-first
+        matches byte-wise lexicographic order, which is what ``states`` is sorted by and what
+        ``get_xsource``'s binary search requires.
+
+        Note the *padding end* is deliberately not pinned here: leading- and trailing-padding are
+        both order-preserving (a constant left-shift is monotonic), so a mutation there is not a
+        defect. See ``_pack_state_words``.
+        """
+        # Nine-byte rows (the n=64 width) so there are two words and the word axis exists at all.
+        # Chosen so byte 0 and the tail disagree on order; the values matter, not which qubits they
+        # correspond to.
+        rows = np.array(
+            [
+                [1, 255, 255, 255, 255, 255, 255, 255, 255],
+                [2, 0, 0, 0, 0, 0, 0, 0, 0],
+            ],
+            dtype=np.uint8,
+        )
+        rows[:, 0] &= 0x7F  # keep the pad bit clear so these are not read as fillers
+        states_u = np.asarray(uniquify_states(rows, rows.shape[0]))
+        assert not np.any(states_u[:, 0] >> 7), "fixture must contain no filler rows"
+
+        # Independent reference: a dict over packed rows, sharing no code with the search.
+        row_of = {row.tobytes(): i for i, row in enumerate(states_u)}
+        # The signature that maps one row onto the other is just their XOR, so both sources exist
+        # and a permuted answer is distinguishable from the right one.
+        xsig = np.bitwise_xor(states_u[0], states_u[1])
+        expected = np.array(
+            [row_of.get(np.bitwise_xor(row, xsig).tobytes(), -1) for row in states_u],
+            dtype=np.int32,
+        )
+        assert np.all(expected >= 0), (
+            f"both partners must exist or this test cannot see a permutation: {expected}"
+        )
+        got = np.asarray(get_xsource(xsig, states_u))
+        assert np.array_equal(got, expected), (
+            f"expected {expected}, got {got} -- word comparison is not MSW-first, so integer word "
+            "order disagrees with byte-wise row order"
+        )
+
 
 class TestUniquifyStates:
     """``uniquify_states`` sorts, deduplicates, and pads to a fixed size with 255 fillers."""
