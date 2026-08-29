@@ -249,8 +249,12 @@ entry point; `hproj(...)` is the dense/debug path. Two conventions dominate:
   constraints if it is ever built: **do not split both axes** (`(0, 2)` is 41× `(1, 2)` per matvec, so
   any X split pays that to save diagonal bytes — the dial belongs on the diagonal axis alone, with
   `cache_level[0]` at 1), and **one compiled variant per distinct `J'`**, which power-of-two rounding
-  makes *worse*, not better (13 splits → 13 variants, rounded → 16). Peak temp memory does **not**
-  regress here, unlike the X axis. Unconfirmed at large `N`. `NOTES.md`.
+  makes *worse*, not better (13 splits → 13 variants, rounded → 16). **Confirmed at large `N`**
+  (to `states_size` 2^21, and 2.60–2.83× on real solves to N=501k): peak temp is 16 B/slot, so it
+  scales with `N` — the invariant is the *ratio*, **4.0% of the memory the split returns**, and `4/J`
+  in the group count, so the dial is only cheap at large `J` (40% overhead at `J=10`). That `O(N)`
+  overhead against an `O(J·N)` store is why the `xcache_groups` peak-memory hazard does not recur here.
+  `NOTES.md`.
   **Quote `K` with any memory figure and never size from `4 * J * N` alone** — a fit taken at `K=1` was
   3.0x wrong for `(1, 1)`. `states_size` also rounds **up to a power of two**: N=24M allocates 33.6M
   slots.

@@ -1256,11 +1256,13 @@ made the filter look worth building.
 
 - **Linear and monotonic**, no cliff. The X axis "never reaches full-cache time" with a
   disproportionate last step; this one lands on it.
-- **Peak temp memory does not regress.** Flat at **1.1 MB** across every intermediate split against
-  0.0–0.5 MB at the endpoints (XLA `memory_analysis`), i.e. 3.5% of the 31.5 MB store at J=60 — where
-  the X-axis split measured 9.0 MB against 10.4 MB, a large fraction of its cache. End-to-end the
-  two-arm overhead is **nil**: `J' = J` measured 632.3 ms against the single-kernel 649.1 (1.027×,
-  noise).
+- **Peak temp memory does not regress.** 1.1 MB at an intermediate split against 0.0–0.5 MB at the
+  endpoints (XLA `memory_analysis`), i.e. 3.5% of the 31.5 MB store at J=60 — where the X-axis split
+  measured 9.0 MB against 10.4 MB, a large fraction of its cache. End-to-end the two-arm overhead is
+  **nil**: `J' = J` measured 632.3 ms against the single-kernel 649.1 (1.027×, noise).
+  **Superseded in the entry below**: that 1.1 MB is not flat in `N` — it is 16 B/slot, so it scales
+  linearly. The invariant is the *ratio*, 4.0% of the memory the split gives back at every
+  `states_size`, and `4/J` in the group count.
 - **Bit-identical at every split** — `max |Δ|` exactly `0.00e+00` against the all-cached reference at
   every `J'`, at both n=60 and n=100.
 
@@ -1297,12 +1299,73 @@ power of two). This is unlike the pre-filter's `cap`, where rounding bounded the
 because `J'` is static per solve, but a caller sweeping it pays one compile per value, and that must be
 documented rather than discovered.
 
-**Caveats.** One laptop CPU. `N` ≈ 50k with `states_size` 65536 in every run, so the flat 1.1 MB peak
-is **unconfirmed at large `N`**, which is where the dial would matter — that is the first thing to
-measure next. Fixtures are 1D Heisenberg with a subspace half-closed under a weight-preserving hop, not
+**Caveats.** One laptop CPU. `N` ≈ 50k with `states_size` 65536 in every run, so the peak-memory claim
+was unconfirmed at large `N` — **now measured, in the entry below**: it holds as a ratio (4.0% of
+savings, invariant in `N`) rather than as the absolute figure quoted here. Fixtures are 1D Heisenberg with a subspace half-closed under a weight-preserving hop, not
 sampled from a circuit. The intermediate solves came from throwaway `run_sqd` instrumentation behind an
 env var, since `sqd` has no such parameter; it was removed and the file restored from a `cp` backup
 (626 passed after).
+
+
+### The diagonal split at large `N`: the overhead is a *ratio*, and "flat 1.1 MB" was an artifact (2026-08-30)
+
+The entry above left one load-bearing claim unmeasured — peak temp memory "flat at 1.1 MB across every
+intermediate split", from a single `states_size` of 65536. Swept to 2^21 it is **not flat**, and the
+corrected statement is stronger.
+
+**Peak temp is exactly 16 B/slot, and it scales linearly with `N`:**
+
+| `states_size` | full diagonal store | peak temp at `J/2` | peak B/slot |
+| --- | --- | --- | --- |
+| 2^16 | 52.4 MB | 1.05 MB | **16.0** |
+| 2^18 | 209.7 MB | 4.20 MB | **16.0** |
+| 2^20 | 838.9 MB | 16.78 MB | **16.0** |
+| 2^21 | 1677.7 MB | 33.56 MB | **16.0** |
+
+Two float64 output buffers, one per kernel arm — `O(N)`, not `O(J·N)`. **That is why the
+`xcache_groups` hazard does not occur here**: its two-kernel overhead was a fraction of a `4·J·N`
+int32 cache and could exceed the saving (9.0 MB against 10.4), while this overhead is `O(N)` against a
+`8·J·N` store.
+
+**So the invariant is a ratio, not an absolute.** Overhead against the memory the split gives back is
+**4.0% at every `states_size`** — invariant because it is a quotient of two terms both linear in `N`,
+which is a far stronger guarantee than a small number at one size.
+
+**It depends on `J` as `4/J`, measured at `states_size = 2^18`, `J' = J/2`:**
+
+| `J` | store B/slot | peak B/slot | overhead vs saved |
+| --- | --- | --- | --- |
+| 10 | 80 | 16.0 | **40.0%** |
+| 25 | 200 | 16.0 | 16.0% |
+| 50 | 400 | 16.0 | 8.0% |
+| 100 | 800 | 16.0 | **4.0%** |
+| 200 | 1600 | 16.0 | **2.0%** |
+
+`16 / (4·J)` exactly. (A `2/J` prediction stated while working this out was wrong by 2× — it divided
+the 16 B/slot by the *full* store rather than the half a `J' = J/2` split gives back. Measured beats
+that prediction; the `1/J` shape was right, the constant was not.) **The dial is only cheap at large
+`J`** — 40% overhead at `J = 10` — but `J = 10` is also where the whole feature is pointless.
+
+**The time ratios hold at scale, on a real Hamiltonian.** 1D Heisenberg n=100, J=100, matvec:
+
+| `N` | `states_size` | store | all-cached | `J/2` | none | `J/2` vs all | exact |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 50,072 | 65536 | 52.4 MB | 4.49 ms | 12.49 | 28.04 | **2.78×** | `0.0e+00` |
+| 187,846 | 262144 | 209.7 MB | 14.70 ms | 38.21 | 79.80 | **2.60×** | `0.0e+00` |
+| 501,157 | 524288 | 419.4 MB | 19.99 ms | 56.51 | 123.97 | **2.83×** | `0.0e+00` |
+
+Stable across a 10× range in `N`, and slightly better than the 2.45× recorded above. Bit-identical at
+every size.
+
+**A trap worth recording, because it produced a 25–39× phantom.** Timing this on
+*synthetic shape-only* arrays — the right approach for peak memory, since that depends on shapes alone —
+measured the `J/2` split at 25–39× rather than 2.6–2.8×. The cause is `_accumulate_diagonal`'s early
+exit: it stops at the first zero coefficient in a zero-padded Z group, and `rng.normal` coefficients are
+never zero, so all `K = 99` terms ran per group where a real Hamiltonian's structured groups stop far
+sooner. **Synthetic arrays are valid for memory and invalid for time** whenever a kernel's trip count is
+data-dependent. `NOTES.md` already records the converse trap (a *broken* arm flatters its own benchmark
+by doing less work); this is the same lesson from the other side — an unrealistically *dense* fixture
+punishes the arm that depends on sparsity.
 
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
