@@ -616,6 +616,55 @@ removes the single-device *sort* but **distributes nothing** (sequential merge, 
 host), and a real multi-node uniquify needs a range-partitioned shuffle, for which chunk-local sorting
 is the per-node kernel and not the algorithm.
 
+### At n=100 the binding constraint is the xsources cache, not the sort (2026-08-29)
+
+Scaling attention has been on `uniquify_states`' sort because it sets the `2^31` ceiling. But an actual
+n=100 solve is dominated by something else. Budget at `B = 13`, `J = 50`, `cache_level[0] = 1`:
+
+| N | states | vectors (~6) | **xsources `[J,N]` int32** | total |
+| --- | --- | --- | --- | --- |
+| 2^24 (17M) | 0.2 GB | 1.6 GB | **3.4 GB** | 5.2 GB |
+| 2^28 (268M) | 3.5 GB | 25.8 GB | **53.7 GB** | 82.9 GB |
+| 2^31 (2147M) | 27.9 GB | 206.2 GB | **429.5 GB** | 663.6 GB |
+
+The cache is **65% of the footprint** at `J = 50` — the largest single object, 8× the state list. So
+`CLAUDE.md`'s "prefer `cache_level[0] = 1`" is right at the sizes it was measured at and *becomes
+impossible* exactly where scaling matters. On a 16 GB node at `N = 2^28`, 14 of 50 groups fit.
+
+**And the penalty for turning it off is much worse at n=100 than the recorded 7-11x.** Measured at
+n=100, N=200k, J=16 with the word-based search: an uncached matvec is **59.8x** slower (106.4 ms against
+1.8 ms), and the precompute breaks even after **1.5 matvecs** against a solve's 100-300. The gap widened
+because the wide-row search is intrinsically dearer per call, so at n=100 the two `cache_level[0]`
+settings are "does not fit" and "60x slower".
+
+**The partial-J dial is the answer, and `docs/scaling-pocs.md` §2 already scoped it: "only worth
+building if the full cache genuinely does not fit — otherwise always cache everything."** At n=100 with
+large N that condition is now met, which it was not when that POC ran. Re-measured with the current
+implementation, caching `J'` of `J = 16` groups and recomputing the rest:
+
+| `J'` | cache | matvec |
+| --- | --- | --- |
+| 0 | 0 MB | 106.0 ms |
+| 4 | 3.2 MB | 79.6 ms |
+| 8 | 6.4 MB | 54.6 ms |
+| 12 | 9.6 MB | 28.2 ms |
+| 16 | 12.8 MB | 1.7 ms |
+
+Linear in `J'` as the POC found, so it is a genuine continuous dial rather than a step. The API shape
+this wants is a **memory budget**, not a mode: cache `floor(budget / (4N))` groups. Note the last step
+(12 -> 16) is disproportionate, so the endpoint is still special — a partial cache never reaches the
+full-cache time.
+
+**Four literature techniques do not transfer, all for the same reason.** Lin tables, DanceQ's
+divide-and-conquer (`tmp/2407.14591v2.pdf`), selected-CI residue arrays and rank-select all assume the
+basis is *characterized* — every state at fixed particle number — so "how many states precede this one"
+is a closed-form combinatorial count (DanceQ Eqs. 15/19/20/23 are all `D_Q(L, n)` binomials). An SQD
+subspace is a **sampled subset**: that count exists only in the sampled list, so the offsets and strides
+those methods need do not exist and no subsystem partitioning creates them. DanceQ's §4.4 conclusion
+does transfer though, and it is the one above: for a matrix-free matvec *"the memory footprint of each
+worker process should be the guiding principle"*, because runtime depends only weakly on the lookup
+scheme. For calibration, their state of the art is 46 spins on ~256 nodes at 512 GiB each.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is
