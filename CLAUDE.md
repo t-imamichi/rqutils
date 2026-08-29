@@ -281,10 +281,21 @@ silent no-op.
 **`states` must be replicated today, but that is not fundamental** (investigated 2026-08-30). The
 `13 * N` per-device cost is 27.9 GB at `N = 2^31` and is the one term the `(0,0)` floor cannot shed.
 What fails on a partitioned `[N, B]` is only `searchsorted` — `bitwise_xor` and `_pack_state_keys` shard
-fine. Wietek & Läuchli (*Phys. Rev. E* **98**, 033309) solve it with **hash-by-prefix ownership plus a
-local binary search**: no distribution metadata, `N/d` rows searched per rank, one `Alltoallv`. All three
-ingredients verified in JAX (`shard_map` + `all_to_all` + local `searchsorted`), and a minimal prototype
-is **bit-identical to `get_xsource`** at 4.0× less per-device memory with zero all-gathers. **Viable only
+fine. Wietek & Läuchli (*Phys. Rev. E* **98**, 033309) solve it with **hash ownership plus a local binary
+search**: no distribution metadata, `N/d` rows searched per rank, one `Alltoallv`. All three ingredients
+verified in JAX (`shard_map` + `all_to_all` + local `searchsorted`), and a prototype is **bit-identical
+to `get_xsource`** at 16× less per-device memory with zero all-gathers. **Hash the whole key, not the
+prefix as published** — a banded subspace (excitations confined to low qubits) has *one* distinct prefix
+and collapses to **16.00× imbalance at d=16**, the same low-entropy-high-bits failure `poc11` recorded
+for range splitting. Whole-key hashing measures 1.01–1.14× on uniform, fixed-weight, banded and
+Zipf-sampled fixtures, and its residual imbalance is Poisson in `N/d` (checked against balls-in-bins),
+so keep `N/d` ≳ 1000. It costs the free local sort — each shard needs its own — which is `poc11`'s
+phase 3, run once at setup. The variable-count routing has a primitive — `jax.lax.ragged_all_to_all`,
+whose published defect (broken reverse-mode rule, "forward-only") is irrelevant since `get_xsource`
+returns indices and is never differentiated — but it is **`UNIMPLEMENTED` on XLA:CPU**, so it cannot be
+tested here. The padded fallback costs 0.4% at `N=2^31, d=64`, and **its capacity is computable from
+`N/d` alone**, which is exactly what the Bloom pre-filter's `cap` was not (there `cap = hits + FP` with
+`hits` the unknown, collapsing to `cap = N`). Raise, do not clamp. **Viable only
 at `cache_level[0] = 1`** — the routing is then paid `J` times per solve, not `J × niter`. Do **not** cite
 DanceQ as precedent: its closed-form index map needs a *complete* symmetry sector, which a sampled
 subspace is not. A project, not a patch; `NOTES.md` has the cost table and what is unbuilt.
