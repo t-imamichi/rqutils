@@ -1222,6 +1222,88 @@ groups. That is the open question this investigation actually surfaced.
 which isolates `K` cleanly but is not a physical Hamiltonian's structure — 1D Heisenberg spreads them
 across `J = n` groups. The crossover arithmetic is structure-independent; the timing ratios are not.
 
+
+### A partial *diagonal* cache works, composes into a solve, and selects a diagonal-only dial (2026-08-30)
+
+The open question the entry above surfaced: `cache_level[1]` is all-or-nothing across X groups, so
+level 2's 808 B/slot at `J=101` cannot be traded down. Prototyped outside the library as two summed
+`_apply_h_kernel` calls -- `(1, 2)` over the first `J'` groups, `(1, 0)` over the rest -- and measured.
+**It works, and unlike the Bloom pre-filter it survives composition into a solve.**
+
+**Real `sqd()` solves**, n=100, J=100, K=99, N=50,072, `states_size` 65536. Every arm returned
+`-52.23606798`, identical to 8 decimals:
+
+| `J'` | diagonal store | memory saved | solve | vs all-cached |
+| --- | --- | --- | --- | --- |
+| 0 | 0 MB | 100% | 3243.8 ms | 5.13× |
+| 25 | 13.1 MB | 75% | 2004.9 ms | **3.17×** |
+| 50 | 26.2 MB | 50% | 1552.2 ms | **2.45×** |
+| 75 | 39.3 MB | 25% | 1091.0 ms | 1.73× |
+| 100 | 52.4 MB | 0% | 632.3 ms | 1.00× |
+
+So **half the diagonal memory for 2.45×**, or 75% of it for 3.17×. At `J=101, K=100` that is
+808 → 404 B/slot; against the 24M-slot budget above, `(1, 2)`'s 43.5 GB → ~24 GB.
+
+**Why it composes where the filter did not, which is the transferable part.** The implied matvec count
+is **129**, stable across n=40/60/100 (from `(s10 - s12) / (mv10 - mv12)`). The diagonal cache is
+*consumed* ~129 times per solve, so a per-matvec saving multiplies; the filter targeted a one-off
+precompute at 4.5–8.4% of a solve, so Amdahl divided it. Matvec ratios of 5.0–8.2× became solve ratios
+of **3.59–5.13×** — compression, not collapse. **The question to ask of any `sqd` optimization is how
+many times per solve its target is paid**, and it is the same "weighted by call count" distinction that
+made the filter look worth building.
+
+**Three ways this axis behaves better than `xcache_groups` does on its own:**
+
+- **Linear and monotonic**, no cliff. The X axis "never reaches full-cache time" with a
+  disproportionate last step; this one lands on it.
+- **Peak temp memory does not regress.** Flat at **1.1 MB** across every intermediate split against
+  0.0–0.5 MB at the endpoints (XLA `memory_analysis`), i.e. 3.5% of the 31.5 MB store at J=60 — where
+  the X-axis split measured 9.0 MB against 10.4 MB, a large fraction of its cache. End-to-end the
+  two-arm overhead is **nil**: `J' = J` measured 632.3 ms against the single-kernel 649.1 (1.027×,
+  noise).
+- **Bit-identical at every split** — `max |Δ|` exactly `0.00e+00` against the all-cached reference at
+  every `J'`, at both n=60 and n=100.
+
+**The projection model was validated against points it was not calibrated on**, since `NOTES.md`
+records the analogous X-axis model drifting 17.5% mid-range. Calibrating
+`solve(J') = fixed + niter * matvec(J')` on the two endpoints only (`niter = 129`, `fixed = 245.9 ms`)
+and testing the middle:
+
+| `J'` | projected | measured | residual |
+| --- | --- | --- | --- |
+| 25 | 2050.7 | 2004.9 | +2.3% |
+| 50 | 1665.6 | 1552.2 | **+7.3%** |
+| 75 | 1207.3 | 1091.0 | **+10.7%** |
+
+Worst non-calibration residual **10.7%**, and it errs *pessimistic* — real solves beat the projection.
+Better than the X axis's 17.5%, and the same rule follows: **a budget API can size the cache by exact
+arithmetic and must not advertise a runtime.**
+
+**Two constraints any design must respect, both measured.**
+
+**Do not split both axes.** Not because of the arm count, but because `cache_level[0] = 0` is
+catastrophic per matvec: over all J groups at n=60, `(0, 2)` costs **73.97 ms against `(1, 2)`'s
+1.80** — a **41×** gap, consistent with the documented 59.8×. Any X-axis split reintroduces it, so a
+shared split point across both axes would pay 41× to save diagonal bytes. A four-arm prototype measured
+39.37 ms against the two-arm 4.97 at the same diagonal split, and the cause is that arm's presence, not
+the arm count. **The two axes are not symmetric: the diagonal axis is cheap to split (5.1× spread), the
+X axis is expensive (41×).** So the dial belongs on the diagonal axis alone, orthogonal to
+`xcache_groups`, with `cache_level[0]` left at 1.
+
+**One compiled variant per distinct `J'`, and power-of-two rounding does not help — it makes it worse.**
+13 distinct splits produced 13 variants; rounding `J'` up to a power of two produced **16**, because
+both arms' lengths vary together (`xs[:jr]` and `xs[jr:]` are two shapes, and the complement is not a
+power of two). This is unlike the pre-filter's `cap`, where rounding bounded the count. Acceptable
+because `J'` is static per solve, but a caller sweeping it pays one compile per value, and that must be
+documented rather than discovered.
+
+**Caveats.** One laptop CPU. `N` ≈ 50k with `states_size` 65536 in every run, so the flat 1.1 MB peak
+is **unconfirmed at large `N`**, which is where the dial would matter — that is the first thing to
+measure next. Fixtures are 1D Heisenberg with a subspace half-closed under a weight-preserving hop, not
+sampled from a circuit. The intermediate solves came from throwaway `run_sqd` instrumentation behind an
+env var, since `sqd` has no such parameter; it was removed and the file restored from a `cp` backup
+(626 passed after).
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is

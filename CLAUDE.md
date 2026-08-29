@@ -240,6 +240,17 @@ entry point; `hproj(...)` is the dense/debug path. Two conventions dominate:
   because it should be chosen. **`diag_signs` is not a compression target** — it is already one bit per
   (state, Z term), so the 1313 B/slot is its information-theoretic size, not slack. Cutting the diagonal
   axis needs *partial* caching over groups (the `xcache_groups` sibling), which does not exist. `NOTES.md`.
+- **A partial *diagonal* cache is measured and works, but is not implemented** (2026-08-30). Prototyped
+  as two summed kernels, `(1, 2)` over the first `J'` groups and `(1, 0)` over the rest: **half the
+  diagonal memory for 2.45×, 75% of it for 3.17×**, through real `sqd()` solves at n=100, J=100,
+  bit-identical energies at every split. Unlike the Bloom filter it **survives composition into a
+  solve**, because the diagonal cache is consumed ~129 times per solve where the filter's target was a
+  one-off — *ask how many times per solve a target is paid* before believing a matvec ratio. Two
+  constraints if it is ever built: **do not split both axes** (`(0, 2)` is 41× `(1, 2)` per matvec, so
+  any X split pays that to save diagonal bytes — the dial belongs on the diagonal axis alone, with
+  `cache_level[0]` at 1), and **one compiled variant per distinct `J'`**, which power-of-two rounding
+  makes *worse*, not better (13 splits → 13 variants, rounded → 16). Peak temp memory does **not**
+  regress here, unlike the X axis. Unconfirmed at large `N`. `NOTES.md`.
   **Quote `K` with any memory figure and never size from `4 * J * N` alone** — a fit taken at `K=1` was
   3.0x wrong for `(1, 1)`. `states_size` also rounds **up to a power of two**: N=24M allocates 33.6M
   slots.
