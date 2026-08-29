@@ -145,6 +145,21 @@ larger effect than the :math:`4 J N` bytes it reclaims -- measured end-to-end at
 returning the same energy. Prefer ``cache_level[0] = 1`` unless the memory genuinely will not fit; the
 diagonal axis is where the real memory-versus-speed judgement lies.
 
+**On that axis, ``cache_level[1] = 1`` is dominated -- prefer 0 or 2.** It caches ``diag_signs``, one
+bit per (state, Z term), then re-derives the diagonal from it on every matvec. Measured end-to-end at
+n=22, N=25k, over :math:`K \in \{16, 64, 128\}`: it is **16-31% slower than ``[1] = 0``** (which
+stores nothing) and **2.2-7.6x slower than ``[1] = 2``**, at every :math:`K`, on both settings of
+``cache_level[0]``, all six levels returning the same energy. The mechanism is that unpacking the
+cached bits costs about what recomputing the parity does (3.16 ms against 2.83 ms per group at
+:math:`K = 128`), so the cache is paid for in bytes and then largely redone in time.
+
+It is also *memory*-dominated once :math:`\lceil K/8 \rceil` reaches the coefficient itemsize --
+:math:`K \geq 64` for float64, :math:`K \geq 128` for complex128 -- since it stores
+:math:`\lceil K/8 \rceil` bytes per state per group against level 2's fixed 8 or 16. That crossover is
+exact arithmetic, not a fit. Below it level 1 is the smaller array, which is its only remaining claim,
+and ``[1] = 0`` is smaller still at zero. Level 1 is retained because the ``cache_level`` sweep is
+load-bearing in the test suite, not because a caller should select it.
+
 When it will not fit, ``xcache_groups`` caches ``J'`` of the ``J`` X groups instead of all or none --
 see :func:`sqd`. Two caveats measured after it shipped: an intermediate ``J'`` can *raise* peak memory,
 since the split runs two matvec kernels, and on a Hamiltonian with many Z signatures per X group the

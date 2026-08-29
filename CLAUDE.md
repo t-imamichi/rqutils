@@ -231,6 +231,26 @@ entry point; `hproj(...)` is the dense/debug path. Two conventions dominate:
   `K`**, the Z signatures per X group — a property of the Hamiltonian, not the subspace. At `K=1` the
   source cache leads; at `J=101, K=100` (1D Heisenberg, n=100) `diag_signs` is 1313 B/slot against its
   404, so `(0, 0)` measures 4.0 GB against `(1, 1)`'s 60.6 GB and `cache_level[1]` is the bigger lever.
+- **Never select `cache_level[1] = 1`; use 0 or 2.** Measured 2026-08-30: it is 16–31% slower than
+  `[1] = 0`, which stores *nothing*, and 2.2–7.6× slower than `[1] = 2`, at every `K` in {16, 64, 128}
+  on both `cache_level[0]` rows. `L1 use ≈ L0 build` is why — unpacking the cached bits costs about what
+  recomputing the parity costs, so it buys bytes and redoes the time. It is *also* the larger array once
+  `ceil(K/8)` reaches the coefficient itemsize (`K ≥ 64` float64, `K ≥ 128` complex128 — exact
+  arithmetic, not a fit). It stays in the API because the `cache_level` sweep is load-bearing, not
+  because it should be chosen. **`diag_signs` is not a compression target** — it is already one bit per
+  (state, Z term), so the 1313 B/slot is its information-theoretic size, not slack. Cutting the diagonal
+  axis needs *partial* caching over groups (the `xcache_groups` sibling), which does not exist. `NOTES.md`.
+- **A partial *diagonal* cache is measured and works, but is not implemented** (2026-08-30). Prototyped
+  as two summed kernels, `(1, 2)` over the first `J'` groups and `(1, 0)` over the rest: **half the
+  diagonal memory for 2.45×, 75% of it for 3.17×**, through real `sqd()` solves at n=100, J=100,
+  bit-identical energies at every split. Unlike the Bloom filter it **survives composition into a
+  solve**, because the diagonal cache is consumed ~129 times per solve where the filter's target was a
+  one-off — *ask how many times per solve a target is paid* before believing a matvec ratio. Two
+  constraints if it is ever built: **do not split both axes** (`(0, 2)` is 41× `(1, 2)` per matvec, so
+  any X split pays that to save diagonal bytes — the dial belongs on the diagonal axis alone, with
+  `cache_level[0]` at 1), and **one compiled variant per distinct `J'`**, which power-of-two rounding
+  makes *worse*, not better (13 splits → 13 variants, rounded → 16). Peak temp memory does **not**
+  regress here, unlike the X axis. Unconfirmed at large `N`. `NOTES.md`.
   **Quote `K` with any memory figure and never size from `4 * J * N` alone** — a fit taken at `K=1` was
   3.0x wrong for `(1, 1)`. `states_size` also rounds **up to a power of two**: N=24M allocates 33.6M
   slots.
