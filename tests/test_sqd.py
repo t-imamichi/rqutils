@@ -326,6 +326,120 @@ class TestGetXsource:
         )
 
 
+class TestPartialXCache:
+    """``xcache_groups`` caches the first J' X groups and recomputes the rest.
+
+    The dial exists because ``cache_level[0]``'s two settings are ``4 * J * N`` bytes and nothing, and
+    at n=100 that is "does not fit" against 59.8x slower (``NOTES.md``), so the intermediate values are
+    the useful ones. Memory is linear in the count.
+    """
+
+    @pytest.mark.parametrize("cache_level", [(1, 0), (1, 1), (1, 2)])
+    def test_every_split_matches_the_full_cache(self, cache_level):
+        """Defect: a split that drops or double-counts a group, i.e. a wrong energy.
+
+        The cached and uncached arms carry different X arrays -- int32 indices against uint8
+        signatures -- so they cannot share one scanned leading axis and the matvec becomes a sum of two
+        kernels. That sum is where a group can go missing or be applied twice, and either shows up as a
+        plausible finite eigenvalue rather than an error, since a subspace with a term dropped is still
+        a valid variational problem. So the reference is the *full* cache at the same
+        ``cache_level``, and every J' from 0 to J must reproduce it.
+
+        The diagonal axis is swept too because it is sliced by the same index: ``hamiltonian.z``,
+        ``diag_signs`` and ``diagonals`` all carry the X group on their leading axis, so a
+        transposed or unsliced diagonal would survive ``cache_level[1] == 2`` and fail the others.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        rng = np.random.default_rng(11)
+        num_qubits = 8
+        labels = ["".join(rng.choice(list("IXYZ"), size=num_qubits)) for _ in range(8)]
+        hamiltonian = PauliSumXZ.from_paulisum((labels, rng.normal(size=len(labels)).tolist()))
+        num_groups = hamiltonian.x.shape[0]
+        states = np.unique(rng.integers(0, 2, size=(40, num_qubits), dtype=np.uint8), axis=0)
+
+        reference = sqd(hamiltonian, states, cache_level=cache_level, return_eigvec=False)
+        for ncached in range(num_groups + 1):
+            got = sqd(
+                hamiltonian,
+                states,
+                cache_level=cache_level,
+                xcache_groups=ncached,
+                return_eigvec=False,
+            )
+            assert got == pytest.approx(reference, abs=1e-10), (
+                f"cache_level={cache_level}, xcache_groups={ncached}: {got} against {reference} for "
+                f"the full cache -- a group is dropped, double-counted, or paired with the wrong "
+                f"diagonal slice"
+            )
+
+    def test_none_and_full_count_agree(self):
+        """``None`` and ``num_groups`` are the same subspace, reached by different graphs.
+
+        ``None`` keeps the single-arm path -- one kernel, no tail tuple -- while an explicit full count
+        would take the two-arm path with an empty second arm. The library resolves the latter to the
+        former (``ncached < njgroups`` is false), so this pins that they agree rather than that one is
+        a special case of the other.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        rng = np.random.default_rng(12)
+        num_qubits = 6
+        labels = ["".join(rng.choice(list("IXYZ"), size=num_qubits)) for _ in range(4)]
+        hamiltonian = PauliSumXZ.from_paulisum((labels, [1.0] * len(labels)))
+        states = np.unique(rng.integers(0, 2, size=(20, num_qubits), dtype=np.uint8), axis=0)
+        num_groups = hamiltonian.x.shape[0]
+
+        implicit = sqd(hamiltonian, states, xcache_groups=None, return_eigvec=False)
+        explicit = sqd(hamiltonian, states, xcache_groups=num_groups, return_eigvec=False)
+        assert implicit == pytest.approx(explicit, abs=1e-12)
+
+    def test_rejects_values_that_would_otherwise_clamp_or_no_op(self):
+        """Three silent misuses, each returning the right answer at the wrong cost.
+
+        Out of range the slice would clamp -- ``J' > J`` caches everything, a negative caches nothing.
+        With ``cache_level[0] == 0`` there is no cache to make partial, so the argument is a pure
+        no-op that reads as "partial caching does not help on my problem". And ``True`` would slice as
+        ``1`` through Python's bool-is-int rule, caching exactly one group.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        hamiltonian = PauliSumXZ.from_paulisum((["IIXX", "ZZII"], [1.0, 1.0]))
+        states = np.array([[0, 0, 0, 0], [0, 0, 0, 1], [1, 1, 0, 0]], dtype=np.uint8)
+        num_groups = hamiltonian.x.shape[0]
+
+        with pytest.raises(ValueError, match="X groups"):
+            sqd(hamiltonian, states, xcache_groups=num_groups + 1, return_eigvec=False)
+        with pytest.raises(ValueError, match="X groups"):
+            sqd(hamiltonian, states, xcache_groups=-1, return_eigvec=False)
+        with pytest.raises(ValueError, match="no source-index cache"):
+            sqd(hamiltonian, states, cache_level=(0, 0), xcache_groups=1, return_eigvec=False)
+        with pytest.raises(TypeError, match="must be None or an int"):
+            sqd(hamiltonian, states, xcache_groups=True, return_eigvec=False)
+
+    def test_partial_cache_keeps_states_for_the_uncached_arm(self):
+        """Defect: ``needs_states`` false on a partial cache, so the uncached arm gets ``None``.
+
+        ``cache_level=(1, 2)`` reads neither signature array, so the full-cache path drops ``states_u``
+        entirely -- that is the documented point of the most aggressive level. A partial cache breaks
+        that: the uncached groups search ``states`` inside every matvec. If ``needs_states`` were left
+        as the level's own value the kernel would receive ``None`` and raise, so this pins the
+        override rather than the absence of a crash.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        rng = np.random.default_rng(13)
+        num_qubits = 6
+        labels = ["".join(rng.choice(list("IXYZ"), size=num_qubits)) for _ in range(4)]
+        hamiltonian = PauliSumXZ.from_paulisum((labels, [1.0] * len(labels)))
+        states = np.unique(rng.integers(0, 2, size=(20, num_qubits), dtype=np.uint8), axis=0)
+
+        # (1, 2) is the level that would otherwise pass states=None.
+        reference = sqd(hamiltonian, states, cache_level=(1, 2), return_eigvec=False)
+        got = sqd(hamiltonian, states, cache_level=(1, 2), xcache_groups=1, return_eigvec=False)
+        assert got == pytest.approx(reference, abs=1e-10)
+
+
 class TestUniquifyStates:
     """``uniquify_states`` sorts, deduplicates, and pads to a fixed size with 255 fillers."""
 
@@ -2164,6 +2278,47 @@ class TestShardedCacheLevels:
         for cache_level, (single, sharded) in sorted(seen.items()):
             assert single == pytest.approx(sharded, abs=1e-12), (
                 f"cache_level={cache_level}: sharded {sharded} disagrees with single-device {single}"
+            )
+
+
+class TestShardedPartialXCache:
+    """A partial source-index cache must agree with single-device on a 4-device mesh.
+
+    Runs as a subprocess for the same reason as ``TestShardedCacheLevels``: the virtual device count
+    has to be set before jax initializes.
+
+    **This is the only test that can see the guard it exists for.** ``run_sqd`` reshards ``states_u``
+    after the precompute because no further searches happen -- true for a full cache, false for a
+    partial one, whose uncached groups search ``states`` inside every matvec, and ``get_xsource``
+    requires that array replicated. Deleting the ``not partial_xcache`` condition on that reshard
+    leaves all six ``TestPartialXCache`` cases **green** and raises on any mesh. Verified by mutation,
+    which is why this exists rather than being folded into the in-process class.
+    """
+
+    def test_partial_cache_agrees_with_single_device_on_a_mesh(self):
+        stdout = run_sharded_child("_sharded_partial_xcache.py", "sqd")
+
+        single = None
+        seen = {}
+        for line in stdout.strip().splitlines():
+            parts = line.split()
+            if parts[:1] == ["single"] and len(parts) == 2:
+                single = float(parts[1])
+            elif parts[:1] == ["mesh"] and len(parts) == 5:
+                seen[(int(parts[1]), int(parts[2]), int(parts[3]))] = float(parts[4])
+
+        assert single is not None, f"child printed no single-device baseline:\n{stdout[-2000:]}"
+        # Assert the grid is complete before checking values, so a child that died partway through
+        # cannot pass on the cells it managed to print.
+        expected = {(1, j, n) for j in (0, 1, 2) for n in range(7)}
+        assert set(seen) == expected, (
+            f"expected {len(expected)} (cache_level, xcache_groups) cells, got {len(seen)} -- the "
+            f"child did not run the full sweep:\n{stdout[-2000:]}"
+        )
+        for key, value in sorted(seen.items()):
+            assert value == pytest.approx(single, abs=1e-12), (
+                f"cache_level=({key[0]}, {key[1]}), xcache_groups={key[2]}: sharded {value} "
+                f"disagrees with single-device {single}"
             )
 
 
