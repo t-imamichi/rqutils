@@ -665,6 +665,50 @@ does transfer though, and it is the one above: for a matrix-free matvec *"the me
 worker process should be the guiding principle"*, because runtime depends only weakly on the lookup
 scheme. For calibration, their state of the art is 46 spins on ~256 nodes at 512 GiB each.
 
+### A Bloom filter breaks the `2^n` dependency the exact bitmap could not (2026-08-29)
+
+The exact membership bitmap in the rank-select family is `2^n / 8` bytes, so it dies at n≈34 no matter
+how sparse the subspace is — it indexes the *Hilbert space*. **A Bloom filter sizes by `N` instead**, so
+the `2^n` term disappears entirely:
+
+| target FP | bits/item | k | at N=24M | at N=2^31 | exact bitmap, any N |
+| --- | --- | --- | --- | --- | --- |
+| 10% | 4.79 | 3 | 14 MB | 1.3 GB | n=30: 0.13 GB |
+| 1% | 9.59 | 7 | 29 MB | 2.6 GB | n=34: 2.15 GB |
+| 0.1% | 14.38 | 10 | 43 MB | 3.9 GB | n=40: **137 GB** |
+
+**False positives are safe here, and that is not generally true of a filter.** `get_xsource` ends with
+an explicit equality test (`found = keys[pos] == target_keys`, and `jnp.all(W[pos] == Wt)` on the wide
+path), so a false positive costs one wasted `searchsorted` that then correctly reports absent. The output
+stays **exact**. False negatives would be fatal, and a Bloom filter cannot produce them. Verified
+bit-identical against `get_xsource` at every setting measured below.
+
+Measured, `jit`-compiled, splitmix64-style mixing (k hashes from one key, no tables):
+
+| n | N | FP measured | filter memory | speedup | exact bitmap |
+| --- | --- | --- | --- | --- | --- |
+| 30 | 4M | 1.02% | 4.8 MB | 2.76× | 134 MB, 4.09× |
+| 30 | 4M | 0.13% | 7.2 MB | 2.87× | 134 MB, 4.09× |
+| **100** | 1M | 1.01% | **1.2 MB** | **4.62×** | **1.6e29 bytes — impossible** |
+| **100** | 1M | 0.13% | **1.8 MB** | **4.50×** | **impossible** |
+
+The n=100 rows use a subspace closed under one bit flip at fixed Hamming weight, giving a realistic
+1.98% hit rate; a uniform-random fixture has ~0 partners and measures the easy case only (6.1–6.9×).
+
+Speedup degrades monotonically with hit rate, and **break-even is ~55%**, above which plain
+`searchsorted` wins. Measured FP holds at 1.00% throughout, independent of hit rate, as theory predicts:
+
+| hit rate | 0.2% | 5.2% | 25.1% | 50.1% | 100% |
+| --- | --- | --- | --- | --- | --- |
+| speedup | 3.83× | 2.82× | 1.89× | 1.13× | 0.72× |
+
+**Two caveats before this is worth building.** It shares the exact pre-filter's `cap` problem — the
+compaction needs a static candidate capacity, an undersized one drops hits silently, and the bound must
+now cover true hits *plus* false positives, so it is `N`-bounded in the worst case exactly as before.
+That is the blocking issue, not the memory. And these are single-signature measurements: the filter is
+built once per subspace and reused across all `J` groups, so a J-fold sweep should do better than the
+per-call figures here, but that is unmeasured.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is
