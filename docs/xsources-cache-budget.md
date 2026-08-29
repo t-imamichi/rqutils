@@ -1,7 +1,16 @@
 # Cutting the `xsources` cache: partial-J caching and a Bloom pre-filter
 
 A design note, not a change. Every number here is measured in-tree on one laptop CPU and recorded in
-`NOTES.md`; no library code implements any of it yet. Written after profiling an n=100 solve showed the
+`NOTES.md`.
+
+> **Status (2026-08-30): partial-J shipped as `xcache_groups`; the Bloom pre-filter is closed and will
+> not be built.** §7's open item — "nothing measured through a full `sqd()` solve" — was the load-bearing
+> one, and it resolves against the filter. The precompute is the only site the filter can attach to, and
+> it is **4.5–8.4%** of a `(1,*)` solve, so Amdahl caps the whole idea at **1.09×**. Worse, the path that
+> would save memory (`cache_level[0] = 0`, the uncached arm at `sqd.py:1876`) is inside the jitted
+> matvec, where the retry policy cannot go — so the filter accelerates the path that already fits and
+> cannot reach the one that does not. §§3–5 remain accurate about the filter *itself*; read them as a
+> measured component study, not a proposal. See `NOTES.md`, "The Bloom pre-filter is closed". Written after profiling an n=100 solve showed the
 scaling bottleneck is not where the rest of the scaling work has been aimed.
 
 ## Contents
@@ -217,6 +226,11 @@ belongs on the precompute.
 no capacity parameter and no silent-failure surface, and it delivers the linear curve in §2 on its own. The
 filter is strictly additive on top and can follow once the capacity policy is settled.
 
+**Outcome:** partial-J shipped as `xcache_groups` (`ae4bdee`). The capacity policy was then settled in §5
+— derive once per sweep, check every group, retry on overflow — so the filter was unblocked on that axis
+and still **will not be built**, for the two reasons in the banner above. The API sketch in this section
+is therefore historical; nothing in it is planned.
+
 ## 7. What is not claimed
 
 - **No GPU measurement.** All of the above is one laptop CPU. A GPU gather is better optimized relative to
@@ -228,8 +242,13 @@ filter is strictly additive on top and can follow once the capacity policy is se
   under a 4-device mesh: zero collectives, output spec identical to the baseline, exact. But `states`
   still costs `13 * N` bytes on every device — 27.9 GB per device at N=2^31 — which is a separate ceiling
   no filter can touch.
-- **Nothing measured through a full `sqd()` solve.** These are matvec and setup-path figures. The
-  composition into a solve is inferred from the module docstring's 66–97% setup share, not measured.
+- ~~**Nothing measured through a full `sqd()` solve.**~~ **Measured 2026-08-30, and it closes the
+  design.** These are matvec and setup-path figures, correct as such; composed into a solve they
+  multiply a **4.5–8.4%** share (n=30..80, 1D Heisenberg), for a ceiling of 1.09×. The module
+  docstring's 66–97% is a *different quantity* — weighted by call count, i.e. the cost of paying the
+  search per matvec against once — and is not headroom for accelerating the precompute. Reading it as
+  such is what made this look worth building; `NOTES.md`, "Two percentages that look contradictory",
+  reconciles them numerically.
 - **The linear model is not reliable enough to promise a runtime.**
   `t = J'*t_cached + (J-J')*t_bf` (ratio 7.6×) fits the endpoints exactly and the middle to 4–6% but
   drifts to **17.5% at `J' = 12`** (20.0 ms measured against 16.5 predicted). A budget can size the cache

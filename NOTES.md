@@ -1102,6 +1102,67 @@ matters at query time, and unusable because of a one-off cost. It would need a C
 that blocks the whole pre-filter family. Bloom stays the better candidate here purely because its build
 is one vectorized `np.bitwise_or.at` with no loop and no failure mode.
 
+
+### The Bloom pre-filter is closed: it cannot reach the path that needs it (2026-08-30)
+
+The six entries above measured the filter itself and settled every open mechanic — the capacity policy,
+the sharding, the hoisted precompute, the composition with `xcache_groups`. What none of them measured
+is the one thing `docs/xsources-cache-budget.md` §7 flagged as missing: **"nothing measured through a
+full `sqd()` solve."** Measured now, on 1D Heisenberg (`J = n`, `K = n-1`) with a fixture half-closed
+under a weight-preserving hop, and the answer closes the line.
+
+**Two structural facts, and either one alone is enough.**
+
+**1. The filter can only attach to the precompute, which is a one-off.** The retry policy is host-side
+sequencing (kernel → `int(ncand)` read → possibly a second kernel) and cannot live inside one `jit`.
+The uncached recompute is at `sqd.py:1876`, inside `_apply_h_kernel`'s `lax.scan`, and on the partial
+path it is `matvec`'s `scanned_tail` arm — called by `ground_locg` every iteration with no host
+interposition available. So the only reachable site is the `jax.lax.scan` at `sqd.py:1008`.
+
+Measured as a share of the solve it runs inside:
+
+| n | J | N | precompute, once | `(1,0)` solve | share |
+| --- | --- | --- | --- | --- | --- |
+| 30 | 30 | 37,817 | 36.0 ms | 469.8 ms | **7.7%** |
+| 40 | 40 | 75,241 | 99.9 ms | 1519.4 ms | **6.6%** |
+| 60 | 60 | 75,295 | 142.6 ms | 3134.1 ms | **4.5%** |
+| 80 | 80 | 75,187 | 356.3 ms | 4246.7 ms | **8.4%** |
+
+Flat at 4.5–8.4% with no trend in `n`. **Amdahl caps the whole idea at 1.09×** end-to-end, and that is
+with an infinitely fast filter. The hit rate is not the problem — it is 1.54–4.14%, deep inside the
+filter's paying region (break-even ~55%).
+
+**2. The filter is unreachable on the path the memory saving requires.** Saving memory means
+`cache_level[0] = 0` or a low `xcache_groups`, i.e. the uncached arm — exactly the site (1) rules out.
+So the filter accelerates the path that already fits and cannot touch the path that does not. The
+`(1,0) → (0,0) + BF` row in the first Bloom entry above reads as a 4.06× memory win, but `(0,0)` alone
+already delivers it: 4.0 GB against 4.1 GB with the filter. **The filter contributes 0.029 GB of
+overhead and no memory saving.**
+
+**Why the 5.6–9.4× figures do not transfer.** They are matvec-and-setup-path numbers, and they are
+correct as such. Composed into a solve they multiply a 4.5–8.4% share.
+
+### Two percentages that look contradictory and are both right (2026-08-30)
+
+Worth stating separately, because reading one as the other is what made the filter look worth building
+and cost a session:
+
+- **"`get_xsource` setup is 66–97% of a solve"** (module docstring, `NOTES.md` above,
+  `docs/scaling-pocs.md`) is **weighted by call count**. It is the cost of paying the `J`-fold search
+  *per matvec* against paying it once — i.e. what `cache_level[0] = 0` actually costs.
+- **4.5–8.4%** is the precompute measured **once**, as a fraction of the `(1,*)` solve it runs inside.
+
+Both describe `sqd.py:1008`; they differ in how many times the work is counted.
+`docs/skqd-sqd-solve-tolerance.md` already confirmed the first "correct as stated" and named this exact
+trap — *"an earlier 3–23% figure measured one `get_xsource` call as a fraction of a solve — a different
+quantity."* **Reconciled numerically**, which is what makes them one fact rather than two: at n=40,
+J=40, `t(0,0)/t(1,0) = 8.76×` (on `NOTES.md`'s stated trend — 7.2× at J=23, 5.7× at J=12, 9.3× at
+J=52) and `t(0,0)/t_precompute = 133`, i.e. the same work paid ~133 times against once.
+
+**So there is no stale claim here to correct.** Quote the 66–97% for "should I turn source caching
+off", never as headroom for accelerating the precompute — the second question needs the one-off share,
+and Amdahl applies to that one.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is

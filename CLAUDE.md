@@ -221,8 +221,11 @@ entry point; `hproj(...)` is the dense/debug path. Two conventions dominate:
   uniquification are `255`, detected via `states_u[:, 0] >> 7`.
 - `cache_level=(source_indices, diagonals)` selects among six matvec strategies. The source-index axis
   is near-free to enable and very expensive to disable — **prefer `cache_level[0] = 1`** (`get_xsource`
-  setup is 66–97% of a solve; see `NOTES.md`). **`xcache_groups=J'` makes that axis a dial** rather than
-  a switch, caching `J'` of the `J` X groups; `None` (the default) is byte-identical to before. Two
+  setup is 66–97% of a solve; see `NOTES.md`). That figure is **weighted by call count** — the cost of
+  paying the `J`-fold search per matvec against once — and is *not* headroom for accelerating the
+  precompute, which is only 4.5–8.4% of a `(1,*)` solve. Reading it as the latter is a recorded trap
+  (`NOTES.md`, "Two percentages that look contradictory"). **`xcache_groups=J'` makes that axis a
+  dial** rather than a switch, caching `J'` of the `J` X groups; `None` (the default) is byte-identical to before. Two
   things measured after it shipped, both in `NOTES.md`: an *intermediate* `J'` can **raise** peak memory
   (two kernels instead of one — 9.0 MB against 10.4 MB at `J=16`), and **which axis dominates is set by
   `K`**, the Z signatures per X group — a property of the Hamiltonian, not the subspace. At `K=1` the
@@ -479,3 +482,16 @@ both belong in it.
 - **Subspace selection by weight shell + diagonal ranking was measured, then rejected** (2026-08-25) —
   sound results against a *uniform random* baseline, which is not what a real SQD workflow produces.
   Do not build on it.
+- **The Bloom pre-filter for `get_xsource` is closed** (2026-08-30). Six prototypes measured it
+  thoroughly and every mechanic was settled — capacity policy, sharding, hoisted precompute,
+  composition with `xcache_groups` — and it is still not worth building, for two structural reasons.
+  **It can only attach to the precompute** (the retry policy is host-side sequencing and cannot live
+  inside one `jit`; the uncached recompute at `sqd.py:1876` is inside `_apply_h_kernel`'s scan, called
+  every iteration), and that precompute is **4.5–8.4%** of a `(1,*)` solve, so Amdahl caps it at
+  **1.09×**. And **the path that would save memory is the one it cannot reach**: `(0,0)` already costs
+  4.0 GB against 4.1 GB with the filter, so the filter is 0.029 GB of overhead and no saving. The
+  published 5.6–9.4× figures are matvec-path, not end-to-end. Three variants were separately rejected —
+  as the subspace *definition* (dead past n≈70, FP count scales `2^n`), for input dedup (0.64–0.79×
+  against `np.unique`), and binary fuse (better query, ~60 s build at N=24M).
+  `docs/xsources-cache-budget.md`, detail in `NOTES.md`. **The memory lever is the diagonal axis, not this one** — `diag_signs` is
+  1313 B/slot against `xsources`' 404 at `J=101, K=100`, and it is uninvestigated.
