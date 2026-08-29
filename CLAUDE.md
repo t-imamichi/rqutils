@@ -174,6 +174,10 @@ Rules, each of which cost a defect to learn — **evidence in `NOTES.md`**:
   exactly 0.0, so "correct but silently unsharded" is invisible to value comparison.
 - **Multi-device paths are testable on CPU** via `--xla_force_host_platform_device_count=4`. Use it for
   correctness only — timings under virtual devices are meaningless.
+- **A guard on a sharding decision may be invisible single-device.** Deleting the `not partial_xcache`
+  condition on `run_sqd`'s post-precompute reshard left all six in-process `TestPartialXCache` cases green
+  and raised on every mesh (`get_xsource` needs `states` replicated). If a change touches resharding, add
+  a `tests/_sharded_*.py` case and mutation-test it *there*; `conftest.run_sharded_child` is the driver.
 - `examples/scaling/poc7_sharding.py` is the fuller sharding harness. Run it after any change to
   `ground_locg`'s reductions or helper signatures, not just after touching `sqd`.
 - `svsim` requires **`mesh.size` to divide `2^num_qubits`** — documented rather than fixed, since a
@@ -220,10 +224,13 @@ entry point; `hproj(...)` is the dense/debug path. Two conventions dominate:
   setup is 66–97% of a solve; see `NOTES.md`). **`xcache_groups=J'` makes that axis a dial** rather than
   a switch, caching `J'` of the `J` X groups; `None` (the default) is byte-identical to before. Two
   things measured after it shipped, both in `NOTES.md`: an *intermediate* `J'` can **raise** peak memory
-  (two kernels instead of one — 9.0 MB against 10.4 MB at `J=16`), and on a real high-`K` Hamiltonian the
-  **diagonal** axis is the bigger lever anyway (`diag_signs` is 1313 B/slot against the source cache's
-  404 at `J=101, K=100`, so `(0, 0)` measures 4.0 GB against `(1, 1)`'s 60.6 GB). Do not size memory from
-  `4 * J * N` alone.
+  (two kernels instead of one — 9.0 MB against 10.4 MB at `J=16`), and **which axis dominates is set by
+  `K`**, the Z signatures per X group — a property of the Hamiltonian, not the subspace. At `K=1` the
+  source cache leads; at `J=101, K=100` (1D Heisenberg, n=100) `diag_signs` is 1313 B/slot against its
+  404, so `(0, 0)` measures 4.0 GB against `(1, 1)`'s 60.6 GB and `cache_level[1]` is the bigger lever.
+  **Quote `K` with any memory figure and never size from `4 * J * N` alone** — a fit taken at `K=1` was
+  3.0x wrong for `(1, 1)`. `states_size` also rounds **up to a power of two**: N=24M allocates 33.6M
+  slots.
 
   The six strategies are one kernel indexed by that 2×3 grid, reached two ways. The **public `apply_h`
   is keyword-only**: name the arrays you have and the strategy follows (see "Known rough edges" for the
@@ -416,6 +423,22 @@ in isolation, **A/B both arms warm** — changing a traced expression invalidate
 and one cold run measured 125 s against a warm 20 s, which reads as a catastrophic regression and is
 not one — and **verify the referent of a cross-reference, not just that it resolves**. All four with
 numbers in `NOTES.md`.
+
+**Pass arrays as arguments to a `jit`ted benchmark, never close over them.** XLA constant-folds a
+closed-over input, so the work happens once at trace time and every later call measures nothing —
+0.175 ms against a true 40.8 ms for `uniquify_states` at N=200k, a 233x phantom speedup. The tell is a
+`slow_operation_alarm ... Constant folding an instruction` line in the log, not an error.
+
+**For memory and compilation counts, ask XLA rather than a formula.**
+`fn.lower(*args).compile().memory_analysis().temp_size_in_bytes` gives peak temp bytes and
+`fn._cache_size()` counts compiled variants. Both caught claims a byte count got wrong: `4 * J' * N`
+predicts a linear saving where the measured peak *rose* (9.0 MB against 10.4 MB).
+
+**A broken arm flatters its own benchmark.** An undersized capacity, a dropped term, a truncated
+candidate list all do *less work*, so they report a *better* number. Two instances: a 16384-slot cap
+against 17913 candidates reported 5.7x where the honest figure was 8.0x, and a `vmap` whose batch axis
+came out last read as "numerically wrong" until the shapes were compared. Verify the output before
+quoting the time.
 
 ## Known rough edges
 
