@@ -614,7 +614,42 @@ read the shipped `uniquify_states` change as a step toward an out-of-core one; t
 Two things the POC's own docstring already says, confirmed here and worth not rediscovering: chunking
 removes the single-device *sort* but **distributes nothing** (sequential merge, full result on one
 host), and a real multi-node uniquify needs a range-partitioned shuffle, for which chunk-local sorting
-is the per-node kernel and not the algorithm. That shuffle is untried.
+is the per-node kernel and not the algorithm.
+
+### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
+
+That shuffle was then built. **It is the one design that removes the single-device sort**, and it is
+correct: output bit-identical to `np.unique(rows, axis=0)`, and **zero `all-gather` / `all-reduce` /
+`collective-permute`** in the compiled HLO. Sample sort with data-derived splitters, fixed-capacity
+buckets, then `NSH` independent `lax.sort`s under `vmap`. Concatenating buckets in splitter order is
+globally sorted, so no cross-bucket comparison ever happens.
+
+Four findings, each of which cost a wrong turn:
+
+- **Equal-range splitting collapses.** Splitting the packed most-significant word's nominal `2^64`
+  range gives **4.00x/8.00x imbalance at NSH=4/8** — i.e. every row in one bucket. At n=100 that word
+  is 7 bytes of leading pad (a consequence of `_pack_state_words`' leading-pad choice), so its range
+  carries almost no information. Data-derived quantiles give **1.07–1.19x** on both uniform and
+  fixed-Hamming-weight fixtures.
+- **A global `argsort` for within-bucket rank defeats the whole design.** The obvious way to compute
+  "position among earlier rows in my bucket" is `argsort(bucket)` — which is a global sort, the exact
+  thing being removed. Measured **256 ms against 8 ms** at N=2M, and it showed up as 208 `sort` ops in
+  the HLO against the incumbent's 29.
+- **The `[N, NSH]` one-hot cumsum is the wrong fix.** Same speed as the alternative but `4*N*NSH`
+  bytes — **34 GB at `N = 2^31, NSH = 4`, 275 GB at NSH=32**. It grows *with* the device count, so
+  adding devices to reach larger `N` makes it worse. Use `NSH` sequential `[N]` cumsums instead: `O(N)`
+  memory, same time, identical result.
+- **Capacity overflow is detectable, which is what makes this shippable.** Static shapes force a
+  per-shard capacity and an undersized one drops rows (16,090 lost at slack 1.05). But the kernel
+  *returns the overflow count*, so a caller can raise. Contrast the rank-select prototype
+  (`docs/rqutils-multiobs-response.md` §5.3), whose analogous `cap` had no detectable failure mode —
+  that is why one is a candidate and the other is not.
+
+Timings are 1.70–2.32x against the incumbent on 4 virtual CPU devices, reported only to show the
+structure is not pathologically slow; **virtual-device timings are meaningless** and the claim here is
+shardability, not speed. Two pieces of real work remain before it could replace `uniquify_states`:
+splitter selection is host-side numpy (one device sees the sample), and reassembly into the
+`[states_size, B]` contract is not implemented — the POC returns `[NSH, cap, NW]` blocks.
 
 ### A rounding-floor residual is not zero, and `== 0.0` is the wrong guard
 

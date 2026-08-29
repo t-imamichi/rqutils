@@ -243,3 +243,33 @@ all unverified." After the fix:
 - Whether sharding is *faster* on real devices, and whether per-device memory divides as intended.
 - Anything at N near 2**31. The largest N measured is 10^6; the source-index cache alone is 400 GB at
   N = 2**31 with J = 50, so that regime is multi-node and outside anything reachable here.
+
+## POC 11: range-partitioned uniquification — the one design that removes the single-device sort
+
+`uniquify_states`' `lax.sort` is the sole remaining cause of the `N <= 2^31` ceiling. POC 9 bounded its
+working set by chunking but distributed nothing; POC 11 is the range-partitioned shuffle POC 9's
+docstring names as the missing algorithm.
+
+Sample sort with data-derived splitters, scatter into fixed-capacity buckets, then `NSH` independent
+`lax.sort`s under `vmap`. Output bit-identical to `np.unique(rows, axis=0)`, and **zero `all-gather`,
+`all-reduce` or `collective-permute`** in the compiled HLO — the property the incumbent cannot have.
+
+It also **works at `B > 8`**, where POC 9 bails out: `_pack_state_words` gives wide rows a `uint64`
+equivalence, so n=100 (`B = 13`) is covered rather than falling back.
+
+Three traps, measured, all recorded in `NOTES.md`:
+
+- Equal-range splitting on the packed MSW collapses to one bucket (4.00x/8.00x imbalance at NSH=4/8),
+  because at n=100 that word is 7 bytes of leading pad. Data-derived quantiles give 1.07–1.19x.
+- Computing within-bucket rank with a global `argsort` reinstates exactly the sort being removed —
+  256 ms against 8 ms at N=2M.
+- The `[N, NSH]` one-hot cumsum alternative costs `4*N*NSH` bytes: 34 GB at `N = 2^31, NSH = 4`, and it
+  grows with the device count. Use `NSH` sequential `[N]` cumsums instead.
+
+Timings read 1.70–2.32x against the incumbent at N = 0.4M–3.4M, but these are **virtual CPU devices**
+and per this document's own warning that number means nothing; the claim is shardability.
+
+**Not production-ready.** Splitter selection is host-side numpy, and reassembly into the
+`[states_size, B]` contract is unimplemented (the POC returns `[NSH, cap, NW]` blocks). Capacity
+overflow drops rows, but the kernel returns the overflow count so a caller can raise — unlike the
+rank-select `cap` in `docs/rqutils-multiobs-response.md` §5.3, which had no detectable failure.
