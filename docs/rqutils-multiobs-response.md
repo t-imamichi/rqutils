@@ -1,22 +1,29 @@
-# Response: the batched gather is declined on evidence, and the scalable win landed elsewhere
+# Response: the batched gather is declined on evidence, and two scalable wins landed elsewhere
 
 Reply to `docs/rqutils-multiobs-request.md`, from the `rqutils` side. Branch `dev`, version still
 `0.2.0` (unreleased).
 
-**All three of your asks are declined, with measurements.** But the investigation turned up a real
-speedup on a *different* part of the same function, and that one has **shipped**: `get_xsource`'s wide
-path (`B > 8`, i.e. n > 60) now compares `uint64` words instead of bytes, worth **3.6-7.7x** at
-n=64-200. Output is bit-identical at every width and your n=30 path is untouched, so there is **nothing
-for you to change** — but if your roadmap goes past 60 qubits, §5.1 is the part of this document to
-read.
+**All three of your asks are declined, with measurements.** But the investigation turned up two real
+speedups elsewhere in the same pipeline, and **both have shipped**: byte-wise comparison was costing
+`O(B)` per operation in two places, and both now work on packed `uint64` words.
+
+- **`get_xsource`'s wide path** (`B > 8`, i.e. n > 60): **3.6-7.7x** at n=64-200 (§5.1).
+- **`uniquify_states`' lexsort**: **1.79-4.89x** from n=30 to n=200 (§5.2) — this one **helps you
+  today**, at n=30, because the sort key count drops at every width.
+
+Together, on the setup path this module's docstring measures at 66-97% of a solve: **1.43x at n=30**,
+4.70x at n=100. Output is identical at every width and no API moved, so there is **nothing for you to
+change** — but see §5.2 for the limit we did *not* remove, which is the one that matters if you are
+heading to n=100 with large `N`.
 
 | # | Ask | Outcome |
 | --- | --- | --- |
 | 1 | An entry point taking a **stack** of X-signatures | **Declined — it already exists.** `_apply_h_kernel` is a `lax.scan` over stacked signatures. Measured that form directly: **~1.0x**. |
 | 2 | Whether the **weight-2 case admits a closed form** | **Declined — the premise is false.** `S ^ X` is *not* a local permutation. Measured below. |
 | 3 | Whether the gather can be **shared rather than batched** | **Answered, and it reframes the problem.** The gather is latency-bound on a `log2(N)` dependent-load chain, not miss-bound across operators. Nothing shareable. |
-| — | (not asked) | **Landed on `dev`:** comparing `uint64` **words** instead of bytes measures **3.6-7.7x** at n=64-200, removing an ~8x cliff at the `B > 8` boundary. Bit-identical output, nothing for you to change. See §5.1. |
-| — | (not asked) | **Counter-proposal, `n <= 32` only:** a rank-select index measures **22–58x**, emits no sort, and shards — but is Hilbert-space-indexed and dies at n~34. See §5.2. |
+| — | (not asked) | **Landed on `dev`:** `get_xsource`'s wide path compares `uint64` **words** instead of bytes — **3.6-7.7x** at n=64-200, removing an ~8x cliff at the `B > 8` boundary. See §5.1. |
+| — | (not asked) | **Landed on `dev`:** `uniquify_states` lexsorts on words too — **1.79-4.89x**, n=30 included, and it was the *larger* of the two costs (14-27x `get_xsource`). See §5.2. |
+| — | (not asked) | **Not pursued, `n <= 32` only:** a rank-select index measures **22–58x**, emits no sort, and shards — but is Hilbert-space-indexed and dies at n~34. See §5.3. |
 
 **Thank you for the `vmap` measurement and for the framing of the status block.** "Treat the *what we
 would like* section as a question, not a specification" is what made this productive: the specification
@@ -146,9 +153,10 @@ and someone rebuilding the check could land on either. It does not affect the ~7
 
 ## 5. Counter-proposals
 
-Two, and the **order matters**: the first scales to any qubit count and is **implemented on `dev`**;
-the second is capped at `n <= 32`, is not implemented, and is offered only because it is large where it
-applies. If you have a long-term target past ~32 qubits, read §5.1 and treat §5.2 as a footnote.
+Three. **§5.1 and §5.2 are implemented on `dev`** and scale to any qubit count; §5.3 is capped at
+`n <= 32`, is not implemented, and is offered only because it is large where it applies. If you have a
+long-term target past ~32 qubits, read §5.1 and §5.2 and treat §5.3 as a footnote. §5.4 records what the
+literature suggested and measurement rejected.
 
 ### 5.1 Compare `uint64` words, not bytes — the scalable one
 
@@ -234,7 +242,72 @@ Two notes from implementing it, both recorded because they are the kind of thing
   at `B = 9`). The padding end is a *compatibility* choice, so that `nwords == 1` reproduces
   `_pack_state_keys` bit for bit. Do not read it as load-bearing.
 
-### 5.2 A rank-select index — large, but capped at `n <= 32`
+### 5.2 The same fix in `uniquify_states`, which turned out to be the bigger cost
+
+**We profiled the rest of the pipeline before stopping, and §5.1 had optimized the smaller of the two
+costs.** At n=100, N=200k:
+
+| component | time |
+| --- | --- |
+| **`uniquify_states`** | **143 ms** |
+| `get_xsource` (one signature) | 6.6 ms |
+| `get_diagonal` | 0.5 ms |
+| `get_diag_signs` | 0.4 ms |
+
+`uniquify_states` is **14-27x `get_xsource`** at every width from n=30 to n=127, and unlike
+`get_xsource` it had no fast path at all — cost grew linearly in `B` throughout, 55 ms at n=30 to
+186 ms at n=127.
+
+Same root cause, in the more expensive function. Its lexsort was
+`jax.lax.sort((*states.T, iota), num_keys=B)` — all `B` uint8 columns as separate key operands, and XLA
+compares key operands one at a time. Keying on `ceil(B/8)` packed words instead cuts 13 keys to 2 at
+n=100. The permutation is unchanged because the packing is order-preserving, and the uniqueness check
+moves to the words for the same reason (the packing is injective: the pad bytes are constant).
+
+A/B against the pre-change module, N = 220k **including duplicates**, output identical at every width:
+
+| n | B | keys before | keys after | before | after | speedup |
+| --- | --- | --- | --- | --- | --- | --- |
+| 30 | 4 | 4 | 1 | 62.9 ms | 35.1 ms | **1.79x** |
+| 60 | 8 | 8 | 1 | 89.7 ms | 35.5 ms | **2.53x** |
+| 64 | 9 | 9 | 2 | 102.6 ms | 42.4 ms | **2.42x** |
+| 100 | 13 | 13 | 2 | 158.4 ms | 43.2 ms | **3.67x** |
+| 127 | 16 | 16 | 2 | 204.6 ms | 43.7 ms | **4.68x** |
+| 200 | 26 | 26 | 4 | 286.1 ms | 58.5 ms | **4.89x** |
+
+**This one helps you today.** Unlike §5.1, which only touches `B > 8`, the key count drops at every
+width — including n=30, where it is worth **1.79x**.
+
+Combined with §5.1 on the setup path the module docstring measures at **66-97% of a solve**
+(`uniquify_states` plus a J-fold `get_xsource` precompute, J=8, N=200k, output identical):
+
+| n | before | after | speedup |
+| --- | --- | --- | --- |
+| 30 | 80.4 ms | 56.1 ms | **1.43x** |
+| 64 | 273.5 ms | 88.0 ms | **3.11x** |
+| 100 | 418.5 ms | 89.1 ms | **4.70x** |
+| 127 | 554.5 ms | 92.2 ms | **6.01x** |
+
+**Status: landed on `dev`.** Same as §5.1 — signature, return contract and filler convention all
+unchanged, nothing for you to change.
+
+It exposed a third coverage gap, and this one is the most dangerous of the three. Keying the sort on
+only the first word (`num_keys=1`) returns an array that is the right shape and contains every unique
+row, but is **not lex-sorted** — which silently violates the precondition `get_xsource`'s binary search
+depends on. **All 189 existing tests pass against that mutant**, because a group must share an entire
+8-byte word before it can be reordered and most fixtures vary the leading bytes. A new test
+(`test_wide_rows_sort_on_every_word_not_just_the_first`) asserts sortedness directly on a fixture where
+four rows share byte 0, and is verified by mutation.
+
+**What we did *not* fix, and it is the real n=100 wall.** That `lax.sort` is still there, still the
+single largest cost in the pipeline, and still the reason two structural limits exist: it is what caps
+`N` at `2^31` (the sort must run on one device) and it is why `uniquify_states` does not shard, where
+`get_xsource` does. We made it ~4x cheaper; we did not make it scale. If your target is n=100 *with large
+N*, the question that matters is replacing it with a sharded or out-of-core uniquification — sketched in
+`examples/scaling/poc9_ooc_uniquify.py` — which is a much larger change than either of these two and one
+we have not attempted.
+
+### 5.3 A rank-select index — large, but capped at `n <= 32`
 
 **Only read this if n <= 32 is a regime you care about.** It is the largest speedup we measured and it
 is architecturally the cleanest, but it is fundamentally not scalable, so we lead with §5.1.
@@ -280,7 +353,7 @@ ship: its compaction needs a static `cap`, an undersized `cap` drops hits with n
 against 884 true candidates), and there is no provable bound below `N` — a subspace closed under a hop
 has a 100% hit rate for that hop. `cap = N` is safe and recovers the baseline exactly.
 
-### 5.3 What we tried from the literature and rejected
+### 5.4 What we tried from the literature and rejected
 
 Recorded so none of it is re-attempted. Every row measured in this tree.
 
@@ -303,22 +376,29 @@ their sorting-based paradigm loses here, and why `23fb226`'s removal of the old 
 
 - **No GPU measurement.** All of the above is one laptop CPU. The gather is better optimized on GPU and
   `23fb226`'s own CPU-to-GH200 ratio compressed from 12–25x to 5.15x, so the §5 figures should be
-  assumed optimistic until measured there. This is the largest open risk. It applies to §5.1 as
-  shipped: the change is a strict reduction in comparison count, so we expect the direction to hold on
-  GPU, but the magnitude is unmeasured.
-- **§5.1's fixtures are synthetic.** The n=64–200 rows are generated, not sampled from a real circuit
-  at those sizes. We did test the adversarial structure (weight-50 plus 1-hop closure, which drops the
-  leading word's discriminating power to 37%) and the win held at 5.80x, but a real sampled subspace at
-  n=100 may differ again.
+  assumed optimistic until measured there. This is the largest open risk. It applies to §5.1 and §5.2
+  as shipped: both are strict reductions in comparison count, so we expect the direction to hold on GPU,
+  but the magnitude is unmeasured — and a GPU sort is well optimized relative to its gather, so §5.2's
+  ratio in particular may compress.
+- **The n>60 fixtures are synthetic.** The n=64–200 rows are generated, not sampled from a real circuit
+  at those sizes. For §5.1 we did test the adversarial structure (weight-50 plus 1-hop closure, which
+  drops the leading word's discriminating power to 37%) and the win held at 5.80x. §5.2's A/B used random
+  rows plus injected duplicates; a real subspace's duplicate rate and prefix structure differ, and the
+  sort's cost depends on both.
 - **The n>60 path is still thinly tested.** §5.1 has landed and the existing byte-width reference test
   covers n=55/63/64/71/80 against an independent lookup table, but **no test runs a subspace anywhere
   near n=100** — `TestInt32Ceiling` bounds `N`, not `n`. If you are heading there, that gap is worth
   closing on your side too: a wrong answer on this path is a *permutation* of the right one, so it stays
   symmetric and finite and will not announce itself.
-- **Nothing measured through `apply_h` or `_expval_kernel`.** §1–§5 exercise `get_xsource` in isolation.
-  Your 105 s at dim 24M is an end-to-end figure; we have not shown what fraction of it §5 would remove.
-- **§5.2 is not implemented and we are not proposing to.** It is a candidate with a blocking design
-  problem (the `cap` bound) on top of its `n <= 32` ceiling. §5.1, by contrast, has landed.
+- **Nothing measured through `apply_h`, `_expval_kernel`, or a full `sqd()` solve.** §1–§5 exercise
+  `get_xsource` and `uniquify_states` directly. The combined 1.43x–6.01x in §5.2 covers the *setup* path
+  only; the module docstring puts that at 66–97% of a solve, but we did not measure a solve to confirm
+  the composition, and your 105 s at dim 24M is an end-to-end figure we have not decomposed.
+- **§5.3 is not implemented and we are not proposing to.** It is a candidate with a blocking design
+  problem (the `cap` bound) on top of its `n <= 32` ceiling. §5.1 and §5.2 have landed.
+- **The `lax.sort` scaling wall is untouched.** §5.2 made it cheaper, not scalable. It is still
+  single-device, still what caps `N` at `2^31`, and still the largest single cost in the pipeline. We
+  have not attempted a sharded or out-of-core replacement.
 - **We did not verify your `spinchain`-side numbers** — the ~47% packing hoist, the 4.6e-19 agreement,
   or the replay timings. They are consistent with everything checkable here.
 
@@ -335,12 +415,17 @@ lever — and that better *selection* of subspace strings is the remaining line 
 more valuable per dimension and multi-observable evaluation gets more central, not less. That would
 change this request's priority without changing anything in it. Tell us if that happens.
 
-**Tell us your target qubit count.** §5.1 has landed, so nothing is blocked on this, but it decides
-whether §5.2 is worth anyone's time and it decides where we look next. The two are not substitutes:
-§5.2 is 22-58x and dies at n~34; §5.1 is 3.6-7.7x and has no ceiling. Note also that the cliff §5.1
-removes (~8x at the `B > 8` boundary, i.e. n > 60) is invisible in your report — every number in it is
-measured on the fast path at n=30 — so if your roadmap crosses 60 qubits, the profile you sent us is not
-the profile you will have.
+**Tell us your target qubit count, and your target `N`.** §5.1 and §5.2 have landed, so nothing is
+blocked on this, but the answer decides where we look next and whether §5.3 is worth anyone's time.
+§5.3 is 22-58x and dies at n~34; §5.1 and §5.2 have no ceiling in `n`. Two things your report cannot
+show us:
+
+- The cliff §5.1 removes (~8x at the `B > 8` boundary, i.e. n > 60) is invisible at n=30 — every number
+  in your report is on the fast path. If your roadmap crosses 60 qubits, the profile you sent is not the
+  profile you will have.
+- `N` matters more than `n` for what is left. The `lax.sort` in `uniquify_states` is now ~4x cheaper but
+  still the largest single cost, still single-device, and still what caps `N` at `2^31`. If you need
+  n=100 *and* large `N`, that is the next thing to attack and it is a much bigger change (§5.2).
 
 ## 8. Reproducing
 
@@ -368,7 +453,12 @@ repro with `jax.config.update("jax_enable_x64", True)`.
   for equality before timing. Take `min` of >=3 warm trials and sweep `n` across the `B = 8`/`B = 9`
   boundary — the `B <= 8` rows are the control and should read ~1.0x. For the adversarial fixture, draw
   fixed-Hamming-weight integers and close them under one bit flip.
-- **rank-select (§5.2):** bitmap of `2^n` bits in `uint64` words via
+- **`uniquify_states` A/B (§5.2):** same two-module setup as above. Include duplicates in the input
+  (`np.concatenate([rows, rows[:N//10]])`) so the uniqueness path is exercised, and pass the arrays as
+  *arguments* to the `jit`ted function -- closing over them lets XLA constant-fold the sort at compile
+  time, which reads as a 1.00x speedup and a `slow_operation_alarm` in the log rather than as an error.
+  Compare full output arrays, not just timings.
+- **rank-select (§5.3):** bitmap of `2^n` bits in `uint64` words via
   `np.bitwise_or.at(bm, keys >> 6, np.uint64(1) << (keys & 63))`, plus an exclusive prefix sum of
   `np.bitwise_count(bm)`. Lookup is `pc[w] + popcount(word & ((1 << b) - 1))` gated on the bit being
   set. Use `.at[w].get(out_sharding=jax.typeof(tk).sharding)` for both gathers or it raises under a
