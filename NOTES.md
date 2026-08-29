@@ -631,6 +631,11 @@ The cache is **65% of the footprint** at `J = 50` — the largest single object,
 `CLAUDE.md`'s "prefer `cache_level[0] = 1`" is right at the sizes it was measured at and *becomes
 impossible* exactly where scaling matters. On a 16 GB node at `N = 2^28`, 14 of 50 groups fit.
 
+**This budget assumes `K = 1`, and a real Hamiltonian is not like that.** 1D Heisenberg at n=100 has
+`K = 100`, where the diagonal arrays are 2-3x the source cache and `xsources` is **22%** of the `(1, 0)`
+footprint rather than 65%. See "Measured on a real n=100 Hamiltonian" below, which supersedes the
+`4 * J * N`-dominates framing in this section and the two that follow it.
+
 **And the penalty for turning it off is much worse at n=100 than the recorded 7-11x.** Measured at
 n=100, N=200k, J=16 with the word-based search: an uncached matvec is **59.8x** slower (106.4 ms against
 1.8 ms), and the precompute breaks even after **1.5 matvecs** against a solve's 100-300. The gap widened
