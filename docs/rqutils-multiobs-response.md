@@ -1,16 +1,21 @@
-# Response: the batched gather is declined on evidence, and the scalable win is elsewhere
+# Response: the batched gather is declined on evidence, and the scalable win landed elsewhere
 
 Reply to `docs/rqutils-multiobs-request.md`, from the `rqutils` side. Branch `dev`, version still
-`0.2.0` (unreleased). **No code has changed.** This is a findings document: the three things you asked
-about are answered with measurements, and there are two counter-proposals that are measured but not
-committed — one of which scales past 32 qubits and one of which does not.
+`0.2.0` (unreleased).
+
+**All three of your asks are declined, with measurements.** But the investigation turned up a real
+speedup on a *different* part of the same function, and that one has **shipped**: `get_xsource`'s wide
+path (`B > 8`, i.e. n > 60) now compares `uint64` words instead of bytes, worth **3.6-7.7x** at
+n=64-200. Output is bit-identical at every width and your n=30 path is untouched, so there is **nothing
+for you to change** — but if your roadmap goes past 60 qubits, §5.1 is the part of this document to
+read.
 
 | # | Ask | Outcome |
 | --- | --- | --- |
 | 1 | An entry point taking a **stack** of X-signatures | **Declined — it already exists.** `_apply_h_kernel` is a `lax.scan` over stacked signatures. Measured that form directly: **~1.0x**. |
 | 2 | Whether the **weight-2 case admits a closed form** | **Declined — the premise is false.** `S ^ X` is *not* a local permutation. Measured below. |
 | 3 | Whether the gather can be **shared rather than batched** | **Answered, and it reframes the problem.** The gather is latency-bound on a `log2(N)` dependent-load chain, not miss-bound across operators. Nothing shareable. |
-| — | (not asked) | **Counter-proposal, scalable:** comparing `uint64` **words** instead of bytes measures **4–7.5x** at n=64–200 and removes an ~8x cliff at the `B > 8` boundary. See §5.1. |
+| — | (not asked) | **Landed on `dev`:** comparing `uint64` **words** instead of bytes measures **3.6-7.7x** at n=64-200, removing an ~8x cliff at the `B > 8` boundary. Bit-identical output, nothing for you to change. See §5.1. |
 | — | (not asked) | **Counter-proposal, `n <= 32` only:** a rank-select index measures **22–58x**, emits no sort, and shards — but is Hilbert-space-indexed and dies at n~34. See §5.2. |
 
 **Thank you for the `vmap` measurement and for the framing of the status block.** "Treat the *what we
@@ -139,11 +144,11 @@ The `jnp.vdot` comparison is right as written (0.089 GiB / 3.3 ms = 27.1 GiB/s f
 array), but "over the same array" is worth making explicit — a two-operand `vdot` would read 54 GiB/s
 and someone rebuilding the check could land on either. It does not affect the ~70x conclusion.
 
-## 5. Counter-proposals, measured but not committed
+## 5. Counter-proposals
 
-Two, and the **order matters**: the first scales to any qubit count, the second is capped at
-`n <= 32` and is offered only because it is large where it applies. If you have a long-term target
-past ~32 qubits, read §5.1 and treat §5.2 as a footnote.
+Two, and the **order matters**: the first scales to any qubit count and is **implemented on `dev`**;
+the second is capped at `n <= 32`, is not implemented, and is offered only because it is large where it
+applies. If you have a long-term target past ~32 qubits, read §5.1 and treat §5.2 as a footnote.
 
 ### 5.1 Compare `uint64` words, not bytes — the scalable one
 
@@ -166,20 +171,30 @@ so a level of the binary search costs `O(B)` byte comparisons — 13 of them at 
 
 The fix is to compare `uint64` **words**: 13 bytes is 2 words, so a level costs 2 comparisons instead
 of 13. Cost then scales as `ceil((n+1)/64)` words, i.e. **logarithmically in packed width**, with no
-`2^n` term. Measured against the current implementation, N = 300k, all outputs **bit-identical**:
+`2^n` term.
 
-| n | B | words | current | multi-word | speedup |
+**This is implemented and measured in-tree, not projected.** The figures below are an A/B of the patched
+`get_xsource` against the pre-change module loaded side by side in one process, N = 300k, all outputs
+**bit-identical at every width**:
+
+| n | B | words | before | after | speedup |
 | --- | --- | --- | --- | --- | --- |
-| 64 | 9 | 2 | 46.4 ms | 9.6 ms | **4.85x** |
-| 80 | 11 | 2 | 56.8 ms | 13.6 ms | **4.18x** |
-| 100 | 13 | 2 | 69.1 ms | 15.4 ms | **4.50x** |
-| 127 | 16 | 2 | 99.4 ms | 13.9 ms | **7.14x** |
-| 200 | 26 | 4 | 151.0 ms | 22.8 ms | **6.63x** |
+| 30 | 4 | 1 | 3.9 ms | 4.0 ms | 0.97x |
+| 60 | 8 | 1 | 4.1 ms | 4.3 ms | 0.95x |
+| 63 | 8 | 1 | 4.3 ms | 4.2 ms | 1.01x |
+| 64 | 9 | 2 | 36.8 ms | 9.7 ms | **3.81x** |
+| 80 | 11 | 2 | 47.0 ms | 9.6 ms | **4.88x** |
+| 100 | 13 | 2 | 56.7 ms | 9.7 ms | **5.81x** |
+| 127 | 16 | 2 | 75.8 ms | 9.8 ms | **7.71x** |
+| 200 | 26 | 4 | 126.9 ms | 17.6 ms | **7.22x** |
 
-Run-to-run spread on this machine is ~1.5x on the absolute times, so treat the speedup column as
-**4–7.5x across n=64–200** rather than as five point estimates: a repeat run of the same sweep read
-4.88x / 5.60x / 4.65x / 7.08x / 7.56x. The direction and rough magnitude are stable; individual cells
-are not.
+Read the range as **~3.6-7.7x across n=64-200**: a repeat of the same A/B on this machine read
+3.56x / 4.40x / 5.41x / 6.48x / 7.08x, so the per-row values move by ~15% run to run while the trend
+does not. The `B <= 8` rows are the control -- that path is not touched, and it reads 0.95-1.06x.
+
+The speedup **grows with n**, which is the point: the "after" column is flat at ~9.7 ms from n=64 to
+n=127 while "before" grows 37 -> 76 ms, because everything from `B = 9` to `B = 16` is two words and
+costs the same. The next step up is at `B = 17` (n >= 128), where a third word is needed.
 
 We stress-tested the obvious objection — that a *real* subspace shares long prefixes, so a leading-word
 discriminator would be less effective than on random rows. It is, and the technique survives it:
@@ -193,11 +208,31 @@ Prefix sharing cuts the leading word's discriminating power from 100% to 37%, an
 falls from 7.4x to 5.8x — the second word resolves the remainder, and 2 word-comparisons still beat 13
 byte-comparisons.
 
-This is the one idea in this document with no exponential term. It is also the smallest change: it
+This is the one idea in this document with no exponential term, and it is the smallest change: it
 replaces the comparison inside an existing loop and touches neither the API nor the `B <= 8` path.
 Note the `B <= 8` boundary is a **correctness** limit for the single-`uint64` key (a wider row would
 alias); a multi-word key has no such limit, so this generalizes the fast path rather than adding a
 third one.
+
+**Status: landed on `dev`.** `get_xsource` now packs wide rows with `_pack_state_words` and compares
+with `_word_less_than`; the byte-wise `_row_less_than` is deleted, having had no other caller. The full
+suite (614 tests), `ruff`, `ty`, and both sharded subprocess harnesses are clean, and the sharded runs
+agree to the last digit with partition specs preserved. **Nothing for you to change** -- the signature,
+the return contract and the `-1` absent marker are all unchanged, and your n=30 path is untouched.
+
+Two notes from implementing it, both recorded because they are the kind of thing that bites later:
+
+- **It exposed a coverage gap.** Reversing the word loop to LSW-first is a genuine permutation defect,
+  and it left all 12 cases of the existing byte-width reference test green: that fixture concentrates
+  variation in the *trailing* bytes, so the leading word rarely decides a comparison. A new test
+  (`test_wide_rows_compare_most_significant_word_first`) forces byte 0 and the tail to disagree on
+  order, where MSW-first and LSW-first differ, and is verified by mutation to fail against the reversed
+  loop.
+- **One invariant we nearly shipped is false.** A draft docstring claimed trailing-padding would
+  reorder rows. It does not -- appending a constant number of zero bytes is a left-shift by `8 * pad`,
+  and a constant left-shift is monotonic (verified exhaustively at `B = 3` and over 20000 random pairs
+  at `B = 9`). The padding end is a *compatibility* choice, so that `nwords == 1` reproduces
+  `_pack_state_keys` bit for bit. Do not read it as load-bearing.
 
 ### 5.2 A rank-select index — large, but capped at `n <= 32`
 
@@ -268,17 +303,22 @@ their sorting-based paradigm loses here, and why `23fb226`'s removal of the old 
 
 - **No GPU measurement.** All of the above is one laptop CPU. The gather is better optimized on GPU and
   `23fb226`'s own CPU-to-GH200 ratio compressed from 12–25x to 5.15x, so the §5 figures should be
-  assumed optimistic until measured there. This is the largest open risk.
+  assumed optimistic until measured there. This is the largest open risk. It applies to §5.1 as
+  shipped: the change is a strict reduction in comparison count, so we expect the direction to hold on
+  GPU, but the magnitude is unmeasured.
 - **§5.1's fixtures are synthetic.** The n=64–200 rows are generated, not sampled from a real circuit
   at those sizes. We did test the adversarial structure (weight-50 plus 1-hop closure, which drops the
   leading word's discriminating power to 37%) and the win held at 5.80x, but a real sampled subspace at
   n=100 may differ again.
-- **The n>60 path is otherwise unexercised here.** No test in this repo runs a subspace at n=100;
-  `TestInt32Ceiling` bounds `N`, not `n`. Before §5.1 ships, the `B > 8` path needs coverage at those
-  widths — including the `_pack_state_keys` boundary at exactly `B = 8` and `B = 9`.
+- **The n>60 path is still thinly tested.** §5.1 has landed and the existing byte-width reference test
+  covers n=55/63/64/71/80 against an independent lookup table, but **no test runs a subspace anywhere
+  near n=100** — `TestInt32Ceiling` bounds `N`, not `n`. If you are heading there, that gap is worth
+  closing on your side too: a wrong answer on this path is a *permutation* of the right one, so it stays
+  symmetric and finite and will not announce itself.
 - **Nothing measured through `apply_h` or `_expval_kernel`.** §1–§5 exercise `get_xsource` in isolation.
   Your 105 s at dim 24M is an end-to-end figure; we have not shown what fraction of it §5 would remove.
-- **No commitment to implement.** §5 is a candidate with a blocking design problem, not a plan.
+- **§5.2 is not implemented and we are not proposing to.** It is a candidate with a blocking design
+  problem (the `cap` bound) on top of its `n <= 32` ceiling. §5.1, by contrast, has landed.
 - **We did not verify your `spinchain`-side numbers** — the ~47% packing hoist, the 4.6e-19 agreement,
   or the replay timings. They are consistent with everything checkable here.
 
@@ -295,11 +335,12 @@ lever — and that better *selection* of subspace strings is the remaining line 
 more valuable per dimension and multi-observable evaluation gets more central, not less. That would
 change this request's priority without changing anything in it. Tell us if that happens.
 
-**Tell us your target qubit count.** It changes which of §5.1 and §5.2 is worth building, and they are
-not substitutes: §5.2 is 22–58x and dies at n~34; §5.1 is 4–7x and has no ceiling. If you are heading
-past 60 qubits, §5.1 is the only one of the two that will still exist there, and it addresses a cliff
-(~8x at the `B > 8` boundary) that your n=30 numbers cannot see at all — everything in your report is
-measured on the fast path. We would rather know that before choosing.
+**Tell us your target qubit count.** §5.1 has landed, so nothing is blocked on this, but it decides
+whether §5.2 is worth anyone's time and it decides where we look next. The two are not substitutes:
+§5.2 is 22-58x and dies at n~34; §5.1 is 3.6-7.7x and has no ceiling. Note also that the cliff §5.1
+removes (~8x at the `B > 8` boundary, i.e. n > 60) is invisible in your report — every number in it is
+measured on the fast path at n=30 — so if your roadmap crosses 60 qubits, the profile you sent us is not
+the profile you will have.
 
 ## 8. Reproducing
 
@@ -319,12 +360,14 @@ repro with `jax.config.update("jax_enable_x64", True)`.
 - **breakdown and ns/level (§3):** time `_pack_state_keys`, the XOR, and a `searchsorted` with both key
   arrays precomputed, against whole `get_xsource`. Then sweep N over 250k–16M and divide ns/target by
   `log2(N)`.
-- **multi-word compare (§5.1):** build `[N, B]` uint8 rows at the target `n` (`B = ceil((n+1)/8)`,
-  pad bit clear, `np.unique(rows, axis=0)` for lex-sorted uniqueness). Repack each row into
-  `ceil(B/8)` big-endian `uint64` words, left-padding the most significant word. Replace the byte-wise
-  `_row_less_than` with a word-wise lexicographic compare (`lt |= eq & (a < b); eq &= (a == b)` over
-  words) and keep the rest of the scan identical. Compare against `get_xsource` on the same input. For
-  the adversarial fixture, draw fixed-Hamming-weight integers and close them under one bit flip.
+- **multi-word compare (§5.1):** this is in the tree, so the repro is an A/B rather than a build. Load
+  the pre-change `sqd.py` as a second module (`importlib.util.spec_from_file_location`) so both live in
+  one process — a copied *repo* does not work, since the venv holds an editable install pointing at the
+  original. Build `[N, B]` uint8 rows at the target `n` (`B = ceil((n+1)/8)`, pad bit clear,
+  `np.unique(rows, axis=0)` for lex-sorted uniqueness), `jit` both `get_xsource`s, and compare outputs
+  for equality before timing. Take `min` of >=3 warm trials and sweep `n` across the `B = 8`/`B = 9`
+  boundary — the `B <= 8` rows are the control and should read ~1.0x. For the adversarial fixture, draw
+  fixed-Hamming-weight integers and close them under one bit flip.
 - **rank-select (§5.2):** bitmap of `2^n` bits in `uint64` words via
   `np.bitwise_or.at(bm, keys >> 6, np.uint64(1) << (keys & 63))`, plus an exclusive prefix sum of
   `np.bitwise_count(bm)`. Lookup is `pc[w] + popcount(word & ((1 << b) - 1))` gated on the bit being
