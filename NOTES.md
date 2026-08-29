@@ -1163,6 +1163,65 @@ J=52) and `t(0,0)/t_precompute = 133`, i.e. the same work paid ~133 times agains
 off", never as headroom for accelerating the precompute — the second question needs the one-off share,
 and Amdahl applies to that one.
 
+
+### `cache_level[1] = 1` is dominated on both axes, and the "compress the diagonal" premise was wrong (2026-08-30)
+
+Opened as "the diagonal axis is the memory lever, and it is uninvestigated" — which is true of the axis
+and false of the framing. **`diag_signs` is already one bit per (state, Z term)**, so the 1313 B/slot at
+`J=101, K=100` is not waste to be compressed; it is `J * ceil(K/8)`, the information-theoretic size of
+what it stores. There is no redundancy for a general-purpose compressor to find. The finding is simpler.
+
+**Level 1 loses to both of its neighbours, at every `K` measured.** End-to-end `sqd()` solves, n=22,
+N=24,674, all six levels returning the same energy (agreement < 1e-8):
+
+| K | J | `(0,0)` | `(0,1)` | `(0,2)` | `(1,0)` | `(1,1)` | `(1,2)` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 16 | 4 | 1868.7 | 1920.0 | 1735.7 | 291.8 | **338.6** | **153.4** |
+| 64 | 4 | 1232.7 | 1375.8 | 1060.4 | 344.3 | **407.2** | **95.7** |
+| 128 | 4 | 486.0 | 533.3 | 340.4 | 175.1 | **228.9** | **29.9** |
+
+ms. Holding `cache_level[0]` fixed and moving only the diagonal axis, level 1 is **16–31% slower than
+level 0** — which stores *nothing* — and **2.2–7.6× slower than level 2**, on both rows.
+
+**The mechanism, which is why this is structural rather than a tuning accident.** Per X group at
+n=24, N=39,736:
+
+| K | ceil(K/8) | L1 store | L2 store | L1/L2 | L0 build | L1 build | L1 *use* | L2 use |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 16 | 2 | 0.131 MB | 0.524 MB | 0.25 | 0.46 | 0.49 | 0.57 | 0 |
+| 64 | 8 | 0.524 MB | 0.524 MB | **1.00** | 1.58 | 1.45 | 1.56 | 0 |
+| 128 | 16 | 1.049 MB | 0.524 MB | **2.00** | 2.83 | 3.27 | 3.16 | 0 |
+
+**`L1 use` ≈ `L0 build`** (3.16 ms against 2.83 at K=128): unpacking the cached bits costs about what
+recomputing the parity from `popcount(state & z)` costs. So level 1 stores `J * ceil(K/8) * N` bytes to
+avoid work it then substantially redoes, while level 2 stores the composed sum and pays nothing.
+
+**And it is memory-dominated above an exact crossover.** Level 1 costs `ceil(K/8)` bytes/slot/group,
+level 2 costs the coefficient itemsize, so they cross when `ceil(K/8) == itemsize`: **`K = 64` for
+float64, `K = 128` for complex128** (an odd-Y string makes the folded coefficients complex — see
+`PauliSumXZ`). The measured `L1/L2` column hits exactly 1.00 and 2.00 at those points; this is
+arithmetic, not a fit. Below the crossover level 1 is the smaller array, which is its only surviving
+claim — and level 0 is smaller still, at zero.
+
+**Independently corroborated by the record.** `docs/skqd-sqd-solve-tolerance.md` found `(1,1)` "the only
+level on the `[0]=1` row slower than `(1,0)`" at n=14/18 and cited it as why `spinchain` exposes only two
+of the six levels. That holds at n=22 and now has a mechanism rather than just an observation.
+
+**So the guidance is: never select `cache_level[1] = 1`.** Use 2 for speed, 0 for minimum footprint.
+`NOTES.md`'s own budget table above already showed `(0,2)` at 920 B/slot against `(0,1)`'s 1433 and
+`(1,2)` at 1296 against `(1,1)`'s 1805 — the comparison had simply not been drawn. Level 1 stays in the
+API because the `cache_level` sweep is load-bearing in the suite (three bugs hid behind the default
+`(1,0)`, each masked by the one before), not because a caller should pick it.
+
+**What this does not close.** Level 2 at `J=101` is still 808 B/slot, and *that* is irreducible in the
+same sense — one composed value per (state, X group). Cutting it needs partial caching on the diagonal
+axis, the sibling of `xcache_groups`, which does not exist: `cache_level[1]` is all-or-nothing across
+groups. That is the open question this investigation actually surfaced.
+
+**Caveats.** One laptop CPU, n=22–24, N=25k–40k. The fixtures place all Z terms in a single X group,
+which isolates `K` cleanly but is not a physical Hamiltonian's structure — 1D Heisenberg spreads them
+across `J = n` groups. The crossover arithmetic is structure-independent; the timing ratios are not.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is
