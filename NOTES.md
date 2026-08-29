@@ -665,6 +665,69 @@ does transfer though, and it is the one above: for a matrix-free matvec *"the me
 worker process should be the guiding principle"*, because runtime depends only weakly on the lookup
 scheme. For calibration, their state of the art is 46 spins on ~256 nodes at 512 GiB each.
 
+### Measured on a real n=100 Hamiltonian: the diagonal axis dominates, not the source cache (2026-08-29)
+
+Every memory figure in the sections below was derived at **K=1** — one Z signature per X group — because
+the fixtures were random Pauli strings. A real Hamiltonian is not like that, and the difference inverts
+the guidance.
+
+**1D Heisenberg at n=100, periodic:** 300 terms group into **J=101 X groups with K=100 Z signatures
+each**, B=13, and the coefficients come out `float64` (the Y terms pair up). Measured from XLA's own
+`memory_analysis().temp_size_in_bytes`, per state *slot* (`states_size`, the power-of-two padded size —
+which is itself a 40% inflation at N=24M, since 24M rounds to 33.6M):
+
+| `cache_level` | B/slot | at N=24M unique |
+| --- | --- | --- |
+| **(0, 0)** | **120** | **4.0 GB** |
+| (1, 0) | 492 | 16.5 GB |
+| (0, 2) | 920 | 30.9 GB |
+| (1, 2) | 1296 | 43.5 GB |
+| (0, 1) | 1433 | 48.1 GB |
+| **(1, 1)** | **1805** | **60.6 GB** |
+
+Stable to ±1 B/slot across N=2000 and N=8000, so the linearity is real; the 24M column is extrapolated,
+not run.
+
+**The three terms, and which one wins:**
+
+| array | shape | B/slot at J=101, K=100 |
+| --- | --- | --- |
+| `diag_signs` (`cache_level[1]==1`) | `[J, ceil(K/8), ss]` | **1313** |
+| `diagonals` (`cache_level[1]==2`) | `[J, ss]` float64 | 808 |
+| `xsources` (`cache_level[0]==1`) | `[J, ss]` int32 | 404 |
+
+`diag_signs` alone nearly accounts for `(1, 1)`'s whole 1805. So on a real n=100 problem
+**`cache_level[1]` is the expensive axis and `cache_level[0]` is the cheap one** — the reverse of the
+K=1 picture, and the reverse of what motivated the partial-J work. `docs/scaling-pocs.md` says the
+diagonal axis "is where the real memory-versus-speed judgement lies"; at K=100 that is emphatically
+true, and the 15x between `(0, 0)` and `(1, 1)` is available today with no new API.
+
+**A prior extrapolation here was wrong and is superseded.** Fitting n=20, K=1 gave
+`bytes/slot = 203 + 4*J`, i.e. 607 at J=101 — **23% too high for `(1, 0)` and 3.0x too low for
+`(1, 1)`**. The `K`-dependent diagonal term was the dominant one and the fit had no way to see it. Do
+not size hardware from a K=1 fit.
+
+### What the Bloom pre-filter is actually worth here
+
+The filter costs **0.029 GB (0.86 B/slot)** at N=24M, flat in `J`. It replaces the `xsources` cache by
+making `cache_level[0] = 0` affordable in *time*, so the memory it saves is exactly that 404 B/slot term
+— **12.4 GB at N=24M, the same in every row** — but the ratio depends entirely on the diagonal level:
+
+| from | to | before | after | ratio |
+| --- | --- | --- | --- | --- |
+| (1, 0) | (0, 0) + BF | 16.5 GB | **4.1 GB** | **4.06x** |
+| (1, 2) | (0, 2) + BF | 43.5 GB | 30.9 GB | 1.41x |
+| (1, 1) | (0, 1) + BF | 60.6 GB | 48.1 GB | 1.26x |
+
+So the honest framing on this Hamiltonian: **the filter is not a memory optimization, it is a speed
+rescue for the cheap-memory setting.** `(0, 0)` already costs 4.0 GB today with no filter, no new API and
+no `cap` hazard; `(0, 0) + BF` costs 4.1 GB. The filter's value there is buying back the ~60x penalty
+that `cache_level[0] = 0` carries, for 0.029 GB — not shrinking the footprint.
+
+Its relative worth would return on a Hamiltonian with **small K** (few Z terms per X group), where the
+diagonal arrays shrink and `xsources` is once again the dominant term. Both readings are correct; which
+one applies is a property of the Hamiltonian, so quote `K` alongside any of these figures.
+
 ### A Bloom filter for *input* dedup: better-targeted, still loses to `np.unique` (2026-08-29)
 
 The narrowest and best-aimed version of the filter idea: `sqd` receives raw measured bitstrings with
