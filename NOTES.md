@@ -665,6 +665,47 @@ does transfer though, and it is the one above: for a matrix-free matvec *"the me
 worker process should be the guiding principle"*, because runtime depends only weakly on the lookup
 scheme. For calibration, their state of the art is 46 spins on ~256 nodes at 512 GiB each.
 
+### Using a Bloom filter as the subspace *definition*: sound, and it loses past n~70 (2026-08-29)
+
+A sharper version of the filter idea: stop treating false positives as wasted work and **accept them into
+the subspace**. The subspace becomes `{x : BF accepts x}` — the sampled states plus whatever else the
+filter admits — and `states` is never materialized.
+
+**The physics is fine, which is why the idea is worth taking seriously.** SQD projects onto whatever
+subspace it is given, and adding basis vectors can only *lower* the variational energy. False positives
+are extra states, not wrong answers.
+
+**Two things kill it, and only the second is fundamental.**
+
+First, mechanically a filter cannot stand in for `states` at all: `get_xsource` needs the **rank** of
+`S[i] ^ X` (a filter has no order), the diagonal builders need `popcount(S[i] & z)` (a filter stores no
+bits), and `sqd` **returns the states** — `sqd.py:624` unpacks `states_u[:subspace_dim]` because the
+eigenvector is indexed by position, so without the basis the eigenvector is uninterpretable. Accepting
+false positives does not fix any of that; it changes which set is being represented, not what operations
+are needed on it.
+
+Second, and this is the one that generalizes: **the false-positive *count* scales with `2^n`, not with
+`N`.** `|accepted| = N + p*(2^n - N)`. At n=100, N=24M, even a `p = 1e-12` filter admits `1.3e18` extra
+states. To hold the false positives to 1% of `N` the filter must get bigger than the list it replaces:
+
+| n | filter bits/item | explicit rows bits/item | smaller |
+| --- | --- | --- | --- |
+| 34 | 23.3 | 40 | filter |
+| 58 | 57.9 | 64 | filter |
+| 66 | 69.4 | 72 | filter |
+| **74** | **81.0** | **80** | **rows** |
+| 100 | 118.5 | 104 | rows |
+
+The crossover is near **n ≈ 70**. The reason is information-theoretic rather than incidental: representing
+an `N`-subset of `2^n` with false-positive rate `p` costs at least `N*log2(1/p)` bits, and driving the FP
+*count* down forces `p → N/2^n`, at which point that bound approaches `N*log2(2^n/N)` — the cost of simply
+listing the elements. **A filter only wins when a fixed FP *rate* is acceptable, never a fixed FP
+*count*.**
+
+So the version that survives is the original one: the filter as a *pre-filter* over an explicit sorted
+list, where a false positive costs one wasted search and the exact answer is recovered by the equality
+test. Not as the subspace's representation.
+
 ### Hoisting the precompute, and the per-group host sync: both affordable (2026-08-29)
 
 Two open items against the pre-filter design, both measured.
