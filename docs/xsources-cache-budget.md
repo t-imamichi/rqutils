@@ -205,6 +205,14 @@ Constraints any design must respect:
 - **The derive/check/retry policy is caller-side sequencing**, not one traced function: it is a kernel
   call, a host-side decision, and possibly a second kernel call. It cannot live inside a single `jit`.
 
+Two mechanics of that design were open questions and are now measured. **Hoisting the precompute out of
+`run_sqd`'s trace is affordable** — it doubles the compiled-variant count (two jitted functions instead of
+one) but costs 1.03× compile time and 1.01× warm run time, and the `states_size` padding still collapses
+many input lengths to one compilation. **The per-group overflow sync costs 2.0% at J=50**, or 0.2% if the
+`ncand` reads are batched into one host transfer. Batching, though, cannot retry a group until all `J` have
+run — fine for a precompute, wrong inside a matvec — which is a second independent reason the filter
+belongs on the precompute.
+
 **Minimal viable subset:** partial-J alone. It is a pure memory/time dial with no probabilistic structure,
 no capacity parameter and no silent-failure surface, and it delivers the linear curve in §2 on its own. The
 filter is strictly additive on top and can follow once the capacity policy is settled.

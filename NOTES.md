@@ -665,6 +665,47 @@ does transfer though, and it is the one above: for a matrix-free matvec *"the me
 worker process should be the guiding principle"*, because runtime depends only weakly on the lookup
 scheme. For calibration, their state of the art is 46 spins on ~256 nodes at 512 GiB each.
 
+### Hoisting the precompute, and the per-group host sync: both affordable (2026-08-29)
+
+Two open items against the pre-filter design, both measured.
+
+**Hoisting the J-fold precompute out of `run_sqd`'s trace does not regress the shape pinning.** The
+concern was `states_size`, which "exists solely to pin array shapes and prevent JIT recompilation"
+(`CLAUDE.md`): `sqd` rounds the input length up to a power of two and pads with filler, so many input
+lengths map to one traced shape. A hoisted precompute takes `states_u` (`[states_size, B]`) and returns
+`[J, states_size]`, both functions of values that are already static, so the pinning survives — verified,
+not argued: **three different input lengths at one `states_size` produce one compilation.**
+
+What hoisting does cost is a **doubled compilation count** — two jitted functions instead of one. At
+nq=12, nine input lengths spanning four distinct `states_size` values: `inside` compiles 4 variants,
+hoisted compiles 4 + 4 = 8. Output identical. But the compilations are cheap and amortized:
+
+| | inside (today) | hoisted | ratio |
+| --- | --- | --- | --- |
+| compile, once per `states_size` | 0.11 s | 0.11 s | **1.03×** |
+| warm run, every solve | 73.9 ms | 75.0 ms | **1.01×** |
+
+at nq=20, N=182k, `states_size` 262144, J=16. So the doubled variant count is a cache-occupancy fact
+rather than a time cost.
+
+**The per-group `int(ncand)` host sync costs 2.0% at J=50, and batching it recovers that.** At N=2M,
+J=50:
+
+| policy | time | overhead |
+| --- | --- | --- |
+| no sync (unsafe) | 609.6 ms | — |
+| sync per group | 621.8 ms | **+2.0%** (244 us/group) |
+| one batched sync (`jnp.max` over all `ncand`, one read) | 611.0 ms | **+0.2%** |
+
+244 us per group is real but small against a ~12 ms per-group kernel. Batching keeps the check on *every*
+group while paying for one device-to-host transfer instead of `J`.
+
+**But batching constrains where the filter can live.** A batched check cannot retry a group until all `J`
+have run, which is fine for a precompute — retry the offenders afterwards — and wrong inside a matvec
+loop, where the result is consumed immediately. Combined with the fact that the retry policy is host-side
+sequencing and cannot live inside one `jit` at all, this is the second independent reason to put the
+filter on the **precompute** rather than the matvec.
+
 ### `jnp.nonzero` does not shard, and it does not matter — the mask is already replicated (2026-08-29)
 
 The pre-filter's compaction is `jnp.nonzero(mask, size=cap)`, and the open question was whether it shards.
