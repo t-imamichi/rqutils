@@ -1493,6 +1493,77 @@ solver on one device. Lowering it needs a different eigensolver structure — fe
 vectors, or a restart scheme that trades vectors for matvecs — not a dtype change. That is a separate
 investigation and nothing here bears on it.
 
+
+### The eigensolver's `O(N)` vector count is at its algorithmic minimum; a smaller basis is a bad trade (2026-08-30)
+
+Opened as the remaining lever on the `(0, 0)` floor, since that floor is 120 B/slot of which only 13 is
+the Hamiltonian. Two findings: the count is **not** slack, and the one way to reduce it costs far more
+than it saves.
+
+**First, the count. Measured, not counted from the source** — `temp_size_in_bytes / (8N)` over a jitted
+`ground_locg`:
+
+| | vectors |
+| --- | --- |
+| total transient, generic tridiagonal matvec | **8.00** |
+| same, pure-diagonal matvec (1 temp) | **7.00** |
+| → the **solver's own** working set | **7** |
+
+Exactly 8.00 at N = 2^16, 2^18, 2^20 and flat across `maxiter` 1/5/30/100, so it is a per-iteration
+working set, not accumulation. One vector belongs to the operator; a real `apply_h` will differ there.
+
+**Seven is the algorithmic minimum for a 3-dimensional Rayleigh–Ritz basis.** The step needs
+`{x, y, p}` *and* each one's image `{ax, ay, ap}` live simultaneously to form `sas`, which is 6, plus
+`r` to construct `p`. That is 7 — the measured number. **So this is a basis-size question, not a
+buffer-reuse question**, and no scheduling or aliasing work can reduce it.
+
+Note the module docstring's "three-vector memory budget" refers to the Rayleigh–Ritz basis `{x, y, p}`,
+not the total footprint. It is easy to read as the latter.
+
+**Second, the smaller basis already exists and is already tested.** `body_iter1` is a complete
+2-dimensional `{x, p}` iteration (`eigenpair_2x2`, its own exclusion bound, `_project_out`), used for
+exactly one step before `body()` takes over. So the variant did not need writing, only looping.
+
+Looped and compared against `ground_locg` at N=16384, `tol = eps(f64)`, on symmetric tridiagonals with
+the off-diagonal scaled to vary the gap. **Both converge to the same eigenvalue to every digit
+printed:**
+
+| off-diagonal | 3-dim iters | 2-dim iters | ratio | θ (both) |
+| --- | --- | --- | --- | --- |
+| 0.05 | 94 | 381 | **4.05×** | −3.759790199 |
+| 0.20 | 130 | 1543 | **11.87×** | −3.872513788 |
+| 0.50 | 115 | 543 | **4.72×** | −4.451636269 |
+| 1.00 | 102 | 327 | **3.21×** | −6.289249277 |
+
+**3.2–11.9× more iterations**, median ~4.4×. That is the `y` term earning its vector: dropping it turns
+locally-optimal CG into steepest descent, whose rate depends on the condition number rather than its
+square root.
+
+**And the saving is smaller than the vector count suggests.** 7 → 5 is 29% of the *working set* but the
+floor also carries states and the 4-vector carry, neither of which changes:
+
+| | `O(N)` vectors | B/slot | at `2^31` |
+| --- | --- | --- | --- |
+| 3-dim (today) | 11 | 120 | **258 GB** |
+| 2-dim | 9 | 104 | 223 GB |
+
+**13.3% off the floor for ~4.4× the time.** 13% more `N` at fixed subspace density is worth well under
+one extra qubit, so the trade is bad in both directions: as a capacity play it buys almost nothing, and
+as a time play it is a large regression.
+
+**Conclusion: closed. Do not pursue a smaller basis.** The 258 GB single-device floor stands, and it is
+dominated by terms that are each individually irreducible — 13 B/slot of states that `get_xsource`
+requires *replicated*, and a Rayleigh–Ritz basis at its minimum. Lowering it further needs a different
+*kind* of change: either distributing `states` (which means replacing the binary search with something
+shardable — `jnp.searchsorted` needs the sorted array replicated) or an out-of-core scheme that streams
+vectors, neither of which is a tweak to this solver.
+
+**Caveats.** One laptop CPU. The iteration-count comparison uses synthetic tridiagonals, not projected
+SQD Hamiltonians; the *direction* is a property of the algorithms (CG versus steepest descent) but the
+4.4× median is fixture-specific. The 2-dim loop is a standalone reimplementation using
+`ground_locg`'s own primitives, not a patched `ground_locg`, so it shares the primitives but not the
+prefilter or the `body_iter0` seeding. Vector counts at `2^31` are arithmetic on measured B/slot.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is

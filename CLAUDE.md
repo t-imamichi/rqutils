@@ -506,6 +506,14 @@ both belong in it.
 - **Subspace selection by weight shell + diagonal ranking was measured, then rejected** (2026-08-25) —
   sound results against a *uniform random* baseline, which is not what a real SQD workflow produces.
   Do not build on it.
+- **Reducing `ground_locg`'s `O(N)` vector count is closed** (2026-08-30). The solver's own working set
+  is **7 vectors, measured** (`temp_size_in_bytes / 8N`, flat in `N` and in `maxiter`; an 8th belongs to
+  the operator), and 7 is the **algorithmic minimum** for a 3-dim Rayleigh–Ritz basis: `{x, y, p}` plus
+  each one's image plus `r` to build `p`. **So it is a basis-size question, not buffer reuse** — no
+  aliasing work helps. The 2-dim `{x, p}` variant already exists as `body_iter1` and only needed
+  looping; it converges to the same eigenvalue but takes **3.2–11.9× more iterations** (median ~4.4×),
+  for 13.3% off the floor (120 → 104 B/slot). Bad in both directions. Note the module docstring's
+  "three-vector memory budget" means the Rayleigh–Ritz basis, **not** the total footprint. `NOTES.md`.
 - **Reduced precision in `ground_locg` is closed, both variants** (2026-08-30). *Arithmetic* in f32
   with f64 storage is `poc6_mixed_precision.py`, rejected in `docs/scaling-pocs.md` §6 (1.17–1.30× at
   fixed iterations, **0.42× end-to-end**, three of four converged solves hitting `maxiter`; re-verified
