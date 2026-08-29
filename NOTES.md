@@ -665,6 +665,44 @@ does transfer though, and it is the one above: for a matrix-free matvec *"the me
 worker process should be the guiding principle"*, because runtime depends only weakly on the lookup
 scheme. For calibration, their state of the art is 46 spins on ~256 nodes at 512 GiB each.
 
+### Partial-J plus a Bloom filter: the two compose, and the filter helps at every setting (2026-08-29)
+
+The two ideas above are complementary — cache the `J'` groups that fit, BF-filter the recompute for the
+rest — so they were measured together. n=100, N=600k, J=16, `p = 1%` filter at **0.72 MB** against a full
+cache of 38.4 MB. Fully-cached matvec is the reference at 6.2 ms. **Every arm verified exact against it.**
+
+| cached `J'` | cache | recompute, plain | recompute, + BF | BF gain | vs full cache |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 0 MB | 447.4 ms | **47.4 ms** | **9.43×** | 7.71× |
+| 4 | 9.6 MB | 336.5 ms | **38.6 ms** | **8.73×** | 6.27× |
+| 8 | 19.2 MB | 162.6 ms | **28.5 ms** | **5.70×** | 4.64× |
+| 12 | 28.8 MB | 112.6 ms | **20.0 ms** | **5.64×** | 3.25× |
+
+**The filter earns its 0.72 MB at every point on the dial**, not just at `J' = 0`: 5.6–9.4× on whatever
+portion is recomputed. And because it is built once per subspace and shared by every group, its cost does
+not scale with `J'` — the `+BF` column is flat while the cache column grows linearly.
+
+So the practical shape is a **memory budget**: cache `floor((budget - |BF|) / (4N))` groups and filter the
+remainder. At n=100, J=50 that reads:
+
+| N | full cache | 16 GB budget | 64 GB budget | 256 GB budget |
+| --- | --- | --- | --- | --- |
+| 24M | 4.8 GB | 50/50 cached | 50/50 | 50/50 |
+| 268M | 53.7 GB | 14/50 cached, 36 filtered | 50/50 | 50/50 |
+| 2^31 | 429.5 GB | 1/50 cached, 49 filtered | 7/50 | 29/50 |
+
+**A caveat on predicting `J'` from a budget.** A linear model
+(`t = J'*t_cached + (J-J')*t_bf`, with `t_bf/t_cached` measured at 7.6×) fits the endpoints exactly and
+the middle to ~4-6%, but drifts to **17.5% at `J' = 12`** — the measured 20.0 ms against a predicted
+16.5 ms. So a budget-based API can size the cache correctly (that is exact arithmetic) but should not
+promise a runtime from the model alone.
+
+**The `cap` failure is not hypothetical, and it inflates its own speedup.** A first run of this used
+`ccap = 16384` against a true worst case of 17,913 candidates across the J groups, silently dropped 933
+real hits, and reported **5.7× instead of the honest 8.0×** on the `J' = 0` arm — the truncated arm does
+less work, so the bug flatters the result. Size the capacity from the worst case over *all* `J` groups,
+not one, and verify against `get_xsource` rather than trusting a timing.
+
 ### A Bloom filter breaks the `2^n` dependency the exact bitmap could not (2026-08-29)
 
 The exact membership bitmap in the rank-select family is `2^n / 8` bytes, so it dies at n≈34 no matter
