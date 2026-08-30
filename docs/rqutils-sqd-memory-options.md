@@ -29,7 +29,13 @@ packed = PauliSumXZ.pack_states(states)        # [N, ceil((num_qubits + 1) / 8)]
 energy, vec, basis = sqd(hamiltonian, packed, packed=True)
 ```
 
-The returned `basis` is **unpacked either way** — the contract does not change, only the input.
+**Superseded 2026-08-30: `packed` now governs the returned `basis` too.** `packed=True` returns the
+`ceil((num_qubits + 1) / 8)`-wide rows the solver searched, so a round trip needs no re-pack;
+`packed=False` is unchanged and unpacks to `num_qubits`. This is a behavioural change for a caller that
+passed `packed=True` and compared the result against an unpacked array — that comparison now sees a
+shape mismatch, and `np.array_equal` returns `False` on differing shapes, so it fails loudly rather than
+silently. One flag rather than a second `return_packed`: two flags make four combinations, two of which
+are format conversions, and `pack_states`/`unpack_states` already are the conversion utilities.
 
 **The saving is yours, not ours.** `sqd` has always worked on the packed form internally; what this
 removes is the 8x expansion you were doing to satisfy the signature, plus the transient peak while both
