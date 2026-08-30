@@ -1987,6 +1987,57 @@ routing rounds is materially more communication than the one round this line ass
 the word packing is *"the wrong trade for an out-of-core design"* at the `2^31` ceiling still stands and is
 unaffected.
 
+
+### The two-round JAX composition works, and the capacity model for a range partition is *not* balls-in-bins (2026-08-30)
+
+The composition above was specified in numpy and left unbuilt in JAX. Built now: **bit-identical to
+`uniquify_states`** at n=100, N=209,400 with duplicates, `states_size` 262,144, at **D=2 and D=4** —
+157,051 unique rows, `np.array_equal` True, including the `[states_size, B]` uint8 output with 255 filler.
+
+**The structure that makes the output spec honest.** Round 2 exists so that after it, shard `s` holds
+exactly output rows `[s·SS/d, (s+1)·SS/d)` — which makes `out_specs=P('x', None)` **true**. That is what
+the earlier dead end was about: private per-shard `[d, cap]` blocks declared `P(None,None,None)` are a
+lie, and `check_vma` rejects them. Routing to a single owner makes the declaration honest instead of
+suppressing the check.
+
+**Collectives, D=4:** 1 `all-gather`, 24 `all-to-all`, 4 `all-reduce`, 0 `collective-permute`.
+
+The `all-reduce` needed explaining rather than accepting. Two of the four are the caller's own `.sum()`
+over `P('x')` results — summing a sharded array across shards *is* a reduction. The rest is
+`u64[256,2]`: the **splitter sample**. `words.at[idx].get(out_sharding=P(None, None))` gathers a
+replicated sample from a partitioned array, and XLA implements that replication as an all-reduce. It is
+4 KB and `O(nsample)`, **independent of `N`** — so the earlier claim that splitter selection is *free* was
+wrong; it is *cheap*, which is a different statement.
+
+**Two capacity defects found, and the second corrects a claim in the entries above.**
+
+*The guard fired on correct input.* The first working version reported **overflow 763,677 beside a
+bit-exact result**, because round 2 funnels every dead row to one bucket, which overflows by design and is
+then dropped harmlessly. The count conflated discarded padding with lost data. Fixed by masking the count
+to **live** elements. **A guard that fires on correct input is worse than none** — it trains a caller to
+ignore the one signal that matters, which is how `poc11`'s `cap` bug shipped.
+
+*Balls-in-bins is the wrong model here.* `poc13` sizes its capacity as `mu + sqrt(2·mu·ln d)`, which is
+correct **for a hash**: each element picks its destination independently at random. **A range partition
+violates that assumption** — the destination is the element's *value* bucket, and bucket sizes are set by
+the data distribution. Measured: buckets `[44557, 57006, 47400, 60437]`, so a shard sends `60437/d ≈
+15,109` rows to the largest bucket's owner, not the `N/d/d = 13,088` the bound predicts. A 1.2× slack over
+that mean still overflowed by 42,712. **`poc11` already had the right rule** — *"slack must exceed the
+splitter imbalance; 1.35 was sufficient in every fixture here"* — and 1.35 is exact here at both D.
+
+Round 2 needs a different baseline again: a bucket's unique rows land **contiguously**, so they reach only
+**1–2 output shards**, not all `d`. Its worst per-destination is therefore ~the whole bucket, so size off
+`ss/d`, not `ss/d/d` — understating it by a factor of `d`.
+
+**The guard is verified in both directions.** Undersizing either round makes overflow nonzero *and*
+`exact` False; at 1.35 both are clean. Exactness and a zero count coincide, which is what makes the free
+check sufficient — and a caller must **raise**, not clamp.
+
+**Still not established.** Virtual devices, so **no speed claim**, and two routing rounds with 24
+`all-to-all` at D=4 is materially more communication than the single round this line originally assumed —
+whether it pays for the 27.9 GB/device it saves needs real interconnect measurement. The prototype lives
+outside `rqutils/`; `states_size` and both capacities are `static_argnums`, and `N` must divide `d`.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is

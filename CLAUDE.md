@@ -337,7 +337,13 @@ bucket `k`'s output offset is data-dependent and does not align with output-shar
 buckets straddled one), so a bucket owner must send to several output shards. Two dead ends recorded:
 per-shard `[d, cap]` blocks **cannot** be declared replicated (`check_vma` is right; suppressing it gives
 a silently wrong answer), and splitters derived from a sharded array must be *passed* to `shard_map`, not
-closed over. JAX form not completed. `NOTES.md`.
+closed over. **Built 2026-08-30: bit-identical at D=2 and D=4**, 1 all-gather / 24 all-to-all / 0
+collective-permute. Two capacity lessons: an overflow guard must count **live** elements only (the first
+version reported 763,677 beside a bit-exact result, because round 2's dead rows overflow one bucket by
+design — a guard that fires on correct input trains callers to ignore it), and **balls-in-bins is the
+wrong model for a range partition** — it assumes independent random destinations, true for `poc13`'s hash
+and false here, so use `poc11`'s "slack must exceed the splitter imbalance" (1.35 is exact). Round 2 needs
+`ss/d`, not `ss/d/d`, since a bucket's rows reach only 1–2 output shards. `NOTES.md`.
 
 **`states` must be lex-sorted** — `get_xsource` is a binary search, not a sort. Always required (the
 sort was equally wrong on unsorted input) but previously undocumented; `hproj(unique_states=True)`
