@@ -2745,3 +2745,46 @@ class TestHamiltonianInputIsCheckable:
             ["qiskit"],
             'assert type(m.HamiltonianInput).__name__ == "TypeAliasType"\n',
         )
+
+
+class TestShardedDiagonals:
+    """The popcount diagonal path on a mesh, with states partitioned rather than replicated.
+
+    ``_z_parity`` is ``sum(bitwise_count(states & z), axis=1) & 1``, so it reduces along the **byte**
+    axis while ``P('x', None)`` shards axis 0. That should make the whole path free of collectives --
+    the easy half of the rule that only elementwise ops and reductions survive a partitioned axis,
+    unlike ``uniquify_states``' ``cumsum``, which reduces *along* the sharded axis and cannot.
+
+    Carried as the last unverified mechanism of the distributed-``states`` design and measured rather
+    than assumed, because "should be free" is exactly the claim this repo requires evidence for. The
+    child asserts the **spec and the values together**: a replicated run agrees to exactly 0.0, so a
+    silently unsharded builder is invisible to value comparison, and a spec check alone would not
+    catch a wrong sign.
+    """
+
+    def test_diagonal_builders_shard_and_agree_with_single_device(self):
+        pytest.importorskip("qiskit")
+        stdout = run_sharded_child("_sharded_diagonals.py", "diagonal builders")
+
+        seen = {}
+        for line in stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) == 5:
+                seen[(parts[0], int(parts[1]))] = (int(parts[2]), int(parts[3]), int(parts[4]))
+
+        # Assert the grid is complete before checking it, so a child that died partway through
+        # cannot pass on the cells it managed to print.
+        expected = {(dtype, n) for dtype in ("real", "complex") for n in (2, 4)}
+        assert set(seen) == expected, f"child printed {sorted(seen)}:\n{stdout[-2000:]}"
+
+        for (dtype, num_devices), (groups, bad_spec, bad_value) in sorted(seen.items()):
+            assert groups > 1, (
+                f"{dtype}/{num_devices}: only {groups} X groups, fixture is degenerate"
+            )
+            assert bad_spec == 0, (
+                f"{dtype}/{num_devices}: {bad_spec} outputs lost their 'x' spec -- the builder ran "
+                "correctly but unsharded, which value comparison alone cannot see"
+            )
+            assert bad_value == 0, (
+                f"{dtype}/{num_devices}: {bad_value} outputs differ from single-device"
+            )
