@@ -1826,6 +1826,60 @@ often pointed at, prefix hashing is unusable and range splitting is unusable; wh
 1.03–1.11× everywhere and invariant to hop, to `d`, and to the subspace growing. `poc12` now carries the
 XXZ fixture and asserts exactness over all 60 hops.
 
+
+### The JAX composition works and is exact: `poc13_hash_partition_jax.py` (2026-08-30)
+
+`poc12` validated the hash-partitioning *algorithm* in numpy and left the JAX implementation as the
+open item, with the caveat that `ragged_all_to_all` is `UNIMPLEMENTED` on XLA:CPU. **The composition
+turned out to be fully verifiable here anyway**, because the dense `all_to_all` over fixed-capacity
+buckets carries the identical dataflow — ragged is a *bandwidth* optimization of the same routing step,
+not a different algorithm — and the dense form runs on CPU.
+
+**Bit-identical to `get_xsource`** on a 1D XXZ Krylov subspace, n=30, N=21,716, hit rate 24.9%:
+
+| D | hop | cap | exact | overflow | all-gather / all-reduce / collective-permute / all-to-all |
+| --- | --- | --- | --- | --- | --- |
+| 2 | (0,1) | 8826 | **yes** | 0 | 0 / 0 / 0 / 8 |
+| 2 | (15,16) | 8826 | **yes** | 0 | 0 / 0 / 0 / 8 |
+| 2 | (29,0) | 8826 | **yes** | 0 | 0 / 0 / 0 / 8 |
+| 4 | (0,1) | 2270 | **yes** | 0 | 0 / 0 / 0 / 12 |
+| 4 | (15,16) | 2270 | **yes** | 0 | 0 / 0 / 0 / 12 |
+| 4 | (29,0) | 2270 | **yes** | 0 | 0 / 0 / 0 / 12 |
+
+The hops are chosen deliberately: `(0,1)` and `(29,0)` touch the **high-order** bits, which is exactly
+where range splitting measured 13.68–14.95× (`poc12`). Under hashing they are indistinguishable from the
+mid-string hop. **Zero all-gather, all-reduce and collective-permute** in every case — only the intended
+`all_to_all`.
+
+**Bucketing must be `D` passes of an `[n]` cumsum, not one `[n, D]` one-hot.** `poc11` rejected the
+one-hot shape for costing `4*N*NSH` bytes; measured here at D=4, **24 B/slot for the one-hot against 13
+for the loop**, and the gap widens in `D` since one is `O(N·D)` and the other `O(N)`. Both give identical
+buckets — verified against a numpy reference before either was used.
+
+**The capacity guard works, and the check is sufficient.** `cap` must be static (`all_to_all` needs a
+fixed shape), derived from the balls-in-bins bound `mu + sqrt(2·mu·ln D)` with `mu = (N/D)/D`. The kernel
+returns a free overflow count (a sum of a mask already computed):
+
+| slack | cap | overflow | exact |
+| --- | --- | --- | --- |
+| 1.6 | 2270 | 0 | **yes** |
+| 0.9 | 1277 | **1284** | **no** |
+
+**Exactness and a zero overflow count coincide**, which is what makes the free check a sufficient guard
+rather than a partial one — and it is why a caller must **raise, not clamp**. Note the contrast that
+mattered: the Bloom pre-filter's `cap = hits + FP` needed `hits`, the unknown being computed, so it
+collapsed to `cap = N`; this capacity depends only on `N/D`, known at setup.
+
+**Two JAX mechanics worth recording.** A rank-0 output cannot be concatenated across the mesh —
+`shard_map` rejects `out_specs=P('x')` on a scalar with "which has rank 0 (and 0 < 1)", so the overflow
+count must be `.reshape(1)`. And the sentinel is `0xFFFF...`, which is unreachable by construction: the
+packed keys carry a zero pad bit at position 0, so no real key is all-ones.
+
+**Still not established.** Nothing on a real interconnect — virtual devices make timings meaningless per
+`CLAUDE.md`, so **no speed claim is made**. The setup phase (owner assignment plus per-shard sort) is
+host-side numpy; in the library it is `poc11`'s phase 3. `uniquify_states` remains a separate blocker,
+and the diagonal builders' `popcount(S[i] & z)` path is still unverified end-to-end.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is
