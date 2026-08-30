@@ -338,10 +338,16 @@ class TestPackedStatesInput:
     def test_packed_and_unpacked_agree_on_everything_returned(self):
         """Defect: a boundary that accepts packed input but reports a different subspace.
 
-        All three return values must match, not just the eigenvalue: the eigenvector is indexed by
-        basis position, and the basis itself is unpacked with a qubit count that used to come from
-        ``states.shape[1]`` -- the *packed* width when the caller passes packed states, which would
-        unpack to the wrong number of qubits while still returning a plausible array.
+        All three return values must describe the same subspace in the same order, not just the
+        eigenvalue: the eigenvector is indexed by basis position, and the basis's qubit count used to
+        come from ``states.shape[1]`` -- the *packed* width when the caller passes packed states,
+        which would unpack to the wrong number of qubits while still returning a plausible array.
+
+        Since 2026-08-30 ``packed`` governs the returned width too, so the two bases are no longer
+        directly comparable. The invariant asserted is the stronger one that survives: unpacking the
+        packed return must reproduce the unpacked return exactly. That still catches the original
+        defect -- a wrong qubit count cannot round-trip to the right rows -- and additionally pins
+        both widths, so neither branch can quietly start returning the other form.
         """
         from rqutils.paulis.symplectic import PauliSumXZ
 
@@ -360,12 +366,46 @@ class TestPackedStatesInput:
         assert np.array_equal(vec_p, vec_u), (
             "eigenvectors differ, so the bases are not the same order"
         )
-        assert np.array_equal(basis_p, basis_u), "returned bases differ"
-        assert basis_p.shape[1] == num_qubits, (
-            f"the returned basis must be unpacked to {num_qubits} qubits regardless of the input "
-            f"form, got width {basis_p.shape[1]} -- the unpack took its qubit count from the packed "
-            f"width"
+        assert basis_u.shape[1] == num_qubits, (
+            f"packed=False must return unpacked rows, got width {basis_u.shape[1]}"
         )
+        assert basis_p.shape[1] == packed.shape[1], (
+            f"packed=True must return the packed width {packed.shape[1]}, got {basis_p.shape[1]}"
+        )
+        assert np.array_equal(np.asarray(PauliSumXZ.unpack_states(basis_p, num_qubits)), basis_u), (
+            "unpacking the packed return does not reproduce the unpacked return"
+        )
+
+    def test_packed_return_round_trips_with_no_repack(self):
+        """The behaviour ``packed``'s return side exists for: feed the output straight back in.
+
+        Before 2026-08-30 the return was unpacked regardless, so a caller holding packed states had
+        to re-pack after every solve. ``pack_states`` is **not idempotent**, so that re-pack was also
+        a live hazard: feeding the returned array back with ``packed=True`` would previously have
+        declared unpacked rows as packed and silently solved a different subspace.
+
+        Asserted on the *second* solve rather than only on shapes, because a returned array of the
+        right width could still be the wrong rows -- and a wrong subspace changes the eigenvalue.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        rng = np.random.default_rng(831)
+        num_qubits = 14
+        labels = real_pauli_strings(num_qubits, 6, rng)
+        hamiltonian = PauliSumXZ.from_paulisum((labels, rng.normal(size=len(labels)).tolist()))
+        states = unique_states(600, num_qubits, rng)
+        packed = PauliSumXZ.pack_states(states)
+
+        first_val, _, first_basis = sqd(hamiltonian, packed, packed=True)
+        assert first_basis.shape[1] == packed.shape[1], "returned width must be the packed width"
+
+        # The round trip: no pack_states call between the two solves.
+        second_val, _, second_basis = sqd(hamiltonian, first_basis, packed=True)
+        assert second_val == pytest.approx(first_val, abs=1e-12), (
+            "the round trip solved a different subspace, so the returned basis is not the one the "
+            "solver searched"
+        )
+        assert np.array_equal(first_basis, second_basis), "basis not stable across the round trip"
 
     def test_mismatched_flag_is_rejected_on_width(self):
         """Each form must be rejected under the wrong flag, at every width where it can be."""

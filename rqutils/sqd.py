@@ -600,14 +600,25 @@ def sqd(
             Set it when you already hold the packed array, to skip an 8x round trip: unpacked states
             are one byte per qubit against ``ceil((num_qubits + 1) / 8)`` bytes packed -- 2.40 GB
             against 0.31 GB at ``num_qubits=100``, ``subspace_dim=24M`` -- and both arrays are live
-            at once during the pack, so the transient peak is their sum. This changes nothing inside:
-            the packed form is what the solver has always used, and the returned basis is unpacked
-            either way.
+            at once during the pack, so the transient peak is their sum. The packed form is what the
+            solver has always used internally.
+
+            **It governs the returned basis too**, so a round trip needs no re-pack: ``packed=True``
+            returns the ``ceil((num_qubits + 1) / 8)``-wide rows the solver searched, ``packed=False``
+            unpacks them to ``num_qubits``. **This is a behavioural change** -- before 2026-08-30 the
+            return was unpacked either way, so a caller passing ``packed=True`` and comparing the
+            result against an unpacked array now gets a shape mismatch. That comparison fails loudly
+            (``np.array_equal`` is ``False`` on differing shapes) rather than silently, which is why
+            the flag governs both directions instead of a second ``return_packed``: two flags make
+            four combinations, two of which are format conversions, and ``sqd`` is not a conversion
+            utility -- :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states` and
+            :meth:`~rqutils.paulis.symplectic.PauliSumXZ.unpack_states` are.
 
             It is a declaration, and a wrong one is not always caught. At ``num_qubits == 1`` the two
             widths coincide, so passing unpacked states with ``packed=True`` silently returns a
             different eigenvalue; every other qubit count is rejected on width. Pass the flag only for
-            an array that came from ``pack_states``.
+            an array that came from ``pack_states``. Note the returned width is *also* wrong in that
+            case, which gives a second chance to notice.
         cache_level: Switches for caching the results of source indices and sign bits / diagonals.
             See the module documentation for the detailed discussion of the resource tradeoff involved.
         xcache_groups: Number of X groups whose source indices to cache, or ``None`` (default) for all
@@ -659,7 +670,10 @@ def sqd(
     Returns:
         Calculated ground state energy, or a tuple of energy, ground state vector, and sorted
         uniquified states (if return_eigvec=True). The returned states are the genuine unique rows
-        only, never the filler slots, so their count can be below ``states_size``.
+        only, never the filler slots, so their count can be below ``states_size``. Their **width
+        follows** ``packed``: ``num_qubits`` columns by default, ``ceil((num_qubits + 1) / 8)`` when
+        ``packed=True``. Both overloads annotate this as ``StateList``, which cannot express the
+        difference, so a type checker will not catch a caller that assumes the wrong width.
 
         **On a degenerate ground eigenvalue the eigenvector is one arbitrary member of the eigenspace,
         and nothing in the return marks that case.** The eigenvalue is still correct. Anything not
@@ -784,10 +798,24 @@ def sqd(
         )
     if return_eigvec:
         eigvec, states_u, subspace_dim = result[1:-1]
-        # `hamiltonian.num_qubits`, not `states.shape[1]`: the latter is the *packed* width when the
-        # caller passed `packed=True`, which would unpack to the wrong qubit count.
-        basis_states = PauliSumXZ.unpack_states(states_u[:subspace_dim], hamiltonian.num_qubits)
-        return (eigval, np.array(eigvec[:subspace_dim]), basis_states)
+        # `packed` now governs BOTH directions: a caller who hands over packed states gets packed
+        # states back, so a round trip through `sqd` needs no re-pack. The returned rows are the same
+        # array `run_sqd` searched, sliced to the genuine uniques.
+        #
+        # Deliberately not a separate `return_packed` flag. Two independent flags make four
+        # combinations of which two are round trips and two are conversions, and `sqd` is not a
+        # conversion utility -- `PauliSumXZ.pack_states`/`unpack_states` are, and a caller wanting
+        # the other width calls one of them. One flag keeps input and output in the same convention
+        # by construction.
+        #
+        # `hamiltonian.num_qubits`, not `states.shape[1]`: the latter is the *packed* width on the
+        # `packed=True` path, which would unpack to the wrong qubit count.
+        basis_states = (
+            states_u[:subspace_dim]
+            if packed
+            else PauliSumXZ.unpack_states(states_u[:subspace_dim], hamiltonian.num_qubits)
+        )
+        return (eigval, np.array(eigvec[:subspace_dim]), np.asarray(basis_states))
     return eigval
 
 

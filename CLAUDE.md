@@ -589,7 +589,18 @@ quoting the time.
   (`functools.partial(apply_h, xsources=xs, diagonals=dg)`), not the `cache_level`; the four
   `examples/scaling/` POCs show the migration.
 
-The last two are downstream-visible breaks. There is no CHANGELOG in this repo — if one is ever added,
+- **`sqd(..., packed=True)` now returns *packed* states** (2026-08-30). `packed` governs both
+  directions, so a round trip needs no re-pack — which also removes a hazard, since
+  `PauliSumXZ.pack_states` is not idempotent and re-packing a returned array was silently wrong. **A
+  caller that passed `packed=True` and compared the result against an unpacked array breaks**, but
+  loudly: `np.array_equal` is `False` on a shape mismatch. `spinchain`'s `skqd` is such a caller
+  (`sqd_backend.py` compares `basis_states` against its own `bitstring_matrix`) — it does **not**
+  round-trip states, so it gains nothing here and needs the comparison updated. One flag rather than a
+  second `return_packed`: two flags make four combinations, two of which are format conversions, and
+  `pack_states`/`unpack_states` already are those. Both overloads annotate `StateList`, which cannot
+  express the width, so **`ty` will not catch a caller assuming the wrong one**.
+
+The last three are downstream-visible breaks. There is no CHANGELOG in this repo — if one is ever added,
 both belong in it.
 
 ## Closed investigations — don't reopen without reading the record
