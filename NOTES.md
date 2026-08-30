@@ -1653,6 +1653,179 @@ scrutiny.** It converts a hard 27.9 GB/device wall into `27.9/d`. It is also muc
 else attempted here — a new partitioning contract, a routed `get_xsource`, and `uniquify_states`
 rebuilt on POC 11 — so it is a project, not a patch.
 
+
+### Hash-partitioning `states`: hash the whole key, not the prefix — the prefix collapses on real subspaces (2026-08-30)
+
+The entry above proposed Wietek & Läuchli's scheme and flagged the untested claim: the 1.02×
+imbalance was measured on an evenly-split *sorted* array and said nothing about a real subspace. Built
+the hash-partitioned variant and tested it on fixtures chosen to break it. **One change to the
+published scheme is required, and the reason is specific to SQD.**
+
+**Prefix hashing collapses completely on a structured subspace.** Imbalance at n=60, N=200k, d=16,
+12 prefix bits:
+
+| fixture | prefix-hash | whole-key hash | range-split | distinct prefixes |
+| --- | --- | --- | --- | --- |
+| uniform | 1.12× | 1.01× | 1.00× | 2048 |
+| fixed-weight n/2 | 1.16× | 1.02× | 1.00× | 2048 |
+| low-weight n/8 | **3.81×** | 1.01× | 1.00× | 779 |
+| banded (last n/4) | **16.00×** — total collapse | **1.09×** | 1.01× | **1** |
+
+The last column is the mechanism: when excitations are confined to low qubits, **every state shares the
+same high bits**, so the prefix hash is constant and one shard takes everything. This is the same root
+cause `poc11_range_partition.py` already recorded for equal-range splitting on the most-significant
+word — *"at n=100 that word is 7 bytes of leading pad"* — namely that **the high bits of an SQD state
+carry almost no entropy.** A banded subspace is not contrived: it is what a circuit acting on a subset
+of qubits produces.
+
+**Hashing the whole key fixes it and costs nothing.** The key is already computed by
+`_pack_state_keys`, so it is one extra `mix64`. Wietek & Läuchli hash the *prefix* because their scheme
+needs prefix-grouping for local enumeration; **rqutils has no such requirement**, so the constraint does
+not carry over.
+
+**The one thing whole-key hashing gives up is the free local sort.** A range split hands each shard a
+contiguous sorted block; a hash hands it a scattered subset that must be sorted per shard. That is
+affordable and already prototyped: `d` independent sorts of `N/d` rows is exactly
+`poc11_range_partition.py`'s phase 3 (`vmap` over `lax.sort`, zero collectives), and it runs **once at
+setup**, not per `get_xsource` call. So the design is *hash to assign owners → per-shard sort → local
+binary search*, with ownership still metadata-free.
+
+**Verified exact on every fixture** against `get_xsource`, at n=60, d=16, with the hop chosen to act on
+qubits each fixture populates (a hop on qubits 0–1 gives the banded fixture a 0% hit rate and tests
+nothing):
+
+| fixture | N | hit rate | imbalance | bit-identical | per-device |
+| --- | --- | --- | --- | --- | --- |
+| uniform | 74,944 | 39.9% | 1.03× | **yes** | 16× less |
+| fixed-weight | 75,156 | 40.3% | 1.02× | **yes** | 16× less |
+| banded | 6,435 | 53.3% | 1.14× | **yes** | 16× less |
+
+**Balance holds as `d` grows, and the residual is Poisson, not structural.** Including a Zipf-sampled
+fixture (2M shots → 148,976 unique, a **92.6% duplicate rate**, matching the 91–97.6% `NOTES.md`
+measured for real shot distributions):
+
+| fixture | N | d=4 | d=16 | d=64 | d=256 | d=1024 |
+| --- | --- | --- | --- | --- | --- | --- |
+| fixed-weight | 200,000 | 1.01× | 1.03× | 1.04× | 1.08× | 1.21× |
+| banded | 6,435 | 1.01× | 1.09× | 1.22× | 1.63× | 2.86× |
+| zipf-sampled | 148,976 | 1.01× | 1.01× | 1.04× | 1.09× | 1.22× |
+
+**Checked against the balls-in-bins bound** `1 + sqrt(2 ln d / (N/d))` rather than asserted: predicted
+and measured agree in magnitude at every point and **both depend only on `N/d`**, not on the fixture.
+Banded degrades because its `N` is 6,435, so `d=1024` leaves ~6 states per shard — not because its
+structure survives. **That is the hash working: it has erased the structure that destroyed prefix
+hashing, leaving ordinary sampling noise**, which a capacity slack absorbs exactly as `poc11`'s `slack`
+parameter does.
+
+**Practical rule:** size shard capacity from `N/d` via the balls-in-bins bound, and keep `N/d` above
+~1000 for a slack under 1.15×. At `N = 2^31` that permits `d` up to ~2×10^6 — far beyond any real mesh.
+
+**Still unbuilt.** The verified prototype is numpy, so it validates the *algorithm*, not a JAX
+implementation; the three JAX ingredients were verified separately in the entry above but not composed
+with hashing. No real-interconnect measurement and **no speed claim**. `uniquify_states` still needs
+rebuilding on `poc11`, and the diagonal builders' `popcount(S[i] & z)` path was not verified end-to-end.
+
+
+### The variable-length routing has a primitive, and the capacity bound is the one the Bloom work lacked (2026-08-30)
+
+The gap left by the hash-partitioning entry above: the prototype is numpy, and a JAX implementation
+needs a routing step where **each shard receives a different, data-dependent count**. MPI does this with
+`Alltoallv`; JAX requires static shapes. Explored, and both routes are now characterized.
+
+**`jax.lax.ragged_all_to_all` exists** (JAX 0.11.1) and is the direct analogue — it takes
+`(operand, output, input_offsets, send_sizes, output_offsets, recv_sizes)` and ships exactly the
+per-destination counts.
+
+**Its known defect does not apply here, which is the useful part.** FESOM2-JAX
+(`arxiv.org/abs/2608.01546`) reports it "has a defective reverse-mode rule in JAX 10.1 and is usable
+**forward-only**", and they fell back to a padded variant to keep exact adjoints. `get_xsource` returns
+**integer indices** and is never differentiated — `sqd` does not backprop through it — so rqutils can use
+the ragged path they had to abandon.
+
+**It cannot be verified in this environment**: `JaxRuntimeError: UNIMPLEMENTED: HLO opcode
+`ragged-all-to-all` is not supported by XLA:CPU ThunkEmitter`. So it is a GPU/TPU-only path here, and
+nothing about it is measured — only that the API exists and the published objection is irrelevant to
+this use.
+
+**The padded fallback is affordable, and its capacity is computable — unlike the Bloom filter's.** Size
+each send buffer by the balls-in-bins bound `cap = m/d + sqrt(2·(m/d)·ln d)` with `m = N/d`:
+
+| `N` | d=4 | d=16 | d=64 | d=256 |
+| --- | --- | --- | --- | --- |
+| 10^6 | 0.7% | 3.8% | 18.8% | **90.1%** |
+| 24×10^6 | 0.1% | 0.8% | 3.8% | 17.4% |
+| 2^31 | 0.0% | 0.1% | 0.4% | **1.8%** |
+
+Padding overhead, as a fraction of the data sent. **It shrinks as `N` grows and grows with `d`** — the
+same `N/d` dependence as the imbalance, and negligible exactly where the feature matters (0.4% at
+`N = 2^31, d = 64`). FESOM2-JAX measured padded against ragged at **0.742 vs 0.589 s/step** on 64 GPUs,
+a 26% penalty rather than a cliff, so the fallback is a real option and not a last resort.
+
+**The contrast with the pre-filter's `cap` is the point, and it is structural.** `NOTES.md` records that
+the capacity problem "blocks the whole pre-filter family": there `cap = hits + FP` and **`hits` is the
+unknown being computed**, so any data-independent bound collapses to `cap = N`, "correct and worthless."
+Here the capacity depends only on `N/d`, **known at setup**, so the bound is tight and derivable in
+advance. The overflow check is equally free — sum the per-destination counts and compare — and the same
+rule carries over: **raise, do not clamp**, since an undersized capacity drops states silently.
+
+So the routing is not a blocker on either path. What remains unbuilt is the JAX composition itself, and
+it cannot be validated on this hardware.
+
+
+### 1D XXZ is the case that decides it: prefix hashing fails at exactly `d`, and range splitting fails on the *targets* (2026-08-30)
+
+The hash-partitioning entry above used synthetic fixtures. Re-run on a real 1D XXZ subspace — built the
+way SQD gets one, a Krylov expansion from |Néel⟩ under the nearest-neighbour hop graph, so it lives in
+one magnetization sector and stays *local* rather than spread over the weight shell. **Both alternatives
+to whole-key hashing fail, and one fails completely.**
+
+**Prefix hashing measures exactly `d`.** At n=30, N=200k, 12 prefix bits:
+
+| scheme | d=4 | d=16 | d=64 | d=256 |
+| --- | --- | --- | --- | --- |
+| prefix-hash | **4.00×** | **16.00×** | **64.00×** | **256.00×** |
+| whole-key hash | 1.00× | 1.02× | 1.04× | 1.11× |
+
+Imbalance equal to `d` at every device count means **one shard holds the entire subspace and the other
+`d-1` hold nothing** — not degradation, complete failure. The cause is **1 distinct prefix**, and it is
+an artifact of the packing width rather than the physics: `B = ceil(31/8) = 4` bytes leaves **33 leading
+zero bits** in the uint64 key, so the top 12 bits are constant *by construction*. At n=60 and n=100 there
+are 312 and 280 distinct prefixes and imbalance is still **2.05–118.98×**, because a
+magnetization-conserving Krylov subspace concentrates near Néel and even the non-pad high bits barely
+vary.
+
+**Range splitting looked competitive and is not — measuring it on the states hides the failure.**
+Splitters derived from the state list balance *that list* by construction (1.00–1.85× measured), but
+**what gets routed is the targets `S ^ X`**. At n=60, d=64, per XXZ hop:
+
+| hop | hit rate | range-split | whole-key hash |
+| --- | --- | --- | --- |
+| (45, 46) | 18.4% | 1.01× | 1.05× |
+| (29, 30) | 18.5% | 2.48× | 1.03× |
+| (15, 16) | 18.3% | 7.90× | 1.04× |
+| (0, 1) | 18.4% | **13.68×** | 1.05× |
+| (59, 0) | 18.5% | **14.95×** | 1.04× |
+
+The failure is **hop-dependent**: swapping *high-order* bits moves a key far in lex order, piling targets
+into few range buckets, while a swap deep in the string barely moves it. **XXZ has a hop on every bond,
+so the worst case is always present** in the J-fold sweep.
+
+**And splitters go stale where a hash cannot.** A real SQD run grows the subspace during configuration
+recovery, so the set the splitters were derived from is not the set later queried. Splitters from half the
+subspace applied to the full set: **32.51×**, against whole-key hashing's **1.04×**. A hash of the key
+does not depend on the population at all, which is the property that matters here.
+
+**Verified exact on XXZ across every X group.** n=60, J=61 groups, K=60, N=80,000, d=64: **61 groups, 0
+mismatches**, hit rates spanning **2.2%–100.0%** (the 100% group is the one where the subspace is closed
+under that hop), imbalance **1.04×–1.10×** throughout, 64× fewer state rows per device. The
+100%-hit-rate group matters — it is the degenerate case where every target is present, and the routing
+handles it at the same imbalance.
+
+**So the design choice is settled by physics, not preference.** On the Hamiltonian this library is most
+often pointed at, prefix hashing is unusable and range splitting is unusable; whole-key hashing is
+1.03–1.11× everywhere and invariant to hop, to `d`, and to the subspace growing. `poc12` now carries the
+XXZ fixture and asserts exactness over all 60 hops.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is
