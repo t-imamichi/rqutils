@@ -51,14 +51,36 @@ communication than the single round this line originally assumed; whether it pay
 of replicated ``states`` it removes needs real interconnect measurement. ``states_size`` and both
 capacities are ``static_argnums``, and ``N`` must divide ``d``.
 
-Run::
+Run on virtual CPU devices (the default -- correctness only)::
 
-    XLA_FLAGS=--xla_force_host_platform_device_count=4 uv run python \\
-        examples/scaling/poc14_uniquify_sharded.py
+    uv run python examples/scaling/poc14_uniquify_sharded.py
 
+Run on real GPUs, which is the only way the routing-cost question can be answered::
+
+    uv run python examples/scaling/poc14_uniquify_sharded.py --devices 0,1,2,3
 """
 
+import argparse
 import functools
+import os
+
+# `argparse` before `import jax`, as in poc8/poc9: CUDA_VISIBLE_DEVICES and XLA_FLAGS are both read
+# at backend initialization, so neither can be set after jax is imported. That is also why this
+# preamble is duplicated per script rather than living in `_scaling_common` -- that module imports jax.
+parser = argparse.ArgumentParser()
+parser.add_argument("--devices", help='Comma-separated GPU ids, e.g. "0,1,2,3".')
+parser.add_argument("--num-qubits", type=int, default=100)
+parser.add_argument(
+    "--host-devices", type=int, default=4, help="Virtual CPU devices when no --devices."
+)
+options = parser.parse_args()
+
+if options.devices:
+    os.environ["CUDA_VISIBLE_DEVICES"] = options.devices
+else:
+    os.environ.setdefault(
+        "XLA_FLAGS", f"--xla_force_host_platform_device_count={options.host_devices}"
+    )
 
 import jax
 import numpy as np
@@ -74,7 +96,7 @@ from rqutils.sqd import _pack_state_words, uniquify_states
 # Sorts above every real packed word, so a padding slot never compares equal to real data. The
 # packed rows carry a zero pad bit at position 0 (see `sqd`), so all-ones is unreachable.
 SENTINEL = jnp.uint64(0xFFFFFFFFFFFFFFFF)
-NUM_QUBITS = 100
+NUM_QUBITS = options.num_qubits
 
 
 def ge_lex(rows, splitter):
@@ -303,13 +325,33 @@ def run(mesh, num_shards, states, states_size, slack=1.35):
     }
 
 
+def shard_counts():
+    """Shard counts to sweep: the powers of two dividing the visible device count.
+
+    Derived rather than hardcoded so the same script is meaningful on 1, 2, 4 or 8 devices. Note
+    ``d = 1`` is skipped here, unlike ``poc13``: with one bucket there is no second routing round to
+    exercise and the run would assert nothing this POC exists for.
+    """
+    total = jax.device_count()
+    return tuple(d for d in (2, 4, 8, 16, 32) if d <= total and total % d == 0)
+
+
+def backend_note():
+    """One line naming the backend, and whether timings from it would mean anything."""
+    backend = jax.default_backend()
+    kind = "REAL" if backend != "cpu" else "virtual"
+    return f"{jax.device_count()} {kind} {backend} device(s)"
+
+
 def main():
     print("POC 14: sharded uniquify_states, two routing rounds\n")
-    if jax.device_count() < 4:
+    print(f"running on {backend_note()}; sweeping shard counts {shard_counts()}")
+    if jax.default_backend() == "cpu":
+        print("  virtual devices: correctness only -- per CLAUDE.md, timings here are meaningless")
+    if not shard_counts():
         raise SystemExit(
-            f"needs 4 devices, found {jax.device_count()}. Run with "
-            "XLA_FLAGS=--xla_force_host_platform_device_count=4 (the count must be set before jax "
-            "initializes, so exporting it here would be too late)."
+            "needs at least 2 devices: with one bucket there is no second routing round, which is "
+            "the mechanism this POC exists to verify. Pass --devices, or --host-devices 2."
         )
     states = xxz_krylov(NUM_QUBITS, 12_000)
     # Duplicate a third of the rows so the dedupe path is actually exercised, then shuffle: the
@@ -321,7 +363,7 @@ def main():
 
     print("\n1. exactness across shard counts")
     print(f"   {'d':>3} {'cap1':>8} {'cap2':>8} {'unique':>8} {'ovf':>7} {'exact':>6}")
-    for num_shards in (2, 4):
+    for num_shards in shard_counts():
         mesh = jax.make_mesh((num_shards,), ("x",), axis_types=(AxisType.Explicit,))
         trimmed = states[: (len(states) // num_shards) * num_shards]
         r = run(mesh, num_shards, trimmed, states_size)
@@ -334,18 +376,55 @@ def main():
         assert r["unique"] == r["reference_unique"], "unique count disagrees"
 
     print("\n2. the overflow guard fires when either round is undersized")
-    mesh = jax.make_mesh((4,), ("x",), axis_types=(AxisType.Explicit,))
-    trimmed = states[: (len(states) // 4) * 4]
+    widest = shard_counts()[-1]
+    mesh = jax.make_mesh((widest,), ("x",), axis_types=(AxisType.Explicit,))
+    trimmed = states[: (len(states) // widest) * widest]
     print(f"   {'slack':>7} {'ovf':>8} {'exact':>6}")
     for slack in (1.35, 0.30):
-        r = run(mesh, 4, trimmed, states_size, slack=slack)
+        r = run(mesh, widest, trimmed, states_size, slack=slack)
         note = "   <- guard fires; a caller MUST raise" if r["overflow"] else ""
         print(f"   {slack:>7} {r['overflow']:>8} {r['exact']!s:>6}{note}")
-    under = run(mesh, 4, trimmed, states_size, slack=0.30)
+    under = run(mesh, widest, trimmed, states_size, slack=0.30)
     assert under["overflow"] > 0, "an undersized capacity must be detected"
     assert not under["exact"], "an undersized capacity does drop rows -- hence the guard"
     print("\n   Exactness and a zero overflow count coincide, which is what makes the free check")
-    print("   sufficient. No speed claim: virtual devices, per CLAUDE.md.")
+    print("   sufficient.")
+
+    print("\n3. timing: two-round routing against the single-device sort")
+    if jax.default_backend() == "cpu":
+        print("   SKIPPED -- virtual devices share one physical backend, so per CLAUDE.md these")
+        print("   timings are meaningless. Re-run with --devices on a multi-GPU box.")
+        return
+    # THE question this line is blocked on. Two rounds is 24 all_to_all at d=4, against removing a
+    # `13 * N`-byte replicated state list from every device. Both arms warm: a cold run measures
+    # compilation, and one such run read 125 s against a warm 20 s elsewhere in this repo.
+    import time
+
+    widest = shard_counts()[-1]
+    trimmed = states[: (len(states) // widest) * widest]
+    mesh = jax.make_mesh((widest,), ("x",), axis_types=(AxisType.Explicit,))
+    print(f"   {'arm':>28} {'ms':>9} {'per-device states':>18}")
+    for label, thunk, per_device in (
+        (
+            "uniquify_states (1 device)",
+            lambda: uniquify_states(jnp.asarray(trimmed), states_size),
+            trimmed.nbytes,
+        ),
+        (
+            f"sharded, two rounds, d={widest}",
+            lambda: run(mesh, widest, trimmed, states_size)["exact"],
+            trimmed.nbytes // widest,
+        ),
+    ):
+        thunk()
+        start = time.perf_counter()
+        for _ in range(3):
+            jax.block_until_ready(thunk())
+        elapsed = (time.perf_counter() - start) / 3 * 1e3
+        print(f"   {label:>28} {elapsed:>8.2f}m {per_device / 1e6:>17.2f}M")
+    print("   A ratio above 1.0 is not automatically a failure: the sharded arm is what lifts the")
+    print("   N <= 2^31 ceiling, so the question is whether the cost is affordable, not whether it")
+    print("   is zero. Report both columns.")
 
 
 if __name__ == "__main__":
