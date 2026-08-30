@@ -1880,6 +1880,65 @@ packed keys carry a zero pad bit at position 0, so no real key is all-ones.
 host-side numpy; in the library it is `poc11`'s phase 3. `uniquify_states` remains a separate blocker,
 and the diagonal builders' `popcount(S[i] & z)` path is still unverified end-to-end.
 
+
+### Sharding `uniquify_states`: three gaps, all closable, and the hard one is a global prefix sum (2026-08-30)
+
+`poc11_range_partition.py` made the *sort* shardable and named two gaps in its own docstring — host-side
+splitter selection, and no reassembly into the `[states_size, B]` contract. Probing those found a third,
+which is the real one. **All three are closable; each mechanism is verified separately, and the full
+composition is not built.**
+
+**`uniquify_states` cannot use the hash partitioning of `poc12`/`poc13`.** Its output feeds
+`get_xsource`, which binary-searches, so the result must be **globally lex-sorted**. A hash destroys
+global order by design. Range partitioning is therefore mandatory here — splitters guarantee bucket
+`i` < bucket `i+1`, so concatenating in order is globally sorted. **That is a real asymmetry between the
+two functions**: `get_xsource` needs balance and gets it from hashing; `uniquify_states` needs order and
+must accept range splitting's imbalance.
+
+**Gap 1 — in-graph splitters: works, but they must compare the full row.** A strided sample gathered with
+`.at[idx].get(out_sharding=P(None, None))` lands replicated (the explicit spec is required; JAX cannot
+infer it off a partitioned axis), and sorting `d*64` rows is negligible. **But ordering the sample by its
+lead word alone collapses.** On a fixture with a constant lead word and the order carried entirely by the
+tail: lead-word-only puts **4000 of 4000 rows in one bucket**, full-row lex gives 990/990/990/1030.
+Neither produces an *ordering violation* — lead-word splitting is sound, never wrong — it simply cannot
+see the tail, which is the same balance collapse `poc11` documented for equal-range on the
+most-significant word.
+
+**An n=100 XXZ fixture does not catch this**: 94.1% of its rows share a lead word with another row, yet
+enough distinct lead values remain that both schemes measured 0 violations and the balance looked fine at
+1.30×. The adversarial fixture was necessary to separate them.
+
+**Gap 2 — reassembly into `[states_size, B]`: works.** Bucket `k`'s rows land at
+`sum(unique counts of buckets < k)`, and those counts are *traced*. A scatter at traced offsets is
+expressible: park dead slots at index `states_size` in a `states_size + 1` buffer and drop them
+(`mode='drop'`), then slice. Verified — output globally sorted, unique count exact, filler correct.
+`states_size` must be `static_argnums`, which it already is in the real function. One subtlety: after
+dedupe the live rows inside a block are **not contiguous** (interior duplicates are blanked), so the
+within-block destination needs a *re-rank* (`cumsum(live) - 1`), not the original slot index.
+
+**Gap 3 — the global prefix sum, which is the blocker `poc11` did not reach.** Ranking a row within its
+bucket is `cumsum(bucket == k)` over the **sharded** axis, and that raises:
+`ShardingTypeError: The input should be fully replicated when axis is not specified to cumsum`. `NOTES.md`
+already records the rule — *"everything that reorders or compacts along the sharded axis fails; only
+elementwise ops and reductions survive."* This is why `poc13` worked and a naive port here does not: there
+the cumsum ran **inside `shard_map`** over each shard's own slice, whereas these ranks must be *global* to
+place rows in a globally sorted output.
+
+**Resolved by a two-level prefix sum**, the standard distributed counting-sort structure: each shard
+cumsums its own slice for a local rank, one `all_gather` of a `[d, d]` per-shard-per-bucket count matrix,
+then add the exclusive prefix over lower-numbered shards. **Verified against a sequential reference** —
+global within-bucket ranks bit-identical, per-shard counts summing to the bucket totals, and **1
+`all_gather`, no all-reduce, no collective-permute, no all-to-all**. The communicated volume is `O(d^2)`,
+**independent of `N`**.
+
+**What is not built.** These are three verified mechanisms, not a working `uniquify_states` — the
+composition was not assembled, so there is no end-to-end exactness check against the real function and
+**no speed claim** (virtual devices, per `CLAUDE.md`). Also unaddressed: the input `[N, B]` must divide
+`d` (`sqd` already rounds `states_size` to a multiple of `mesh.size`, so the machinery exists), and
+`poc11`'s capacity `slack` remains a correctness parameter needing the raise-not-clamp treatment. Note
+`uniquify_states`' word packing is documented as *"the wrong trade for an out-of-core design"* at the
+`2^31` ceiling (6–15 GB of extra buffer); that judgement is unchanged by anything here.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is
