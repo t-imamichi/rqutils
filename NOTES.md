@@ -2039,6 +2039,32 @@ whether it pays for the 27.9 GB/device it saves needs real interconnect measurem
 outside `rqutils/`; `states_size` and both capacities are `static_argnums`, and `N` must divide `d`.
 
 
+### Widening the POC device sweep found a latent `all_to_all` bug a 4-device box hid (2026-08-30)
+
+Reorganizing `poc13`/`poc14` to run on real GPUs replaced their hardcoded `XLA_FLAGS=...count=4` with
+`poc8`'s `--devices` convention (argparse **before** `import jax`, since `CUDA_VISIBLE_DEVICES` and
+`XLA_FLAGS` are both read at backend initialization) and derived the shard sweep from
+`jax.device_count()` rather than pinning `(2, 4)`. **That immediately failed at 8 devices**, and the
+cause was a real defect rather than a limitation:
+
+`ValueError: The size of all_to_all split_axis (4) has to be divisible by the size of the named axis
+x (8)`. `run_case` took `mesh` and `num_shards` as **independent parameters that had to agree**. The
+send buffer got `num_shards` rows while the mesh axis had `jax.device_count()` devices, so routing is
+only well-defined when the two are equal — and **a 4-device box makes them coincide**, which is why
+every earlier run passed. Fixed by deriving `num_shards = mesh.shape["x"]` inside `run_case`, so the
+pair cannot disagree.
+
+**The transferable point: a hardcoded device count is not a fixture, it is a coincidence.** Sweeping
+the parameter is what separated two quantities that had been silently identical — the same reason
+`CLAUDE.md` says to sweep `cache_level` rather than sample it, and the same shape as the three bugs
+that hid behind its default `(1, 0)`.
+
+Also: `d = 1` needed handling in both scripts, for *different* reasons. `poc13` runs it as a
+meaningful degenerate case (zero collectives, still exact) but must **skip its overflow section** —
+with one bucket the derived capacity is ~`N`, so a 0.9x slack is still ample, nothing overflows, and
+the section's premise is false rather than its assertion weak. `poc14` **raises** at `d = 1`: with one
+bucket there is no second routing round, which is the mechanism it exists to verify.
+
 ### The popcount diagonal path already shards — verified, no work needed (2026-08-30)
 
 Carried as the last open item of the distributed-`states` line ("the diagonal builders need

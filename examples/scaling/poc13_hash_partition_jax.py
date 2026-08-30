@@ -34,11 +34,37 @@ phase (owner assignment plus the per-shard sort) is host-side numpy here -- in t
 ``poc11``'s phase 3, ``D`` independent ``lax.sort``s under ``vmap``. And ``uniquify_states`` remains a
 separate blocker.
 
-Run::
+Run on virtual CPU devices (the default -- correctness only)::
 
-    XLA_FLAGS=--xla_force_host_platform_device_count=4 uv run python \\
-        examples/scaling/poc13_hash_partition_jax.py
+    uv run python examples/scaling/poc13_hash_partition_jax.py
+
+Run on real GPUs, which is the only way the timing question can be answered::
+
+    uv run python examples/scaling/poc13_hash_partition_jax.py --devices 0,1,2,3
 """
+
+import argparse
+import os
+
+# `argparse` before `import jax`, as in poc8/poc9: CUDA_VISIBLE_DEVICES and XLA_FLAGS are both read
+# at backend initialization, so neither can be set after jax is imported. That is also why this
+# preamble is duplicated per script rather than living in `_scaling_common` -- that module imports jax.
+parser = argparse.ArgumentParser()
+parser.add_argument("--devices", help='Comma-separated GPU ids, e.g. "0,1,2,3".')
+parser.add_argument("--num-qubits", type=int, default=30)
+parser.add_argument(
+    "--host-devices", type=int, default=4, help="Virtual CPU devices when no --devices."
+)
+options = parser.parse_args()
+
+if options.devices:
+    # A filter over what the driver already exposes -- it cannot conjure a GPU, so a one-GPU box
+    # correctly still reports one device and the sweep below shrinks to match.
+    os.environ["CUDA_VISIBLE_DEVICES"] = options.devices
+else:
+    os.environ.setdefault(
+        "XLA_FLAGS", f"--xla_force_host_platform_device_count={options.host_devices}"
+    )
 
 import jax
 import numpy as np
@@ -54,7 +80,7 @@ from rqutils.sqd import _pack_state_keys, get_xsource
 # Sorts above every real key, so a padded slot never matches a target. The packed keys carry a zero
 # pad bit at position 0 (see `sqd`), so all-ones is unreachable by construction.
 SENTINEL = np.uint64(0xFFFFFFFFFFFFFFFF)
-NUM_QUBITS = 30
+NUM_QUBITS = options.num_qubits
 
 
 def mix64(x, xnp=jnp):
@@ -198,8 +224,16 @@ def hop_signature(num_qubits, a, b):
     return np.packbits(np.concatenate([np.zeros(1, np.uint8), eye[a] + eye[b]]))
 
 
-def run_case(mesh, num_shards, states, xsig, slack=1.6):
-    """Run the distributed kernel and compare against ``get_xsource``."""
+def run_case(mesh, states, xsig, slack=1.6):
+    """Run the distributed kernel and compare against ``get_xsource``.
+
+    ``num_shards`` is derived from the mesh rather than passed alongside it. They were separate
+    parameters that had to agree, and on a box with more devices than the swept shard count they did
+    not: the send buffer got ``num_shards`` rows while the mesh axis had ``jax.device_count()``, and
+    ``all_to_all`` raised "The size of all_to_all split_axis (4) has to be divisible by the size of
+    the named axis x (8)". A 4-device box hid it because the two coincided there.
+    """
+    num_shards = mesh.shape["x"]
     reference = np.asarray(jax.jit(get_xsource)(xsig, jnp.asarray(states)))
     targets = np.asarray(_pack_state_keys(jnp.bitwise_xor(jnp.asarray(states), xsig)))
     local_keys, local_gidx, _ = partition(states, num_shards)
@@ -227,18 +261,31 @@ def run_case(mesh, num_shards, states, xsig, slack=1.6):
     }
 
 
+def shard_counts():
+    """Shard counts to sweep: the powers of two dividing the visible device count.
+
+    Derived rather than hardcoded so the same script is meaningful on 1, 2, 4 or 8 devices --
+    `--devices 0,1` on a two-GPU box sweeps (1, 2), an eight-GPU box sweeps (1, 2, 4, 8). Explicit
+    sharding rejects a mesh larger than the device count, so a hardcoded 4 turns a smaller box into
+    a crash inside `make_mesh` rather than a smaller run.
+    """
+    total = jax.device_count()
+    counts = [d for d in (1, 2, 4, 8, 16, 32) if d <= total and total % d == 0]
+    return tuple(counts)
+
+
+def backend_note():
+    """One line naming the backend, and whether timings from it would mean anything."""
+    backend = jax.default_backend()
+    kind = "REAL" if backend != "cpu" else "virtual"
+    return f"{jax.device_count()} {kind} {backend} device(s)"
+
+
 def main():
     print("POC 13: distributed get_xsource under shard_map\n")
-    print(f"devices visible: {jax.device_count()}")
-    # Without the flag this dies inside `make_mesh` with "Number of devices 1 must be >= the product
-    # of mesh_shape (2,)", which reads as a JAX bug rather than a missing environment variable. The
-    # count must be set before jax initializes, so it cannot be fixed from here -- only reported.
-    if jax.device_count() < 4:
-        raise SystemExit(
-            f"needs 4 devices, found {jax.device_count()}. This POC shards across a mesh, so run it "
-            "with XLA_FLAGS=--xla_force_host_platform_device_count=4 (the count must be set before "
-            "jax initializes, so exporting it here would be too late)."
-        )
+    print(f"running on {backend_note()}; sweeping shard counts {shard_counts()}")
+    if jax.default_backend() == "cpu":
+        print("  virtual devices: correctness only -- per CLAUDE.md, timings here are meaningless")
     states = xxz_krylov(NUM_QUBITS, 20_000)
     print(f"1D XXZ Krylov subspace, nq={NUM_QUBITS}, N={len(states)}\n")
 
@@ -246,12 +293,12 @@ def main():
     print(
         f"   {'D':>3} {'hop':>9} {'hit%':>6} {'cap':>7} {'exact':>6} {'ovf':>4} {'ag/ar/cp/a2a':>14}"
     )
-    for num_shards in (2, 4):
+    for num_shards in shard_counts():
         mesh = jax.make_mesh((num_shards,), ("x",), axis_types=(AxisType.Explicit,))
         trimmed = states[: (len(states) // num_shards) * num_shards]
         # (0,1) and (nq-1,0) touch the high-order bits, which is where a range split fails
         for a, b in ((0, 1), (NUM_QUBITS // 2, NUM_QUBITS // 2 + 1), (NUM_QUBITS - 1, 0)):
-            r = run_case(mesh, num_shards, trimmed, hop_signature(NUM_QUBITS, a, b))
+            r = run_case(mesh, trimmed, hop_signature(NUM_QUBITS, a, b))
             print(
                 f"   {num_shards:>3} {(a, b)!s:>9} {r['hit_rate'] * 100:>5.1f}% {r['cap']:>7} "
                 f"{r['exact']!s:>6} {r['overflow']:>4} {r['collectives']!s:>14}"
@@ -261,21 +308,69 @@ def main():
     print("   zero all-gather / all-reduce / collective-permute in every case.")
 
     print("\n2. the overflow check fires rather than truncating silently")
-    mesh = jax.make_mesh((4,), ("x",), axis_types=(AxisType.Explicit,))
-    trimmed = states[: (len(states) // 4) * 4]
+    widest = shard_counts()[-1]
+    if widest == 1:
+        # With one bucket the derived capacity is ~N, so even a 0.9x slack is ample and nothing
+        # overflows -- the section's premise ("an undersized capacity drops targets") is false at
+        # d=1, so skip it rather than weaken the assertion.
+        print("   SKIPPED -- one shard means one bucket, so no capacity is undersized.")
+        return
+    mesh = jax.make_mesh((widest,), ("x",), axis_types=(AxisType.Explicit,))
+    trimmed = states[: (len(states) // widest) * widest]
     xsig = hop_signature(NUM_QUBITS, 0, 1)
     for slack in (1.6, 0.9):
-        r = run_case(mesh, 4, trimmed, xsig, slack=slack)
+        r = run_case(mesh, trimmed, xsig, slack=slack)
         note = "<- a caller MUST raise" if r["overflow"] else ""
         print(
             f"   slack={slack}: cap={r['cap']:>6} overflow={r['overflow']:>6} "
             f"exact={r['exact']!s:>5}  {note}"
         )
-    under = run_case(mesh, 4, trimmed, xsig, slack=0.9)
+    under = run_case(mesh, trimmed, xsig, slack=0.9)
     assert under["overflow"] > 0, "undersized capacity must be detected"
     assert not under["exact"], "an undersized capacity does drop targets -- hence the check"
     print("\n   Exactness and a zero overflow count coincide, which is what makes the free")
-    print("   check a sufficient guard. No speed claim: virtual devices, per CLAUDE.md.")
+    print("   check a sufficient guard.")
+
+    print("\n3. timing: routed search against the replicated baseline")
+    if jax.default_backend() == "cpu":
+        print("   SKIPPED -- virtual devices share one physical backend, so per CLAUDE.md these")
+        print("   timings are meaningless. Re-run with --devices on a multi-GPU box.")
+        return
+    # The question the whole distributed-states line is blocked on: routing costs one all_to_all
+    # per X group, and buys `13 * N` bytes per device instead of on every device. Only a real
+    # interconnect can say whether that trades well. Both arms warm -- per CLAUDE.md a cold run
+    # measures compilation, which reads as a catastrophic regression and is not one.
+    import time
+
+    widest = shard_counts()[-1]
+    if widest == 1:
+        print("   SKIPPED -- one device, so there is no routing to measure.")
+        return
+    mesh = jax.make_mesh((widest,), ("x",), axis_types=(AxisType.Explicit,))
+    trimmed = states[: (len(states) // widest) * widest]
+    xsig = hop_signature(NUM_QUBITS, 0, 1)
+    reference = jax.jit(get_xsource)
+    print(f"   {'arm':>26} {'ms':>9} {'per-device states':>18}")
+    for label, thunk, per_device in (
+        (
+            "replicated get_xsource",
+            lambda: reference(xsig, jnp.asarray(trimmed)),
+            trimmed.nbytes,
+        ),
+        (
+            f"hash-routed, d={widest}",
+            lambda: run_case(mesh, trimmed, xsig)["exact"],
+            trimmed.nbytes // widest,
+        ),
+    ):
+        thunk()  # warm: compile before timing, never measure the trace
+        start = time.perf_counter()
+        for _ in range(3):
+            jax.block_until_ready(thunk())
+        elapsed = (time.perf_counter() - start) / 3 * 1e3
+        print(f"   {label:>26} {elapsed:>8.2f}m {per_device / 1e6:>17.2f}M")
+    print("   Report BOTH columns: the routed arm buys per-device memory and spends interconnect,")
+    print("   so a time ratio alone cannot say whether the trade is good.")
 
 
 if __name__ == "__main__":
