@@ -2038,6 +2038,61 @@ check sufficient — and a caller must **raise**, not clamp.
 whether it pays for the 27.9 GB/device it saves needs real interconnect measurement. The prototype lives
 outside `rqutils/`; `states_size` and both capacities are `static_argnums`, and `N` must divide `d`.
 
+
+### The popcount diagonal path already shards — verified, no work needed (2026-08-30)
+
+Carried as the last open item of the distributed-`states` line ("the diagonal builders need
+`popcount(S[i] & z)`, i.e. the state *bits* — those shard elementwise, but that was not verified
+end-to-end"). **Verified now, and there is nothing to build:** every function on the path shards with
+**zero collectives** and returns bit-identical values.
+
+**Why it was never at risk, which is the point worth keeping.** `_z_parity` is
+`sum(bitwise_count(states & z), axis=1) & 1`: two elementwise ops and a reduction along the **byte**
+axis. For a `P('x', None)` state array the sharded axis is axis 0, so the reduction runs entirely within
+each device's own rows. `NOTES.md`'s rule — *"everything that reorders or compacts along the sharded axis
+fails; only elementwise ops and reductions survive"* — is satisfied in its easiest form: **the reduction
+is over the unsharded axis.** Contrast `uniquify_states`, whose `cumsum` reduces *along* the sharded axis
+and needed a two-level prefix sum.
+
+Measured on 1D XXZ, `P('x', None)` states, 4 devices — asserting the **spec and the values together**,
+since `NOTES.md` records that a replicated run agrees to exactly 0.0 and "correct but silently unsharded"
+is invisible to value comparison alone:
+
+| function | out spec | values | max diff |
+| --- | --- | --- | --- |
+| `_z_parity` | `P('x',)` | match | 0.00e+00 |
+| `get_diag_signs` | `P('x', None)` | match | 0.00e+00 |
+| `get_diagonal` | `P('x',)` | match | 0.00e+00 |
+| `compute_diagonal` | `P('x',)` | match | 0.00e+00 |
+
+**Swept over every X group and both coefficient dtypes**, at n=40 (J=41, K=40, N=9,220 for real; J=42 for
+the complex case, where a single odd-Y string makes `.c` complex128): **0 failures out of 41 and 42
+groups** for all three builders, counting a missing `'x'` in the output spec as a failure alongside a
+value mismatch. And **`apply_h` end-to-end at both cache levels that use this path** — `(1, 0)` which
+recomputes from `zsignatures`, and `(1, 1)` which unpacks cached `diag_signs` — output spec `P('x',)`
+and `max|diff| = 0.00e+00` on both dtypes.
+
+**One pre-existing behaviour found and correctly attributed.** `apply_h` with a **real** `vec` against
+**complex128** coefficients raises `TypeError: scan body function carry input and carry output must have
+equal types ... float64[N] but ... complex128[N]`. That looked like a sharding failure in the first run
+and is not: it **reproduces on a single device with no mesh at all**. It is an undocumented dtype
+contract — `vec` must be promotable to the coefficient dtype — and `PauliSumXZ` makes `.c` complex
+whenever any Pauli string has an odd Y count. Worth knowing, unrelated to this work, and *not* fixed
+here.
+
+**Pinned by `tests/_sharded_diagonals.py` and mutation-verified.** Dropping the single
+`out_sharding=jax.typeof(states).sharding` on `get_diag_signs`' `init` accumulator makes the whole
+builder run **correctly but unsharded**: `bad_value = 0` — every value still bit-identical — while
+`bad_spec` goes to 42/44. **A value-only test passes that mutant silently**, which is the concrete
+demonstration of `CLAUDE.md`'s rule rather than a restatement of it. Placing the mutation *inside* the
+scan instead raises on a carry-type mismatch, so the `init` line is the one that had to be mutated to
+produce the silent form.
+
+**So the distributed-`states` line has no remaining unverified mechanism.** `get_xsource` (`poc13`),
+`uniquify_states` (`poc14`) and the diagonal path all have working, exact, sharded forms. What remains is
+entirely the open question stated in those entries: whether the routing communication pays for the
+27.9 GB/device it removes, which needs a real interconnect and cannot be answered on virtual devices.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is

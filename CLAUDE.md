@@ -345,6 +345,17 @@ wrong model for a range partition** — it assumes independent random destinatio
 and false here, so use `poc11`'s "slack must exceed the splitter imbalance" (1.35 is exact). Round 2 needs
 `ss/d`, not `ss/d/d`, since a bucket's rows reach only 1–2 output shards. `NOTES.md`.
 
+**The popcount diagonal path already shards — verified 2026-08-30, nothing to build.** `_z_parity`,
+`get_diag_signs`, `get_diagonal`, `compute_diagonal` and `apply_h` at `(1,0)`/`(1,1)` all return
+`P('x', …)` with **zero collectives** and bit-identical values, over every X group and both coefficient
+dtypes. It was never at risk because `sum(bitwise_count(states & z), axis=1)` reduces along the **byte**
+axis, i.e. the *unsharded* one — the easy half of the elementwise-and-reductions-survive rule, unlike
+`uniquify_states`' `cumsum` along the sharded axis. **So no mechanism in the distributed-`states` design
+is unverified any more**; what remains is whether the routing pays for the 27.9 GB/device, which needs a
+real interconnect. Separately: `apply_h` with a real `vec` and **complex128** coefficients raises on the
+scan carry dtype — **pre-existing, reproduces single-device with no mesh**, an undocumented contract that
+`vec` be promotable to `.c`'s dtype.
+
 **`states` must be lex-sorted** — `get_xsource` is a binary search, not a sort. Always required (the
 sort was equally wrong on unsorted input) but previously undocumented; `hproj(unique_states=True)`
 skips its `np.unique` and so can violate it. Two paths selected statically on width: `uint64` keys for
