@@ -306,6 +306,15 @@ at `cache_level[0] = 1`** — the routing is then paid `J` times per solve, not 
 DanceQ as precedent: its closed-form index map needs a *complete* symmetry sector, which a sampled
 subspace is not. A project, not a patch; `NOTES.md` has the cost table and what is unbuilt.
 
+**Sharding `uniquify_states` needs *range* partitioning, not the hash `get_xsource` uses** — its output
+feeds a binary search, so it must stay globally lex-sorted, and a hash destroys global order. Three gaps
+probed 2026-08-30, all closable, none composed: in-graph splitters work but **must compare the full row**
+(lead-word-only is sound yet puts 4000/4000 rows in one bucket, and a 94%-lead-word-sharing XXZ fixture
+cannot detect that); reassembly into `[states_size, B]` works via a scatter at traced offsets, re-ranking
+live rows since dedupe leaves them non-contiguous; and the within-bucket rank is a **global** prefix sum,
+which `cumsum` refuses on a sharded axis — fixed by a two-level sum (local cumsum + one `[d,d]`
+`all_gather`, `O(d²)` and independent of `N`), verified against a sequential reference. `NOTES.md`.
+
 **`states` must be lex-sorted** — `get_xsource` is a binary search, not a sort. Always required (the
 sort was equally wrong on unsorted input) but previously undocumented; `hproj(unique_states=True)`
 skips its `np.unique` and so can violate it. Two paths selected statically on width: `uint64` keys for
