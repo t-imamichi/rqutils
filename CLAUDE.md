@@ -34,6 +34,24 @@ goes stale within a turn — amend then and you rewrite published history. `git 
 Confirmed 2026-08-25. Both are ahead of `dev` in commit count, which makes them look like work waiting to
 be integrated; they are not.
 
+**`main` is a strict ancestor of `dev` and holds nothing unique — don't consult it for ideas.**
+`git rev-list --left-right --count main...dev` is **`0 272`** (confirmed 2026-08-30): every `main` commit
+is already on `dev`, and `main`'s tip is 2026-07-17, six weeks behind. It is the PR target, not a source.
+Checked specifically because it looks like the place to find an older, simpler approach: the set of
+sharding constructs in `main` but not `dev` is **empty** for both `sqd.py` and `ground_locg.py`, so `dev`
+is a strict superset there too.
+
+Where `main` *differs* it is worse, and one difference is instructive. Its `get_xsource` concatenates
+`[2N, B]` and sorts, which **cannot shard at all** — `lax.sort` raises *"Arguments to sort must be
+unsharded over the sorting dimension"* on a partitioned axis (verified 2026-08-30) — costs a 73 GB
+buffer at `N = 2^31`, and is the origin of the 66–97%-of-a-solve figure. `dev`'s `searchsorted` replaced
+it at 12–25x per signature. **The generalizable rule is already in `NOTES.md`: a sort is the
+anti-pattern for sharding, since only elementwise ops and reductions survive a partitioned axis.**
+
+The one thing neither branch fixed is `uniquify_states`' sort — `main` has two `lax.sort` calls,
+`dev` has one, and that survivor is why `N <= 2^31` still stands. See `NOTES.md`, "Sharding
+`uniquify_states`", for the three gaps and the verified mechanism for each.
+
 **`product`** holds the `rqutils/product.py` (SCIP product-state solver) investigation and an SDP
 lower-bound spike. Its **conclusions are already on `dev`**: `CLAUDE.md` and `NOTES.md` here are
 byte-identical to `product`'s, and `docs/rqutils-precond-request.md` / `docs/sdp-lower-bound.md` carry
