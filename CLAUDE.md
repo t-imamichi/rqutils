@@ -331,7 +331,13 @@ probed 2026-08-30, all closable, none composed: in-graph splitters work but **mu
 cannot detect that); reassembly into `[states_size, B]` works via a scatter at traced offsets, re-ranking
 live rows since dedupe leaves them non-contiguous; and the within-bucket rank is a **global** prefix sum,
 which `cumsum` refuses on a sharded axis — fixed by a two-level sum (local cumsum + one `[d,d]`
-`all_gather`, `O(d²)` and independent of `N`), verified against a sequential reference. `NOTES.md`.
+`all_gather`, `O(d²)` and independent of `N`), verified against a sequential reference. **Composed
+2026-08-30: the algorithm is bit-identical to `uniquify_states`, and it needs *two* routing rounds** —
+bucket `k`'s output offset is data-dependent and does not align with output-shard boundaries (2 of 4
+buckets straddled one), so a bucket owner must send to several output shards. Two dead ends recorded:
+per-shard `[d, cap]` blocks **cannot** be declared replicated (`check_vma` is right; suppressing it gives
+a silently wrong answer), and splitters derived from a sharded array must be *passed* to `shard_map`, not
+closed over. JAX form not completed. `NOTES.md`.
 
 **`states` must be lex-sorted** — `get_xsource` is a binary search, not a sort. Always required (the
 sort was equally wrong on unsorted input) but previously undocumented; `hproj(unique_states=True)`

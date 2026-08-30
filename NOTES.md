@@ -1939,6 +1939,54 @@ composition was not assembled, so there is no end-to-end exactness check against
 `uniquify_states`' word packing is documented as *"the wrong trade for an out-of-core design"* at the
 `2^31` ceiling (6–15 GB of extra buffer); that judgement is unchanged by anything here.
 
+
+### Composing sharded `uniquify_states`: the algorithm is exact, and it needs *two* routing rounds (2026-08-30)
+
+The three mechanisms from the probe above compose into an algorithm that is **bit-identical to
+`uniquify_states`** — verified in numpy at n=100, N=209,400 with duplicates, `states_size` 262,144, d=4:
+**157,051 unique rows, `np.array_equal` True**, including the `[states_size, B]` uint8 layout and its 255
+filler. Bucket imbalance 1.15%.
+
+**But the composition needs a second routing round that the probe did not anticipate, and this is the
+finding.** The output is a *sharded* `[states_size, B]` array, so shard `s` owns a contiguous block of
+rows. Bucket `k`'s unique rows land at a **data-dependent** global offset — the prefix sum of earlier
+buckets' unique counts — which does **not** align with output-shard boundaries. Measured on this fixture:
+offsets `[0, 22279, 50782, 96614]` against a shard size of 65,536, so **2 of 4 buckets straddle a
+boundary**. A bucket owner must therefore send rows to more than one output shard. Zero crossings would be
+luck, not a property.
+
+So the real structure is **route → sort/dedupe → route again**:
+
+1. splitters from a strided sample, compared on the **full row** (the probe's gap 1)
+2. `all_to_all` #1: rows to their bucket's owner
+3. local sort + dedupe — each owner ends up holding one sorted unique run
+4. `all_gather` of the `d` unique counts, giving each bucket's global offset
+5. `all_to_all` #2: rows from bucket owner to output-shard owner
+
+**Two dead ends worth recording, because both looked right.**
+
+*Private per-shard blocks cannot be declared replicated.* Having every shard scatter into its own
+`[d, cap]` block and giving `out_specs=P(None, None, None)` is rejected: *"implies that the corresponding
+output value is replicated across mesh axis 'x', but could not infer replication over any axes."*
+**`check_vma` was correct and the spec was the lie** — those blocks are per-shard *partial* results, so
+declaring them replicated would need a cross-shard reduction to become true. Suppressing the check with
+`check_vma=False` would have produced a silently wrong answer. Routing to a single owner per bucket
+removes the reduction entirely, which is why step 2 exists.
+
+*A value derived from an explicitly-sharded array cannot be closed over.*
+`NotImplementedError: Closing over inputs to shard_map where the input is sharded on 'Explicit' axes is
+not implemented.` The splitters are computed outside `shard_map` from the sharded `words`, so they must be
+**passed as an argument** with `P(None, None)`, not captured. The error names the workaround.
+
+**Status: algorithm verified, JAX composition not built.** The numpy version above is exact and is the
+specification; the JAX form reached the two errors named here and was not completed. What it needs beyond
+the probe's three mechanisms is the second `all_to_all` plus its destination arithmetic, and a capacity
+for *that* buffer as well — the second round's per-destination counts are as data-dependent as the first's,
+so `poc13`'s raise-not-clamp treatment applies twice. **No speed claim**: numpy, single process, and two
+routing rounds is materially more communication than the one round this line assumed. `poc11`'s note that
+the word packing is *"the wrong trade for an out-of-core design"* at the `2^31` ceiling still stands and is
+unaffected.
+
 ### The range-partitioned shuffle works — `poc11_range_partition.py` (2026-08-29)
 
 That shuffle was then built. **It is the one design that removes the single-device sort**, and it is
