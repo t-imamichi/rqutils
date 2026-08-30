@@ -293,7 +293,10 @@ the prefix is constant *by construction*), and range splitting balances the *sta
 1.03–1.11× everywhere, verified exact over all 61 XXZ X groups at hit rates 2.2–100%. Whole-key hashing measures 1.01–1.14× on uniform, fixed-weight, banded and
 Zipf-sampled fixtures, and its residual imbalance is Poisson in `N/d` (checked against balls-in-bins),
 so keep `N/d` ≳ 1000. It costs the free local sort — each shard needs its own — which is `poc11`'s
-phase 3, run once at setup. The variable-count routing has a primitive — `jax.lax.ragged_all_to_all`,
+phase 3, run once at setup. **`poc13_hash_partition_jax.py` is the JAX composition**, bit-identical to
+`get_xsource` at D=2/4 over three hops with **zero all-gather/all-reduce/collective-permute**; bucket
+with `D` passes of an `[n]` cumsum, never an `[n, D]` one-hot (24 vs 13 B/slot at D=4, and `O(N·D)` vs
+`O(N)`). The variable-count routing has a primitive — `jax.lax.ragged_all_to_all`,
 whose published defect (broken reverse-mode rule, "forward-only") is irrelevant since `get_xsource`
 returns indices and is never differentiated — but it is **`UNIMPLEMENTED` on XLA:CPU**, so it cannot be
 tested here. The padded fallback costs 0.4% at `N=2^31, d=64`, and **its capacity is computable from
