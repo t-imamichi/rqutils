@@ -654,7 +654,9 @@ def ground_locg(
                itself. An existing call passing an explicit ``tol`` **keeps working but changes
                criterion** -- at :math:`n = 2\times10^5` the old ``tol=1e-6`` admitted a residual of
                order :math:`10^0`, where it now demands :math:`10^{-6}`. Nothing raises. Callers that
-               tuned ``tol`` empirically must re-derive it; callers passing ``None`` are unaffected.
+               tuned ``tol`` empirically must re-derive it. ``None`` still converges but is **not**
+               unchanged -- it is 3-4 decades tighter and measured 1.18-1.49x slower through ``sqd``,
+               the gap growing with :math:`N`.
 
             The floor is :math:`\mathrm{eps} \cdot \|A\|_2` with **no** :math:`n` dependence
             (measured over :math:`n = 70..32768` and six decades of :math:`\|A\|`, dense and

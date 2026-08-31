@@ -2271,6 +2271,32 @@ assertion. Only a fixture large enough for the scaling to bite (n=10, 200 states
 requested 1e-8) or one *varying* dimension (4.006e-05 vs 6.331e-11 from one `tol`) discriminated. If the
 defect is in how something **scales**, the fixture must span that axis.
 
+**The default got slower, and the "unchanged" claim was asserted rather than measured.** The first
+write-up of this entry said `tol=None` behaviour was essentially unchanged. Measured (`tol=None` on both
+sides, warm, best of 5, A/B against a worktree of `c400fae`): **1.18–1.49x slower, median 1.33x, and the
+gap grows with `N`** — 1.22x at N=200, 1.33x at N=800, 1.41x at N=2898, 1.49x at N=9460. Energies
+bit-identical; the residual goes from ~1e-10 to ~1e-14, and that is where the time goes.
+
+| `N` | before | after | slower | resid before | resid after |
+| --- | --- | --- | --- | --- | --- |
+| 200 | 1.06 ms | 1.29 ms | 1.22x | 1.58e-11 | 8.82e-15 |
+| 800 | 3.48 ms | 4.64 ms | 1.33x | 7.34e-11 | 1.02e-14 |
+| 2898 | 18.68 ms | 26.32 ms | 1.41x | 2.35e-10 | 1.23e-14 |
+| 9460 | 81.19 ms | 120.79 ms | 1.49x | — | — |
+
+**The mechanism makes the direction inevitable, so no benchmark was needed to *suspect* it:** the old
+default was `eps` compared against `tol·(‖Ax‖+|θ|)·N·10`, so its *effective* absolute bound carried an
+`N` factor; the new default `4·eps·‖Ax₀‖` does not. The ratio is ~`N·10/4` — ~5,100x at N=800, ~10⁶ at
+N=2e5. Two bounds differing by a factor of `N` cannot be equivalent, and the discrepancy has to grow
+with `N`. **A claim that behaviour is unchanged is a claim about a measurement**; the repo rule to A/B
+whole calls against a worktree of the pre-change revision existed and was not applied until asked.
+
+The `N` factor was deliberately *not* put back into the default: a default meaning 1e-10 at one size and
+1e-8 at another is the property the change existed to remove. That is a judgement call, and the reply
+offers to reverse it as a two-line change if the caller prefers the old timing. The caller's fix is to
+pass `tol` explicitly — at 1e-6 they are ~1.5x ahead of the *old* default, so the change only pays if
+the parameter is used.
+
 **Also unaddressed, and stated in the reply:** `p_is_zero` still reports convergence regardless of `tol`
 (the stationary-point route, pre-existing and by design), so a converged result *can* carry a residual
 above `tol`. And a residual bound is not an accuracy guarantee — `|E − λ_min| ≲ ‖r‖²/gap`, so the energy

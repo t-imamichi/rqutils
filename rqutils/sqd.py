@@ -612,7 +612,13 @@ def sqd(
                existing call passing an explicit ``tol`` **keeps working but changes criterion** and
                nothing raises -- at :math:`N = 2\times10^5` the old ``tol=1e-6`` admitted a residual
                of order :math:`10^0` where it now demands :math:`10^{-6}`. Re-derive any empirically
-               tuned value; ``None`` is unaffected.
+               tuned value.
+
+               ``None`` still converges, but it is **not** unchanged: the default is 3-4 decades
+               tighter than the old one and measured **1.18-1.49x slower**, the gap growing with
+               :math:`N` (the old default's effective bound carried an :math:`N` factor; this one does
+               not). Pass an explicit ``tol`` if the extra decades are not wanted --
+               ``docs/rqutils-tol-response.md`` §5.1 has the table.
 
             A caller with a residual requirement can now state it directly: ``tol=1e-6`` means
             :math:`\|Hv - Ev\| < 10^{-6}`, at any :math:`N`. Values below the floor are **rejected**

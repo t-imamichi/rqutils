@@ -20,6 +20,16 @@ Reply to `docs/rqutils-tol-request.md`, from the `rqutils` side. Branch `dev`, v
 > warm on a real 1D XXZ subspace (N=800): **1.96x at `tol=1e-6`** against the default, monotonic across
 > the range (§4.1). But your table's `1e-12`/`1e-9` rows were taken under the *old relative* `tol` and
 > do not carry over to the new semantics — §4.2.
+>
+> **⚠️ Correction, and it withdraws a reassurance an earlier revision of this document gave you.** That
+> revision said `tol=None` behaviour is "essentially unchanged" and that you are therefore "unaffected
+> today". **Both are wrong.** The new default is **1.18–1.49x slower**, A/B'd warm against the
+> pre-change revision, and **the slowdown grows with `N`** — 1.22x at N=200 rising to 1.49x at N=9460.
+> The default is also 3–4 decades tighter (1e-14 against 1e-10), which is where the time goes; energies
+> are bit-identical. The claim was made without measuring, and it was the one claim in this document
+> that you would have relied on to do nothing. **You are not unaffected. §5.1 has the table and what to
+> do about it** — the short version is: pass `tol=_RESIDUAL_TOLERANCE` explicitly and you end up ahead
+> of where you started, not behind.
 
 ---
 
@@ -28,7 +38,7 @@ Reply to `docs/rqutils-tol-request.md`, from the `rqutils` side. Branch `dev`, v
 | Change | Where |
 | --- | --- |
 | `tol` is an absolute bound on `‖Hv − Ev‖₂` | `ground_locg` (the convergence test), `sqd`, `run_sqd` |
-| `tol=None` resolves to `4·eps·max(‖Ax₀‖, 1)` | `ground_locg` |
+| `tol=None` resolves to `4·eps·max(‖Ax₀‖, 1)` — **tighter and slower than the old default**, §5.1 | `ground_locg` |
 | A below-floor `tol` raises `ValueError` naming a value that works | `sqd` |
 | `residual_floor(opnorm_bound, dtype)` — public, so you can compute the floor yourself | `ground_locg` |
 
@@ -108,6 +118,10 @@ The request's §"The ask" projects "~2x on the median solve". **Confirmed.** Rea
 Monotonic, which is the shape to expect: the residual falls geometrically, so each decade of `tol` buys
 a roughly constant number of iterations.
 
+**Note the baseline.** "vs default" here means against the *new* `tol=None`, which is itself 1.18–1.49x
+slower than the old default (§5.1). Against the **old** default the 1.96x nets to roughly 1.5x. Quote
+whichever you mean, but say which.
+
 One caveat on how to reproduce this. `tol` is a **traced** argument of `run_sqd`, not a static one
 (`run_sqd._cache_size()` stays at 1 across three distinct values), so changing it does **not** retrace
 the solver — but the *first* call in a process still pays the trace. An earlier draft of this document
@@ -167,15 +181,71 @@ synthetic-vs-real distinction is the one your own status block called the differ
 name, so an existing explicit `tol=…` call keeps working and **changes criterion with nothing raised**:
 at `dim = 2e5` the old `tol=1e-6` admitted a residual of order 1e0 where it now demands 1e-6.
 
-- **You are unaffected today.** The request states `spinchain` passes no `tol` at any call site, and
-  `tol=None` behaviour is essentially unchanged (the default now carries the operator's scale, which
-  it had to — a bare `eps` is below the floor for any `‖H‖ > 1` and would have made every default call
-  raise).
 - **Anyone who tuned `tol` empirically must re-derive it.** There is no CHANGELOG in this repo; the
   notice is a `.. warning::` block in both `sqd`'s and `ground_locg`'s published docstrings.
+- **Anyone relying on the default is slower, not unaffected** — §5.1. This corrects an earlier
+  revision of this document.
 
 `ground_locg` with a **callable** `mat` cannot check the floor — it has no coefficients to bound `‖H‖`
 with — so a below-floor `tol` there exhausts `maxiter` rather than raising. `sqd` always checks.
+
+### 5.1 The default got slower, by a factor that grows with `N`
+
+An earlier revision of this document told you `tol=None` was "essentially unchanged" and that you were
+"unaffected today". That was asserted without measuring it. Measured — `tol=None` on both sides, warm,
+best of 5, real 1D XXZ, A/B against a worktree of the pre-change revision `c400fae`:
+
+| `N` | before | after | **slower** | residual before | residual after |
+| --- | --- | --- | --- | --- | --- |
+| 200 | 1.06 ms | 1.29 ms | **1.22x** | 1.58e-11 | 8.82e-15 |
+| 800 | 3.48 ms | 4.64 ms | **1.33x** | 7.34e-11 | 1.02e-14 |
+| 859 | 4.03 ms | 4.73 ms | **1.18x** | 8.36e-11 | 1.62e-14 |
+| 2898 | 18.68 ms | 26.32 ms | **1.41x** | 2.35e-10 | 1.23e-14 |
+| 9460 | 81.19 ms | 120.79 ms | **1.49x** | — | — |
+
+Median **1.33x**, and **rising with `N`**. Energies are bit-identical at every size, so this is not an
+accuracy trade — it is the same answer, converged 3–4 decades further than before, paid for in
+iterations.
+
+**Why.** The old default was `eps`, but it was compared against `tol·(‖Ax‖ + |θ|)·N·10`, so the
+*effective* absolute bound it admitted was `eps·(‖Ax‖ + |θ|)·N·10` — carrying `N`. The new default is
+`4·eps·‖Ax₀‖`, which does not. The ratio between them is therefore ~`N·10/4`:
+
+| `N` | old bound | new bound | old/new |
+| --- | --- | --- | --- |
+| 800 | 9.4e-11 | 1.8e-14 | ~5,100x |
+| 2898 | 3.4e-10 | 1.8e-14 | ~18,000x |
+| 200000 | 1.8e-08 | 1.8e-14 | ~1,000,000x |
+
+**At your `dim = 200000` the new default is ~10⁶x tighter than the old one.** The 1.49x at N=9460 is a
+*lower bound* on what you would see. We did not measure at your size — the dense `eigvalsh` reference
+that validates these runs does not fit past N≈3000, and extrapolating a wall-clock ratio from a bound
+ratio is exactly the kind of inference this document tells you not to trust elsewhere. Treat the
+`dim=200000` row as arithmetic on the bounds, not a measurement.
+
+**What to do about it, and why this is still a net win for you.** Do not stay on the default. Pass
+`tol=_RESIDUAL_TOLERANCE` (1e-6) explicitly, which was the point of the request:
+
+| what you run | residual delivered | vs the *old* default |
+| --- | --- | --- |
+| old default (before this change) | ~1e-10 at N=800, ~1e-8 at N=2e5 | 1.00x |
+| new default (`tol=None`) | ~1e-14 | **0.67–0.82x** — slower, worst at large `N` |
+| `tol=1e-6`, as you asked for | ~5e-07 | **~1.5x faster** |
+
+The middle row is the regression. The bottom row is the ask, and it is *faster than where you started*
+while delivering a residual your guard can accept — 1.96x against the new default (§4.1), which nets to
+roughly 1.5x against the old one. **The change is only a win for you if you pass the parameter.** If
+you ship it and keep `tol=None`, you take a 1.3–1.5x loss for accuracy you do not use.
+
+**Why the default was not left alone.** Under absolute semantics a bare `eps` sits *below* the
+achievable floor `eps·‖H‖` for any `‖H‖ > 1`, so the convergence test becomes unsatisfiable and every
+default call would exhaust `maxiter` and raise — mutation-tested, `RuntimeError: did not converge in
+maxiter=8000` at `‖H‖ = 219` (§7). The default had to acquire the operator's scale. What it could
+*also* have acquired is the `N` factor, reproducing the old effective bound exactly; we did not, because
+a default that means 1e-10 at one size and 1e-8 at another is the property this whole change existed to
+remove, and reintroducing it in the default brings it back through a side door. That is a judgement
+call, not a measurement — **if you would rather have the old timing on the default than a default that
+names a residual, say so and it is a two-line change.**
 
 ## 6. What lands in spinchain
 
@@ -185,7 +255,12 @@ As the request proposed, with one simplification: there is no new keyword, so
 ground_state_packed(..., tol=_RESIDUAL_TOLERANCE)
 ```
 
-and the solver's criterion and `_RESIDUAL_TOLERANCE` are now the same quantity. Keep the guard — §1's
+and the solver's criterion and `_RESIDUAL_TOLERANCE` are now the same quantity.
+
+**Do this rather than treating it as optional.** Per §5.1 the new default is 1.18–1.49x slower than the
+old one and the gap grows with `N`, so leaving `tol=None` is now the one choice that is strictly worse
+than before this change. Passing the parameter is what turns the regression into the ~1.5x you were
+asking for. Keep the guard — §1's
 `p_is_zero` note is one reason it still earns its place, and the request's own argument (a Rayleigh
 quotient cannot detect non-convergence; it has already caught a real upstream regression) is the
 other. It is now checking the contract the solver was asked to meet.
@@ -223,6 +298,15 @@ was ~4200x looser, so the solver overshot it and satisfied the absolute assertio
 only discriminate on a fixture large enough for the `N` scaling to bite (n=10, 200 states) or one that
 varies dimension explicitly. This is the same effect that makes single-`dim` `tol` comparisons
 unreliable, and it is why §4.2 asks you not to scale the request's rows.
+
+**And the compatibility claim was asserted, not measured.** "`tol=None` behaviour is essentially
+unchanged" appeared in three places — this document, `CLAUDE.md`, and the `sqd` docstring — on the
+strength of reading the two code paths rather than timing them. It is wrong by 1.18–1.49x (§5.1). The
+reasoning that should have caught it needs no benchmark at all: the old default's *effective* bound
+carried an `N` factor and the new one does not, so they cannot be equivalent, and the discrepancy has to
+grow with `N`. A claim about behaviour being unchanged is a claim about a measurement, and this repo's
+own rule is to A/B whole calls against a worktree of the pre-change revision. We did that only once
+asked.
 
 Separately, our first large-`N` floor sweep reported constants from 1.2e3 to 4.8e7 — non-monotonic
 across five decades, which no rounding model produces. `maxiter=120` had left the residual still

@@ -630,9 +630,13 @@ quoting the time.
   and `ground_locg`. It was relative, scaled internally by `(‖Hv‖ + |E|)·N·10`. **This break is silent**
   — the old and new forms both take a small float, so an existing explicit `tol=` keeps working and
   changes criterion with nothing raised: at `N = 2e5` the old `tol=1e-6` admitted a residual of order
-  `1e0` where it now demands `1e-6`. `tol=None` callers are unaffected (the default now carries the
-  operator's scale, `4·eps·max(‖Ax₀‖, 1)`; a bare `eps` is below the floor for any `‖H‖ > 1` and would
-  make every default call raise). Taken as a rename rather than a new keyword deliberately, so the
+  `1e0` where it now demands `1e-6`. **`tol=None` still converges but is not unchanged** — it resolves
+  to `4·eps·max(‖Ax₀‖, 1)`, which it had to (a bare `eps` is below the floor for any `‖H‖ > 1` and would
+  make every default call raise), and that is 3–4 decades tighter than the old effective bound, so it
+  measures **1.18–1.49x slower, the gap growing in `N`** (the old bound carried an `N` factor; this one
+  does not). An earlier revision of this entry said default callers were unaffected — asserted from
+  reading the two code paths, never timed. **A claim that behaviour is unchanged is a claim about a
+  measurement**: A/B it against a worktree of the pre-change revision. Taken as a rename rather than a new keyword deliberately, so the
   `.. warning::` in both published docstrings is the only notice. A below-floor `tol` raises
   `ValueError` from `sqd` — the floor is `4·eps·Σ|c_k|`, exposed as `ground_locg.residual_floor`.
   `docs/rqutils-tol-response.md` is the reply to the request that prompted it; evidence in `NOTES.md`.
