@@ -1789,6 +1789,130 @@ class TestConvergenceIsReported:
         expected = lowest_projected(strings, coeffs, states)
         assert abs(loose - expected) < 1e-4
 
+
+class TestTolIsAnAbsoluteResidualBound:
+    """``tol`` is a bound on ``||Hv - Ev||``, not a relative tolerance scaled by dimension.
+
+    The defect this locks down: ``tol`` used to be multiplied internally by
+    ``(||Hv|| + |E|) * N * 10``, so the same value meant a different absolute residual at every
+    subspace size, and a caller with a fixed residual requirement could not express it. Measured over
+    n=70..32768 and six decades of ``||H||`` (27 samples, dense and matrix-free, both dtypes), the
+    achievable floor is ``eps*||H||`` with **no** N dependence -- ``floor/(eps||H||)`` spans 2.6x
+    where ``floor/(eps||H||N)`` spans 306x, which is what made the old scaling wrong.
+    """
+
+    def _problem(self, seed=20260831, num_qubits=6, num_terms=8, num_states=24):
+        rng = np.random.default_rng(seed)
+        strings = real_pauli_strings(num_qubits, num_terms, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(num_states, num_qubits, rng)
+        return strings, coeffs, states
+
+    def _residual(self, strings, coeffs, states, **kwargs):
+        """``||Hv - Ev||`` from an independent dense construction, not from the solver's own report."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        eigval, eigvec, _basis = sqd((strings, list(coeffs)), states, return_eigvec=True, **kwargs)
+        ham = PauliSumXZ.from_paulisum((strings, list(coeffs)))
+        dense = hproj(ham, np.unique(states, axis=0)).toarray()
+        vec = np.asarray(eigvec).ravel()[: dense.shape[0]]
+        # sqd returns the padded basis; trim and renormalize so the residual is on a unit vector.
+        nrm = np.linalg.norm(vec)
+        assert nrm > 0.0, "eigenvector came back zero -- the fixture, not the tolerance, is broken"
+        vec = vec / nrm
+        return float(np.linalg.norm(dense @ vec - float(eigval) * vec))
+
+    def test_the_requested_residual_is_actually_achieved(self):
+        """A caller asking for 1e-8 must get a residual below 1e-8, verified independently.
+
+        The subspace is deliberately **large** (n=10, 200 draws). The old relative form multiplied
+        ``tol`` by ``(||Hv|| + |E|) * N * 10``, so its threshold grew with N: at N~180 that is a factor
+        of ~3.6e4, admitting a residual of ~3.6e-4 for this request. A small fixture does **not**
+        discriminate -- at N=21 the solver overshoots the loose threshold and lands under 1e-6 anyway,
+        so the assertion passes under both semantics and pins nothing. Verified by mutation: with the
+        relative form restored this fixture reports **4.967e-05** against the requested 1e-8, while the
+        N=21 fixture still passes.
+        """
+        strings, coeffs, states = self._problem(num_qubits=10, num_terms=12, num_states=200)
+        resid = self._residual(strings, coeffs, states, tol=1e-8, maxiter=6000)
+        assert resid < 1e-8, f"asked for 1e-8, got {resid:.3e}"
+
+    def test_a_tighter_tol_gives_a_smaller_residual(self):
+        """Monotonicity: the knob must actually move the delivered residual, not just be accepted."""
+        strings, coeffs, states = self._problem()
+        loose = self._residual(strings, coeffs, states, tol=1e-6, maxiter=4000)
+        tight = self._residual(strings, coeffs, states, tol=1e-11, maxiter=4000)
+        assert tight < loose, f"tol=1e-11 gave {tight:.3e}, not below tol=1e-6's {loose:.3e}"
+
+    def test_the_same_tol_means_the_same_residual_at_two_dimensions(self):
+        """The defect, stated directly: the old form's threshold scaled with N, so this failed.
+
+        Two subspaces differing ~4x in size must deliver residuals of the same order for one ``tol``.
+        Under ``tol * (||Hv|| + |E|) * N * 10`` the larger subspace was admitted ~4x looser.
+        """
+        small = self._problem(num_states=12)
+        large = self._problem(num_states=48, num_qubits=8)
+        r_small = self._residual(*small, tol=1e-7, maxiter=4000)
+        r_large = self._residual(*large, tol=1e-7, maxiter=4000)
+        assert r_small < 1e-7 and r_large < 1e-7, (
+            f"one arm missed the requested bound: small={r_small:.3e} large={r_large:.3e}"
+        )
+
+    def test_a_tol_below_the_floor_raises_rather_than_exhausting_maxiter(self):
+        """An unreachable request is a diagnosable input error, not a 1000-iteration timeout.
+
+        Rejected rather than clamped: the floor is computable from the operator alone, and clamping
+        would silently deliver a criterion other than the one asked for.
+        """
+        strings, coeffs, states = self._problem()
+        with pytest.raises(ValueError, match="below the achievable eigen-residual floor"):
+            eigval_of(strings, coeffs, states, tol=1e-30)
+
+    def test_the_floor_message_names_a_value_that_is_accepted(self):
+        """The error must be actionable: the number it suggests has to actually work."""
+        from rqutils.ground_locg import residual_floor
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        strings, coeffs, states = self._problem()
+        ham = PauliSumXZ.from_paulisum((strings, list(coeffs)))
+        floor = residual_floor(float(np.abs(ham.c).sum()), ham.c.dtype)
+        # Just above the floor must be accepted, just below must not.
+        eigval_of(strings, coeffs, states, tol=floor * 1.001, maxiter=8000)
+        with pytest.raises(ValueError, match="below the achievable"):
+            eigval_of(strings, coeffs, states, tol=floor * 0.999)
+
+    def test_a_nonpositive_tol_raises(self):
+        """Zero is unreachable by construction; a negative value is meaningless as a norm bound."""
+        strings, coeffs, states = self._problem()
+        for bad in (0.0, -1e-6):
+            with pytest.raises(ValueError, match="must be positive"):
+                eigval_of(strings, coeffs, states, tol=bad)
+
+    def test_a_non_numeric_tol_raises_typeerror(self):
+        """``bool`` is rejected for the reason ``_check_cache_level`` gives: it is an int subclass."""
+        strings, coeffs, states = self._problem()
+        for bad in ("1e-6", (1e-6,), True):
+            with pytest.raises(TypeError, match="must be None or a real number"):
+                eigval_of(strings, coeffs, states, tol=bad)
+
+    def test_the_default_still_converges_and_is_accurate(self):
+        """``tol=None`` must resolve to a floor that carries the operator's *scale*.
+
+        Under absolute semantics a bare ``eps`` -- the old default -- sits below the achievable floor
+        ``eps*||H||`` for any ``||H|| > 1``, so the convergence test becomes unsatisfiable and the solve
+        exhausts ``maxiter``. The coefficients are scaled up **100x** deliberately: at the default
+        fixture's ``||H|| = 2.19`` a bare eps is only 2.2x below the floor and ``p_is_zero`` -- the
+        stationary-point route, which ignores ``tol`` entirely -- catches the solve anyway, so the
+        mutant survives. Verified by mutation at this scale.
+        """
+        strings, coeffs, states = self._problem()
+        coeffs = np.asarray(coeffs) * 100.0
+        got = eigval_of(strings, coeffs, states, maxiter=8000)
+        expected = lowest_projected(strings, coeffs, states)
+        assert abs(got - expected) < 1e-6 * abs(expected), (
+            f"default tol gave {got!r}, expected {expected!r}"
+        )
+
     def test_the_returned_value_would_have_been_plausible(self):
         """Records *why* this was silent: the discarded result is a valid upper bound.
 

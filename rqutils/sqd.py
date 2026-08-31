@@ -210,7 +210,12 @@ from jax.sharding import PartitionSpec, get_abstract_mesh
 from numpy.typing import DTypeLike, NDArray
 from scipy.sparse import coo_array, csr_array
 
-from rqutils.ground_locg import _check_prefilter, ground_locg
+from rqutils.ground_locg import (
+    _check_prefilter,
+    _check_tol,
+    ground_locg,
+    residual_floor,
+)
 from rqutils.paulis.symplectic import PauliSumXZ
 
 LOG = logging.getLogger(__name__)
@@ -328,6 +333,11 @@ def _check_xcache_groups(xcache_groups: Any, cache_level: tuple[int, int], num_g
             "larger value caches everything and a negative caches nothing, both returning the right "
             "answer at the wrong cost."
         )
+
+
+def _residual_floor_of(hamiltonian: PauliSumXZ) -> float:
+    """The achievable eigen-residual floor for this Hamiltonian, for guards and error messages."""
+    return residual_floor(float(np.abs(hamiltonian.c).sum()), hamiltonian.c.dtype)
 
 
 def _check_cache_level(cache_level: Any) -> None:
@@ -591,8 +601,24 @@ def sqd(
         return_eigvec: Whether to return the eigenvector (coefficients and unique state bitstrings).
         maxiter: Maximum LOBPCG iterations. **Non-convergence now raises** rather than returning
             the iteration cap's best guess -- see ``Raises``.
-        tol: Convergence tolerance passed to :func:`rqutils.ground_locg.ground_locg`. ``None`` uses
-            the machine epsilon of the operator dtype.
+        tol: **Absolute** bound on the eigen-residual :math:`\|Hv - Ev\|_2`, forwarded to
+            :func:`rqutils.ground_locg.ground_locg`. ``None`` derives the achievable floor from the
+            operator.
+
+            .. warning::
+
+               **This changed meaning.** ``tol`` was a *relative* tolerance, scaled internally by
+               :math:`(\|Hv\| + |E|)\,N \cdot 10`. It is now the absolute residual itself, so an
+               existing call passing an explicit ``tol`` **keeps working but changes criterion** and
+               nothing raises -- at :math:`N = 2\times10^5` the old ``tol=1e-6`` admitted a residual
+               of order :math:`10^0` where it now demands :math:`10^{-6}`. Re-derive any empirically
+               tuned value; ``None`` is unaffected.
+
+            A caller with a residual requirement can now state it directly: ``tol=1e-6`` means
+            :math:`\|Hv - Ev\| < 10^{-6}`, at any :math:`N`. Values below the floor are **rejected**
+            (see ``Raises``) rather than silently clamped or left to exhaust ``maxiter``; the floor is
+            :math:`4\,\varepsilon \sum_k |c_k|`, available as
+            :func:`rqutils.ground_locg.residual_floor`.
         packed: Whether ``states`` is already bit-packed, i.e. the output of
             :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states`. Default ``False``, which takes
             the unpacked ``(subspace_dim, num_qubits)`` form and packs it internally.
@@ -702,7 +728,9 @@ def sqd(
             :math:`2^{31} - 1`, the ceiling imposed by the int32 indices used for subspace positions
             (beyond it an index wraps negative and the subspace is silently permuted); or if either
             ``prefilter`` entry is negative -- see :func:`rqutils.ground_locg._check_prefilter`, which explains why a
-            negative value would otherwise be absorbed as a silent no-op.
+            negative value would otherwise be absorbed as a silent no-op; or if ``tol`` is
+            non-positive or below the achievable eigen-residual floor
+            :math:`4\,\varepsilon\sum_k|c_k|`, which no solve could reach.
         TypeError: If ``cache_level`` is not a pair of ints, or ``prefilter`` is neither None nor a
             ``(degree, cycles)`` pair of ints.
     """
@@ -733,6 +761,11 @@ def sqd(
         )
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
+    # `tol` is an absolute eigen-residual bound, so whether it is reachable depends on the operator's
+    # scale. Checked here and not in `run_sqd` because that is jitted -- sum|c_k| is traced there, and
+    # a traced value cannot raise. This is the outermost point where it is concrete, and it must come
+    # after the PauliSumXZ conversion above, which is what supplies `.c`.
+    _check_tol(tol, float(np.abs(hamiltonian.c).sum()), hamiltonian.c.dtype)
     states = _check_states_shape(states, hamiltonian.num_qubits, packed)
 
     if not (mesh := get_abstract_mesh()).empty and (resid := states_size % mesh.size) != 0:
@@ -793,8 +826,10 @@ def sqd(
             "residual test is satisfied, so this often means the default cap was simply too low "
             "rather than that anything is wrong. Measured on a 37-state subspace with a relative gap "
             "of 5.5e-04, theta was already correct to 4e-16 by iteration 500 while the residual only "
-            "crossed the threshold at 1091. Loosening `tol` is the other lever; a genuinely "
-            "ill-conditioned subspace is the rarer cause."
+            "crossed the threshold at 1091. Loosening `tol` is the other lever -- it is an absolute "
+            f"residual bound, and the floor for this operator is {_residual_floor_of(hamiltonian):.3e}, "
+            "so any value above that is reachable in principle. A genuinely ill-conditioned subspace "
+            "is the rarer cause."
         )
     if return_eigvec:
         eigvec, states_u, subspace_dim = result[1:-1]
@@ -1028,7 +1063,10 @@ def run_sqd(
     Args:
         maxiter: Maximum LOBPCG iterations, forwarded to :func:`rqutils.ground_locg.ground_locg`.
             Static, as it is there.
-        tol: Convergence tolerance. ``None`` uses the operator dtype's machine epsilon.
+        tol: Absolute bound on the eigen-residual ``||Hv - Ev||``, forwarded to
+            :func:`rqutils.ground_locg.ground_locg`. ``None`` derives the achievable floor
+            from the operator. Validated in :func:`sqd`, which is where ``sum|c_k|`` is
+            concrete -- this function is jitted, so it cannot raise on it.
         prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter, forwarded to
             :func:`rqutils.ground_locg.ground_locg`. Static, as it is there -- passed by keyword, so
             unlike ``cache_level`` it needs no :func:`functools.partial` binding. See :func:`sqd` on
