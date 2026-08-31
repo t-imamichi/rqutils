@@ -14,6 +14,14 @@ macOS (it is GNU coreutils) — use the Bash tool's own timeout rather than wrap
 The shell is fish: **quote grep globs** (`--include="*.py"`). Unquoted, fish fails with
 `(eval):1: no matches found` before grep runs — which looks like "no results", not "no command".
 
+**macOS `sed -i` needs an explicit backup arg** (`sed -i '' 's/x/y/' f`). Without it BSD sed reads the
+filename as the backup suffix and fails with `undefined label` — **while exiting 0**, so it reads as a
+successful no-op. Prefer a short `python3 -` heredoc for in-place edits.
+
+**Don't put `cd` in a backgrounded command** — "session cwd remains" applies to *subsequent* commands,
+not the backgrounded one, so `cd /tmp && uv run ...` leaves the project and fails with `No module named
+jax` (plus a `--extra has no effect outside a project` warning). Use `uv run --directory <project>`.
+
 **Worktrees need `worktree.baseRef: "head"`** (in `.claude/settings.json`). The default `fresh`
 branches from `origin/main`, 144 commits behind `dev` and predating the `dev` extra, so `uv run
 --extra dev` fails outright. A fresh worktree also gets a bare venv: run the full
@@ -172,6 +180,12 @@ Rules, each of which cost a defect to learn — **evidence in `NOTES.md`**:
   session: a coercion added to `sqd` while the test traced `run_sqd` directly, and a mutation of
   `vinit_nodiag` when the fixture takes `vinit_from_min_diag`. Both read as missing coverage and were
   not. Check which branch your fixture reaches *before* concluding anything.
+- **A mutant can also survive because the fixture is too *small*, not because the layer is wrong.**
+  Seven of nine new tests passed against a restored relative-convergence form: at `N=21` its threshold
+  was ~4200x looser than the absolute one, so the solver's own overshoot satisfied the assertion anyway.
+  Only a fixture large enough for the scaling to bite (n=10, 200 states, giving 4.967e-05 against a
+  requested 1e-8) or one *varying* the scaled quantity discriminated. **If the defect is in how
+  something scales, the fixture must span that axis** — magnitude, not just code path.
 - **To prove an option is a no-op, compare traced graphs, not energies.** On a well-conditioned
   fixture a *working* `prefilter=(16, 1)` returns a bit-identical energy to no prefilter at all (only
   `(32, 2)` moved the last ulp), so "same energy as baseline" is satisfied by both arms and pins
@@ -367,6 +381,13 @@ real interconnect. Separately: `apply_h` with a real `vec` and **complex128** co
 scan carry dtype — **pre-existing, reproduces single-device with no mesh**, an undocumented contract that
 `vec` be promotable to `.c`'s dtype.
 
+**`sqd` returns 3 values with `return_eigvec=True` (`eigval, eigvec, basis`) and a bare `float`
+otherwise** — not a 5-tuple. The convergence flag and subspace dim are consumed inside `sqd`, which
+raises on non-convergence rather than returning it; `run_sqd` is the one that returns them.
+**`hproj` returns a scipy `csr_array`** — `np.asarray()` on it yields a **0-d object array**, not the
+matrix, so the failure surfaces frames later as `IndexError: tuple index out of range`. Use
+`.toarray()`.
+
 **`states` must be lex-sorted** — `get_xsource` is a binary search, not a sort. Always required (the
 sort was equally wrong on unsorted input) but previously undocumented; `hproj(unique_states=True)`
 skips its `np.unique` and so can violate it. Two paths selected statically on width: `uint64` keys for
@@ -401,6 +422,11 @@ with a power-iteration or Lanczos estimate — that is exactly the defect in
 `docs/rqutils-prefilter-bug.md`, where the estimate returned an **excited** eigenpair with
 `converged=True`. Prefer a loose bound: over-estimating degrades resolution smoothly, under-estimating
 changes the answer.
+
+**`ground_locg(debug=True)` runs the full `maxiter`** — it switches `while_loop` to `scan`, so it does
+*not* stop at convergence, and returns a 5th element with per-iteration `r`/`theta`/`reltol` (2 extra
+leading rows for the seed steps). With `tol=0` that makes the residual *trajectory* observable, which is
+how a floor or a plateau gets measured; `debug=False` returns 4 and stops early.
 
 **`precond` is gone** (2026-08-28), with its tests and `examples/scaling/poc10_deflation_precond.py`.
 It worked — 2.76× median on a *positive-definite* operator — but no `sqd` caller can reach that: `sqd`
@@ -600,8 +626,19 @@ quoting the time.
   `pack_states`/`unpack_states` already are those. Both overloads annotate `StateList`, which cannot
   express the width, so **`ty` will not catch a caller assuming the wrong one**.
 
-The last three are downstream-visible breaks. There is no CHANGELOG in this repo — if one is ever added,
-both belong in it.
+- **`tol` is now an *absolute* bound on the eigen-residual `‖Hv − Ev‖₂`** (2026-08-31), on both `sqd`
+  and `ground_locg`. It was relative, scaled internally by `(‖Hv‖ + |E|)·N·10`. **This break is silent**
+  — the old and new forms both take a small float, so an existing explicit `tol=` keeps working and
+  changes criterion with nothing raised: at `N = 2e5` the old `tol=1e-6` admitted a residual of order
+  `1e0` where it now demands `1e-6`. `tol=None` callers are unaffected (the default now carries the
+  operator's scale, `4·eps·max(‖Ax₀‖, 1)`; a bare `eps` is below the floor for any `‖H‖ > 1` and would
+  make every default call raise). Taken as a rename rather than a new keyword deliberately, so the
+  `.. warning::` in both published docstrings is the only notice. A below-floor `tol` raises
+  `ValueError` from `sqd` — the floor is `4·eps·Σ|c_k|`, exposed as `ground_locg.residual_floor`.
+  `docs/rqutils-tol-response.md` is the reply to the request that prompted it; evidence in `NOTES.md`.
+
+The last four are downstream-visible breaks. There is no CHANGELOG in this repo — if one is ever added,
+all of them belong in it.
 
 ## Closed investigations — don't reopen without reading the record
 

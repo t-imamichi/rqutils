@@ -2188,6 +2188,95 @@ cannot isolate `body_iter1`. `maxiter=0` returns `rho_init` and skips the step; 
 recovers whatever `body_iter1` discarded. So a mutant zeroing `tmp_p` unconditionally survives that
 class and is caught by `TestDtypes` instead. The test says so rather than implying coverage it lacks.
 
+### The eigen-residual floor is `eps·‖H‖` with no dimension dependence, and `tol` is now absolute (2026-08-31)
+
+From `docs/rqutils-tol-request.md` (the `spinchain` side asked for a `tol` that means the eigen-residual,
+so their solver criterion and their `_RESIDUAL_TOLERANCE = 1e-6` guard would be one number). Shipped;
+reply in `docs/rqutils-tol-response.md`.
+
+**The question that had to be settled first.** An absolute `tol` is only safe if it stays satisfiable as
+`N` grows. The old test was `‖r‖ < tol·(‖Ax‖ + |θ|)·N·10`, whose `N·10` factor *asserts* an `O(N)`
+rounding budget. If that were real, an absolute bound would become unreachable at large `N`.
+
+**Method.** `debug=True` switches `ground_locg` from `while_loop` to `scan`, so it runs the full
+`maxiter` regardless of convergence; with `tol=0` the test is never satisfied and the per-iteration `r`
+diagnostics expose the whole trajectory. The floor is the median of the last quartile — past convergence
+the residual *oscillates* in rounding noise rather than settling, so a single final iterate reads as a 2x
+trend that is pure noise.
+
+**Result — 27 samples, `N = 70..32768`, `‖H‖₂` over six decades, float64 and complex128, dense and
+matrix-free:**
+
+| model | min | median | max | spread |
+| --- | --- | --- | --- | --- |
+| `floor / (eps·‖H‖)` | 0.494 | **0.839** | 1.260 | **2.6x** |
+| `floor / (eps·‖H‖·N)` | 1.9e-05 | 2.4e-04 | 5.8e-03 | 306x |
+
+```
+floor(‖Hv − Ev‖)  ≈  eps(dtype) · ‖H‖₂        no N dependence
+```
+
+The `N·10` factor was **slack, not a rounding budget** — 700x to 94600x looser than the floor across the
+sweep. That is why no single value of the old relative `tol` could be both fast and admissible for a
+caller with a fixed residual requirement: the same `tol` meant a different absolute residual at every
+`N`. The request's own table shows it — `tol=1e-12` gave 5.0e-06 at one size and 4.4e-06 at another.
+
+Three arms, because one sweep alone would not have distinguished the models:
+
+- **Scale invariance** (the decisive one). Fixed `N = 800`, `H` scaled over 10⁻³..10³: `floor/(eps·‖H‖)`
+  stayed in [0.51, 1.16] with no trend. Isolates the mechanism from the size sweep.
+- **Matrix-free matches dense.** Same subspaces, `floor_mf/floor_dense` ∈ [0.66, 1.57] — straddling 1.0
+  with no bias, i.e. two samples of one noise floor. So the packed-scan `Ax` carries the same constant as
+  a dense matvec and the floor reached through `sqd()` is the one measured. Note `N` there is the
+  *padded* `states_size`; had the floor been `O(N)` the padding would have shown as a systematic `> 1`.
+- **A third, unlooked-for confirmation.** `poc7_sharding` independently reports `‖Hv−ev‖/‖H‖` of 5.5e-16
+  and 6.6e-16 — a script written for another purpose.
+
+**Why `‖r‖` carries no `N`:** it is a vector *norm*, dominated by the per-element relative error in
+computing `Ax`, not by a sum that grows with the element count.
+
+**What shipped.** `‖r‖ < tol`; `tol=None` → `4·eps·max(‖Ax₀‖, 1)`; a below-floor `tol` raises from `sqd`
+with `4·eps·Σ|c_k|` (`Σ|c_k|` is already computed for `prefilter_hi`, and is a measured 1.56–1.90x
+over-estimate of `‖H‖₂` on 1D XXZ — the safe direction). Raised, not clamped: the floor is computable
+from the operator alone. The guard cannot live beside the gate it guards — `converged` is a traced
+boolean inside a `while_loop` — so it sits in `sqd`, the outermost point where `Σ|c_k|` is concrete.
+
+**Two measurement errors made and corrected, both worth keeping.**
+
+1. **A non-monotonic "floor" is an unconverged trajectory, not a floor.** The first large-`N` sweep
+   reported constants from 1.2e3 to 4.8e7, non-monotonic across five decades — which no rounding model
+   produces. `maxiter=120` had left the residual descending **799–2096x within its final quartile**, so
+   the tail median sampled a live trajectory. Raising to 700–900 brought the descent factor to 0.57–1.27
+   and the floor to the predicted value. A **plateau gate** (`r[75%]/r[-1] < 3`) now rejects such rows.
+   Had only large `N` been run, the artifact would have read as "the matrix-free path has a much higher
+   floor" — plausible and entirely wrong. This is "a broken arm flatters its own benchmark" in mirror
+   image: the under-converged arm reports a *worse* number, which is why it was catchable.
+2. **`tol` does not retrace the solver, and a cold call is not a measurement.** An earlier draft of the
+   response claimed `tol` enters the jit cache key and used that to decline publishing a speedup. It is a
+   **traced** argument — `run_sqd._cache_size()` stays at 1 across three values — and the 0.327s-vs-0.003s
+   observation behind the claim was one cold call. Warm, all arms: **5.06 → 4.21 → 3.21 → 2.58 ms** for
+   `None → 1e-12 → 1e-9 → 1e-6`, i.e. **1.96x** at `tol=1e-6`, monotonic. Verifying the claim produced
+   the number.
+
+**A claim deliberately left open.** Whether a residual-targeted `tol` compresses the reported 13.5x
+draw-to-draw variance. Iterations-to-`‖r‖<1e-8` track the relative spectral gap (2.3x rise against a 2.0x
+relgap fall) while `N` rises 16x — but relgap and `N` are correlated in the XXZ family, so this does *not*
+separate them. Settling it needs a draw-to-draw sweep at fixed `N` and fixed Hamiltonian, i.e. their
+fixture. Recorded as suggestive, not decisive.
+
+**A mutation-survival mechanism distinct from the two already in `CLAUDE.md`.** Seven of nine new tests
+passed against a mutant restoring the relative form — right layer, right branch, fixture too *small*: at
+`N=21` the old threshold was ~4200x looser, so the solver's own overshoot satisfied the absolute
+assertion. Only a fixture large enough for the scaling to bite (n=10, 200 states → 4.967e-05 against a
+requested 1e-8) or one *varying* dimension (4.006e-05 vs 6.331e-11 from one `tol`) discriminated. If the
+defect is in how something **scales**, the fixture must span that axis.
+
+**Also unaddressed, and stated in the reply:** `p_is_zero` still reports convergence regardless of `tol`
+(the stationary-point route, pre-existing and by design), so a converged result *can* carry a residual
+above `tol`. And a residual bound is not an accuracy guarantee — `|E − λ_min| ≲ ‖r‖²/gap`, so the energy
+error depends on a gap the caller does not have; measured ΔE was 1–7 decades *better* than the residual at
+every arm, but that is the well-conditioned regime, not a promise.
+
 ## `precond` was removed; `sqd` defaults to `prefilter=(32, 2)`
 
 2026-08-28, acting on the comparison below.
