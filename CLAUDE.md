@@ -2,112 +2,54 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-This file holds the **rules**. Their evidence — measurements, post-mortems, and the simplifications
-that were tried and measured worse — lives in **`NOTES.md`**. Read that before changing anything here
-that looks redundant or over-engineered: most of it is load-bearing for a reason someone had to find
-the hard way.
+**This file holds only the rules.** Every measurement, post-mortem, rejected alternative and dated
+record lives in **`NOTES.md`** — read it before changing anything here that looks redundant or
+over-engineered, because most of it is load-bearing for a reason someone had to find the hard way.
+When a rule needs evidence, it points there rather than restating it.
 
-## Environment & commands
+## Environment
 
-Always use `uv run python` (not bare `python`) — the venv at `.venv` is managed by uv. No `timeout` on
-macOS (it is GNU coreutils) — use the Bash tool's own timeout rather than wrapping a command in it.
-The shell is fish: **quote grep globs** (`--include="*.py"`). Unquoted, fish fails with
-`(eval):1: no matches found` before grep runs — which looks like "no results", not "no command".
+- **Always `uv run python`**, never bare `python` — the venv at `.venv` is managed by uv.
+- **Extras are not installed by default**: `mpl`, `qutip`, `qiskit`, `docs`, `dev` (pytest + ruff + ty).
+  Pull them in per invocation: `uv run --extra qiskit python examples/sqd.py 8 --num-paulis 10`.
+  `mpi4py` is imported by `examples/` but declared nowhere — install it manually for the
+  multi-process path.
+- **No `timeout` on macOS** (it is GNU coreutils) — use the Bash tool's own timeout.
+- **The shell is fish: quote grep globs** (`--include="*.py"`). Unquoted, fish fails with
+  `(eval):1: no matches found` *before* grep runs, which reads as "no results" rather than an error.
+- **macOS `sed -i` needs an explicit backup arg** (`sed -i '' 's/x/y/' f`). Without it BSD sed reads the
+  filename as the suffix and fails — **while exiting 0**, so it looks like a successful no-op. Prefer a
+  short `python3 -` heredoc for in-place edits, and assert the match count before writing.
+- **Don't put `cd` in a backgrounded command.** "Session cwd remains" applies to *subsequent* commands,
+  not the backgrounded one, so `cd /tmp && uv run ...` leaves the project and fails with `No module
+  named jax`. Use `uv run --directory <project>`.
 
-**macOS `sed -i` needs an explicit backup arg** (`sed -i '' 's/x/y/' f`). Without it BSD sed reads the
-filename as the backup suffix and fails with `undefined label` — **while exiting 0**, so it reads as a
-successful no-op. Prefer a short `python3 -` heredoc for in-place edits.
+### Git
 
-**Don't put `cd` in a backgrounded command** — "session cwd remains" applies to *subsequent* commands,
-not the backgrounded one, so `cd /tmp && uv run ...` leaves the project and fails with `No module named
-jax` (plus a `--extra has no effect outside a project` warning). Use `uv run --directory <project>`.
+- **No network access**: `git fetch` fails. `origin/*` is whatever the last fetch left, so
+  `rev-list --left-right --count` can report `0 0` for commits that were never pushed — and the reverse.
+- **`git branch -r --contains <sha>` plus `git reflog show origin/<branch>` is the reliable check**
+  before amending, rebasing, or any force-push. The reflog distinguishes `update by push` from a fetch.
+- **`dev` is the only live branch.** `main` is the PR target and a strict ancestor holding nothing
+  unique. `metal` and `product` are stale reference branches — do not merge them, and do not delete
+  them: `metal` alone holds the segment-sum diagonal builder for ragged X groups. Both are *ahead* of
+  `dev` in commit count, which makes them look like pending work; they are not.
+- **Integrate with `git merge --ff`**, not `--no-ff`. Older history shows merge commits; that is not the
+  convention to follow.
+- **Worktrees need `worktree.baseRef: "head"`** (already set in `.claude/settings.json`). The default
+  `fresh` branches from `origin/main`, which predates the `dev` extra, so `uv run --extra dev` fails
+  outright.
 
-**Worktrees need `worktree.baseRef: "head"`** (in `.claude/settings.json`). The default `fresh`
-branches from `origin/main`, 144 commits behind `dev` and predating the `dev` extra, so `uv run
---extra dev` fails outright. A fresh worktree also gets a bare venv: run the full
-`--extra dev --extra qiskit --extra mpl --extra qutip` or 23 tests **silently skip**, including
-the qiskit reference comparisons this file calls the trustworthy oracle.
-
-**No network access for git in this environment** — `git fetch` fails (`ssh: connect to host
-github.com port 22: Operation not permitted`). `origin/*` refs are whatever the last successful fetch
-left, so `rev-list --left-right --count` can report `0 0` for commits that were never pushed. Merges
-against `origin/dev` use the cached ref; re-fetch from a networked shell before trusting either.
-
-**Check `git rev-list --left-right --count origin/<branch>...HEAD` before amending.** Work happens on
-feature branches (`metal`, not `main`) that get pushed mid-session, so "my commits are still local"
-goes stale within a turn — amend then and you rewrite published history. `git branch -r --contains
-<sha>` is the per-commit check.
-
-**`dev` is the only live branch. `metal` and `product` are both stale — reference only, do not merge.**
-Confirmed 2026-08-25. Both are ahead of `dev` in commit count, which makes them look like work waiting to
-be integrated; they are not.
-
-**`main` is a strict ancestor of `dev` and holds nothing unique — don't consult it for ideas.**
-`git rev-list --left-right --count main...dev` is **`0 272`** (confirmed 2026-08-30): every `main` commit
-is already on `dev`, and `main`'s tip is 2026-07-17, six weeks behind. It is the PR target, not a source.
-Checked specifically because it looks like the place to find an older, simpler approach: the set of
-sharding constructs in `main` but not `dev` is **empty** for both `sqd.py` and `ground_locg.py`, so `dev`
-is a strict superset there too.
-
-Where `main` *differs* it is worse, and one difference is instructive. Its `get_xsource` concatenates
-`[2N, B]` and sorts, which **cannot shard at all** — `lax.sort` raises *"Arguments to sort must be
-unsharded over the sorting dimension"* on a partitioned axis (verified 2026-08-30) — costs a 73 GB
-buffer at `N = 2^31`, and is the origin of the 66–97%-of-a-solve figure. `dev`'s `searchsorted` replaced
-it at 12–25x per signature. **The generalizable rule is already in `NOTES.md`: a sort is the
-anti-pattern for sharding, since only elementwise ops and reductions survive a partitioned axis.**
-
-The one thing neither branch fixed is `uniquify_states`' sort — `main` has two `lax.sort` calls,
-`dev` has one, and that survivor is why `N <= 2^31` still stands. See `NOTES.md`, "Sharding
-`uniquify_states`", for the three gaps and the verified mechanism for each.
-
-**`product`** holds the `rqutils/product.py` (SCIP product-state solver) investigation and an SDP
-lower-bound spike. Its **conclusions are already on `dev`**: `CLAUDE.md` and `NOTES.md` here are
-byte-identical to `product`'s, and `docs/rqutils-precond-request.md` / `docs/sdp-lower-bound.md` carry
-the findings. What lives *only* on `product` is the code — `rqutils/product.py` itself, its `pyscipopt`
-and `clarabel` dependencies, and `examples/scaling/poc_sdp_*.py` — plus the commit-by-commit record.
-**`dev` has no `rqutils/product.py`**, so ignore any prose here that describes it as a module; the
-investigation is **closed** (see "Closed investigations" below) and the module was never brought over.
-
-**`metal`** diverged in both
-directions (18 vs 28 commits) and several items were done *independently on both* — the MLX removal, the
-`2^31` subspace ceiling, `apply_h`'s keyword-only rewrite (C1), C2 and C3 — so `git log --cherry-pick`
-reports every `metal` commit as unique and the overlap is invisible from the log alone. Where they overlap,
-`dev` is the more thorough: on the `cache_level[0] == 0` `ShardingTypeError` its fix carries a dedicated
-`tests/_sharded_cache_levels.py` subprocess harness (231 insertions) against `metal`'s 52.
-
-One thing is **only** on `metal` and would be lost if it is deleted: the **segment-sum diagonal builder for
-ragged X groups** (`f29a3f8`, made sharding-transparent by `16f4646`, exposed via a `diagonals()` entry
-point in `01e7bc0`) — `dev` has no `all_diagonals`, no `diagonals()` and no segment-sum path. Also
-`metal`-only: an API reorganization into three documented tiers and a CHANGELOG. Cherry-pick from there
-rather than rebasing the branch if any of that is wanted later.
-
-```bash
-uv run python -c "import rqutils; print(rqutils.__version__)"
-
-# Optional deps are extras, not installed by default. Pull them in per-invocation:
-uv run --extra qiskit python examples/sqd.py 8 --num-paulis 10 --subspace-frac 0.5
-uv run --extra qiskit python examples/svsim.py 12 --out /tmp/out.h5
-uv run --extra mpl   python ...   # matplotlib, for qprint(output='mpl')
-uv run --extra qutip python ...   # qutip Qobj input to qprint
-```
-
-Extras: `mpl`, `qutip`, `qiskit`, `docs`, `dev` (pytest + ruff + ty). `mpi4py` is imported by `examples/` but declared nowhere — install it manually if you need the multi-process path.
-
-`examples/` holds the three library demos (`sqd.py`, `svsim.py`, `bench.py`) plus the scaling POCs
-under `examples/scaling/` (findings in `docs/scaling-pocs.md`). The POCs reach `_scaling_common.py`
-through `sys.path.insert(0, dirname(__file__))`, so they are run as scripts, not imported.
-
-The MLX port that used to live under `examples/mlx/` (8 scripts, ~2.7k lines) has been **deleted** —
-see the Architecture section for what it left behind.
-
-Docs (regenerates `docs/source/apidoc/` via `sphinx-apidoc`, which is **not** committed):
+### Docs
 
 ```bash
 cd docs && uv run --extra docs make html    # output in docs/build/html
-cd docs && uv run --extra docs make clean   # also removes source/apidoc
-# Sphinx caches: a rebuild prints NO warnings even when they exist. `make clean` first, or a
-# docstring regression reads as a clean build.
+cd docs && uv run --extra docs make clean   # also removes source/apidoc (not committed)
 ```
+
+**Sphinx caches: a rebuild prints no warnings even when they exist.** `make clean` first, or a docstring
+regression reads as a clean build. Note `grep -c warning` on the output counts the "build succeeded, N
+warnings" summary line too.
 
 ## Linting and type checking
 
@@ -117,31 +59,21 @@ uv run --extra dev ruff format rqutils/ tests/ examples/    # format (line width
 uv run --extra dev ty check rqutils/ tests/ examples/       # type check
 ```
 
-All three are clean; keep them that way. Config lives in `[tool.ruff]` / `[tool.ty.rules]` in
-`pyproject.toml`, and every suppression there carries the reason it exists — read those comments
-before adding another. Notebooks are excluded from both tools: they get their names from IPython
-magics (`%aimport rqutils.paulis`) that static analysis cannot see.
+All three are clean; keep them that way. Config is in `[tool.ruff]` / `[tool.ty.rules]` in
+`pyproject.toml`, and every suppression carries the reason it exists — read those comments before adding
+another. Pre-commit runs only whitespace/EOF/YAML/large-file hooks, not ruff or ty. Notebooks are
+excluded from both: they get names from IPython magics that static analysis cannot see.
 
-Several `[tool.ty.rules]` categories are set to `ignore` because JAX ships almost no type
-information and numpy's stubs are stricter than this library's dtype-generic `npmod` convention
-allows. Those were triaged individually rather than blanket-disabled — prefer fixing a real finding
-in the code over widening the ignore list. Pre-commit runs only whitespace/EOF/YAML/large-file
-hooks; it does not run ruff or ty.
-
-**A global ignore hides real defects; prefer a per-line `# ty: ignore[rule]`.** Three rules were
-retired by fixing their few real sites, and two of the three had a genuine bug behind them — a `None`
-angle reaching `angle / 2.0` in `conftest.gate_unitary`, and `QPrintBase._process` annotated
-`list[list[Term]]` while returning a flat `list[Term]`. Count first: `ty check -c 'rules.X="error"'`
-per rule, then read the diagnostics rather than the count. The two patterns that did the work are a
-per-line suppression where the stub is genuinely wrong (`math.py`'s `1.0j * mat`) and `@overload` where
-a runtime flag picks the return shape (`sqd`'s `return_eigvec`). `invalid-return-type` is the next
-candidate at 7 sites; `invalid-argument-type` (96) is the one to leave alone.
-
-New scripts under `examples/` trip rules the existing tree does not: **B023** (a `lambda` in a `for`
-loop capturing the loop variable — endemic to benchmark harnesses passing thunks to a timer; fix by
-binding as a default arg, `lambda vec=vec: ...`, not by restructuring the loop) and **E402** (imports
-after the mandatory `jax.config.update('jax_enable_x64', True)`, which needs `# noqa: E402`).
-`ruff --fix` resolves neither.
+- **A global ignore hides real defects; prefer a per-line `# ty: ignore[rule]`.** Several `ty` rules are
+  `ignore`d because JAX ships almost no type information and numpy's stubs are stricter than the
+  dtype-generic `npmod` convention allows — but prefer fixing a real finding over widening the list.
+  Count first with `ty check -c 'rules.X="error"'`, then read the diagnostics rather than the count.
+  The two patterns that work are a per-line suppression where the stub is genuinely wrong, and
+  `@overload` where a runtime flag picks the return shape.
+- **New scripts under `examples/` trip rules the library does not**: **B023** (a `lambda` in a `for` loop
+  capturing the loop variable — endemic to benchmark harnesses; fix by binding as a default arg,
+  `lambda vec=vec: ...`) and **E402** (imports after the mandatory
+  `jax.config.update('jax_enable_x64', True)`, needing `# noqa: E402`). `ruff --fix` resolves neither.
 
 ## Testing
 
@@ -150,575 +82,403 @@ uv run --extra dev pytest              # whole suite
 uv run --extra dev pytest -v -x        # verbose, stop at first failure
 ```
 
-**Don't run the suite for a markdown-only change.** `CLAUDE.md`, `NOTES.md` and `docs/*.md` are not
-imported by anything and pytest does not collect them, so the result is known before it runs — ~35 s of
-nothing, and it dilutes the signal from the runs that do matter. `git status --short` is the check: if
-every path ends in `.md`, skip straight to the commit. The same goes for ruff and `ty`, which only look
-at `rqutils/ tests/ examples/`.
+**Run the full extras** — `--extra dev --extra qiskit --extra mpl --extra qutip` — or 23 tests
+**silently skip**, including the qiskit reference comparisons this file treats as the trustworthy
+oracle. A fresh worktree gets a bare venv, so this bites there first.
 
-Docstrings are the exception that isn't obvious: they live in `.py`, so editing one **is** a code change
-for `ty` and for the docs build (`cd docs && make clean && make html`), even though no test asserts on
-them.
+**Don't run the suite for a markdown-only change.** `testpaths = ["tests"]` and
+`python_files = ["test_*.py"]`, so pytest never looks at `*.md` — the result is known before it runs, and
+a green run that could not have been red dilutes the signal. `git status --short` is the check. Ruff and
+`ty` likewise only target `rqutils/ tests/ examples/`. **Docstrings are the exception**: they live in
+`.py`, so editing one *is* a code change for `ty` and the docs build.
 
-One `tests/test_<module>.py` per module; all seven are covered. `tests/` also holds three Jupyter
-notebooks used as scratchpads (pytest does not collect them) and `tests/_sharded_*.py` scripts — the
-leading underscore keeps them uncollected, and they are subprocessed under
-`XLA_FLAGS=--xla_force_host_platform_device_count=4` because the virtual device count must be set
-before jax initializes.
+`tests/conftest.py` enables `jax_enable_x64` before any `rqutils` import — every tolerance depends on it
+— and holds the shared reference helpers, each validated against qiskit before being trusted. It also
+configures caches taking the suite from ~53 s to ~6 s; expect ~53 s cold. One `tests/test_<module>.py`
+per module. `tests/_sharded_*.py` are subprocessed under
+`XLA_FLAGS=--xla_force_host_platform_device_count=4` (the device count must be set before jax
+initializes); the leading underscore keeps them uncollected, as do the scratchpad notebooks.
 
-`tests/conftest.py` enables `jax_enable_x64` before any `rqutils` import — every tolerance in the suite
-depends on it — and holds the shared reference helpers (dense Pauli sums, projections, gate unitaries),
-each validated against qiskit before being trusted. It also configures caches that take the suite from
-~53 s to ~6 s; expect ~53 s on a first run.
+### Writing tests
 
-Rules, each of which cost a defect to learn — **evidence in `NOTES.md`**:
-
-- **Tests are organized by defect.** Name the defect a new test locks down and record the measured
-  wrong value. Prefer an *independent* reference (dense construction, scipy, qiskit) over
-  self-consistency: several bugs made every internal code path agree on the same wrong number.
-- **A "does X change the answer?" test needs an arm where X is truly absent.** Verify that; don't
-  assume it from the parameter being unset. The padding test that looked like such a control had
-  filler slots in *both* arms and passed against a mutant returning −1.2 for a true −0.8297058541.
-- **Verify a new test fails against the bug it targets by reverting the fix in place** — a copy of the
-  repo does not work, since the venv holds an editable install pointing at the original. `NOTES.md`
-  has the mutation-testing recipe; mutate `@jax.jit` code in a **fresh subprocess** or both arms reuse
-  one compiled kernel.
-- **Undo a mutation with `cp` from your own backup, never `git checkout <file>`.** The file usually
-  holds unrelated uncommitted work; a checkout discards all of it and the suite passes either way, so
-  nothing flags it. `NOTES.md`'s recipe says to copy first — the restore step is the half that matters.
-- **Aim a mutant at the layer and branch the test actually exercises.** Two survived this way in one
-  session: a coercion added to `sqd` while the test traced `run_sqd` directly, and a mutation of
-  `vinit_nodiag` when the fixture takes `vinit_from_min_diag`. Both read as missing coverage and were
-  not. Check which branch your fixture reaches *before* concluding anything.
-- **A mutant can also survive because the fixture is too *small*, not because the layer is wrong.**
-  Seven of nine new tests passed against a restored relative-convergence form: at `N=21` its threshold
-  was ~4200x looser than the absolute one, so the solver's own overshoot satisfied the assertion anyway.
-  Only a fixture large enough for the scaling to bite (n=10, 200 states, giving 4.967e-05 against a
-  requested 1e-8) or one *varying* the scaled quantity discriminated. **If the defect is in how
-  something scales, the fixture must span that axis** — magnitude, not just code path.
-- **To prove an option is a no-op, compare traced graphs, not energies.** On a well-conditioned
-  fixture a *working* `prefilter=(16, 1)` returns a bit-identical energy to no prefilter at all (only
-  `(32, 2)` moved the last ulp), so "same energy as baseline" is satisfied by both arms and pins
-  nothing. `jax.make_jaxpr` string equality separates them; it caught a `cycles=0`→`1` coercion the
-  energy form missed.
-- **A green suite after reverting a fix means the test is missing, not that the guard is dead.** Some
-  guards are only reachable when other defects compound with them. Look for a *more direct* assertion
-  (the invariant, off `debug=True` diagnostics) before recording a negative result.
+- **Tests are organized by defect.** Name the defect a new test locks down and record the measured wrong
+  value. Prefer an *independent* reference (dense construction, scipy, qiskit) over self-consistency:
+  several bugs made every internal path agree on the same wrong number.
+- **A "does X change the answer?" test needs an arm where X is truly absent.** Verify that; don't infer
+  it from the parameter being unset.
 - **Fixtures are built inside each test body; there are no `@pytest.fixture` state generators.**
-  Deliberate — several tests pick a seed for a specific pathology and assert the fixture still has it,
-  and moving draws into fixtures makes RNG stream position depend on fixture ordering. Keep new
-  generators as plain functions taking `rng`; `unique_states`/`collapsing_states` are the pattern.
-  They take `rng` **last**: `real_pauli_strings(num_qubits, count, rng)` (returns strings only —
-  draw coefficients separately) and `unique_states(num_draws, num_qubits, rng)`.
-- **Sweep `cache_level`, don't sample it** — three bugs hid behind the default `(1, 0)`, each masked by
-  the one before. One needed a *complex* fixture, not just the parameter varied.
+  Deliberate — tests pick a seed for a specific pathology and assert the fixture still has it, and
+  moving draws into fixtures makes RNG stream position depend on fixture ordering. Keep new generators
+  as plain functions taking `rng` **last**: `real_pauli_strings(num_qubits, count, rng)` (strings only —
+  draw coefficients separately), `unique_states(num_draws, num_qubits, rng)`.
+- **Sweep `cache_level`, don't sample it** — bugs hide behind the default `(1, 0)`, and one needed a
+  *complex* fixture rather than just the parameter varied.
+- **A physically-motivated fixture can invert a conclusion a synthetic one reaches.** Build it from the
+  Hamiltonian's own structure; `examples/scaling/poc12`'s `xxz_krylov` is the pattern. And **check the
+  fixture exercises the thing under test** — a hop on qubits 0-1 gives a band-limited subspace a 0% hit
+  rate, so the search is never called.
+- **Don't assert an exact float boundary against a separately computed value.** Two summation orders
+  over the same numbers differ in the last ulp, so an `x == threshold` arm tests floating-point
+  associativity rather than the code. Test strictly inside the region.
+
+### Mutation testing
+
+**Verify a new test fails against the bug it targets by reverting the fix in place.** A copy of the repo
+does not work — the venv holds an editable install pointing at the original. Mutate `@jax.jit` code in a
+**fresh subprocess** or both arms reuse one compiled kernel. `NOTES.md` has the recipe.
+
+**Undo a mutation with `cp` from your own backup, never `git checkout <file>`.** The file usually holds
+unrelated uncommitted work; a checkout discards all of it, and the suite passes either way so nothing
+flags it. The restore step is the half that matters.
+
+Four reasons a mutant survives that are *not* missing coverage:
+
+- **Wrong layer or branch.** Check which branch your fixture reaches before concluding anything.
+- **Fixture too small.** If the defect is in how something *scales*, the fixture must span that axis —
+  magnitude, not just code path. A threshold thousands of times looser than the correct one is still
+  satisfied by the solver's own overshoot on a small fixture.
+- **Compounding guards.** Some guards are only reachable when other defects coincide. Look for a more
+  direct assertion — the invariant itself, or `debug=True` diagnostics — before recording a negative.
+- **The option is a genuine no-op on that fixture.** To prove an option does nothing, compare traced
+  graphs (`jax.make_jaxpr` string equality), not energies: a *working* option can return a bit-identical
+  energy, so "same as baseline" is satisfied by both arms and pins nothing.
+
+### Sharding tests
+
+- **Multi-device paths are testable on CPU** via `--xla_force_host_platform_device_count=4`. Correctness
+  only — timings under virtual devices are meaningless.
 - **Assert the sharding *spec*, not just the values.** A replicated run agrees with single-device to
   exactly 0.0, so "correct but silently unsharded" is invisible to value comparison.
-- **Multi-device paths are testable on CPU** via `--xla_force_host_platform_device_count=4`. Use it for
-  correctness only — timings under virtual devices are meaningless.
-- **A guard on a sharding decision may be invisible single-device.** Deleting the `not partial_xcache`
-  condition on `run_sqd`'s post-precompute reshard left all six in-process `TestPartialXCache` cases green
-  and raised on every mesh (`get_xsource` needs `states` replicated). If a change touches resharding, add
+- **A guard on a sharding decision may be invisible single-device.** If a change touches resharding, add
   a `tests/_sharded_*.py` case and mutation-test it *there*; `conftest.run_sharded_child` is the driver.
-- **A physically-motivated fixture can invert a conclusion a synthetic one reaches.** On 1D XXZ
-  (magnetization-conserving, so generated by local hops from a reference state) prefix hashing measures
-  an imbalance of *exactly* `d` where random draws show 1.12x, and range splitting looks competitive on
-  the states while failing 14.95x on the targets. Build the fixture from the Hamiltonian's own structure
-  before concluding; `examples/scaling/poc12`'s `xxz_krylov` is the pattern. And **check the fixture
-  exercises the thing under test** — a hop on qubits 0-1 gives a band-limited subspace a 0% hit rate, so
-  the search is never called.
-- **A guard must not fire on correct input.** An overflow count that included discarded *padding*
-  reported 763,677 beside a bit-exact result — useless, and worse than useless because it trains a caller
-  to ignore the one signal that matters. Mask such a count to live elements, then verify **both
-  directions**: the guard fires when data is genuinely dropped, and exactness and a zero count coincide.
-- `examples/scaling/poc7_sharding.py` is the fuller sharding harness. Run it after any change to
+- **`examples/scaling/poc7_sharding.py` is the fuller harness.** Run it after any change to
   `ground_locg`'s reductions or helper signatures, not just after touching `sqd`.
-- `svsim` requires **`mesh.size` to divide `2^num_qubits`** — documented rather than fixed, since a
-  state vector's indices *are* the basis states and cannot be padded. `PartitionSpec(None)` replicates.
+- **`svsim` requires `mesh.size` to divide `2^num_qubits`** — documented rather than fixed, since a state
+  vector's indices *are* the basis states and cannot be padded. `PartitionSpec(None)` replicates.
+
+## Measuring
+
+- **Use `eigvalsh` or sparse `eigsh(k=1)`, never `eigh`** — 77 s vs 0.02 s at the sizes here.
+- **A/B whole calls against a worktree of the pre-change revision**, not a predicate in isolation. A
+  predicate microbenchmark has twice reported a regression that whole-call timing showed to be zero.
+- **A/B both arms warm.** Changing a traced expression invalidates the compilation cache; one cold run
+  measured 125 s against a warm 20 s, which reads as catastrophic and is not.
+- **Pass arrays as arguments to a `jit`ted benchmark, never close over them.** XLA constant-folds a
+  closed-over input, so the work happens once at trace time — 0.175 ms against a true 40.8 ms, a 233x
+  phantom speedup. The tell is a `slow_operation_alarm ... Constant folding` line, not an error.
+- **Ask how many times per solve the target is paid, before believing any ratio.** A one-off precompute
+  is 4.5–8.4% of a solve, so Amdahl capped one 5.6–9.4x optimization at 1.09x; a per-matvec target
+  consumed ~129 times kept most of its 5.0–8.2x. Same solver, opposite outcomes, one discriminator.
+- **A quantity measured at one size is not a law.** Sweep the parameter before calling something flat,
+  and prefer a ratio of two measured terms over an absolute.
+- **For memory and compilation counts, ask XLA rather than a formula.**
+  `fn.lower(*args).compile().memory_analysis().temp_size_in_bytes` and `fn._cache_size()`. Byte-count
+  formulas have predicted a saving where the measured peak *rose*.
+- **A broken arm flatters its own benchmark.** An undersized capacity, a dropped term, a truncated
+  candidate list all do *less work* and so report a *better* number. Verify the output before quoting
+  the time.
+- **Verify the referent of a cross-reference, not just that it resolves.**
 
 ## Architecture
 
-Seven largely independent modules under `rqutils/`; nothing but `sqd.py → {paulis/symplectic.py,
-ground_locg.py}` and `qprint.py → paulis/general.py` couples them.
+Eight modules under `rqutils/`, largely independent: only `sqd.py → {paulis/symplectic.py,
+ground_locg.py}` and `qprint.py → paulis/general.py` couple them. `_types.py` and `math.py` are support.
 
-**Two unrelated Pauli representations — do not confuse them:**
+### Two unrelated Pauli representations — do not confuse them
 
-- `paulis/general.py` — dense generalized (Gell-Mann-like) basis for arbitrary dimension. The whole
-  public surface is `paulis(dim)`, `pauli_matrices(dim)`, `components()`, and `labels()`; `compose`,
-  `truncate`, `l0_projector`, `symmetry` and `paulis_shape` were removed as dead code, so don't
-  reintroduce a caller expecting them. Normalization is `tr(λ_k λ_l) = 2δ_kl`, so
-  **`λ_0 = sqrt(2/n)·I`, not `I`** — the most bug-prone invariant here. Basis-index ordering is fixed
-  by a shell-by-shell construction loop, and `components`/`labels` both index by basis position, so a
-  reordering would disagree with the labels users read while every function stayed self-consistent.
-  Shapes: `paulis(dim)` → `(d1², …, D, D)` (basis axes *first*); component arrays → `(…, d1², …)`
-  (component axes *last*). Everything is memoized in module-level dicts keyed by a
-  `tuple(int)`-normalized `dim` (`_normalize_dim`).
-- `paulis/symplectic.py` — `PauliSumXZ`, a bit-packed qubit-only form for JAX/GPU. Convention
-  `Q = (-i)^{x·z} Z^z X^x` with **little-endian qubit ordering** (Qiskit's `.x`/`.z` get reversed on
-  ingest). Terms are grouped by unique X signature, Z groups zero-padded to a rectangle, the
-  `(-i)^{popcount(x&z)}` phase folded into the coefficients, then `np.packbits`. Signatures always
-  reserve **one pad bit at position 0** (a dummy identity, aligning with the pad bit consumers put in
-  their state bitstrings) — not optional, so alignment cannot be got wrong. Decoding a packed signature
-  back to an integer must shift by `8*nbytes - (num_qubits + 1)`; dropping the `+1` silently returns a
-  *permutation* (`NOTES.md`). The class is now just `from_paulisum` and the `arrays` property. **A
-  complex coefficient raises** (non-Hermitian); there is no `force_real` flag and none could work —
-  check `.c.dtype` if you need float64.
+**`paulis/general.py`** — dense generalized (Gell-Mann-like) basis for arbitrary dimension. Public
+surface is `paulis(dim)`, `pauli_matrices(dim)`, `components()`, `labels()`.
 
-**`sqd.py`** — sample-based quantum diagonalization: project a large Pauli-sum Hamiltonian onto the
-subspace spanned by a list of computational-basis bitstrings and solve matrix-free. `sqd(...)` is the
-entry point; `hproj(...)` is the dense/debug path. Two conventions dominate:
+- Normalization is `tr(λ_k λ_l) = 2δ_kl`, so **`λ_0 = sqrt(2/n)·I`, not `I`** — the most bug-prone
+  invariant here.
+- Basis-index ordering is fixed by a shell-by-shell construction loop, and `components`/`labels` both
+  index by basis position, so a reordering would disagree with the labels users read while every
+  function stayed self-consistent.
+- Shapes: `paulis(dim)` → `(d1², …, D, D)` (basis axes *first*); component arrays → `(…, d1², …)`
+  (component axes *last*). Everything is memoized keyed by a `tuple(int)`-normalized `dim`.
 
-- States carry **one extra zero pad bit at position 0** before `packbits`. `PauliSumXZ` reserves the
-  same bit unconditionally, so the two are aligned by construction — this used to be an opt-in
-  `add_padding` flag, and the two sides disagreeing is how `hproj` shipped broken. Filler slots from
-  uniquification are `255`, detected via `states_u[:, 0] >> 7`.
-- `cache_level=(source_indices, diagonals)` selects among six matvec strategies. The source-index axis
-  is near-free to enable and very expensive to disable — **prefer `cache_level[0] = 1`** (`get_xsource`
-  setup is 66–97% of a solve; see `NOTES.md`). That figure is **weighted by call count** — the cost of
-  paying the `J`-fold search per matvec against once — and is *not* headroom for accelerating the
-  precompute, which is only 4.5–8.4% of a `(1,*)` solve. Reading it as the latter is a recorded trap
-  (`NOTES.md`, "Two percentages that look contradictory"). **`xcache_groups=J'` makes that axis a
-  dial** rather than a switch, caching `J'` of the `J` X groups; `None` (the default) is byte-identical to before. Two
-  things measured after it shipped, both in `NOTES.md`: an *intermediate* `J'` can **raise** peak memory
-  (two kernels instead of one — 9.0 MB against 10.4 MB at `J=16`), and **which axis dominates is set by
-  `K`**, the Z signatures per X group — a property of the Hamiltonian, not the subspace. At `K=1` the
-  source cache leads; at `J=101, K=100` (1D Heisenberg, n=100) `diag_signs` is 1313 B/slot against its
-  404, so `(0, 0)` measures 4.0 GB against `(1, 1)`'s 60.6 GB and `cache_level[1]` is the bigger lever.
-- **Never select `cache_level[1] = 1`; use 0 or 2.** Measured 2026-08-30: it is 16–31% slower than
-  `[1] = 0`, which stores *nothing*, and 2.2–7.6× slower than `[1] = 2`, at every `K` in {16, 64, 128}
-  on both `cache_level[0]` rows. `L1 use ≈ L0 build` is why — unpacking the cached bits costs about what
-  recomputing the parity costs, so it buys bytes and redoes the time. It is *also* the larger array once
-  `ceil(K/8)` reaches the coefficient itemsize (`K ≥ 64` float64, `K ≥ 128` complex128 — exact
-  arithmetic, not a fit). It stays in the API because the `cache_level` sweep is load-bearing, not
-  because it should be chosen. **`diag_signs` is not a compression target** — it is already one bit per
-  (state, Z term), so the 1313 B/slot is its information-theoretic size, not slack. Cutting the diagonal
-  axis needs *partial* caching over groups (the `xcache_groups` sibling), which does not exist. `NOTES.md`.
-- **A partial *diagonal* cache is measured and works, but is not implemented** (2026-08-30). Prototyped
-  as two summed kernels, `(1, 2)` over the first `J'` groups and `(1, 0)` over the rest: **half the
-  diagonal memory for 2.45×, 75% of it for 3.17×**, through real `sqd()` solves at n=100, J=100,
-  bit-identical energies at every split. Unlike the Bloom filter it **survives composition into a
-  solve**, because the diagonal cache is consumed ~129 times per solve where the filter's target was a
-  one-off (see the call-count rule under measuring, below). Two
-  constraints if it is ever built: **do not split both axes** (`(0, 2)` is 41× `(1, 2)` per matvec, so
-  any X split pays that to save diagonal bytes — the dial belongs on the diagonal axis alone, with
-  `cache_level[0]` at 1), and **one compiled variant per distinct `J'`**, which power-of-two rounding
-  makes *worse*, not better (13 splits → 13 variants, rounded → 16). **Confirmed at large `N`**
-  (to `states_size` 2^21, and 2.60–2.83× on real solves to N=501k): peak temp is 16 B/slot, so it
-  scales with `N` — the invariant is the *ratio*, **4.0% of the memory the split returns**, and `4/J`
-  in the group count, so the dial is only cheap at large `J` (40% overhead at `J=10`). That `O(N)`
-  overhead against an `O(J·N)` store is why the `xcache_groups` peak-memory hazard does not recur here.
-  `NOTES.md`.
-  **Quote `K` with any memory figure and never size from `4 * J * N` alone** — a fit taken at `K=1` was
-  3.0x wrong for `(1, 1)`. `states_size` also rounds **up to a power of two**: N=24M allocates 33.6M
-  slots.
+**`paulis/symplectic.py`** — `PauliSumXZ`, a bit-packed qubit-only form for JAX/GPU. Convention
+`Q = (-i)^{x·z} Z^z X^x` with **little-endian qubit ordering** (Qiskit's `.x`/`.z` are reversed on
+ingest). Terms are grouped by unique X signature, Z groups zero-padded to a rectangle, the
+`(-i)^{popcount(x&z)}` phase folded into the coefficients, then `np.packbits`.
 
-  The six strategies are one kernel indexed by that 2×3 grid, reached two ways. The **public `apply_h`
-  is keyword-only**: name the arrays you have and the strategy follows (see "Known rough edges" for the
-  break this was). Internally `run_sqd` calls the private `_apply_h_kernel` with an assembled tuple and
-  `cache_level` bound via `functools.partial` — it **must** stay static there, since `ground_locg`
-  splats `args` positionally and `static_argnames` would never see it.
-  `states_size` exists solely to pin array shapes and prevent JIT recompilation.
+- Signatures always reserve **one pad bit at position 0**, aligning with the pad bit consumers put in
+  their state bitstrings — not optional, so alignment cannot be got wrong.
+- Decoding a packed signature back to an integer must shift by `8*nbytes - (num_qubits + 1)`; dropping
+  the `+1` silently returns a *permutation*.
+- **A complex coefficient raises** (non-Hermitian); there is no `force_real` flag and none could work.
+  Check `.c.dtype` if you need float64.
 
-**The rule for a new solver option on `run_sqd`:** forwarded to `ground_locg` by *keyword* → put it
-in `static_argnames`; riding inside the positionally-splatted `args` → bind it with
-`functools.partial`. `cache_level` is the second case (hence the note above), `prefilter` the first —
-so the `static_argnames` list is not evidence that `cache_level` could join it.
+### `sqd.py` — sample-based quantum diagonalization
 
-`sqd` forwards `prefilter` but **not `precond`** — preconditioning `sqd` is a closed investigation
-(see below), so that gap is deliberate, not an oversight to fix. The prefilter's published 1.88x is
-`ground_locg`-on-dense-operators; **it is unmeasured through `apply_h`**, so treat it as
-off-by-default plumbing, not a recommended setting. Malformed values are rejected by
-`_check_prefilter`, since the filter's own `degree > 1 and cycles > 0` gate would absorb them as a
-silent no-op.
+Project a Pauli-sum Hamiltonian onto the subspace spanned by computational-basis bitstrings and solve
+matrix-free. `sqd(...)` is the entry point, `hproj(...)` the dense/debug path.
 
-**`states` must be replicated today, but that is not fundamental** (investigated 2026-08-30). The
-`13 * N` per-device cost is 27.9 GB at `N = 2^31` and is the one term the `(0,0)` floor cannot shed.
-What fails on a partitioned `[N, B]` is only `searchsorted` — `bitwise_xor` and `_pack_state_keys` shard
-fine. Wietek & Läuchli (*Phys. Rev. E* **98**, 033309) solve it with **hash ownership plus a local binary
-search**: no distribution metadata, `N/d` rows searched per rank, one `Alltoallv`. All three ingredients
-verified in JAX (`shard_map` + `all_to_all` + local `searchsorted`), and a prototype is **bit-identical
-to `get_xsource`** at 16× less per-device memory with zero all-gathers. **Hash the whole key, not the
-prefix as published, and not a range split** — on a real **1D XXZ** Krylov subspace prefix hashing
-measures **exactly `d`** (one shard holds everything; at n=30 the packing leaves 33 leading zero bits so
-the prefix is constant *by construction*), and range splitting balances the *states* while failing on the
-**targets** `S ^ X` at up to **14.95×** — hop-dependent, worst when the hop touches high-order bits, and
-**32.51×** once splitters go stale as configuration recovery grows the subspace. Whole-key hashing is
-1.03–1.11× everywhere, verified exact over all 61 XXZ X groups at hit rates 2.2–100%. Whole-key hashing measures 1.01–1.14× on uniform, fixed-weight, banded and
-Zipf-sampled fixtures, and its residual imbalance is Poisson in `N/d` (checked against balls-in-bins),
-so keep `N/d` ≳ 1000. It costs the free local sort — each shard needs its own — which is `poc11`'s
-phase 3, run once at setup. **`poc13_hash_partition_jax.py` is the JAX composition**, bit-identical to
-`get_xsource` at D=2/4 over three hops with **zero all-gather/all-reduce/collective-permute**; bucket
-with `D` passes of an `[n]` cumsum, never an `[n, D]` one-hot (24 vs 13 B/slot at D=4, and `O(N·D)` vs
-`O(N)`). The variable-count routing has a primitive — `jax.lax.ragged_all_to_all`,
-whose published defect (broken reverse-mode rule, "forward-only") is irrelevant since `get_xsource`
-returns indices and is never differentiated — but it is **`UNIMPLEMENTED` on XLA:CPU**, so it cannot be
-tested here. The padded fallback costs 0.4% at `N=2^31, d=64`, and **its capacity is computable from
-`N/d` alone**, which is exactly what the Bloom pre-filter's `cap` was not (there `cap = hits + FP` with
-`hits` the unknown, collapsing to `cap = N`). Raise, do not clamp. **Viable only
-at `cache_level[0] = 1`** — the routing is then paid `J` times per solve, not `J × niter`. Do **not** cite
-DanceQ as precedent: its closed-form index map needs a *complete* symmetry sector, which a sampled
-subspace is not. A project, not a patch; `NOTES.md` has the cost table and what is unbuilt.
+**Return shapes.** `sqd` returns 3 values with `return_eigvec=True` (`eigval, eigvec, basis`) and a bare
+`float` otherwise — not a 5-tuple; the convergence flag and subspace dim are consumed inside `sqd`,
+which raises on non-convergence. `hproj` returns a scipy `csr_array`, so `np.asarray()` on it yields a
+**0-d object array** and the failure surfaces frames later as `IndexError`. Use `.toarray()`.
 
-**Sharding `uniquify_states` needs *range* partitioning, not the hash `get_xsource` uses** — its output
-feeds a binary search, so it must stay globally lex-sorted, and a hash destroys global order. Three gaps
-probed 2026-08-30, all closable, none composed: in-graph splitters work but **must compare the full row**
-(lead-word-only is sound yet puts 4000/4000 rows in one bucket, and a 94%-lead-word-sharing XXZ fixture
-cannot detect that); reassembly into `[states_size, B]` works via a scatter at traced offsets, re-ranking
-live rows since dedupe leaves them non-contiguous; and the within-bucket rank is a **global** prefix sum,
-which `cumsum` refuses on a sharded axis — fixed by a two-level sum (local cumsum + one `[d,d]`
-`all_gather`, `O(d²)` and independent of `N`), verified against a sequential reference. **Composed
-2026-08-30: the algorithm is bit-identical to `uniquify_states`, and it needs *two* routing rounds** —
-bucket `k`'s output offset is data-dependent and does not align with output-shard boundaries (2 of 4
-buckets straddled one), so a bucket owner must send to several output shards. Two dead ends recorded:
-per-shard `[d, cap]` blocks **cannot** be declared replicated (`check_vma` is right; suppressing it gives
-a silently wrong answer), and splitters derived from a sharded array must be *passed* to `shard_map`, not
-closed over. **Built 2026-08-30: bit-identical at D=2 and D=4**, 1 all-gather / 24 all-to-all / 0
-collective-permute. Two capacity lessons: an overflow guard must count **live** elements only (the first
-version reported 763,677 beside a bit-exact result, because round 2's dead rows overflow one bucket by
-design — a guard that fires on correct input trains callers to ignore it), and **balls-in-bins is the
-wrong model for a range partition** — it assumes independent random destinations, true for `poc13`'s hash
-and false here, so use `poc11`'s "slack must exceed the splitter imbalance" (1.35 is exact). Round 2 needs
-`ss/d`, not `ss/d/d`, since a bucket's rows reach only 1–2 output shards. `NOTES.md`.
+**Two invariants that produced silent wrong answers:**
 
-**The popcount diagonal path already shards — verified 2026-08-30, nothing to build.** `_z_parity`,
-`get_diag_signs`, `get_diagonal`, `compute_diagonal` and `apply_h` at `(1,0)`/`(1,1)` all return
-`P('x', …)` with **zero collectives** and bit-identical values, over every X group and both coefficient
-dtypes. It was never at risk because `sum(bitwise_count(states & z), axis=1)` reduces along the **byte**
-axis, i.e. the *unsharded* one — the easy half of the elementwise-and-reductions-survive rule, unlike
-`uniquify_states`' `cumsum` along the sharded axis. **So no mechanism in the distributed-`states` design
-is unverified any more**; what remains is whether the routing pays for the 27.9 GB/device, which needs a
-real interconnect. Separately: `apply_h` with a real `vec` and **complex128** coefficients raises on the
-scan carry dtype — **pre-existing, reproduces single-device with no mesh**, an undocumented contract that
-`vec` be promotable to `.c`'s dtype.
+- **States carry one extra zero pad bit at position 0** before `packbits`, aligned with
+  `PauliSumXZ`'s by construction. Filler slots from uniquification are `255`, detected via
+  `states_u[:, 0] >> 7`.
+- **`states` must be lex-sorted** — `get_xsource` is a binary search, not a sort. Always required;
+  `hproj(unique_states=True)` skips its `np.unique` and so can violate it. Two paths selected statically
+  on width (`uint64` keys for `B ≤ 8` bytes, explicit lexicographic beyond) — a **correctness** boundary,
+  not a performance one.
 
-**`sqd` returns 3 values with `return_eigvec=True` (`eigval, eigvec, basis`) and a bare `float`
-otherwise** — not a 5-tuple. The convergence flag and subspace dim are consumed inside `sqd`, which
-raises on non-convergence rather than returning it; `run_sqd` is the one that returns them.
-**`hproj` returns a scipy `csr_array`** — `np.asarray()` on it yields a **0-d object array**, not the
-matrix, so the failure surfaces frames later as `IndexError: tuple index out of range`. Use
-`.toarray()`.
+**`cache_level=(source_indices, diagonals)`** selects among six matvec strategies, one kernel indexed by
+that 2×3 grid.
 
-**`states` must be lex-sorted** — `get_xsource` is a binary search, not a sort. Always required (the
-sort was equally wrong on unsorted input) but previously undocumented; `hproj(unique_states=True)`
-skips its `np.unique` and so can violate it. Two paths selected statically on width: `uint64` keys for
-`B ≤ 8` bytes, explicit lexicographic search beyond — a **correctness** boundary, not a performance
-one.
+- **Prefer `cache_level[0] = 1`.** `get_xsource` setup is 66–97% of a solve — a figure **weighted by call
+  count** (the `J`-fold search per matvec against once), *not* headroom for accelerating the precompute,
+  which is only 4.5–8.4% of a `(1,*)` solve. Misreading it as the latter is a recorded trap.
+- **Never select `cache_level[1] = 1`; use 0 or 2.** It is slower than `[1] = 0`, which stores *nothing*,
+  because unpacking the cached bits costs about what recomputing the parity costs — it buys bytes and
+  redoes the time. It stays in the API because the sweep is load-bearing, not because it should be
+  chosen.
+- **Which axis dominates is set by `K`**, the Z signatures per X group — a property of the Hamiltonian,
+  not the subspace. **Quote `K` with any memory figure and never size from `4 * J * N` alone.**
+  `states_size` also rounds **up to a power of two**.
+- **`diag_signs` is not a compression target** — it is already one bit per (state, Z term), so its size
+  is information-theoretic, not slack.
 
-**`vinit_from_min_diag`'s added weight must carry the seed component's own sign.** A bare `+1.0`
-subtracts where the seed is negative, and `_spread_seed` maps index 0 to *exactly* −1.0 at every
-`states_size`, so `argmin(diagonal) == 0` cancelled it to zero and `sqd` returned a wrong eigenvalue
-with `converged=True` (`NOTES.md`). Don't replace `jnp.sign` with `copysign` — the seed is complex
-whenever the coefficients are.
+**The public `apply_h` is keyword-only**: name the arrays you have and the strategy follows. Internally
+`run_sqd` calls the private `_apply_h_kernel` with an assembled tuple and `cache_level` bound via
+`functools.partial` — it **must** stay static there, since `ground_locg` splats `args` positionally and
+`static_argnames` would never see it. `states_size` exists solely to pin array shapes against JIT
+recompilation.
 
-**`run_sqd`'s initial vector is a deterministic pseudo-random spread (`_spread_seed`), not a one-hot.**
-Don't "simplify" it back — a one-hot cannot leave its connected component, so a subspace whose
-Hamiltonian splits into disconnected blocks silently returned that block's minimum with
-`converged=True`.
+**Rule for a new solver option on `run_sqd`:** forwarded to `ground_locg` by *keyword* → `static_argnames`;
+riding inside the positionally-splatted `args` → bind with `functools.partial`. `cache_level` is the
+second case, `prefilter` the first — so the `static_argnames` list is not evidence that `cache_level`
+could join it.
 
-**`ground_locg.py`** — single-vector (block-size-1) LOBPCG specialization used as `sqd`'s eigensolver,
-with the Rayleigh–Ritz step solved analytically (`eigenpair_2x2`, `eigenpair_3x3` via Cardano) instead
-of via `eigh`, to keep memory down for huge vectors. It is sharding-transparent **only if the `mat`
-callable preserves output sharding** — that contract is why every `apply_*` in `sqd.py` passes
-`out_sharding=jax.typeof(vec).sharding`. It also takes an optional `prefilter` (`None` |
-`(degree, cycles)` Chebyshev, use `(32, 2)`; its call site must stay **after** the dtype promotion and
-**before** `body_iter0` — `docs/locg-chebyshev-prefilter.md` has the tables). **There is no `precond`
-argument** — it was removed 2026-08-28; see below.
+**`sqd` forwards `prefilter` but not `precond`** — that gap is deliberate (see Closed investigations).
+The prefilter's published 1.88x is `ground_locg`-on-dense-operators and **unmeasured through `apply_h`**,
+so treat it as off-by-default plumbing rather than a recommended setting.
+
+**Two initial-vector invariants, both of which returned a wrong eigenvalue with `converged=True`:**
+
+- **`run_sqd`'s initial vector is a deterministic pseudo-random spread (`_spread_seed`), not a one-hot.**
+  A one-hot cannot leave its connected component, so a Hamiltonian splitting into disconnected blocks
+  silently returned that block's minimum.
+- **`vinit_from_min_diag`'s added weight must carry the seed component's own sign.** A bare `+1.0`
+  subtracts where the seed is negative. Don't replace `jnp.sign` with `copysign` — the seed is complex
+  whenever the coefficients are.
+
+**`states` must be replicated today, but that is not fundamental.** The `13 * N` per-device cost is the
+one term the `(0,0)` floor cannot shed. Only `searchsorted` fails on a partitioned `[N, B]`; a
+hash-ownership-plus-local-search design is verified bit-identical at 16× less per-device memory, and the
+popcount diagonal path already shards with zero collectives. **Hash the whole key, not a prefix, and not
+a range split.** `uniquify_states` is the exception — its output feeds a binary search so it must stay
+globally lex-sorted, which needs *range* partitioning; that is built and bit-identical too. What remains
+unverified is whether the routing pays, which needs a real interconnect. `NOTES.md` has the cost tables,
+the balance measurements, the dead ends, and what is unbuilt. **A sort is the anti-pattern for sharding**
+— only elementwise ops and reductions survive a partitioned axis.
+
+### `ground_locg.py` — the eigensolver
+
+Single-vector (block-size-1) LOBPCG specialization used as `sqd`'s eigensolver, with the Rayleigh–Ritz
+step solved analytically (`eigenpair_2x2`, `eigenpair_3x3` via Cardano) rather than via `eigh`, to keep
+memory down for huge vectors.
+
+**Every guard in it is load-bearing and was measured**; `docs/locg.md` catalogues seven defects that each
+failed *silently* (it is stale on scope and line numbers). Don't "simplify" the balancing, the
+re-orthogonalizations or the zero-direction masks, don't unify `body_iter1`'s exclusion bound with
+`body()`'s, and don't reintroduce the one-matmul `_compute_sas` form.
+
+**Sharding-transparent only if the `mat` callable preserves output sharding** — that contract is why
+every `apply_*` in `sqd.py` passes `out_sharding=jax.typeof(vec).sharding`.
+
+**Convergence is `‖r‖ < max(atol, rtol·(‖Ax‖ + |θ|))`** — either arm suffices.
+
+- `atol` is an absolute residual bound, default `0.0` (no absolute arm). **`None` is rejected**: a
+  derived absolute bound is the unintuitive construct this replaced.
+- `rtol` is a fraction of the operator magnitude — the `np.allclose` meaning, dimension-independent.
+  **`None` is accepted** and resolves to `4·eps` of the *promoted* dtype, which cannot be a literal: a
+  hardcoded float64 value exhausts a 500-iteration cap at float32.
+- **Do not put an `n` factor in `rtol`'s scale.** It makes the bound exceed `‖A‖` at large `n`, so the
+  first iterate reports convergence on an arbitrary eigenpair.
+- **Both arms are guarded against accept-anything** (`rtol >= 0.5`, `atol >= Σ|c_k|`), and a below-floor
+  `atol` raises **only when `rtol == 0`** — with a live relative arm it is harmless, and rejecting it
+  would fire on correct input. The floor is `4·eps·Σ|c_k|`, exposed as `residual_floor`.
 
 **`prefilter` needs `prefilter_hi`, a true upper bound on `λ_max`, and there is no way to compute one
-from matvecs.** Kuczyński–Woźniakowski (1992) prove it; a block-diagonal operator with a start vector
-in one block hides the other block entirely. The array path derives Gershgorin `max_i Σ_j |A_ij|`
-automatically; a **callable raises** without it; `sqd` passes `Σ|c_k|`. Don't "fix" a missing bound
-with a power-iteration or Lanczos estimate — that is exactly the defect in
-`docs/rqutils-prefilter-bug.md`, where the estimate returned an **excited** eigenpair with
+from matvecs.** Kuczyński–Woźniakowski (1992) prove it. The array path derives Gershgorin automatically;
+a **callable raises** without it; `sqd` passes `Σ|c_k|`. Don't "fix" a missing bound with a
+power-iteration or Lanczos estimate — that defect returned an **excited** eigenpair with
 `converged=True`. Prefer a loose bound: over-estimating degrades resolution smoothly, under-estimating
-changes the answer.
+changes the answer. Its call site must stay **after** the dtype promotion and **before** `body_iter0`.
 
-**`ground_locg(debug=True)` runs the full `maxiter`** — it switches `while_loop` to `scan`, so it does
-*not* stop at convergence, and returns a 5th element with per-iteration `r`/`theta`/`reltol` (2 extra
-leading rows for the seed steps). With `atol=rtol=0` that makes the residual *trajectory* observable,
-which is how a floor or a plateau gets measured; `debug=False` returns 4 and stops early. (`sqd` rejects
-that pair as unsatisfiable; a direct `ground_locg` call does not validate, which is what makes it usable
-as an instrument.)
+**`sqd` defaults to `prefilter=(32, 2)`** — 1.49× median end-to-end (min 1.15×). Quote *that*, not the
+2.43× dense wall-clock or the 5.02× iteration count. `ground_locg` defaults to `None`, since it cannot
+derive a bound from a callable.
 
-**`precond` is gone** (2026-08-28), with its tests and `examples/scaling/poc10_deflation_precond.py`.
-It worked — 2.76× median on a *positive-definite* operator — but no `sqd` caller can reach that: `sqd`
-solves the raw indefinite projected `H`, and on it literal Jacobi **fails to converge** (8000-iteration
-cap, wrong answer). Don't reintroduce it as a fallback for a missing `prefilter_hi`; that trades a clean
-`ValueError` for a silent wrong answer. `NOTES.md` has the measurements and the one route that would
-work (shift-then-Jacobi, 1.45×, dominated by the prefilter).
+**`debug=True` runs the full `maxiter`** — it switches `while_loop` to `scan`, so it does *not* stop at
+convergence, and appends a dict of per-iteration diagnostics (`x`, `y`, `r`, `theta`, `rho`, `kappa`,
+`sas`, `rtol_scale`, `converged`; 2 extra leading rows for the seed steps). With `atol=rtol=0` that makes
+the residual *trajectory* observable, which is how a floor or plateau gets measured. `sqd` rejects that
+pair as unsatisfiable; a direct `ground_locg` call does not validate, which is what makes it usable as an
+instrument.
 
-**`sqd` defaults to `prefilter=(32, 2)`** — 1.49× median end-to-end (min 1.15×), and `sqd` derives the
-required bound itself. Quote *that* figure, not the 2.43× dense wall-clock or the 5.02× iteration count.
-`ground_locg` still defaults to `None`, since it cannot derive a bound from a callable.
+**A validator belongs in the module that owns the gate it compensates for.** `_check_prefilter` and
+`_check_tols` live here, not in `sqd.py`, because this module holds the branches that would otherwise
+absorb a malformed value silently. `sqd.py` imports them — and is the caller for `_check_tols`, being the
+outermost point where `Σ|c_k|` is concrete (`run_sqd` is jitted, and a traced value cannot raise).
 
-**A validator belongs in the module that owns the gate it compensates for.** `_check_prefilter` lives
-here, not in `sqd.py`, because `_chebyshev_prefilter`'s `degree > 1 and cycles > 0` is what silently
-absorbs a malformed value; `sqd.py` imports it. Sited wrongly, the *published* entry point is the
-unguarded one.
+### `svsim.py`
 
-Every guard in it is load-bearing and was measured; `docs/locg.md` catalogues seven defects (I1–I7)
-that each failed *silently*. **Don't "simplify" the balancing, the re-orthogonalizations, or the
-zero-direction masks**, don't unify `body_iter1`'s exclusion bound with `body()`'s, and don't
-reintroduce the one-matmul `_compute_sas` form. `NOTES.md` has the measurements and notes that
-`docs/locg.md` is stale on scope and line numbers.
+JAX state-vector simulator. Gates compile to the same symplectic form and apply via a single
+`jax.lax.scan`, so only `x, y, z, cz, rx, ry, rz, rzz` are supported — transpile to
+`basis_gates=['rx','ry','rz','rzz']` first. **`sin` is complex128, not real** — it carries the rotation's
+leading `i` and the convention's `(-i)^{x·z}` phase, and narrowing it silently breaks every `y`/`ry` gate
+and so every transpiled circuit. `cz` is only decomposed on the `QuantumCircuit` path, and is correct
+only up to a uniform `exp(iπ/4)`.
 
-**The MLX port is gone** — deleted, not deprecated-in-place, because the JAX solver measured faster
-even on the MLX GPU backend. Don't reintroduce a second solver implementation without that measurement
-going the other way first. `NOTES.md` records what the deletion left behind, including the trap that
-**deleting a comparison arm can remove the only test of something else**.
+### `qprint.py`
 
-**`svsim.py`** — JAX state-vector simulator. Gates are compiled to the same symplectic `CircuitXZ`
-(x, z, cos, sin) form and applied by a single `jax.lax.scan`, so only `x, y, z, cz, rx, ry, rz, rzz`
-are supported; transpile to `basis_gates=['rx','ry','rz','rzz']` first. **`sin` is complex128, not
-real** — it carries the rotation's leading `i` and the convention's `(-i)^{x·z}` phase, and narrowing
-it silently breaks every `y`/`ry` gate and so every transpiled circuit. `cz` is only decomposed on the
-`QuantumCircuit` path and is correct only up to a uniform `exp(iπ/4)`.
+Pretty-printer with two orthogonal axes: `fmt` picks the content class (`QPrintBraKet` / `QPrintPauli` /
+`QPrintMatrix`) and `output` picks the rendering (`'text'` returns the object for lazy `__repr__`,
+`'latex'` a string, `'mpl'` a Figure). `QPrintBase` owns all numerics; subclasses override only
+`_qobj_data`, `_add_labels`, `_format_lhs`. **Test the full `fmt` × `output` grid, not a diagonal** —
+bugs have lived in cells nothing exercised.
 
-**`qprint.py`** — pretty-printer with two orthogonal axes: `fmt` picks the content class
-(`QPrintBraKet` / `QPrintPauli` / `QPrintMatrix`) and `output` picks the rendering (`'text'` returns
-the object for lazy `__repr__`, `'latex'` a string, `'mpl'` a Figure). `QPrintBase` owns all numerics;
-subclasses only override `_qobj_data`, `_add_labels`, `_format_lhs`. **Test the full `fmt` × `output`
-grid, not a diagonal of it** — four bugs lived in cells nothing exercised (`NOTES.md`).
-
-**`product.py` is not on this branch** (see the branch note above). Mentioned only because
-`docs/rqutils-precond-request.md` and `docs/sdp-lower-bound.md` reference it: both values it returns are
-*upper* bounds on the true ground energy, which is why the whole preconditioner-shift line is closed.
-
-## Conventions to follow when editing
+## Conventions when editing
 
 **`npmod`** — numeric functions take `npmod: ModuleType = np` as the last kwarg so callers can pass
-`jax.numpy` for traceable execution. The rule: **validation and early returns must be gated on
-`if npmod is np:`**, but **Python-level shape inference must NOT be** — it operates on static values and
-is needed identically by both backends. Gating it broke `paulis/general.py`'s entire `npmod=jnp` path in
-three places, which is why `_normalize_dim` is now called unconditionally at every site. Shape
-arithmetic should use `np` explicitly, not `npmod` (`jnp.sqrt` rejects the plain tuples that
+`jax.numpy` for traceable execution. **Validation and early returns must be gated on `if npmod is np:`;
+Python-level shape inference must NOT be** — it operates on static values and both backends need it
+identically. Use `np` explicitly for shape arithmetic, not `npmod` (`jnp.sqrt` rejects the plain tuples
 `array.shape` returns). Prefer an unrolled Python loop over `jax.lax.fori_loop` when the trip count is
-static — a traced loop index cannot subscript a static dimension tuple
-(`TracerIntegerConversionError`). `components` is the only `npmod` consumer left;
-`tests/test_paulis_general.py::TestNpmodParity` pins it, including under `jax.jit`.
+static — a traced index cannot subscript a static dimension tuple. `components` is the only consumer
+left; `TestNpmodParity` pins it, including under `jax.jit`.
 
 **Optional dependencies** — uniform `try: import X / except ImportError: HAS_X = False / else:
 HAS_X = True` at module top, every use guarded by `HAS_X and isinstance(...)`, and the runtime path
-raises a `RuntimeError` rather than failing at import. `numpy`, `scipy`, `h5py`, and **`jax`** are hard
-dependencies (`pyscipopt` is not — it is only on the stale `product` branch).
+raising `RuntimeError` rather than failing at import. `numpy`, `scipy`, `h5py` and **`jax`** are hard
+dependencies.
 
 **A type alias must name every arm in its `type` statement — never widen one afterwards with
-`X |= OptionalType` under a `HAS_*` guard.** A `type` statement is evaluated *statically*, so the
-augmented assignment mutates only the runtime object and the added arm is invisible to a type checker
-whether or not the optional package is installed. All three aliases had this (`sqd.HamiltonianInput`,
-`svsim.CircuitInput`, `qprint.PrintReturnType`); every correct `sqd(SparsePauliOp, ...)` call was an
-`invalid-argument-type` error for a downstream caller who type-checks. Naming the arm unconditionally is
-safe because a `type` statement is **lazy** — nothing reads `__value__`, so an annotation-only import is
-never resolved at runtime. Import that arm under `TYPE_CHECKING` if it is not already needed at runtime
-(`sqd`), and leave the existing runtime import alone if it is (`svsim` needs it for an `isinstance`).
+`X |= OptionalType` under a `HAS_*` guard.** A `type` statement is evaluated statically, so the augmented
+assignment mutates only the runtime object and the added arm is invisible to a type checker. Naming the
+arm unconditionally is safe because a `type` statement is **lazy** — import it under `TYPE_CHECKING` if
+not already needed at runtime. **This repo cannot see the defect itself**: `invalid-argument-type` is
+`ignore`d, so `ty check` passes against the broken form. The regression tests re-enable the rule
+per-invocation via `conftest.assert_type_checks`. Two traps: `ty` silently checks **nothing** for a file
+outside the project root, and resolves an alias to an opaque `TypeAliasType` without evaluating it, so no
+runtime assertion can pin this.
 
-Note **this repo cannot see that defect itself**: `invalid-argument-type` is `ignore` in
-`[tool.ty.rules]`, so `ty check` passes against the broken form. The three regression tests re-enable
-the rule per-invocation via `ty check -c` (`conftest.assert_type_checks`), and pin the
-without-the-package import too (`conftest.assert_imports_without`). Two traps if you write another:
-`ty` silently checks **nothing** for a file outside the project root, and it resolves an alias to an
-opaque `TypeAliasType` without evaluating its value, so no runtime assertion can pin this.
+**Sharding is implicit** — the library reads `jax.sharding.get_abstract_mesh()`; setting the mesh is the
+*caller's* job. Examples establish the pattern: a single axis named `'x'` with `AxisType.Explicit`, plus
+`jax.config.update('jax_enable_x64', True)` (without x64 you silently get complex64/int32).
 
-**Don't index a sharded array to read one element.** `seed.at[i].add(f(seed[i]))` is correct
-arithmetic but emits an `all-gather` per read — measured 3 on a 4-device mesh, each materializing the
-whole vector on every device, which is what `ground_locg`'s single-vector budget exists to avoid. Use a
-`broadcasted_iota` mask and an elementwise `where` instead; bit-identical, no collective. Check with
+**Don't index a sharded array to read one element.** `seed.at[i].add(f(seed[i]))` is correct arithmetic
+but emits an `all-gather` per read, each materializing the whole vector on every device — which is what
+`ground_locg`'s single-vector budget exists to avoid. Use a `broadcasted_iota` mask and an elementwise
+`where`; bit-identical, no collective. Check with
 `.lower(...).compile().as_text().count("all-gather")`, not by reading the source.
 
-**Sharding is implicit** — the library reads `jax.sharding.get_abstract_mesh()`; it is the *caller's*
-job to set the mesh. The examples establish the expected pattern: a single axis named `'x'` with
-`AxisType.Explicit`, plus `jax.config.update('jax_enable_x64', True)` (without x64 you silently get
-complex64/int32 — you'll see truncation warnings).
+### Comments
 
-**Code comments should be concise.** One line where one line will do; a short block only for a
-non-obvious invariant or a defect the comment is there to prevent recurring. Prefer stating the
-constraint over narrating the code — if a comment restates what the next line plainly says, delete it.
-Long explanations belong in the docstring (user-facing) or `NOTES.md` (evidence, measurements,
-post-mortems), not inline.
+**Concise: one line where one line will do.** A short block only for a non-obvious invariant or a defect
+the comment prevents recurring. Prefer stating the constraint over narrating the code. Long explanations
+belong in the docstring (user-facing) or `NOTES.md` (evidence), not inline.
 
 **A comment must earn its length; length alone is not the test.** Ask what a reader loses if it is
-deleted. A block that records a measured defect earns any length — `sqd.py`'s 27 lines over one
-statement carry four silent-wrong-answer failures with their measured values, and deleting them removes
-the only thing stopping recurrence. A block that re-explains what a `docs/` file or `NOTES.md` already
-says earns nothing at any length. Measured 2026-08-29: 41 blocks in `rqutils/` and `tests/` are longer
-than the code beneath them, and the ones inspected were all the first kind. **Do not trim by ratio.**
+deleted. A block recording a measured defect earns any length — deleting it removes the only thing
+stopping recurrence. A block re-explaining what `NOTES.md` or `docs/` already says earns nothing at any
+length. **Do not trim by ratio.** Two failure modes to check for instead:
 
-Two failure modes to check for instead, both of which produced real bloat here:
+- **Editing by appending** — revisiting a comment and adding a paragraph instead of rewriting the
+  existing one, leaving two explanations of one statement and often a now-false opening sentence.
+- **Restating a document that already exists.** Check whether the content belongs in `NOTES.md` or
+  `docs/` before writing it inline.
 
-- **Editing by appending.** Revisiting a comment and adding a paragraph instead of rewriting the
-  existing one. `[tool.ty.rules]`'s comment reached 22 lines over 4 lines of config across three
-  visits, with the same `jax.jit` explanation stated twice in one block.
-- **Restating a document that already exists.** Before writing an inline block, check whether the
-  content belongs in — or is already in — `NOTES.md` or `docs/`. That same comment duplicated
-  `docs/typing-notes.md` in full.
+**A rule stated near-identically in two places: prefer one statement plus a pointer.**
 
-The same applies to a rule stated near-identically in two places: prefer one statement plus a pointer.
+### Docstrings
 
-**Docstrings feed the published API reference.** Every module opens with a raw docstring that is a full
-reST document: over/underlined title, `.. currentmodule::`, prose with `.. math::` derivations of the
-normalization conventions, and an explicit API section (`.. autofunction::` / `.. autoclass::` /
-`.. autosummary::`). Function docstrings are Google-style (`Args:` / `Returns:` / `Raises:`) via
-napoleon. Adding a public module requires **both** those directives **and** a manual line in the
-`toctree` of `docs/source/index.rst`.
+**They feed the published API reference.** Every module opens with a raw docstring that is a full reST
+document: over/underlined title, `.. currentmodule::`, prose with `.. math::` derivations, and an
+explicit API section. Function docstrings are Google-style (`Args:` / `Returns:` / `Raises:`) via
+napoleon. Adding a public module requires **both** those directives **and** a manual `toctree` line in
+`docs/source/index.rst`.
 
-**Docstrings with LaTeX must be raw strings**, `.. autoclass::` needs `:members:`, `:math:`
-exponents must be braced, and a docstring's body indentation must be **uniform** — writing
-8-space continuations into a 4-space docstring makes reST read the deeper lines as a block quote
-and nests `Args:`/`Returns:`/`Raises:` beyond napoleon's reach. Four hazards that no tool
-catches: ruff, `ty`, pytest and the control-char sweep all pass. Detailed with both check
-commands in `NOTES.md`.
+Four hazards no tool catches — ruff, `ty`, pytest and the control-char sweep all pass:
 
-**Writing `Raises:` sections finds bugs** — it caught three wrong claims in one pass. Trigger every
-raise you document (`NOTES.md`).
+- **LaTeX needs a raw string.**
+- **`.. autoclass::` needs `:members:`.**
+- **`:math:` exponents must be braced.**
+- **Body indentation must be uniform** — 8-space continuations in a 4-space docstring make reST read the
+  deeper lines as a block quote, nesting `Args:`/`Returns:`/`Raises:` beyond napoleon's reach.
 
-**When measuring: use `eigvalsh` or sparse `eigsh(k=1)`, never `eigh`** (77 s vs 0.02 s at the sizes
-here), **A/B whole calls against a worktree of the pre-change revision** rather than timing a predicate
-in isolation, **A/B both arms warm** — changing a traced expression invalidates the compilation cache,
-and one cold run measured 125 s against a warm 20 s, which reads as a catastrophic regression and is
-not one — and **verify the referent of a cross-reference, not just that it resolves**. All four with
-numbers in `NOTES.md`.
+**One `Args:` entry per parameter.** Documenting two in one entry leaves the second absent from the
+rendered reference.
 
-**Ask how many times per solve an optimization's target is paid, before believing any ratio.** A one-off
-precompute is 4.5–8.4% of a solve, so Amdahl divided the Bloom filter's 5.6–9.4x to a 1.09x ceiling; the
-diagonal cache is consumed ~129 times, so 5.0–8.2x per matvec became 3.59–5.13x end-to-end. Same repo,
-same solver, opposite outcomes, one discriminator — and it is the same "weighted by call count"
-distinction that makes the 66–97% figure easy to misread.
-
-**A quantity measured at one size is not a law.** "Peak temp is flat at 1.1 MB" was an artifact of a
-single `states_size` — it is 16 B/slot, linear in `N`; the invariant was the *ratio* (4.0% of what the
-split returns). Sweep the parameter before calling something flat, and prefer a ratio of two measured
-terms over an absolute.
-
-**Pass arrays as arguments to a `jit`ted benchmark, never close over them.** XLA constant-folds a
-closed-over input, so the work happens once at trace time and every later call measures nothing —
-0.175 ms against a true 40.8 ms for `uniquify_states` at N=200k, a 233x phantom speedup. The tell is a
-`slow_operation_alarm ... Constant folding an instruction` line in the log, not an error.
-
-**For memory and compilation counts, ask XLA rather than a formula.**
-`fn.lower(*args).compile().memory_analysis().temp_size_in_bytes` gives peak temp bytes and
-`fn._cache_size()` counts compiled variants. Both caught claims a byte count got wrong: `4 * J' * N`
-predicts a linear saving where the measured peak *rose* (9.0 MB against 10.4 MB).
-
-**A broken arm flatters its own benchmark.** An undersized capacity, a dropped term, a truncated
-candidate list all do *less work*, so they report a *better* number. Two instances: a 16384-slot cap
-against 17913 candidates reported 5.7x where the honest figure was 8.0x, and a `vmap` whose batch axis
-came out last read as "numerically wrong" until the shapes were compared. Verify the output before
-quoting the time.
+**Writing `Raises:` sections finds bugs** — it caught three wrong claims in one pass. Trigger every raise
+you document.
 
 ## Known rough edges
 
-- `paulis(dim)` for multiple subsystems uses `np.einsum` with 3 letters per subsystem, capping at ~17
-  subsystems; `sparse=True` for products raises `NotImplementedError`.
-- `sqd` and `hproj` are limited to `N ≤ 2^31 - 1` subspace states, **enforced** (`_MAX_STATES`) in both
-  entry points *and* on `uniquify_states`' static `states_size`, where the int32 iota is actually
-  created — six `examples/scaling/` scripts call the un-underscored helpers directly and reached the
-  iota with neither entry-point guard in the chain. `TestInt32Ceiling` covers both sides of the
-  boundary. `NOTES.md` explains why the guard placement is what it is.
-- **`hproj(unique_states=True)` now raises on unsorted or duplicate-containing input, where it used to
-  return a wrong matrix.** A behavioural change, though "break" means callers were silently receiving a
-  non-symmetric projection. Both halves of "uniquified and lex-sorted" are load-bearing (see the
-  binary-search note above); the check is host-side numpy at 12–14% of `hproj`, on that opt-in path
-  only. Pass `np.unique(states, axis=0)`, or leave `unique_states=False`.
-- **`apply_h` is keyword-only; its positional `(scanned, cache_level)` form is gone.** A call like
-  `apply_h(vec, (xsources, diagonals), None, (1, 2))` now raises `TypeError`; the replacement is
-  `apply_h(vec, xsources=..., diagonals=...)`. Deliberately a hard break rather than a deprecation
-  shim — the point is that the six valid input sets become the only constructible ones, and the unpaired
-  form was unverifiable (`NOTES.md`). Callers binding a matvec thunk should bind the *arrays*
-  (`functools.partial(apply_h, xsources=xs, diagonals=dg)`), not the `cache_level`; the four
-  `examples/scaling/` POCs show the migration.
+Downstream-visible breaks and hard limits. There is no CHANGELOG; if one is added, all of these belong
+in it.
 
-- **`sqd(..., packed=True)` now returns *packed* states** (2026-08-30). `packed` governs both
-  directions, so a round trip needs no re-pack — which also removes a hazard, since
-  `PauliSumXZ.pack_states` is not idempotent and re-packing a returned array was silently wrong. **A
-  caller that passed `packed=True` and compared the result against an unpacked array breaks**, but
-  loudly: `np.array_equal` is `False` on a shape mismatch. `spinchain`'s `skqd` is such a caller
-  (`sqd_backend.py` compares `basis_states` against its own `bitstring_matrix`) — it does **not**
-  round-trip states, so it gains nothing here and needs the comparison updated. One flag rather than a
-  second `return_packed`: two flags make four combinations, two of which are format conversions, and
-  `pack_states`/`unpack_states` already are those. Both overloads annotate `StateList`, which cannot
-  express the width, so **`ty` will not catch a caller assuming the wrong one**.
+- **`paulis(dim)`** for multiple subsystems uses `np.einsum` with 3 letters per subsystem, capping at ~17
+  subsystems. `sparse=True` for products raises `NotImplementedError`.
+- **`N ≤ 2^31 - 1` subspace states**, enforced (`_MAX_STATES`) in `sqd` and `hproj` *and* on
+  `uniquify_states`' static `states_size`, where the int32 iota is created — `examples/scaling/` scripts
+  call the un-underscored helpers directly and reach the iota with neither entry-point guard in the
+  chain. `TestInt32Ceiling` covers both sides.
+- **`hproj(unique_states=True)` raises on unsorted or duplicate-containing input**, where it used to
+  return a silently non-symmetric projection. The check is host-side numpy at 12–14% of `hproj`, on that
+  opt-in path only. Pass `np.unique(states, axis=0)` or leave `unique_states=False`.
+- **`apply_h` is keyword-only**; the positional `(scanned, cache_level)` form raises `TypeError`. A hard
+  break rather than a shim, so the six valid input sets become the only constructible ones. Bind the
+  *arrays* for a matvec thunk (`functools.partial(apply_h, xsources=xs, diagonals=dg)`), not the
+  `cache_level`.
+- **`sqd(..., packed=True)` returns *packed* states.** One flag governs both directions, so a round trip
+  needs no re-pack — which also removes a hazard, `pack_states` not being idempotent. A caller comparing
+  the result against an unpacked array breaks loudly on the shape mismatch. Both overloads annotate
+  `StateList`, which cannot express the width, so **`ty` will not catch a caller assuming the wrong one**.
+- **`tol` is gone**, replaced by `atol`/`rtol` (see `ground_locg.py` above). `tol=` raises `TypeError`
+  with no alias, deliberately: it meant *relative* in one revision and *absolute* in the next, so
+  silently resolving it to one of the pair would be the worst option. `tol=x` on the absolute form is
+  `atol=x, rtol=0.0`; on the relative form there is **no exact equivalent**. Also an **arity** change —
+  `ground_locg`'s positional signature gained a slot.
+- **`apply_h` with a real `vec` and complex128 coefficients raises** on the scan carry dtype.
+  Pre-existing and reproduces single-device: an undocumented contract that `vec` be promotable to `.c`'s
+  dtype.
 
-- **`tol` is gone; convergence is `‖r‖ < max(atol, rtol·(‖Hv‖ + |E|))`** (2026-09-01), on both `sqd` and
-  `ground_locg`. Either arm suffices — `atol` names an absolute residual (so a caller whose consumer
-  checks 1e-6 can *say* 1e-6, at every `N`), `rtol` is a fraction of the operator magnitude, the
-  `np.allclose` meaning. **`tol=` raises `TypeError`, no alias**, deliberately: it meant *relative*
-  before 2026-08-31 and *absolute* after, so a third revision resolving it silently to one of the pair
-  would be the worst option. Migrating, `tol=x` on the absolute form is `atol=x, rtol=0.0`; on the
-  relative form there is **no exact equivalent** (see below). Also an **arity** change — `ground_locg`'s
-  positional signature gained a slot, which `tests/test_ground_locg.py`'s all-positional arm exists to
-  catch.
+## Closed investigations — don't reopen without reading `NOTES.md`
 
-  **`atol` defaults to `0.0` and rejects `None`; `rtol` defaults to `None` → `4·eps`.** The asymmetry is
-  load-bearing, not sloppiness: `rtol`'s default is the *promoted dtype's* epsilon, which cannot be a
-  literal — a hardcoded `8.88e-16` converges in 28 iterations at float64 and **exhausts a 500-iteration
-  cap at float32** (measured; `TestRtolNoneIsDtypeDerived` pins it and says to revisit this if it ever
-  starts passing). `atol` has no such excuse, so `0.0` means "no absolute arm" and `None` is an error.
-
-  **`rtol`'s scale carries no `N` factor, and that is a refusal rather than an omission.** The `n·10`
-  form shipped first (it reproduces the pre-2026-08-31 relative `tol` exactly, which is what the
-  requester asked for) and was withdrawn on measurement: the bound **can exceed `‖H‖`** — `rtol=1e-8` at
-  `n=2^20` gave 4.2 against `‖H‖ = 20`, so the first iterate reported convergence with an arbitrary
-  eigenpair and `converged=True`. It also saturated (`rtol=1e-6` and `1e-4` bit-identical) and could not
-  be stated without knowing `n`. The cost is that one `rtol` no longer scales across dimensions; a caller
-  needing that sets `atol` per call. `docs/rqutils-atol-rtol-response.md` gives the three routes.
-
-  **Both arms are guarded against accept-anything**: `rtol >= 0.5` (where `2·rtol·‖H‖` reaches `‖H‖`) and
-  `atol >= Σ|c_k|`. The `atol` half was **missing from the first implementation** — the guard's own
-  justification is about the *bound*, not about which parameter produced it, and it was applied to one arm
-  anyway; `atol=100` against `‖H‖ = 17` converged in **one iteration**. Found only by re-probing `atol`
-  after being asked whether it had been reviewed as carefully as `rtol`. **When a guard's argument is
-  stated in terms of a derived quantity, check every input that reaches it.**
-
-  A below-floor `atol` still raises, but **only when `rtol == 0`** — with a live relative arm it is
-  harmless, and rejecting it would fire on correct input. Floor is `4·eps·Σ|c_k|`, exposed as
-  `ground_locg.residual_floor`. Evidence in `NOTES.md`; the two request/response pairs are
-  `docs/rqutils-tol-*.md` and `docs/rqutils-atol-rtol-*.md`.
-
-All four of the above are downstream-visible breaks. There is no CHANGELOG in this repo — if one is ever
-added, every one of them belongs in it.
-
-## Closed investigations — don't reopen without reading the record
-
-- **Preconditioning `sqd` is closed, and `precond` has been deleted** (2026-08-28). It shipped and
-  measured 1.79–2.76× median on a *shifted* operator, but `sqd` solves the raw indefinite projected
-  `H`, where literal Jacobi **fails to converge**; six routes to a usable shift were measured and
-  rejected — including a level-1 SDP bound that is valid, tightest-available, and still matched by a
-  free `O(N)` diagonal bound. The blocking argument is structural: no bound on `H`, however tight, can
-  reach the shift those figures used. The two-level/deflation candidate the record called "untried" was
-  then tried and **rejected** (0.68–0.98×, `docs/deflation-preconditioner.md`), so the line is fully
-  closed. `docs/rqutils-precond-request.md`,
-  `docs/sdp-lower-bound.md`, summary in `NOTES.md`.
-- **Subspace selection by weight shell + diagonal ranking was measured, then rejected** (2026-08-25) —
-  sound results against a *uniform random* baseline, which is not what a real SQD workflow produces.
-  Do not build on it.
-- **Reducing `ground_locg`'s `O(N)` vector count is closed** (2026-08-30). The solver's own working set
-  is **7 vectors, measured** (`temp_size_in_bytes / 8N`, flat in `N` and in `maxiter`; an 8th belongs to
-  the operator), and 7 is the **algorithmic minimum** for a 3-dim Rayleigh–Ritz basis: `{x, y, p}` plus
-  each one's image plus `r` to build `p`. **So it is a basis-size question, not buffer reuse** — no
-  aliasing work helps. The 2-dim `{x, p}` variant already exists as `body_iter1` and only needed
-  looping; it converges to the same eigenvalue but takes **3.2–11.9× more iterations** (median ~4.4×),
-  for 13.3% off the floor (120 → 104 B/slot). Bad in both directions. Note the module docstring's
-  "three-vector memory budget" means the Rayleigh–Ritz basis, **not** the total footprint. `NOTES.md`.
-- **Reduced precision in `ground_locg` is closed, both variants** (2026-08-30). *Arithmetic* in f32
-  with f64 storage is `poc6_mixed_precision.py`, rejected in `docs/scaling-pocs.md` §6 (1.17–1.30× at
-  fixed iterations, **0.42× end-to-end**, three of four converged solves hitting `maxiter`; re-verified
-  2026-08-30). *Storage* of a carried vector at f32 — a distinct, memory-motivated proposal the POC does
-  not cover — is closed by one measurement: rounding `ax` to f32 raises the residual floor to 6.8e-7,
-  **3.1e6× the f64 `tol`**, so the convergence test becomes unsatisfiable. The cause is catastrophic
-  cancellation in `r = Ax - θx` (`ax` is `O(‖A‖)`, `r` is `O(1e-9)`), not a tunable tolerance. Storing
-  `r` alone is harmless but worth only 4 B/slot. **The `(0,0)` floor is 120 B/slot — 258 GB at `2^31` —
-  and that is the honest single-device ceiling**; lowering it needs a solver with fewer carried `O(N)`
-  vectors, not a dtype change. `NOTES.md`.
-- **The Bloom pre-filter for `get_xsource` is closed** (2026-08-30). Six prototypes measured it
-  thoroughly and every mechanic was settled — capacity policy, sharding, hoisted precompute,
-  composition with `xcache_groups` — and it is still not worth building, for two structural reasons.
-  **It can only attach to the precompute** (the retry policy is host-side sequencing and cannot live
-  inside one `jit`; the uncached recompute at `sqd.py:1876` is inside `_apply_h_kernel`'s scan, called
-  every iteration), and that precompute is **4.5–8.4%** of a `(1,*)` solve, so Amdahl caps it at
-  **1.09×**. And **the path that would save memory is the one it cannot reach**: `(0,0)` already costs
-  4.0 GB against 4.1 GB with the filter, so the filter is 0.029 GB of overhead and no saving. The
-  published 5.6–9.4× figures are matvec-path, not end-to-end. Three variants were separately rejected —
-  as the subspace *definition* (dead past n≈70, FP count scales `2^n`), for input dedup (0.64–0.79×
-  against `np.unique`), and binary fuse (better query, ~60 s build at N=24M).
-  `docs/xsources-cache-budget.md`, detail in `NOTES.md`. **The memory lever is the diagonal axis, not this one** — `diag_signs` is
-  1313 B/slot against `xsources`' 404 at `J=101, K=100`, and it is uninvestigated.
+- **Preconditioning `sqd`**, and `precond` is deleted. It measured well on a *shifted* operator, but
+  `sqd` solves the raw indefinite projected `H` where literal Jacobi fails to converge, and the blocking
+  argument is structural: no bound on `H`, however tight, reaches the shift those figures used. Six
+  routes measured and rejected, including the deflation candidate. Don't reintroduce it as a fallback for
+  a missing `prefilter_hi` — that trades a clean `ValueError` for a silent wrong answer.
+- **Reducing `ground_locg`'s `O(N)` vector count.** The working set is 7 vectors, measured, and 7 is the
+  *algorithmic minimum* for a 3-dim Rayleigh–Ritz basis — so it is a basis-size question, not buffer
+  reuse, and no aliasing work helps. The 2-dim variant converges but takes 3.2–11.9× more iterations for
+  13.3% off the floor. The module docstring's "three-vector memory budget" means the Rayleigh–Ritz basis,
+  **not** the total footprint.
+- **Reduced precision in `ground_locg`, both variants.** f32 arithmetic with f64 storage is 0.42×
+  end-to-end. f32 *storage* of a carried vector is closed by one measurement: rounding `ax` to f32 raises
+  the residual floor 3.1e6× above tolerance, from catastrophic cancellation in `r = Ax - θx`, not a
+  tunable tolerance. **The `(0,0)` floor is 120 B/slot and that is the honest single-device ceiling** —
+  lowering it needs a solver with fewer carried `O(N)` vectors, not a dtype change.
+- **The Bloom pre-filter for `get_xsource`.** Every mechanic was settled and it is still not worth
+  building: it can only attach to the precompute, which is 4.5–8.4% of a solve, so Amdahl caps it at
+  1.09×; and the path that would save memory is the one it cannot reach. Three variants separately
+  rejected. **The memory lever is the diagonal axis, not this one.**
+- **A partial *diagonal* cache is measured and works but is not implemented** — half the diagonal memory
+  for 2.45×, bit-identical energies. Two constraints if it is ever built: **do not split both axes**, and
+  **one compiled variant per distinct `J'`** (power-of-two rounding makes that *worse*). The overhead is
+  4.0% of the memory the split returns, so the dial is only cheap at large `J`.
+- **Subspace selection by weight shell + diagonal ranking.** Sound against a *uniform random* baseline,
+  which is not what a real SQD workflow produces. Do not build on it.
+- **The MLX port**, deleted rather than deprecated because the JAX solver measured faster even on the
+  MLX GPU backend. Don't reintroduce a second solver implementation without that measurement going the
+  other way first.
