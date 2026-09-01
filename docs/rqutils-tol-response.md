@@ -3,10 +3,33 @@
 Reply to `docs/rqutils-tol-request.md`, from the `rqutils` side. Branch `dev`, version still `0.2.0`
 (unreleased).
 
+> # ⚠️ SUPERSEDED 2026-09-01 — `tol` no longer exists
+>
+> **Do not copy code from this document.** `tol` was removed and replaced by the pair `atol`/`rtol`,
+> so every `tol=` call below raises `TypeError`. Convergence is now
+>
+> ```text
+> ‖Hv − Ev‖₂  <  max(atol, rtol · (‖Hv‖ + |E|))
+> ```
+>
+> satisfying **either** arm. See `docs/rqutils-atol-rtol-request.md` and its response for the reasoning;
+> §6 below has been rewritten with the working call, and §1 and §5.1 carry inline notes where their
+> conclusions no longer hold.
+>
+> **What this document still gets right, and why it is kept:** the residual-floor measurement of §2
+> (`eps·‖H‖`, no `N` dependence, 27 samples) is unchanged and is the evidence base for the current
+> design. So is §3's guard rationale and §4.2's warning about scaling tolerance figures across
+> definitions — a warning this document then violated itself, twice, which §7 records.
+>
+> **The one conclusion that reversed:** §5.1 measured the absolute-`tol` default as 1.18–1.49x slower
+> than `c400fae`'s and told you to pass an explicit `tol` to recover it. That default is gone. The
+> current default (`atol=0.0, rtol=None`) is relative again, so the regression §5.1 describes no longer
+> applies — but it is *also* not `c400fae`, because `rtol`'s scale dropped the `N · 10` factor.
+
 > **Status: shipped.** `tol` is now an **absolute bound on `‖Hv − Ev‖₂`** on both `sqd` and
 > `ground_locg`, taken as a rename-in-place rather than a new keyword. You can pass
-> `tol=_RESIDUAL_TOLERANCE` and the solver's convergence criterion and your guard's threshold become
-> the same number, which is what you asked for.
+> `atol=_RESIDUAL_TOLERANCE` (this said `tol=` when written — see the banner above) and the solver's
+> convergence criterion and your guard's threshold become the same number, which is what you asked for.
 >
 > **One correction, and it is to the mechanism, not the ask.** The request attributes the cost to
 > "surplus digits" below what the caller can verify. That is right about the *symptom*. The cause is
@@ -28,8 +51,8 @@ Reply to `docs/rqutils-tol-request.md`, from the `rqutils` side. Branch `dev`, v
 > The default is also 3–4 decades tighter (1e-14 against 1e-10), which is where the time goes; energies
 > are bit-identical. The claim was made without measuring, and it was the one claim in this document
 > that you would have relied on to do nothing. **You are not unaffected. §5.1 has the table and what to
-> do about it** — the short version is: pass `tol=_RESIDUAL_TOLERANCE` explicitly and you end up ahead
-> of where you started, not behind.
+> do about it** — the short version is: pass the tolerance explicitly rather than relying on a default.
+> (The regression itself is gone with the absolute default; §6 has the call that works today.)
 
 ---
 
@@ -37,8 +60,8 @@ Reply to `docs/rqutils-tol-request.md`, from the `rqutils` side. Branch `dev`, v
 
 | Change | Where |
 | --- | --- |
-| `tol` is an absolute bound on `‖Hv − Ev‖₂` | `ground_locg` (the convergence test), `sqd`, `run_sqd` |
-| `tol=None` resolves to `4·eps·max(‖Ax₀‖, 1)` — **tighter and slower than the old default**, §5.1 | `ground_locg` |
+| ~~`tol` is an absolute bound on `‖Hv − Ev‖₂`~~ — **superseded**, now `atol`; see the banner | `ground_locg` (the convergence test), `sqd`, `run_sqd` |
+| ~~`tol=None` resolves to `4·eps·max(‖Ax₀‖, 1)`~~ — **gone**; the default is now `atol=0.0, rtol=None` | `ground_locg` |
 | A below-floor `tol` raises `ValueError` naming a value that works | `sqd` |
 | `residual_floor(opnorm_bound, dtype)` — public, so you can compute the floor yourself | `ground_locg` |
 
@@ -88,11 +111,16 @@ our first look — that an absolute tolerance becomes unsatisfiable at scale —
 `sqd` rejects a `tol` below `4·eps·Σ|c_k|` (3.2x margin over the worst measured constant):
 
 ```
-ValueError: tol=1.000e-30 is below the achievable eigen-residual floor 2.931e-14 for this
-operator (4 * eps * sum|c_k|, with sum|c_k|=33 bounding ||H||_2), so the solve could never
-converge and would exhaust maxiter. The floor is eps*||H||_2 and does not shrink with
-subspace size -- measured over n=70..32768 and six decades of ||H||. Pass tol >= 2.931e-14.
+ValueError: atol=1.000e-30 is below the achievable eigen-residual floor 2.931e-14 for this
+operator (4 * eps * sum|c_k|, with sum|c_k|=33 bounding ||H||_2) and rtol=0 leaves no other
+arm, so the solve could never converge and would exhaust maxiter. The floor is eps*||H||_2
+and does not shrink with subspace size -- measured over n=70..32768 and six decades of
+||H||. Pass atol >= 2.931e-14, or a non-zero rtol.
 ```
+
+*(Text as of 2026-09-01. The original said `tol=`; the `and rtol=0 leaves no other arm` clause was added
+with the pair, because a below-floor `atol` is harmless when the relative arm can still fire — a guard
+must not fire on correct input.)*
 
 `Σ|c_k|` is already computed for `prefilter_hi`, so the guard is free. It is a **1.56–1.90x
 over-estimate** of `‖H‖₂` on 1D XXZ fixtures, which is the safe direction: it raises the reported
@@ -223,8 +251,16 @@ that validates these runs does not fit past N≈3000, and extrapolating a wall-c
 ratio is exactly the kind of inference this document tells you not to trust elsewhere. Treat the
 `dim=200000` row as arithmetic on the bounds, not a measurement.
 
-**What to do about it, and why this is still a net win for you.** Do not stay on the default. Pass
-`tol=_RESIDUAL_TOLERANCE` (1e-6) explicitly, which was the point of the request:
+**What to do about it, and why this is still a net win for you.**
+
+> **Superseded 2026-09-01.** The regression this section measures was in the *absolute* `tol=None`
+> default, which no longer exists — the current default is relative again, so there is nothing here to
+> recover. The advice below is kept because the *reasoning* still applies to choosing a criterion: pass
+> the tolerance rather than relying on a default whose value you did not choose. Substitute
+> `atol=_RESIDUAL_TOLERANCE, rtol=0.0` for the `tol=…` in the table.
+
+Do not stay on the default. Pass `tol=_RESIDUAL_TOLERANCE` (1e-6) explicitly, which was the point of
+the request:
 
 | what you run | residual delivered | vs the *old* default |
 | --- | --- | --- |
@@ -249,21 +285,32 @@ names a residual, say so and it is a two-line change.**
 
 ## 6. What lands in spinchain
 
-As the request proposed, with one simplification: there is no new keyword, so
+> **Rewritten 2026-09-01.** The original text of this section said to pass `tol=_RESIDUAL_TOLERANCE`.
+> That raises `TypeError` now. The working call is below.
 
 ```python
-ground_state_packed(..., tol=_RESIDUAL_TOLERANCE)
+ground_state_packed(..., atol=_RESIDUAL_TOLERANCE, rtol=0.0)
 ```
 
-and the solver's criterion and `_RESIDUAL_TOLERANCE` are now the same quantity.
+`atol` is the absolute bound on `‖Hv − Ev‖₂`, so the solver's criterion and `_RESIDUAL_TOLERANCE` are
+the same quantity — which was the whole point of the original request, and it is delivered.
 
-**Do this rather than treating it as optional.** Per §5.1 the new default is 1.18–1.49x slower than the
-old one and the gap grows with `N`, so leaving `tol=None` is now the one choice that is strictly worse
-than before this change. Passing the parameter is what turns the regression into the ~1.5x you were
-asking for. Keep the guard — §1's
-`p_is_zero` note is one reason it still earns its place, and the request's own argument (a Rayleigh
-quotient cannot detect non-convergence; it has already caught a real upstream regression) is the
-other. It is now checking the contract the solver was asked to meet.
+**Why `rtol=0.0` explicitly.** Convergence is `max(atol, rtol · scale)`, so leaving `rtol` at its
+default (`None` → `4·eps`) means the *looser* of the two arms wins. On a complex128 XXZ subspace with
+your reported `Σ|c_k| ≈ 19` the relative arm targets ~1e-14 — far tighter than 1e-6, so `atol` binds
+either way and the default is harmless. Verified on such a fixture: `atol=1e-6, rtol=0.0` and
+`atol=1e-6` alone both deliver a residual of **9.497e-07**, bit-identical. Stating `rtol=0.0` makes the
+criterion exactly the one your guard checks, with nothing else able to satisfy it; drop it if you would
+rather have "whichever is looser".
+
+**Keep the guard.** §1's `p_is_zero` note is one reason it still earns its place, and the request's own
+argument (a Rayleigh quotient cannot detect non-convergence; it has already caught a real upstream
+regression) is the other. It is now checking the contract the solver was asked to meet.
+
+**On the timing advice this section used to give:** it said passing the parameter was necessary to
+recover a 1.18–1.49x default regression. That regression is gone with the absolute default, so passing
+`atol` is now a choice about *criterion*, not about speed. If you want the speed figure, it is 1.85x for
+`atol=1e-6` against the current default — measured in the atol/rtol response, not here.
 
 Two things the request raised that this change does **not** give you:
 
