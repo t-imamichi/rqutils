@@ -426,8 +426,11 @@ def _check_tols(atol: Any, rtol: Any, opnorm_bound: float, dtype: DTypeLike) -> 
 
     Raises:
         TypeError: If ``atol`` is not a real number, or ``rtol`` is neither None nor a real number.
-        ValueError: If either is negative; if both are zero; or if ``atol`` is below the achievable
-            residual floor while ``rtol`` is zero, leaving no reachable criterion.
+            Note ``atol=None`` raises :class:`ValueError`, not this -- it is a rejected *value* with a
+            documented replacement (``0.0``), not an unusable type.
+        ValueError: If ``atol`` is ``None``; if either is negative; if both are zero; if ``atol`` is
+            below the achievable residual floor while ``rtol`` is zero; or if ``rtol`` is at least 0.5,
+            where its bound reaches ``||A||`` and any vector would report convergence.
     """
     if atol is None:
         raise ValueError(
@@ -856,8 +859,18 @@ def ground_locg(
         number of gradient descent iterations performed, and whether the convergence criterion was
         met. Check the fourth value rather than comparing the third against ``maxiter``, which is
         ambiguous. With ``debug=True`` a fifth element is appended, a dict of stacked per-iteration
-        diagnostics; narrow on ``len(result) == 5`` before reading it, since ``debug`` is a static
-        flag that a type checker cannot follow into the return arity.
+        diagnostics keyed ``x``, ``y``, ``r``, ``theta``, ``rho``, ``kappa``, ``sas``,
+        ``rtol_scale`` and ``converged``; narrow on ``len(result) == 5`` before reading it, since
+        ``debug`` is a static flag that a type checker cannot follow into the return arity.
+
+        **The ``rtol_scale`` key was named ``reltol`` before 2026-09-01.** It holds
+        :math:`\|Ax\| + |\theta|`, the quantity ``rtol`` multiplies -- never a tolerance, and never
+        the residual floor the old name suggested. Once converged :math:`x` is the ground eigenvector,
+        so this is :math:`\approx 2|\lambda_{\min}|` (verified 3.9990 against
+        :math:`|\lambda_{\min}| = 2`), **not** :math:`2\|A\|_2` -- those coincide only when the
+        ground state is also the largest-magnitude one. A caller reading ``diag["reltol"]`` now gets a
+        ``KeyError``, which is the intended failure: the old name was off by roughly
+        :math:`1/\varepsilon` against what it implied.
 
     Raises:
         ValueError: If ``xinit`` is an integer and ``mat`` is a callable but ``vspace`` is None. The
@@ -1001,7 +1014,7 @@ def _ground_locg_callable(
 
         return sas
 
-    def diagnostics(xcurr, ycurr, rcurr, theta, kappa=None, reltol=None, converged=None):
+    def diagnostics(xcurr, ycurr, rcurr, theta, kappa=None, scale=None, converged=None):
         sas = compute_sas(
             (xcurr, ycurr, rcurr), tuple(matvec(v, *args) for v in (xcurr, ycurr, rcurr))
         )
@@ -1011,8 +1024,8 @@ def _ground_locg_callable(
 
         if kappa is None:
             kappa = jnp.zeros(3, dtype=xcurr.dtype)
-        if reltol is None:
-            reltol = jnp.array(0.0)
+        if scale is None:
+            scale = jnp.array(0.0)
         if converged is None:
             converged = jnp.array(False)
 
@@ -1024,7 +1037,15 @@ def _ground_locg_callable(
             "rho": rho,
             "kappa": kappa,
             "sas": sas,
-            "reltol": reltol,
+            # Renamed from "reltol" 2026-09-01: the value is the scale `||Ax|| + |theta|` that `rtol`
+            # multiplies, never a tolerance. A `debug=True` caller reading `diag["reltol"]` now gets a
+            # KeyError rather than a number ~2|lambda_min| where the old name promised a floor near
+            # eps*||A|| -- loud, and the old name was off by ~1e16 against what it claimed.
+            #
+            # `rtol_scale` here, not the local's bare `scale`: the local sits three lines from
+            # `rtol * scale` so context disambiguates it, while a key is read on its own out of a dict
+            # of nine, where "scale" could be any of several quantities in this solver.
+            "rtol_scale": scale,
             "converged": converged,
         }
 
@@ -1139,22 +1160,6 @@ def _ground_locg_callable(
         axnext = matvec(xnext, *args)
         rnext = axnext - xnext * theta
         norm_rnext = jnp.linalg.norm(rnext)
-        # `tol` is an ABSOLUTE bound on the eigen-residual ||Ax - theta x||, not a relative one.
-        #
-        # This replaced a relative test, `norm_r < tol * (||Ax|| + |theta|) * n * 10`, whose scaling
-        # was measured wrong in the term that mattered: sweeping n over 70..32768 and ||A|| over six
-        # decades (27 samples, dense and matrix-free, float64 and complex128), the achievable floor is
-        #
-        #     floor(||r||) ~= eps(dtype) * ||A||_2      constant 0.49..1.26, median 0.84
-        #
-        # with NO n dependence -- `floor/(eps ||A|| n)` spans 306x over the same data where
-        # `floor/(eps ||A||)` spans 2.6x. So the old formula's `* n * 10` was slack, not a rounding
-        # budget: 700x to 94600x looser than the floor across that sweep. That slack is why no single
-        # value of the old `tol` could be both fast and admissible for a caller with a fixed residual
-        # requirement -- the same `tol` meant a different absolute residual at every n.
-        #
-        # `reltol` is retained in the debug diagnostics only, as the floor estimate, so a caller can
-        # see how much headroom a given `tol` has.
         # Two independent tolerances, satisfied by EITHER -- hence `max`, not `min`:
         #
         #     ||r|| < max(atol, rtol * (||Ax|| + |theta|))
@@ -1165,27 +1170,19 @@ def _ground_locg_callable(
         # the `(||Ax|| + |theta|)` factor and nothing else: ||r|| has units of ||A||, and dividing by
         # something with those units is what makes `rtol` dimensionless.
         #
-        # The pre-2026-08-31 form multiplied this by a further `n * 10`, and that is deliberately gone.
-        # Neither factor was a rounding budget -- the achievable floor is eps*||A|| with no `n` term
-        # (measured over n=70..32768: `floor/(eps||A||)` spans 2.6x where `floor/(eps||A||n)` spans
-        # 306x) -- and folding a dimension count and a bare 10 into a "relative" tolerance made it
-        # unpredictable and, at large `n`, actively dangerous: `rtol=1e-8` at n=2^20 produced a bound of
-        # 4.2 against ||A|| = 20, i.e. 21% of the operator norm, so the solve converged immediately and
-        # returned a wrong answer with `converged=True`. The dial also saturated -- rtol=1e-6 and 1e-4
-        # returned bit-identical answers, the `p_is_zero` route firing before the tolerance did.
-        #
-        # The cost is that one `rtol` no longer scales itself across dimensions; a caller needing that
-        # sets `atol` per dimension instead. `sqd` now rejects an `rtol` whose bound reaches ||A||.
+        # Do NOT reintroduce the pre-2026-08-31 `* n * 10` factor on the scale: it made `rtol=1e-8` at
+        # n=2^20 a bound of 4.2 against ||A|| = 20, so the first iterate "converged" on a wrong answer.
+        # The module docstring has the measurements; `sqd` rejects an `rtol` whose bound reaches ||A||.
         #
         # `abs(theta)` rather than `+theta`: the sum must not cancel for either sign of theta, and a
         # ground-state search is typically negative-definite. The natural-looking `norm(Ax) - theta` was
         # measured going *negative* for a positive-definite operator, making the test unsatisfiable.
-        reltol = jnp.linalg.norm(axnext) + jnp.abs(theta)
+        scale = jnp.linalg.norm(axnext) + jnp.abs(theta)
         # A zeroed search direction means {x, y} already spans the residual: we are at a stationary
         # point of the Rayleigh quotient and no further iteration can lower theta.
-        converged = jnp.logical_or(norm_rnext < jnp.maximum(atol, rtol * reltol), p_is_zero)
+        converged = jnp.logical_or(norm_rnext < jnp.maximum(atol, rtol * scale), p_is_zero)
         if log_level <= logging.DEBUG:
-            jax.debug.print("Residual {}, reltol {}, converged: {}", norm_rnext, reltol, converged)
+            jax.debug.print("Residual {}, scale {}, converged: {}", norm_rnext, scale, converged)
 
         state = _State(
             niter=state.niter + 1,
@@ -1197,7 +1194,7 @@ def _ground_locg_callable(
             ax=axnext,
         )
         if debug:
-            return state, diagnostics(xnext, ynext, rnext, theta, kappa, reltol, converged)
+            return state, diagnostics(xnext, ynext, rnext, theta, kappa, scale, converged)
         return state
 
     if log_level <= logging.DEBUG:

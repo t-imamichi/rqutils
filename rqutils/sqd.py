@@ -747,8 +747,8 @@ def sqd(
             ``state.theta``, a valid variational **upper bound**, so finite, real and above the true
             minimum -- indistinguishable from a correct result by inspection. ``docs/locg.md`` records
             that this absence "is the reason I4 could hide", a sign error that made the convergence
-            test unsatisfiable so the solver silently never converged. Raise ``maxiter`` or loosen
-            ``tol`` to proceed.
+            test unsatisfiable so the solver silently never converged. Raise ``maxiter``, or loosen
+            ``atol`` / ``rtol``, to proceed.
         ValueError: If ``states_size`` is smaller than ``states.shape[0]``, or if it exceeds
             :math:`2^{31} - 1`, the ceiling imposed by the int32 indices used for subspace positions
             (beyond it an index wraps negative and the subspace is silently permuted); or if either
@@ -1095,10 +1095,10 @@ def run_sqd(
     Args:
         maxiter: Maximum LOBPCG iterations, forwarded to :func:`rqutils.ground_locg.ground_locg`.
             Static, as it is there.
-        atol: Absolute bound on the eigen-residual ``||Hv - Ev||``; ``rtol``: relative tolerance on
-            ``||Hv|| + |E|``. Convergence is the ``max`` of the two, so either suffices.
-            Both forwarded to :func:`rqutils.ground_locg.ground_locg` and validated in :func:`sqd`,
-            which is where ``sum|c_k|`` is concrete -- this function is jitted, so it cannot raise.
+        atol: Absolute bound on the eigen-residual ``||Hv - Ev||``. Validated in :func:`sqd`, which is
+            where ``sum|c_k|`` is concrete -- this function is jitted, so it cannot raise.
+        rtol: Relative tolerance on ``||Hv|| + |E|``. Convergence is the ``max`` of the two arms, so
+            either suffices; see :func:`rqutils.ground_locg.ground_locg`, which both are forwarded to.
         prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter, forwarded to
             :func:`rqutils.ground_locg.ground_locg`. Static, as it is there -- passed by keyword, so
             unlike ``cache_level`` it needs no :func:`functools.partial` binding. See :func:`sqd` on

@@ -1791,7 +1791,7 @@ class TestConvergenceIsReported:
 
 
 class TestAtolAndRtol:
-    """Convergence is ``||r|| < max(atol, rtol * (||Hv|| + |E|) * N * 10)`` -- either arm suffices.
+    """Convergence is ``||r|| < max(atol, rtol * (||Hv|| + |E|))`` -- either arm suffices.
 
     Two defects are locked down here, one per arm.
 

@@ -542,7 +542,7 @@ class TestGroundLocg:
         )
         assert len(result) == 5
         diagnostics = result[4]
-        for key in ("x", "y", "r", "theta", "rho", "kappa", "sas", "reltol", "converged"):
+        for key in ("x", "y", "r", "theta", "rho", "kappa", "sas", "rtol_scale", "converged"):
             assert np.shape(diagnostics[key])[0] == maxiter + 2, f"{key} row count"
 
 
