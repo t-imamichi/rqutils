@@ -1230,8 +1230,11 @@ class TestDebugOverloadIsCheckable:
         assert len(ground_locg(mat, vec)) == 4
         assert len(ground_locg(mat, vec, debug=False)) == 4
         assert len(ground_locg(mat, vec, debug=True)) == 5
-        # All-positional through debug, as the scaling POCs call it.
-        assert len(ground_locg(mat, vec, (), 200, None, None, None, None, True)) == 5
+        # All-positional through debug, as the scaling POCs call it. Note `tol` became the pair
+        # (atol, rtol), so this list gained a slot -- an arity change every positional caller sees, which
+        # is the whole reason this arm is asserted. `atol` must be 0.0 rather than None: only `rtol`
+        # accepts None, and passing None for atol raises by design.
+        assert len(ground_locg(mat, vec, (), 200, 0.0, None, None, None, None, True)) == 5
         # A bool that is not a literal must still reach the debug path.
         assert len(ground_locg(mat, vec, debug=bool(dim > 0))) == 5
 

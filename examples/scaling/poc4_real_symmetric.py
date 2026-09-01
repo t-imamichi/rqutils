@@ -14,7 +14,7 @@ The comparison is deliberately awkward to make fair. A real and a complex Hamilt
 operators* with different spectra and different convergence behaviour, so a raw solve-time ratio
 conflates "complex arithmetic is slower" with "this problem needed more iterations". Two controls:
 
-- **Fixed iteration count** (``maxiter`` pinned, ``tol=0``) isolates per-iteration cost. This is the
+- **Fixed iteration count** (``maxiter`` pinned, ``atol=rtol=0``) isolates per-iteration cost. This is the
   number to quote: a solve-time ratio silently mixes per-iteration cost with iteration *count*, so
   read per-iteration timings from the fixed-count arm rather than from the converged solve.
 - **Same X/Z structure**: the real and complex problems are generated from the same seed and the same
@@ -100,8 +100,8 @@ def main():
             f"real={info[True][2] / 2**20:7.2f}MB  ({info[False][2] / info[True][2]:.2f}x)"
         )
 
-    header("POC 4c: full solve at FIXED iteration count (tol=0) -- per-iteration cost")
-    print("tol=0 forces exactly maxiter iterations, so this cannot be confounded by the two")
+    header("POC 4c: full solve at FIXED iteration count (atol=rtol=0) -- per-iteration cost")
+    print("atol=rtol=0 forces exactly maxiter iterations, so this cannot be confounded by the two")
     print("operators needing different iteration counts to converge.")
     print(f"{'N':>9s}  {'iters':>6s}  {'complex ms':>12s}  {'real ms':>10s}  {'verdict':>34s}")
     maxiter = 40
@@ -117,7 +117,10 @@ def main():
                     lambda v, mv=mv: mv(v),
                     vec,
                     maxiter=maxiter,
-                    tol=0.0,
+                    # Both arms zero: nothing satisfies |r| < 0, so this runs exactly maxiter
+                    # iterations. `sqd` rejects this pair; a direct `ground_locg` call does not.
+                    atol=0.0,
+                    rtol=0.0,
                 )
 
             _ = jax.block_until_ready(solve())

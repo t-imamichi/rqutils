@@ -133,7 +133,9 @@ def main():
     print("  together with 6c before believing any speedup.")
 
     header("POC 6c: end-to-end solve time -- does the per-matvec win survive?")
-    print("Fixed iteration count (tol=0) isolates per-iteration cost; the converged solve shows")
+    print(
+        "Fixed iteration count (atol=rtol=0) isolates per-iteration cost; the converged solve shows"
+    )
     print("whether extra iterations eat the gain.")
     print(
         f"{'N':>8s}  {'dtype':>8s}  {'mode':>10s}  {'f64 ms':>10s}  {'mixed ms':>10s}  "
@@ -146,7 +148,7 @@ def main():
         mv64, mvmx = make_matvecs(xs, dg)
 
         for mode, kw in [
-            ("fixed(40)", {"maxiter": 40, "tol": 0.0}),
+            ("fixed(40)", {"maxiter": 40, "atol": 0.0, "rtol": 0.0}),
             ("converge", {"maxiter": 300}),
         ]:
 

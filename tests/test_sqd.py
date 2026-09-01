@@ -1779,26 +1779,36 @@ class TestConvergenceIsReported:
         expected = lowest_projected(strings, coeffs, states)
         assert abs(got - expected) < 1e-6
 
-    def test_a_loose_tol_converges_sooner_without_changing_the_answer(self):
-        """``tol`` must be plumbed through, not accepted and ignored."""
+    def test_a_loose_atol_converges_sooner_without_changing_the_answer(self):
+        """``atol`` must be plumbed through, not accepted and ignored."""
         rng = np.random.default_rng(20260825)
         strings = real_pauli_strings(6, 8, rng)
         coeffs = rng.normal(size=len(strings))
         states = unique_states(20, 6, rng)
-        loose = eigval_of(strings, coeffs, states, tol=1e-6)
+        loose = eigval_of(strings, coeffs, states, atol=1e-6)
         expected = lowest_projected(strings, coeffs, states)
         assert abs(loose - expected) < 1e-4
 
 
-class TestTolIsAnAbsoluteResidualBound:
-    """``tol`` is a bound on ``||Hv - Ev||``, not a relative tolerance scaled by dimension.
+class TestAtolAndRtol:
+    """Convergence is ``||r|| < max(atol, rtol * (||Hv|| + |E|) * N * 10)`` -- either arm suffices.
 
-    The defect this locks down: ``tol`` used to be multiplied internally by
-    ``(||Hv|| + |E|) * N * 10``, so the same value meant a different absolute residual at every
-    subspace size, and a caller with a fixed residual requirement could not express it. Measured over
-    n=70..32768 and six decades of ``||H||`` (27 samples, dense and matrix-free, both dtypes), the
-    achievable floor is ``eps*||H||`` with **no** N dependence -- ``floor/(eps||H||)`` spans 2.6x
-    where ``floor/(eps||H||N)`` spans 306x, which is what made the old scaling wrong.
+    Two defects are locked down here, one per arm.
+
+    ``atol`` exists because a purely *relative* tolerance cannot name a residual: the old ``tol`` was
+    multiplied by ``(||Hv|| + |E|) * N * 10``, so one value meant a different absolute residual at every
+    subspace size and a caller with a fixed 1e-6 requirement could not express it. The achievable floor
+    is ``eps*||H||`` with **no** N dependence -- measured over n=70..32768 and six decades of ``||H||``
+    (27 samples, dense and matrix-free, both dtypes), ``floor/(eps||H||)`` spans 2.6x where
+    ``floor/(eps||H||N)`` spans 306x -- so the ``N`` factor was slack, not a rounding budget.
+
+    ``rtol`` exists because a purely *absolute* tolerance cannot scale: a pipeline solving at several N
+    in one run needs a per-dimension bound from one value, and the slack the floor measurement exposed
+    is exactly that scaling property. So it is retained deliberately rather than corrected away.
+
+    The ``max`` is what makes the pair strictly more expressive than either alone, and it is why the
+    below-floor guard is conditioned on ``rtol == 0``: with a live relative arm, an unreachable ``atol``
+    is harmless, and a guard that rejected it would fire on correct input.
     """
 
     def _problem(self, seed=20260831, num_qubits=6, num_terms=8, num_states=24):
@@ -1834,15 +1844,15 @@ class TestTolIsAnAbsoluteResidualBound:
         N=21 fixture still passes.
         """
         strings, coeffs, states = self._problem(num_qubits=10, num_terms=12, num_states=200)
-        resid = self._residual(strings, coeffs, states, tol=1e-8, maxiter=6000)
+        resid = self._residual(strings, coeffs, states, atol=1e-8, rtol=0.0, maxiter=6000)
         assert resid < 1e-8, f"asked for 1e-8, got {resid:.3e}"
 
     def test_a_tighter_tol_gives_a_smaller_residual(self):
         """Monotonicity: the knob must actually move the delivered residual, not just be accepted."""
         strings, coeffs, states = self._problem()
-        loose = self._residual(strings, coeffs, states, tol=1e-6, maxiter=4000)
-        tight = self._residual(strings, coeffs, states, tol=1e-11, maxiter=4000)
-        assert tight < loose, f"tol=1e-11 gave {tight:.3e}, not below tol=1e-6's {loose:.3e}"
+        loose = self._residual(strings, coeffs, states, atol=1e-6, rtol=0.0, maxiter=4000)
+        tight = self._residual(strings, coeffs, states, atol=1e-11, rtol=0.0, maxiter=4000)
+        assert tight < loose, f"atol=1e-11 gave {tight:.3e}, not below atol=1e-6's {loose:.3e}"
 
     def test_the_same_tol_means_the_same_residual_at_two_dimensions(self):
         """The defect, stated directly: the old form's threshold scaled with N, so this failed.
@@ -1852,8 +1862,8 @@ class TestTolIsAnAbsoluteResidualBound:
         """
         small = self._problem(num_states=12)
         large = self._problem(num_states=48, num_qubits=8)
-        r_small = self._residual(*small, tol=1e-7, maxiter=4000)
-        r_large = self._residual(*large, tol=1e-7, maxiter=4000)
+        r_small = self._residual(*small, atol=1e-7, rtol=0.0, maxiter=4000)
+        r_large = self._residual(*large, atol=1e-7, rtol=0.0, maxiter=4000)
         assert r_small < 1e-7 and r_large < 1e-7, (
             f"one arm missed the requested bound: small={r_small:.3e} large={r_large:.3e}"
         )
@@ -1866,7 +1876,7 @@ class TestTolIsAnAbsoluteResidualBound:
         """
         strings, coeffs, states = self._problem()
         with pytest.raises(ValueError, match="below the achievable eigen-residual floor"):
-            eigval_of(strings, coeffs, states, tol=1e-30)
+            eigval_of(strings, coeffs, states, atol=1e-30, rtol=0.0)
 
     def test_the_floor_message_names_a_value_that_is_accepted(self):
         """The error must be actionable: the number it suggests has to actually work."""
@@ -1877,40 +1887,101 @@ class TestTolIsAnAbsoluteResidualBound:
         ham = PauliSumXZ.from_paulisum((strings, list(coeffs)))
         floor = residual_floor(float(np.abs(ham.c).sum()), ham.c.dtype)
         # Just above the floor must be accepted, just below must not.
-        eigval_of(strings, coeffs, states, tol=floor * 1.001, maxiter=8000)
+        eigval_of(strings, coeffs, states, atol=floor * 1.001, rtol=0.0, maxiter=8000)
         with pytest.raises(ValueError, match="below the achievable"):
-            eigval_of(strings, coeffs, states, tol=floor * 0.999)
+            eigval_of(strings, coeffs, states, atol=floor * 0.999, rtol=0.0)
 
-    def test_a_nonpositive_tol_raises(self):
-        """Zero is unreachable by construction; a negative value is meaningless as a norm bound."""
+    def test_a_negative_tolerance_raises(self):
+        """Negative is meaningless as a norm bound. Zero is **legal** and means "disable this arm"."""
         strings, coeffs, states = self._problem()
-        for bad in (0.0, -1e-6):
-            with pytest.raises(ValueError, match="must be positive"):
-                eigval_of(strings, coeffs, states, tol=bad)
+        with pytest.raises(ValueError, match="atol must be non-negative"):
+            eigval_of(strings, coeffs, states, atol=-1e-6)
+        with pytest.raises(ValueError, match="rtol must be non-negative"):
+            eigval_of(strings, coeffs, states, rtol=-1e-6)
 
-    def test_a_non_numeric_tol_raises_typeerror(self):
+    def test_atol_none_raises_but_rtol_none_is_the_default(self):
+        """The asymmetry is the point: only ``rtol`` has a derivable value.
+
+        ``atol=None`` would have to mean "derive an absolute bound", which is the unintuitive construct
+        this pair replaced -- 0.0 already expresses "no absolute arm".
+        """
+        strings, coeffs, states = self._problem()
+        with pytest.raises(ValueError, match="atol must be a number, not None"):
+            eigval_of(strings, coeffs, states, atol=None)
+        # rtol=None is the default and must simply work.
+        eigval_of(strings, coeffs, states, rtol=None, maxiter=8000)
+
+    def test_both_tolerances_zero_raises(self):
+        """No residual satisfies ``|r| < 0``, so this would exhaust maxiter. Diagnosable here."""
+        strings, coeffs, states = self._problem()
+        with pytest.raises(ValueError, match="both 0.0"):
+            eigval_of(strings, coeffs, states, atol=0.0, rtol=0.0)
+
+    def test_a_non_numeric_tolerance_raises_typeerror(self):
         """``bool`` is rejected for the reason ``_check_cache_level`` gives: it is an int subclass."""
         strings, coeffs, states = self._problem()
         for bad in ("1e-6", (1e-6,), True):
+            with pytest.raises(TypeError, match="must be a real number"):
+                eigval_of(strings, coeffs, states, atol=bad)
             with pytest.raises(TypeError, match="must be None or a real number"):
-                eigval_of(strings, coeffs, states, tol=bad)
+                eigval_of(strings, coeffs, states, rtol=bad)
 
-    def test_the_default_still_converges_and_is_accurate(self):
-        """``tol=None`` must resolve to a floor that carries the operator's *scale*.
+    def test_a_below_floor_atol_is_accepted_when_rtol_can_still_fire(self):
+        """**A guard must not fire on correct input.**
 
-        Under absolute semantics a bare ``eps`` -- the old default -- sits below the achievable floor
-        ``eps*||H||`` for any ``||H|| > 1``, so the convergence test becomes unsatisfiable and the solve
-        exhausts ``maxiter``. The coefficients are scaled up **100x** deliberately: at the default
-        fixture's ``||H|| = 2.19`` a bare eps is only 2.2x below the floor and ``p_is_zero`` -- the
-        stationary-point route, which ignores ``tol`` entirely -- catches the solve anyway, so the
-        mutant survives. Verified by mutation at this scale.
+        With ``rtol > 0`` a below-floor ``atol`` is harmless -- the relative arm still converges the
+        solve -- so rejecting it would fail a working configuration. That is the defect class recorded
+        in ``CLAUDE.md`` (an overflow count that included padding, reported 763,677 beside a bit-exact
+        result). The guard is conditioned on ``rtol == 0``, not on ``atol < floor`` alone.
         """
+        strings, coeffs, states = self._problem()
+        # Unreachable as an absolute bound, but rtol=None (the default) carries the solve.
+        got = eigval_of(strings, coeffs, states, atol=1e-30, maxiter=8000)
+        expected = lowest_projected(strings, coeffs, states)
+        assert abs(got - expected) < 1e-6, f"got {got!r}, expected {expected!r}"
+        # And the same value with rtol explicitly zero *must* raise.
+        with pytest.raises(ValueError, match="below the achievable"):
+            eigval_of(strings, coeffs, states, atol=1e-30, rtol=0.0)
+
+    def test_convergence_is_the_looser_of_the_two_arms(self):
+        """``max``, not ``min``: satisfying **either** tolerance converges the solve.
+
+        Asserted through the delivered residual rather than a timing, since a ``max`` and a ``min`` differ
+        by which arm binds. A loose ``atol`` beside a tight ``rtol`` must deliver the *loose* residual.
+        """
+        strings, coeffs, states = self._problem()
+        # atol=1e-4 is far looser than the rtol arm; max() must pick it, so the residual lands near 1e-4
+        # rather than at the ~1e-11 the relative arm alone would reach.
+        loose = self._residual(strings, coeffs, states, atol=1e-4, rtol=2.22e-16, maxiter=8000)
+        rel_only = self._residual(strings, coeffs, states, atol=0.0, rtol=2.22e-16, maxiter=8000)
+        assert loose > rel_only, (
+            f"max() did not take the looser arm: atol=1e-4 gave {loose:.3e}, "
+            f"rtol-only gave {rel_only:.3e} -- a min() would make these equal"
+        )
+        assert loose < 1e-4, f"the loose arm should still bound the residual, got {loose:.3e}"
+
+    def test_the_default_pair_scales_with_dimension(self):
+        """``atol=0.0, rtol=None`` is the pre-2026-08-31 relative form: one value, per-N bound.
+
+        This is the property a single ``atol`` cannot have, and the reason ``rtol`` exists. The delivered
+        residual must **grow** with N under one unchanged tolerance.
+        """
+        small = self._problem(num_states=12)
+        large = self._problem(num_qubits=10, num_states=200)
+        r_small = self._residual(*small, maxiter=8000)
+        r_large = self._residual(*large, maxiter=8000)
+        assert r_large > r_small, (
+            f"the relative default did not scale with N: small={r_small:.3e} large={r_large:.3e}"
+        )
+
+    def test_the_default_converges_and_is_accurate(self):
+        """A bare call must still work, and match an independent reference."""
         strings, coeffs, states = self._problem()
         coeffs = np.asarray(coeffs) * 100.0
         got = eigval_of(strings, coeffs, states, maxiter=8000)
         expected = lowest_projected(strings, coeffs, states)
         assert abs(got - expected) < 1e-6 * abs(expected), (
-            f"default tol gave {got!r}, expected {expected!r}"
+            f"default tolerances gave {got!r}, expected {expected!r}"
         )
 
     def test_the_returned_value_would_have_been_plausible(self):

@@ -212,7 +212,7 @@ from scipy.sparse import coo_array, csr_array
 
 from rqutils.ground_locg import (
     _check_prefilter,
-    _check_tol,
+    _check_tols,
     ground_locg,
     residual_floor,
 )
@@ -508,7 +508,8 @@ def sqd(
     cache_level: tuple[int, int] = ...,
     xcache_groups: int | None = ...,
     maxiter: int = ...,
-    tol: float | None = ...,
+    atol: float = ...,
+    rtol: float | None = ...,
     prefilter: tuple[int, int] | None = ...,
 ) -> tuple[float, Vector, StateList]: ...
 
@@ -524,7 +525,8 @@ def sqd(
     cache_level: tuple[int, int] = ...,
     xcache_groups: int | None = ...,
     maxiter: int = ...,
-    tol: float | None = ...,
+    atol: float = ...,
+    rtol: float | None = ...,
     prefilter: tuple[int, int] | None = ...,
 ) -> float: ...
 
@@ -539,7 +541,8 @@ def sqd(
     cache_level: tuple[int, int] = (1, 0),
     xcache_groups: int | None = None,
     maxiter: int = 1000,
-    tol: float | None = None,
+    atol: float = 0.0,
+    rtol: float | None = None,
     prefilter: tuple[int, int] | None = (32, 2),
 ) -> float | tuple[float, Vector, StateList]:
     r"""Perform a sample-based quantum diagonalization of the Hamiltonian.
@@ -601,29 +604,41 @@ def sqd(
         return_eigvec: Whether to return the eigenvector (coefficients and unique state bitstrings).
         maxiter: Maximum LOBPCG iterations. **Non-convergence now raises** rather than returning
             the iteration cap's best guess -- see ``Raises``.
-        tol: **Absolute** bound on the eigen-residual :math:`\|Hv - Ev\|_2`, forwarded to
-            :func:`rqutils.ground_locg.ground_locg`. ``None`` derives the achievable floor from the
-            operator.
+        atol: **Absolute** bound on the eigen-residual :math:`\|Hv - Ev\|_2`, forwarded to
+            :func:`rqutils.ground_locg.ground_locg`. Default ``0.0``, which disables this arm.
+
+            Set it when a downstream consumer has a fixed residual requirement: ``atol=1e-6`` means
+            :math:`\|Hv - Ev\| < 10^{-6}` at **every** :math:`N`, which no relative tolerance can
+            express. ``None`` is **rejected** -- pass ``0.0`` to disable the arm, since a *derived*
+            absolute bound is the unintuitive construct this pair replaced.
+        rtol: **Relative** tolerance, multiplying :math:`(\|Hv\| + |E|)\,N \cdot 10`. ``None`` (the
+            default) uses the operator dtype's machine epsilon, which is the behaviour this library had
+            before 2026-08-31: an effective bound of roughly :math:`20\,\varepsilon\,\|H\|_2 N`, since
+            :math:`\|Hv\| \approx |E|` at convergence. Measured, that is 1.9e-11 at :math:`N = 256` and
+            4.4e-10 at :math:`N = 4096`. Pass ``0.0`` to disable the arm.
+
+            One ``rtol`` covers **several dimensions**, which is its reason for existing: a pipeline
+            solving at :math:`N = 4596` and :math:`N = 2.7\times10^6` in one run gets a per-dimension
+            bound from a single value, where a single ``atol`` cannot be right for both. Note :math:`N`
+            is the **padded** ``states_size``, not the live count, so the bound steps at powers of two.
+
+            **Convergence is** ``||r|| < max(atol, rtol * scale)`` **-- either arm suffices.** So the
+            defaults (``atol=0.0, rtol=None``) reproduce the pre-2026-08-31 relative behaviour exactly,
+            ``atol=x, rtol=0.0`` gives absolute-only behaviour, and setting both takes whichever is
+            looser -- usually what a caller wants.
 
             .. warning::
 
-               **This changed meaning.** ``tol`` was a *relative* tolerance, scaled internally by
-               :math:`(\|Hv\| + |E|)\,N \cdot 10`. It is now the absolute residual itself, so an
-               existing call passing an explicit ``tol`` **keeps working but changes criterion** and
-               nothing raises -- at :math:`N = 2\times10^5` the old ``tol=1e-6`` admitted a residual
-               of order :math:`10^0` where it now demands :math:`10^{-6}`. Re-derive any empirically
-               tuned value.
+               **``tol`` is removed, and it had two different meanings.** It was *relative* up to
+               2026-08-31 and *absolute* after. There is no alias: ``tol=`` raises ``TypeError`` rather
+               than silently resolving to one of the pair. Migrating from the relative form, ``tol=x``
+               becomes ``rtol=x``; from the absolute form, ``atol=x``. A bare call with neither is the
+               relative form, so the 1.18-1.49x default slowdown the absolute-``tol`` revision
+               introduced is **undone** -- at the cost of a default bound that varies with :math:`N`
+               again, which is precisely the trade this pair exists to let the caller make.
 
-               ``None`` still converges, but it is **not** unchanged: the default is 3-4 decades
-               tighter than the old one and measured **1.18-1.49x slower**, the gap growing with
-               :math:`N` (the old default's effective bound carried an :math:`N` factor; this one does
-               not). Pass an explicit ``tol`` if the extra decades are not wanted --
-               ``docs/rqutils-tol-response.md`` §5.1 has the table.
-
-            A caller with a residual requirement can now state it directly: ``tol=1e-6`` means
-            :math:`\|Hv - Ev\| < 10^{-6}`, at any :math:`N`. Values below the floor are **rejected**
-            (see ``Raises``) rather than silently clamped or left to exhaust ``maxiter``; the floor is
-            :math:`4\,\varepsilon \sum_k |c_k|`, available as
+            An ``atol`` below the achievable floor :math:`4\,\varepsilon\sum_k|c_k|` is rejected **only
+            when ``rtol`` is zero**, since otherwise the relative arm can still fire. See ``Raises`` and
             :func:`rqutils.ground_locg.residual_floor`.
         packed: Whether ``states`` is already bit-packed, i.e. the output of
             :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states`. Default ``False``, which takes
@@ -734,9 +749,10 @@ def sqd(
             :math:`2^{31} - 1`, the ceiling imposed by the int32 indices used for subspace positions
             (beyond it an index wraps negative and the subspace is silently permuted); or if either
             ``prefilter`` entry is negative -- see :func:`rqutils.ground_locg._check_prefilter`, which explains why a
-            negative value would otherwise be absorbed as a silent no-op; or if ``tol`` is
-            non-positive or below the achievable eigen-residual floor
-            :math:`4\,\varepsilon\sum_k|c_k|`, which no solve could reach.
+            negative value would otherwise be absorbed as a silent no-op; if ``atol`` is ``None`` or
+            either tolerance is negative; if **both** tolerances are zero, leaving no satisfiable
+            criterion; or if ``atol`` is below the achievable eigen-residual floor
+            :math:`4\,\varepsilon\sum_k|c_k|` **while** ``rtol`` is zero, so no arm can fire.
         TypeError: If ``cache_level`` is not a pair of ints, or ``prefilter`` is neither None nor a
             ``(degree, cycles)`` pair of ints.
     """
@@ -767,11 +783,11 @@ def sqd(
         )
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
-    # `tol` is an absolute eigen-residual bound, so whether it is reachable depends on the operator's
-    # scale. Checked here and not in `run_sqd` because that is jitted -- sum|c_k| is traced there, and
-    # a traced value cannot raise. This is the outermost point where it is concrete, and it must come
-    # after the PauliSumXZ conversion above, which is what supplies `.c`.
-    _check_tol(tol, float(np.abs(hamiltonian.c).sum()), hamiltonian.c.dtype)
+    # Whether `atol` is reachable depends on the operator's scale, so this needs `.c`. Checked here and
+    # not in `run_sqd` because that is jitted -- sum|c_k| is traced there, and a traced value cannot
+    # raise. This is the outermost point where it is concrete, and it must come after the PauliSumXZ
+    # conversion above, which is what supplies `.c`.
+    _check_tols(atol, rtol, float(np.abs(hamiltonian.c).sum()), hamiltonian.c.dtype)
     states = _check_states_shape(states, hamiltonian.num_qubits, packed)
 
     if not (mesh := get_abstract_mesh()).empty and (resid := states_size % mesh.size) != 0:
@@ -810,7 +826,8 @@ def sqd(
         cache_level,
         xcache_groups=xcache_groups,
         maxiter=maxiter,
-        tol=tol,
+        atol=atol,
+        rtol=rtol,
         prefilter=prefilter,
     )
     LOG.info("Found ground eigenpair in %f seconds.", time.time() - start)
@@ -825,17 +842,19 @@ def sqd(
     # is a traced boolean there and cannot be branched on at trace time.
     if not bool(result[-1]):
         raise RuntimeError(
-            f"LOBPCG did not converge in maxiter={maxiter} iterations (tol={tol!r}). The value it "
+            f"LOBPCG did not converge in maxiter={maxiter} iterations (atol={atol!r}, "
+            f"rtol={rtol!r}). The value it "
             f"reached, {eigval!r}, is a variational upper bound rather than the ground energy -- "
             "finite and plausible, which is why this raises instead of returning it. Raise `maxiter` "
             "first: a near-degenerate ground state converges in the eigenVALUE long before the "
             "residual test is satisfied, so this often means the default cap was simply too low "
             "rather than that anything is wrong. Measured on a 37-state subspace with a relative gap "
             "of 5.5e-04, theta was already correct to 4e-16 by iteration 500 while the residual only "
-            "crossed the threshold at 1091. Loosening `tol` is the other lever -- it is an absolute "
-            f"residual bound, and the floor for this operator is {_residual_floor_of(hamiltonian):.3e}, "
-            "so any value above that is reachable in principle. A genuinely ill-conditioned subspace "
-            "is the rarer cause."
+            "crossed the threshold at 1091. Loosening a tolerance is the other lever: `atol` is an "
+            f"absolute residual bound whose floor for this operator is "
+            f"{_residual_floor_of(hamiltonian):.3e}, so any value above that is reachable in "
+            "principle; `rtol` scales with (||Hv|| + |E|) * N * 10 instead. A genuinely "
+            "ill-conditioned subspace is the rarer cause."
         )
     if return_eigvec:
         eigvec, states_u, subspace_dim = result[1:-1]
@@ -1053,7 +1072,8 @@ def run_sqd(
     cache_level: tuple[int, int] = (1, 0),
     xcache_groups: int | None = None,
     maxiter: int = 1000,
-    tol: float | None = None,
+    atol: float = 0.0,
+    rtol: float | None = None,
     prefilter: tuple[int, int] | None = (32, 2),
     log_level: int = logging.INFO,
 ) -> tuple[float, bool] | tuple[float, jax.Array, jax.Array, int, bool]:
@@ -1069,10 +1089,10 @@ def run_sqd(
     Args:
         maxiter: Maximum LOBPCG iterations, forwarded to :func:`rqutils.ground_locg.ground_locg`.
             Static, as it is there.
-        tol: Absolute bound on the eigen-residual ``||Hv - Ev||``, forwarded to
-            :func:`rqutils.ground_locg.ground_locg`. ``None`` derives the achievable floor
-            from the operator. Validated in :func:`sqd`, which is where ``sum|c_k|`` is
-            concrete -- this function is jitted, so it cannot raise on it.
+        atol: Absolute bound on the eigen-residual ``||Hv - Ev||``; ``rtol``: relative tolerance on
+            ``(||Hv|| + |E|) * N * 10``. Convergence is the ``max`` of the two, so either suffices.
+            Both forwarded to :func:`rqutils.ground_locg.ground_locg` and validated in :func:`sqd`,
+            which is where ``sum|c_k|`` is concrete -- this function is jitted, so it cannot raise.
         prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter, forwarded to
             :func:`rqutils.ground_locg.ground_locg`. Static, as it is there -- passed by keyword, so
             unlike ``cache_level`` it needs no :func:`functools.partial` binding. See :func:`sqd` on
@@ -1291,7 +1311,8 @@ def run_sqd(
         vinit,
         args=args,
         maxiter=maxiter,
-        tol=tol,
+        atol=atol,
+        rtol=rtol,
         prefilter=prefilter,
         prefilter_hi=prefilter_hi,
         log_level=log_level,

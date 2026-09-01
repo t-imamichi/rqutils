@@ -367,48 +367,79 @@ def residual_floor(opnorm_bound: float, dtype: DTypeLike) -> float:
     return 4.0 * float(np.finfo(np.dtype(dtype)).eps) * float(opnorm_bound)
 
 
-def _check_tol(tol: Any, opnorm_bound: float, dtype: DTypeLike) -> None:
-    r"""Raise unless ``tol`` is None or an absolute residual bound above the achievable floor.
+def _check_tols(atol: Any, rtol: Any, opnorm_bound: float, dtype: DTypeLike) -> None:
+    r"""Raise unless ``atol``/``rtol`` are usable tolerances for :func:`ground_locg`.
 
-    Sited here, beside the convergence test it guards, for the reason :func:`_check_prefilter` gives.
-    It cannot be enforced *at* that test: ``converged`` is a traced boolean inside a
-    ``jax.lax.while_loop``, so nothing there can raise. :func:`rqutils.sqd.sqd` is the outermost point
-    where :math:`\sum_k |c_k|` is concrete, which is why it is the caller.
+    The convergence test is ``||r|| < max(atol, rtol * scale)`` -- satisfied by **either** arm -- so the
+    two are validated differently:
 
-    A below-floor ``tol`` is rejected rather than clamped. Clamping would silently deliver a different
-    convergence criterion than the one requested, and the floor is *computable* from the operator
-    alone -- the condition under which this repo's ``poc13`` note says to raise rather than clamp.
-    Without the check the failure is a full ``maxiter`` of iterations ending in the non-convergence
-    ``RuntimeError``, which reports the symptom rather than the diagnosable cause.
+    * ``atol`` is an absolute residual bound. ``None`` is **rejected**: a derived absolute bound is the
+      unintuitive construct this pair replaced, and 0.0 already expresses "no absolute arm". Negative is
+      rejected; 0.0 is legal and means exactly that.
+    * ``rtol`` is a multiplier on ``(||Ax|| + |theta|) * n * 10``. ``None`` is accepted and resolves to
+      the operator dtype's epsilon (see :func:`ground_locg`). Negative is rejected; 0.0 disables the arm.
+
+    **The floor check fires only when ``atol`` is the sole arm.** The achievable residual floor is
+    ``eps * ||H||_2``, so a below-floor ``atol`` cannot be met -- but with ``rtol > 0`` the relative arm
+    still can, and rejecting that configuration would fail a *working* call. This repo has already paid
+    for a guard that fired on correct input (an overflow count that included discarded padding, reported
+    763,677 beside a bit-exact result); the condition is `rtol == 0`, not `atol < floor` alone.
+
+    Both arms zero is rejected outright: no residual satisfies ``|| r || < 0``, so the solve would run to
+    ``maxiter`` and raise. That is diagnosable here and only a symptom there.
+
+    Sited in this module, beside the test it guards, for the reason :func:`_check_prefilter` gives. It
+    cannot be enforced *at* that test: ``converged`` is a traced boolean inside a ``jax.lax.while_loop``,
+    so nothing there can raise. :func:`rqutils.sqd.sqd` is the outermost point where
+    :math:`\sum_k |c_k|` is concrete, which is why it is the caller.
 
     Args:
-        tol: The caller's value, unvalidated.
+        atol: The caller's absolute tolerance, unvalidated.
+        rtol: The caller's relative tolerance, unvalidated.
         opnorm_bound: An upper bound on the operator's spectral norm.
         dtype: The operator dtype whose epsilon sets the floor.
 
     Raises:
-        TypeError: If ``tol`` is neither None nor a real number.
-        ValueError: If ``tol`` is non-positive, or below the achievable residual floor.
+        TypeError: If ``atol`` is not a real number, or ``rtol`` is neither None nor a real number.
+        ValueError: If either is negative; if both are zero; or if ``atol`` is below the achievable
+            residual floor while ``rtol`` is zero, leaving no reachable criterion.
     """
-    if tol is None:
-        return
-    if isinstance(tol, bool) or not isinstance(tol, (int, float, np.floating, np.integer)):
-        raise TypeError(f"tol must be None or a real number, got {type(tol).__name__}")
-    tol = float(tol)
-    if tol <= 0.0:
+    if atol is None:
         raise ValueError(
-            f"tol must be positive, got {tol!r}. It is an absolute bound on the eigen-residual "
-            "||Hv - Ev||; zero is unreachable by construction."
+            "atol must be a number, not None -- pass 0.0 to disable the absolute arm and rely on "
+            "rtol. Only rtol accepts None (it resolves to the operator dtype's epsilon)."
         )
-    floor = residual_floor(opnorm_bound, dtype)
-    if tol < floor:
+    for name, value in (("atol", atol), ("rtol", rtol)):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float, np.floating, np.integer)):
+            raise TypeError(
+                f"{name} must be {'None or ' if name == 'rtol' else ''}a real number, got "
+                f"{type(value).__name__}"
+            )
+        if float(value) < 0.0:
+            raise ValueError(f"{name} must be non-negative, got {float(value)!r}")
+
+    atol = float(atol)
+    # None means "derive from dtype", which is always positive, so it cannot make both arms zero.
+    rtol_is_zero = rtol is not None and float(rtol) == 0.0
+    if atol == 0.0 and rtol_is_zero:
         raise ValueError(
-            f"tol={tol:.3e} is below the achievable eigen-residual floor {floor:.3e} for this "
-            f"operator (4 * eps * sum|c_k|, with sum|c_k|={float(opnorm_bound):.4g} bounding "
-            f"||H||_2), so the solve could never converge and would exhaust maxiter. The floor is "
-            f"eps*||H||_2 and does not shrink with subspace size -- measured over n=70..32768 and "
-            f"six decades of ||H||. Pass tol >= {floor:.3e}, or tol=None for this default."
+            "atol and rtol are both 0.0, so no residual can satisfy the convergence test and the "
+            "solve would exhaust maxiter. Set atol to the residual you need, or rtol=None to use "
+            "the dtype epsilon against the (||Hv|| + |E|) * N * 10 scale."
         )
+    if atol > 0.0 and rtol_is_zero:
+        floor = residual_floor(opnorm_bound, dtype)
+        if atol < floor:
+            raise ValueError(
+                f"atol={atol:.3e} is below the achievable eigen-residual floor {floor:.3e} for this "
+                f"operator (4 * eps * sum|c_k|, with sum|c_k|={float(opnorm_bound):.4g} bounding "
+                f"||H||_2) and rtol=0 leaves no other arm, so the solve could never converge and "
+                f"would exhaust maxiter. The floor is eps*||H||_2 and does not shrink with subspace "
+                f"size -- measured over n=70..32768 and six decades of ||H||. Pass "
+                f"atol >= {floor:.3e}, or a non-zero rtol."
+            )
 
 
 def _check_prefilter(prefilter: Any) -> None:
@@ -562,7 +593,8 @@ def ground_locg(
     xinit: jax.Array | int,
     args: tuple = ...,
     maxiter: int = ...,
-    tol: float | None = ...,
+    atol: float = ...,
+    rtol: float | None = ...,
     vspace: tuple[int, DTypeLike] | None = ...,
     prefilter: tuple[int, int] | None = ...,
     prefilter_hi: float | None = ...,
@@ -577,7 +609,8 @@ def ground_locg(
     xinit: jax.Array | int,
     args: tuple = ...,
     maxiter: int = ...,
-    tol: float | None = ...,
+    atol: float = ...,
+    rtol: float | None = ...,
     vspace: tuple[int, DTypeLike] | None = ...,
     prefilter: tuple[int, int] | None = ...,
     prefilter_hi: float | None = ...,
@@ -593,7 +626,8 @@ def ground_locg(
     xinit: jax.Array | int,
     args: tuple,
     maxiter: int,
-    tol: float | None,
+    atol: float,
+    rtol: float | None,
     vspace: tuple[int, DTypeLike] | None,
     prefilter: tuple[int, int] | None,
     prefilter_hi: float | None,
@@ -608,7 +642,8 @@ def ground_locg(
     xinit: jax.Array | int,
     args: tuple = ...,
     maxiter: int = ...,
-    tol: float | None = ...,
+    atol: float = ...,
+    rtol: float | None = ...,
     vspace: tuple[int, DTypeLike] | None = ...,
     prefilter: tuple[int, int] | None = ...,
     prefilter_hi: float | None = ...,
@@ -622,7 +657,8 @@ def ground_locg(
     xinit: jax.Array | int,
     args: tuple = (),
     maxiter: int = 1000,
-    tol: float | None = None,
+    atol: float = 0.0,
+    rtol: float | None = None,
     vspace: tuple[int, DTypeLike] | None = None,
     prefilter: tuple[int, int] | None = None,
     prefilter_hi: float | None = None,
@@ -642,28 +678,54 @@ def ground_locg(
             arrives as a 0-d traced array. Must have a non-vanishing overlap with :math:`v_0`.
         args: Additional arguments to callable ``mat``.
         maxiter: Maximum number of gradient descent iterations.
-        tol: **Absolute** bound on the eigen-residual :math:`\|Ax - \theta x\|_2`. The solve reports
-            convergence once the residual falls below this value. If None, ``4 * eps * \|Ax_0\|`` is
-            used -- the measured achievable floor plus a safety factor.
+        atol: **Absolute** bound on the eigen-residual :math:`\|Ax - \theta x\|_2`. Default ``0.0``,
+            which disables this arm and leaves ``rtol`` to decide. Set it when a downstream consumer has
+            a fixed residual requirement: ``atol=1e-6`` means :math:`\|r\| < 10^{-6}` at **every**
+            :math:`n`, which no relative tolerance can express.
+
+            **``None`` is rejected** -- pass ``0.0`` to disable the arm. A *derived* absolute bound is
+            the unintuitive construct this pair replaced: an absolute residual is either a number the
+            caller wants or it is not wanted at all.
+
+            The achievable floor is :math:`\mathrm{eps} \cdot \|A\|_2` with **no** :math:`n` dependence
+            (measured over :math:`n = 70..32768` and six decades of :math:`\|A\|`, dense and
+            matrix-free, both dtypes: the constant spans 0.49-1.26 while the :math:`n`-scaled form
+            spans 306x). An ``atol`` below that floor is unreachable **when ``rtol`` is zero**;
+            :func:`rqutils.sqd.sqd` rejects that combination. With a non-zero ``rtol`` it is harmless,
+            because the relative arm can still fire.
+        rtol: **Relative** tolerance, multiplying the scale
+
+            .. math:: \mathrm{scale} = (\|Ax\| + |\theta|)\,n \cdot 10
+
+            so the effective bound is :math:`\mathrm{rtol} \cdot \mathrm{scale}`. If ``None`` (the
+            default), the operator dtype's machine epsilon is used -- :math:`2.22\times10^{-16}` for
+            float64/complex128, giving an effective bound of roughly
+            :math:`20\,\mathrm{eps}\,\|A\|_2\,n` since :math:`\|Ax\| \approx |\theta|` at convergence.
+            Measured, that is 1.9e-11 at :math:`n = 256` and 4.4e-10 at :math:`n = 4096`. Pass ``0.0``
+            to disable the arm.
+
+            :math:`|\theta|` rather than :math:`+\theta` because the sum must not cancel for either
+            sign, and a ground-state search is typically negative-definite; the natural-looking
+            ``norm(Ax) - theta`` was measured going *negative* for a positive-definite operator, which
+            makes the test unsatisfiable.
+
+            The point of this arm is that **one value covers several dimensions**. A pipeline solving at
+            :math:`n = 4596` and :math:`n = 2.7\times10^6` in one run gets a per-dimension bound from a
+            single ``rtol``; a single ``atol`` cannot be right for both. The :math:`n \cdot 10` factor is
+            *slack* rather than a rounding budget (the floor above has no :math:`n` term), and it is
+            retained deliberately -- that slack is the scaling property.
+
+            **Convergence is** ``||r|| < max(atol, rtol * scale)`` **-- either arm suffices.** So
+            ``atol=0.0, rtol=None`` (the defaults) is the pre-2026-08-31 relative behaviour exactly;
+            ``atol=x, rtol=0.0`` is the absolute-only behaviour that briefly *was* ``tol``; and setting
+            both takes whichever is looser, which is usually what a caller wants.
 
             .. warning::
 
-               **This changed meaning.** ``tol`` was previously a *relative* tolerance, multiplied
-               internally by :math:`(\|Ax\| + |\theta|)\,n \cdot 10`, so the same value meant a
-               different absolute residual at every subspace size. It is now the absolute residual
-               itself. An existing call passing an explicit ``tol`` **keeps working but changes
-               criterion** -- at :math:`n = 2\times10^5` the old ``tol=1e-6`` admitted a residual of
-               order :math:`10^0`, where it now demands :math:`10^{-6}`. Nothing raises. Callers that
-               tuned ``tol`` empirically must re-derive it. ``None`` still converges but is **not**
-               unchanged -- it is 3-4 decades tighter and measured 1.18-1.49x slower through ``sqd``,
-               the gap growing with :math:`N`.
-
-            The floor is :math:`\mathrm{eps} \cdot \|A\|_2` with **no** :math:`n` dependence
-            (measured over :math:`n = 70..32768` and six decades of :math:`\|A\|`, dense and
-            matrix-free, both dtypes: the constant spans 0.49-1.26 while the :math:`n`-scaled form
-            spans 306x). A value below that floor can never be reached; :func:`rqutils.sqd.sqd`
-            rejects one, and a bare ``ground_locg`` call with a callable ``mat`` cannot check it and
-            will simply exhaust ``maxiter``.
+               **``tol`` is gone, twice over.** It was relative until 2026-08-31, absolute after, and is
+               now removed in favour of this pair -- a rename with no alias, so ``tol=`` raises
+               ``TypeError`` rather than silently meaning one of the two. A caller who had
+               ``tol=x`` on the *relative* form wants ``rtol=x``; on the *absolute* form, ``atol=x``.
         vspace: Specification (dimension, dtype) of the vector space. Required only when ``mat`` is
             a callable and ``xinit`` is an integer.
         prefilter_hi: Upper bound on :math:`\lambda_{\max}`, used as the filter's upper interval
@@ -760,7 +822,8 @@ def ground_locg(
             xinit,
             args,
             maxiter,
-            tol,
+            atol,
+            rtol,
             vspace=vspace,
             prefilter=prefilter,
             prefilter_hi=prefilter_hi,
@@ -771,7 +834,8 @@ def ground_locg(
         mat,
         xinit,
         maxiter,
-        tol,
+        atol,
+        rtol,
         prefilter=prefilter,
         prefilter_hi=prefilter_hi,
         debug=debug,
@@ -784,7 +848,8 @@ def _ground_locg_matrix(
     mat: jax.Array,
     xinit: jax.Array,
     maxiter: int,
-    tol: jax.Array | float | None,
+    atol: jax.Array | float,
+    rtol: jax.Array | float,
     prefilter: tuple[int, int] | None = None,
     prefilter_hi: jax.Array | float | None = None,
     debug: bool = False,
@@ -812,7 +877,8 @@ def _ground_locg_matrix(
         xinit,
         (),
         maxiter,
-        tol,
+        atol,
+        rtol,
         vspace=vspace,
         prefilter=prefilter,
         prefilter_hi=prefilter_hi,
@@ -836,7 +902,8 @@ def _ground_locg_callable(
     xinit: jax.Array | int,
     args: tuple,
     maxiter: int,
-    tol: jax.Array | float | None,
+    atol: jax.Array | float,
+    rtol: jax.Array | float,
     vspace: tuple[int, DTypeLike] | None = None,
     prefilter: tuple[int, int] | None = None,
     prefilter_hi: jax.Array | float | None = None,
@@ -1024,10 +1091,22 @@ def _ground_locg_callable(
         #
         # `reltol` is retained in the debug diagnostics only, as the floor estimate, so a caller can
         # see how much headroom a given `tol` has.
-        reltol = jnp.finfo(jnp.result_type(axnext.dtype, float)).eps * jnp.linalg.norm(axnext)
+        # Two independent tolerances, satisfied by EITHER -- hence `max`, not `min`:
+        #
+        #     ||r|| < max(atol, rtol * (||Ax|| + |theta|) * n * 10)
+        #
+        # `atol` bounds the residual absolutely, so a caller with a fixed requirement (a downstream
+        # guard at 1e-6) can name it and have it hold at every `n`. `rtol` scales with the operator and
+        # the dimension, so one value covers a pipeline that solves at several `n` in one run -- the
+        # property the pre-2026-08-31 relative form had, and the reason it is back rather than replaced.
+        #
+        # `abs(theta)` rather than `+theta`: the sum must not cancel for either sign of theta, and a
+        # ground-state search is typically negative-definite. The natural-looking `norm(Ax) - theta` was
+        # measured going *negative* for a positive-definite operator, making the test unsatisfiable.
+        reltol = (jnp.linalg.norm(axnext) + jnp.abs(theta)) * xcurr.shape[0] * 10
         # A zeroed search direction means {x, y} already spans the residual: we are at a stationary
         # point of the Rayleigh quotient and no further iteration can lower theta.
-        converged = jnp.logical_or(norm_rnext < tol, p_is_zero)
+        converged = jnp.logical_or(norm_rnext < jnp.maximum(atol, rtol * reltol), p_is_zero)
         if log_level <= logging.DEBUG:
             jax.debug.print("Residual {}, reltol {}, converged: {}", norm_rnext, reltol, converged)
 
@@ -1092,17 +1171,15 @@ def _ground_locg_callable(
     # rather than the state initializer.
     rho_init = seed.rho
 
-    if tol is None:
-        # `tol` is absolute now, so the default must carry the operator's scale: a bare eps would be
-        # unsatisfiable for any ||A|| > 1. The floor is eps*||A||_2 (measured; see the convergence
-        # block in `body`), and ||seed.ax|| is a lower bound on it for a normalized x -- the cheapest
-        # available proxy, needing no extra matvec. The factor 4 is the margin over the worst of 27
-        # measured samples (max constant 1.26, so 3.2x).
+    if rtol is None:
+        # Only `rtol` takes None; `atol` defaults to 0.0 instead, because a "derived absolute bound" is
+        # exactly the unintuitive thing this pair replaced -- an absolute residual is either a number the
+        # caller wants or it is not wanted at all.
         #
-        # Derive it from the operator, not from the initial guess: a float32 xinit on a complex128
+        # Derive it from the operator dtype, not from the initial guess: a float32 xinit on a complex128
         # problem would otherwise silently loosen this by nine orders of magnitude. `work_dtype` is
         # already that promotion.
-        tol = 4.0 * jnp.finfo(work_dtype).eps * jnp.maximum(jnp.linalg.norm(seed.ax), 1.0)
+        rtol = float(jnp.finfo(work_dtype).eps)
 
     state, diag1 = body_iter1(seed.x, seed.r, seed.ax, rho_init)
     if debug:
