@@ -2297,11 +2297,87 @@ offers to reverse it as a two-line change if the caller prefers the old timing. 
 pass `tol` explicitly — at 1e-6 they are ~1.5x ahead of the *old* default, so the change only pays if
 the parameter is used.
 
+> **Superseded 2026-09-01.** The offer above was taken up, and then withdrawn on measurement. `tol` is
+> gone; convergence is `max(atol, rtol·(‖Hv‖+|E|))`. The `N` factor came back with `rtol` and lasted one
+> commit — see the next entry. The **floor measurement in this entry still stands** and is the evidence
+> base for the new design; only the `tol`-shaped conclusions below it are stale.
+
 **Also unaddressed, and stated in the reply:** `p_is_zero` still reports convergence regardless of `tol`
 (the stationary-point route, pre-existing and by design), so a converged result *can* carry a residual
 above `tol`. And a residual bound is not an accuracy guarantee — `|E − λ_min| ≲ ‖r‖²/gap`, so the energy
 error depends on a gap the caller does not have; measured ΔE was 1–7 decades *better* than the residual at
 every arm, but that is the well-conditioned regime, not a promise.
+
+### `atol`/`rtol`: the pair is right, and `rtol`'s scale took two tries to get right (2026-09-01)
+
+From `docs/rqutils-atol-rtol-request.md`; reply in `docs/rqutils-atol-rtol-response.md`. `tol` is gone,
+convergence is `‖r‖ < max(atol, rtol·(‖Hv‖ + |E|))`, either arm sufficing.
+
+**The pair itself was never in doubt** — a purely relative test cannot name a residual, a purely absolute
+one cannot track an operator whose scale the caller does not know, and `max` makes both special cases. The
+`max` is load-bearing: a `min` would require *both*, which is strictly less expressive than either alone.
+
+**`rtol`'s scale shipped wrong once.** The first cut multiplied by `n · 10`, exactly as the request asked,
+because that reproduces the pre-2026-08-31 relative `tol` bit-for-bit. Probing the parameter *across its
+range* — which should have preceded the commit, not followed it — found three failures:
+
+1. **The bound can exceed `‖H‖`.** Every normalized `v` has `‖Hv − Ev‖ ≤ ‖H‖`, so past that the test
+   carries no information: `rtol=1e-8` at `n=2^20` gave a bound of **4.2 against `‖H‖ = 20`**, the first
+   iterate reported convergence, and the eigenpair was arbitrary with `converged=True`.
+2. **It saturated.** `rtol=1e-6` and `rtol=1e-4` returned bit-identical answers — 100x of dial, one
+   outcome.
+3. **It was unstatable.** `rtol=1e-8` meant 4.1e-3 at `n=1024` and 8.4e0 at `n=2^21`.
+
+The scale is now `‖Hv‖ + |E|` alone. That factor is required — `‖r‖` has units of `‖H‖`, so a
+dimensionless `rtol` needs it — and `n · 10` is not, the floor having no `n` term (previous entry).
+Verified dimension-independent: one `rtol`, one Hamiltonian, four sizes gives **2.03e-14 at N=64 and
+2.19e-14 at N=1024**, flat across 16x.
+
+**The generalizable rule: a tolerance parameter must be statable without knowing the problem size.** If
+its useful range moves with `n`, callers cannot reason about it and its top end silently becomes an
+accept-anything. Folding a dimension count into something named "relative" is what made all three
+failures possible at once.
+
+**The cost is real and was accepted deliberately:** one `rtol` no longer scales across dimensions, which
+is the property the requester wanted for an end-to-end lock spanning several subspace sizes. Their
+constants will likely still fail. Three routes offered in the reply, the recommended one being a single
+`atol` (the bound no longer varies, so there is nothing for the constants to track).
+
+**A guard whose argument is about a derived quantity must be checked against every input reaching it.**
+Both arms now reject accept-anything — `rtol >= 0.5`, `atol >= Σ|c_k|` — but the `atol` half was **missing
+from the first implementation**, even though the guard's own error text argues from the *bound* ("every
+normalized vector satisfies `‖Hv − Ev‖ ≤ ‖H‖`"), which says nothing about which parameter produced it.
+Measured consequence: `atol=100` against `‖H‖ = 17` was accepted and converged in **one iteration**. It
+was found only because someone asked whether `atol` had been reviewed as carefully as `rtol`; it had not.
+The salience asymmetry is the lesson — `rtol` got scrutiny because its failure had just been *measured*,
+while `atol` felt safe for having been designed rather than inherited.
+
+**The below-floor guard is conditioned on `rtol == 0`.** With a live relative arm an unreachable `atol` is
+harmless, so an unconditional check would fire on correct input — the defect class this repo already paid
+for with an overflow count that included padding.
+
+**`rtol=None` is kept, and the asymmetry with `atol` is principled.** `rtol`'s default is the *promoted*
+dtype's epsilon and cannot be a literal: a hardcoded `4·eps(f64)` = 8.88e-16 converges in **28 iterations
+at float64 and exhausts a 500-iteration cap at float32** (`converged=False`, so `sqd` would raise). `atol`
+has no dtype-derived value a caller would want, so it takes `0.0` and rejects `None`.
+`TestRtolNoneIsDtypeDerived` pins this, and its failure message says to revisit the asymmetry if it ever
+starts passing. `rtol=None` resolves to `4·eps`, not `eps`: the scale is ~`2‖H‖`, so `eps` would target
+only 2x the floor, inside the 0.49–1.26 spread of the floor's own constant.
+
+**Two test defects, both of the "passes for the wrong reason" kind.**
+
+- The dimension-property test compared fixtures differing in **both** qubit count and subspace size, so
+  `‖H‖` moved alongside `N` — and it passed against a formula with no dimension term at all. A test that
+  varies two axes cannot attribute a difference to either. Rewritten to move one at a time.
+- A boundary test asserted `atol == Σ|c_k|` exactly and **did not raise**: `sqd` sums the *padded*
+  coefficient rectangle, so its value is one ulp higher (`6.47309024676594` against the test's
+  `6.473090246765939`). The test was asserting floating-point associativity, not the guard. Exact-boundary
+  tests on independently-computed floats are unsound; test strictly inside the region.
+
+**And a figure that did not survive the redesign.** The `atol=1e-6` speedup is **1.85x** against the new
+default (4.60 → 2.49 ms warm, best of 5, N=800). An earlier draft carried over 1.96x, measured against the
+`n · 10` default — a different quantity. A tolerance ratio is only meaningful beside the definition it was
+taken under, which is the same trap the requester's own table fell into.
 
 ## `precond` was removed; `sqd` defaults to `prefilter=(32, 2)`
 

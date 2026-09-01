@@ -150,6 +150,16 @@ uv run --extra dev pytest              # whole suite
 uv run --extra dev pytest -v -x        # verbose, stop at first failure
 ```
 
+**Don't run the suite for a markdown-only change.** `CLAUDE.md`, `NOTES.md` and `docs/*.md` are not
+imported by anything and pytest does not collect them, so the result is known before it runs — ~35 s of
+nothing, and it dilutes the signal from the runs that do matter. `git status --short` is the check: if
+every path ends in `.md`, skip straight to the commit. The same goes for ruff and `ty`, which only look
+at `rqutils/ tests/ examples/`.
+
+Docstrings are the exception that isn't obvious: they live in `.py`, so editing one **is** a code change
+for `ty` and for the docs build (`cd docs && make clean && make html`), even though no test asserts on
+them.
+
 One `tests/test_<module>.py` per module; all seven are covered. `tests/` also holds three Jupyter
 notebooks used as scratchpads (pytest does not collect them) and `tests/_sharded_*.py` scripts — the
 leading underscore keeps them uncollected, and they are subprocessed under
@@ -425,8 +435,10 @@ changes the answer.
 
 **`ground_locg(debug=True)` runs the full `maxiter`** — it switches `while_loop` to `scan`, so it does
 *not* stop at convergence, and returns a 5th element with per-iteration `r`/`theta`/`reltol` (2 extra
-leading rows for the seed steps). With `tol=0` that makes the residual *trajectory* observable, which is
-how a floor or a plateau gets measured; `debug=False` returns 4 and stops early.
+leading rows for the seed steps). With `atol=rtol=0` that makes the residual *trajectory* observable,
+which is how a floor or a plateau gets measured; `debug=False` returns 4 and stops early. (`sqd` rejects
+that pair as unsatisfiable; a direct `ground_locg` call does not validate, which is what makes it usable
+as an instrument.)
 
 **`precond` is gone** (2026-08-28), with its tests and `examples/scaling/poc10_deflation_precond.py`.
 It worked — 2.76× median on a *positive-definite* operator — but no `sqd` caller can reach that: `sqd`
@@ -626,23 +638,44 @@ quoting the time.
   `pack_states`/`unpack_states` already are those. Both overloads annotate `StateList`, which cannot
   express the width, so **`ty` will not catch a caller assuming the wrong one**.
 
-- **`tol` is now an *absolute* bound on the eigen-residual `‖Hv − Ev‖₂`** (2026-08-31), on both `sqd`
-  and `ground_locg`. It was relative, scaled internally by `(‖Hv‖ + |E|)·N·10`. **This break is silent**
-  — the old and new forms both take a small float, so an existing explicit `tol=` keeps working and
-  changes criterion with nothing raised: at `N = 2e5` the old `tol=1e-6` admitted a residual of order
-  `1e0` where it now demands `1e-6`. **`tol=None` still converges but is not unchanged** — it resolves
-  to `4·eps·max(‖Ax₀‖, 1)`, which it had to (a bare `eps` is below the floor for any `‖H‖ > 1` and would
-  make every default call raise), and that is 3–4 decades tighter than the old effective bound, so it
-  measures **1.18–1.49x slower, the gap growing in `N`** (the old bound carried an `N` factor; this one
-  does not). An earlier revision of this entry said default callers were unaffected — asserted from
-  reading the two code paths, never timed. **A claim that behaviour is unchanged is a claim about a
-  measurement**: A/B it against a worktree of the pre-change revision. Taken as a rename rather than a new keyword deliberately, so the
-  `.. warning::` in both published docstrings is the only notice. A below-floor `tol` raises
-  `ValueError` from `sqd` — the floor is `4·eps·Σ|c_k|`, exposed as `ground_locg.residual_floor`.
-  `docs/rqutils-tol-response.md` is the reply to the request that prompted it; evidence in `NOTES.md`.
+- **`tol` is gone; convergence is `‖r‖ < max(atol, rtol·(‖Hv‖ + |E|))`** (2026-09-01), on both `sqd` and
+  `ground_locg`. Either arm suffices — `atol` names an absolute residual (so a caller whose consumer
+  checks 1e-6 can *say* 1e-6, at every `N`), `rtol` is a fraction of the operator magnitude, the
+  `np.allclose` meaning. **`tol=` raises `TypeError`, no alias**, deliberately: it meant *relative*
+  before 2026-08-31 and *absolute* after, so a third revision resolving it silently to one of the pair
+  would be the worst option. Migrating, `tol=x` on the absolute form is `atol=x, rtol=0.0`; on the
+  relative form there is **no exact equivalent** (see below). Also an **arity** change — `ground_locg`'s
+  positional signature gained a slot, which `tests/test_ground_locg.py`'s all-positional arm exists to
+  catch.
 
-The last four are downstream-visible breaks. There is no CHANGELOG in this repo — if one is ever added,
-all of them belong in it.
+  **`atol` defaults to `0.0` and rejects `None`; `rtol` defaults to `None` → `4·eps`.** The asymmetry is
+  load-bearing, not sloppiness: `rtol`'s default is the *promoted dtype's* epsilon, which cannot be a
+  literal — a hardcoded `8.88e-16` converges in 28 iterations at float64 and **exhausts a 500-iteration
+  cap at float32** (measured; `TestRtolNoneIsDtypeDerived` pins it and says to revisit this if it ever
+  starts passing). `atol` has no such excuse, so `0.0` means "no absolute arm" and `None` is an error.
+
+  **`rtol`'s scale carries no `N` factor, and that is a refusal rather than an omission.** The `n·10`
+  form shipped first (it reproduces the pre-2026-08-31 relative `tol` exactly, which is what the
+  requester asked for) and was withdrawn on measurement: the bound **can exceed `‖H‖`** — `rtol=1e-8` at
+  `n=2^20` gave 4.2 against `‖H‖ = 20`, so the first iterate reported convergence with an arbitrary
+  eigenpair and `converged=True`. It also saturated (`rtol=1e-6` and `1e-4` bit-identical) and could not
+  be stated without knowing `n`. The cost is that one `rtol` no longer scales across dimensions; a caller
+  needing that sets `atol` per call. `docs/rqutils-atol-rtol-response.md` gives the three routes.
+
+  **Both arms are guarded against accept-anything**: `rtol >= 0.5` (where `2·rtol·‖H‖` reaches `‖H‖`) and
+  `atol >= Σ|c_k|`. The `atol` half was **missing from the first implementation** — the guard's own
+  justification is about the *bound*, not about which parameter produced it, and it was applied to one arm
+  anyway; `atol=100` against `‖H‖ = 17` converged in **one iteration**. Found only by re-probing `atol`
+  after being asked whether it had been reviewed as carefully as `rtol`. **When a guard's argument is
+  stated in terms of a derived quantity, check every input that reaches it.**
+
+  A below-floor `atol` still raises, but **only when `rtol == 0`** — with a live relative arm it is
+  harmless, and rejecting it would fire on correct input. Floor is `4·eps·Σ|c_k|`, exposed as
+  `ground_locg.residual_floor`. Evidence in `NOTES.md`; the two request/response pairs are
+  `docs/rqutils-tol-*.md` and `docs/rqutils-atol-rtol-*.md`.
+
+All four of the above are downstream-visible breaks. There is no CHANGELOG in this repo — if one is ever
+added, every one of them belongs in it.
 
 ## Closed investigations — don't reopen without reading the record
 
