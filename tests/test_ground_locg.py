@@ -1184,9 +1184,14 @@ class TestRtolNoneIsDtypeDerived:
 
     This is the whole reason ``rtol`` accepts ``None`` while ``atol`` rejects it: the default is the
     operator dtype's epsilon, which cannot be written as a literal in the signature. Measured on a
-    float32 operator -- ``rtol=None`` converges in 28 iterations, where the float64 literal ``4*eps64``
-    = 8.88e-16 exhausts a 500-iteration cap with ``converged=False``. On float64 the two agree exactly
-    (72 iterations each), so a test at the default dtype alone cannot see the difference.
+    float32 operator (seed 3) -- ``rtol=None`` converges in 28 iterations, where the float64 literal
+    ``4*eps64`` = 8.88e-16 exhausts a 500-iteration cap with ``converged=False``. On float64 the two
+    agree exactly (72 iterations each), so a test at the default dtype alone cannot see the
+    difference.
+
+    Both arms sweep 20 seeds. The iteration counts above are seed 3's; the *outcomes* (cap-with-no-
+    convergence for the literal, convergence to -2.0 for the derived default) hold at every seed, and
+    that invariance is the point -- see the comment on the literal arm.
     """
 
     @staticmethod
@@ -1199,26 +1204,43 @@ class TestRtolNoneIsDtypeDerived:
             jnp.asarray(rng.standard_normal(dim), dtype=dtype),
         )
 
-    def test_a_float64_literal_rtol_cannot_converge_in_float32(self):
+    # Swept over seeds, not run on one: this arm is a canary for *any* change that lets the
+    # residual read lower than it truly is, and on a single operator it is decided by luck. Five
+    # separate matvec-reuse variants (naive (AV)k, Kahan-compensated, periodic-refresh at k=8,
+    # residual-growth-triggered, and Kahan+k=8) each passed on the original seed=3 while reporting
+    # `converged=True` on 25-66 of 100 seeds -- the reuse makes `r = Ax - theta*x` cancel against
+    # its own error, so the reported residual understated the true one by up to 59x. Seed 3 simply
+    # happens to be one where it does not. 20 seeds is enough that each of those variants fails
+    # here; the sweep is the assertion, so do not narrow it back to a single operator.
+    @pytest.mark.parametrize("seed", range(20))
+    def test_a_float64_literal_rtol_cannot_converge_in_float32(self, seed):
         """The failure a literal default would have caused, asserted directly."""
-        mat, vec = self._operator(jnp.float32)
+        mat, vec = self._operator(jnp.float32, seed=seed)
         literal = 4.0 * float(np.finfo(np.float64).eps)
         _eigval, _vec, niter, converged = ground_locg(mat, vec, maxiter=500, rtol=literal)
         assert not bool(converged), (
-            f"a float64 rtol literal converged on a float32 operator in {int(niter)} iterations -- "
-            "if this now passes, the dtype-derived default is no longer load-bearing and the "
-            "atol/rtol None asymmetry should be revisited"
+            f"a float64 rtol literal converged on a float32 operator (seed {seed}) in "
+            f"{int(niter)} iterations -- if this now passes, either the dtype-derived default is no "
+            "longer load-bearing and the atol/rtol None asymmetry should be revisited, or the "
+            "residual is being computed from a reused image of A rather than a fresh matvec"
         )
-        assert int(niter) == 500, f"expected the iteration cap, got {int(niter)}"
+        assert int(niter) == 500, f"expected the iteration cap, got {int(niter)} (seed {seed})"
 
-    def test_rtol_none_converges_at_both_precisions(self):
+    @pytest.mark.parametrize("seed", range(20))
+    def test_rtol_none_converges_at_both_precisions(self, seed):
         """And the derived default does converge, at each dtype, to the same eigenvalue."""
         for dtype in (jnp.float32, jnp.float64):
-            mat, vec = self._operator(dtype)
+            mat, vec = self._operator(dtype, seed=seed)
             eigval, _vec, niter, converged = ground_locg(mat, vec, maxiter=500)
-            assert bool(converged), f"rtol=None did not converge at {np.dtype(dtype).name}"
-            assert int(niter) < 500, f"{np.dtype(dtype).name} hit the cap at {int(niter)}"
-            assert eigval == pytest.approx(-2.0, abs=1e-5), f"{np.dtype(dtype).name}: {eigval}"
+            assert bool(converged), (
+                f"rtol=None did not converge at {np.dtype(dtype).name} (seed {seed})"
+            )
+            assert int(niter) < 500, (
+                f"{np.dtype(dtype).name} hit the cap at {int(niter)} (seed {seed})"
+            )
+            assert eigval == pytest.approx(-2.0, abs=1e-5), (
+                f"{np.dtype(dtype).name} (seed {seed}): {eigval}"
+            )
 
 
 class TestDebugOverloadIsCheckable:

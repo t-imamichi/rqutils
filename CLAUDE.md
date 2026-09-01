@@ -312,6 +312,9 @@ a **callable raises** without it; `sqd` passes `Σ|c_k|`. Don't "fix" a missing 
 power-iteration or Lanczos estimate — that defect returned an **excited** eigenpair with
 `converged=True`. Prefer a loose bound: over-estimating degrades resolution smoothly, under-estimating
 changes the answer. Its call site must stay **after** the dtype promotion and **before** `body_iter0`.
+The prohibition is on a power-iteration estimate as a **filter bound**, not on the estimate itself: as a
+*convergence-test scale* it is safe, since under-estimating there only tightens the test. Other
+implementations use it exactly that way.
 
 **`sqd` defaults to `prefilter=(32, 2)`** — 1.49× median end-to-end (min 1.15×). Quote *that*, not the
 2.43× dense wall-clock or the 5.02× iteration count. `ground_locg` defaults to `None`, since it cannot
@@ -482,3 +485,22 @@ in it.
 - **The MLX port**, deleted rather than deprecated because the JAX solver measured faster even on the
   MLX GPU backend. Don't reintroduce a second solver implementation without that measurement going the
   other way first.
+- **Reusing `Ax` to cut `body()`'s 3 matvecs to 2.** Measured 1.31–1.42× through `apply_h` (1.5× dense)
+  and it makes the **reported residual understate the true one by 59×** in float32, because
+  `r = ax − θx` cancels against the staleness the two terms share. **The error originates in the operator
+  application, not the reconstruction** — an exact f64 combination of f32 images still drifts 1.43e-07 —
+  so every technique that improves how the terms are combined works on the wrong stage. Sixteen arms
+  measured (compensated sums, Dekker exact products, f64 widening, six orderings, cycling, fixed and
+  triggered refresh, a carried error term, an `⟨x|r⟩` detector): **all sit at honesty
+  `TRUE‖r‖/reported‖r‖` = 6.5–13.6× against baseline's 0.95**, and arithmetic accuracy is *uncorrelated*
+  with it. Judge any future arm by that ratio, not by spurious-convergence counts, which reward an
+  inflated-but-wrong residual. The only clean arms cost their speedup back (~1.10×), matching the +22.1%
+  "delayed convergence" the residual-replacement literature reports. Don't reopen without reading the
+  entry; if you do, the untested shape is *total* replacement.
+- **Compensated summation anywhere in `ground_locg`.** `jnp.sum` is already tree-reduced (~1.5e-16
+  relative, flat in `N`), a blocked-Kahan `compute_sas` leaves the residual floor bit-identical, and
+  compensation **breaks sharding** — sequential accumulation over blocks reshapes a partitioned axis and
+  `lax.scan` raises `0th dimension of all xs should be replicated`. The whole family is closed by a
+  published measurement: CG with *every* inner product **and matvec** correctly rounded (Ozaki scheme,
+  doi:10.1145/3432261.3432270) leaves the true residual at **median 1.002×**, worse in 3 of 8 cases. It
+  buys reproducibility and some iteration count, never attainable accuracy.

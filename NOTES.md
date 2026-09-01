@@ -2379,6 +2379,194 @@ default (4.60 → 2.49 ms warm, best of 5, N=800). An earlier draft carried over
 `n · 10` default — a different quantity. A tolerance ratio is only meaningful beside the definition it was
 taken under, which is the same trap the requester's own table fell into.
 
+### Reusing `Ax` to cut the matvec count is closed, and the canary that should have caught it was one seed (2026-09-02)
+
+Opened from Nottoli/Giannì/Levitt/Lipparini, *Theor. Chem. Acc.* **142**:69 (2023) (= arXiv:2305.06668),
+whose §3.1.2 "reuse of applications" obtains `AX^[k+1]` and `AP^[k+1]` as `(AV)u` instead of fresh
+products. `body()` spends **3 matvecs per iteration** (`ay`, `ap`, `axnext`; jaxpr
+`while.body_jaxpr: dot_general=3`) and the third is removable: `xnext = (x κ₀ + y κ₁ + p κ₂)/‖·‖`, so
+`axnext = (ax κ₀ + ay κ₁ + ap κ₂)/‖·‖` from images already formed for `sas`.
+
+**It is fast and it silently breaks the residual.** Warm, arrays as arguments:
+
+| | baseline | 3→2 | speedup |
+| --- | --- | --- | --- |
+| dense N=2048 / 4096 | 376 / 1507 ms | 252 / 996 ms | 1.49× / 1.51× |
+| `sqd` n=16 / n=18 | 1157 / 6609 ms | 885 / 4654 ms | 1.31× / 1.42× |
+
+Iteration counts and eigenvalues are unchanged. But in float32 the **reported residual understates the
+true one by 59×** (1.23e-08 against 7.23e-07, the true value recomputed in f64 from the returned `x`, `θ`),
+and with `atol=rtol=0` it reaches exactly `0.0`. `r = axnext − θ·xnext` subtracts two quantities that
+*share* the staleness in `axnext`, so the error cancels out of `r` while remaining in `Ax`. Injecting a
+known `ε` into `ax` shows it directly: reported `‖r‖` tracks `ε` (1e-8 → 1.0e-08, 1e-6 → 1.0e-06) while
+the true residual stays at 1.6e-15. Memory also rises **8.00 → 9.00 vectors** (64 → 72 B/slot): holding
+both images until `axnext` extends their live ranges, which XLA had been reusing.
+
+**The root cause, which subsumes every repair attempt below.** The reused image's error **originates in
+the operator application, not the reconstruction**. Isolated: `‖f32 matvec(x) − f64 A·x‖ = 1.2127e-07`,
+and `‖exact-f64 combination of the f32 images − A·x_next‖ = 1.4258e-07` — the drift is fully present with
+an *exact* combination. It is the matvec error already inside `ax`/`ay`/`ap`, mapped through `κ`. So every
+technique that improves *how the three terms are combined* operates on a stage where the error does not
+live. That single fact predicts all of the arms below, and is the reason to stop rather than try another.
+
+**This matches the published bounds, so it is not an artifact of this solver.** The mixed-precision CG
+error analysis (arXiv:2510.11379; and van der Vorst's earlier statement of the same point) finds that the
+**matvec's** rounding dominates the residual gap, that computing inner products in higher precision does
+**not** substantially reduce it, and that "to reduce the size of the residual gap, it is necessary to
+compute an accurate matrix-vector product."
+
+**And the strongest form of compensation has been measured, by someone else, and it buys nothing.**
+Mukunoki, Ozaki, Ogita & Iakymchuk (*HPCAsia 2021*, doi:10.1145/3432261.3432270) run CG with **every**
+inner product *and every matrix-vector multiplication* computed **correctly rounded** via the Ozaki
+scheme — error-free transformations, i.e. the ceiling of what any compensation can achieve, strictly
+beyond Kahan or Dekker. Their Table 2(a), relative true residual against plain FP64 over 8 matrices:
+**median 1.002×, range 0.930–1.147×** — i.e. *unchanged*, and **worse in 3 of 8 cases**. Iteration counts
+do improve (median 1.067×, up to 1.385×) and reproducibility is achieved, which is the paper's actual
+goal; attainable accuracy is not. So correctly-rounded arithmetic — the limit of the entire compensation
+family — does not move the residual gap even when applied to the matvec itself.
+
+The two levers are therefore a *fresh* matvec (baseline) or a *higher-precision* one, and the latter is
+already closed here (`ax` demoted to f32 raises the residual floor 3.1e6×, entry above). The Ozaki /
+error-free-transformation line (OzBLAS) is aimed at reproducibility and accurate BLAS, not at this gap.
+
+**The metric that matters is honesty, not the spurious count.** Honesty is `TRUE‖r‖ / reported‖r‖` at the
+exit iterate over 40 f32 seeds (1.0 = honest, >1 = understates); spurious is `converged=True` under
+`rtol = 4·eps64` on a f32 operator, which must be unsatisfiable.
+
+| arm | honesty (median) | worst | spurious | `sqd` n=18 |
+| --- | --- | --- | --- | --- |
+| **baseline** | **0.95** | 1.70 | **0/100** | 1.00× |
+| naive `(AV)κ` | 9.44 | ∞ | 137/200 | 1.42× |
+| `jnp.sum` over stacked axis | — | — | 66/100 | — |
+| Kahan/Neumaier sums | 9.54 | ∞ | 49/200 | ~1.4× dense |
+| Dekker/Veltkamp exact products + Kahan | 6.51 | ∞ | 140/200 | ~1.4× dense |
+| widened to f64 (arithmetic ceiling) | — | — | 140/200 | — |
+| `|κ|`-ascending order | 10.15 | 50.7 | 23/200 | — |
+| signed-κ ascending | 11.07 | 41.6 | 23/200 | — |
+| signed-κ descending | 9.98 | 505.3 | 38/200 | — |
+| elementwise ascending order | 8.13 | ∞ | 57/200 | — |
+| cycled order (`niter % 6`) | 13.60 | 354.0 | 43/200 | — |
+| periodic refresh, k=8 | — | — | 58/100 | 1.35× |
+| residual-growth trigger | — | — | 10/25 | — |
+| Kahan + k=8 | — | — | 57/200 | ~1.3× |
+| **θ-stagnation trigger** | — | — | **0/100** | **1.10–1.14×** |
+| **Kahan + k=2** | — | — | **0/100** | **1.10×** |
+
+**Every reuse arm sits at honesty 6.5–13.6× against baseline's 0.95, regardless of the arithmetic.**
+Arithmetic accuracy and residual honesty are **uncorrelated**: the arm with the best possible arithmetic
+(Dekker, matching `best(1 rounding)` exactly) is 6.51, the worst arithmetic (cycled order) is 13.60, and
+`|κ|`-ascending is 10.15 despite a 26% error reduction. **Do not rank these arms by spurious count** — it
+is threshold-dependent and rewards a residual that is inflated-but-wrong: `sortkappa`'s 23/200 is the
+*best* spurious count and the *second-worst* honesty, and it still fails the canary on seed 17.
+
+Findings that make each family structural rather than mistuned:
+
+- **Sums: a 13% ceiling.** Exact f64 summation of the *same* three inputs improves the step error only
+  13% (1.348e-07 → 1.177e-07). `jnp.sum` is **bitwise identical** to chained adds here — its advantage is
+  reassociating a long axis, and a 3-long axis admits only `(a+b)+c` (measured gain 1.00× at 3 and 8
+  terms, 3.41× at 64, 7.68× at 1024). `einsum`/`tensordot` are slightly *worse* (2.38e-07).
+- **Products: the gap is real, closing it does not help.** Product rounding is **56.9% of the error by
+  RMS** — a genuine gap that Kahan-on-sums leaves untouched. Dekker/Veltkamp two-product recovers it
+  exactly (`p+e` reproduces `a*b` with **zero error on 100%** of elements) and the combination then
+  matches `best(1 rounding)` (max 2.3785e-07 against naive's 3.5826e-07, a 43% reduction), at **no new
+  N-element temporaries and no measurable time**. It is nonetheless *bit-identical to the f64-widened arm*
+  and scores the same 140/200 — both reach the arithmetic ceiling, and the ceiling is not where the error
+  is.
+- **Ordering: exhausted, and uncorrelated.** Six orderings measured. Term order alone spans 2.64e-07 to
+  3.58e-07 (a 35% effect); ascending is optimal and descending worst, as theory says. Signed-κ ordering is
+  **not a distinct strategy** — it agrees with `|κ|`-ordering on **88.3%** of iterations (both put the
+  dominant `κ₀` last) and is bit-identical on a realistic `κ`; signed-*descending* degenerates to naive
+  exactly. Cycling all six permutations to *decorrelate* the error is the **worst** arm (13.60, max 354×):
+  error coherence was helping, since a fixed order makes the drift a smooth function of the iterate that
+  partly cancels in `r = ax − θx`, while varying it injects fresh noise each step.
+- **A carried compensation term is well-defined, exactly propagable, and useless.** The error recurrence
+  is *exactly linear in the same* `κ`: `d_next = (dx·κ₀ + dy·κ₁ + dp·κ₂)/ν`, verified to **3.6e-16**
+  against `‖d‖ ≈ 8.6e-08`. But seeded from a genuinely fresh state (`d = 0`) it stays **exactly 0.0**
+  while the true drift grows to 1.8e-07 — the recurrence transports *inherited* error perfectly and is
+  blind to error *created* per step. Seeding it from the Dekker tails plus the Kahan compensation is still
+  exactly 0.0, because with exact products and compensated sums **there is no rounding in the combination
+  to capture**. To seed `d` at all you must compare a reused image against a measured one, i.e. pay the
+  matvec — so the scheme degenerates to periodic refresh plus **+3 carried O(N) vectors** (8.00 → 11.00,
+  +37.5% on the floor). Strictly dominated; do not build it.
+- **`⟨x|r⟩` cannot serve as an in-solver drift detector.** The Rayleigh-Ritz invariant does hold — `θ`
+  equals `ρ = ⟨x|Ax⟩` to ±8.9e-16, so `|⟨x|r⟩|/‖Ax‖` sits at ~1.2e-07 ≈ f32 eps in the baseline (normalize
+  by `‖Ax‖`, **not** by `‖r‖`, which is eps/eps ≈ O(1) near convergence and reads as a spurious failure).
+  But it is **flat across every arm** (median-of-max 3.74e-07 baseline against 3.50e-07 naive — the broken
+  arm reads *lower*), and as a discriminator it points backwards: spurious runs median 4.0e-13, honest runs
+  3.6e-07, ranges overlapping over seven decades. The reuse error is **overwhelmingly perpendicular** to
+  `x` (‖err‖ 6.9e-07 = 2.0e-07 parallel + 6.7e-07 perpendicular), and `⟨x|r⟩` is blind to the
+  perpendicular 71% by construction. Projecting the parallel part out
+  (`rnext -= xnext·⟨xnext|rnext⟩`) takes 66/100 → 55/100 — it repairs 29% of a symptom — and is a harmless
+  no-op on the honest baseline. The general rule: **an invariant that `θ` protects cannot report on
+  `ax`'s staleness**, because `θ` is computed from `sas`, i.e. from the fresh-matvec side.
+- **Kahan does not compose with refreshing.** Plain vs +Kahan at k=2/4/8/16: 0/0, 10/9, 58/57, 98/96.
+  The refresh period alone decides the outcome; per-step compensation is irrelevant once error compounds
+  over k iterations.
+- **`‖κ‖ = 1` is necessary but not sufficient.** The paper's safety argument is that `u` is orthogonal so
+  `(AV)u` loses no precision. `eigenpair_3x3` already returns a normalized vector — measured
+  `‖κ‖ = 1.000000` at every iteration — so the condition *held* while the variant failed. The bound
+  controls per-step **amplification** (‖u‖=1 → error stays O(ε); ‖u‖=51 → 50× worse), not **accumulation**
+  across iterations. Their Algorithm 1 line 27, `AW^[k+1] = A W^[k+1]`, is a genuine matvec, so one fresh
+  product per iteration re-injects exact information structurally — the role the baseline's third matvec
+  plays here.
+
+**The literature calls this "loss of attainable accuracy from recurrence-updated residuals"** (Greenbaum,
+*SIAM J. Matrix Anal. Appl.* 18(3):535–551, 1997) and its remedy is **replacement, not compensation**
+(van der Vorst & Ye, *SIAM J. Sci. Comput.* 22(3):835–852, 2000; Sleijpen & van der Vorst, *Computing*
+56(2), 1996). Two things from that literature close the ledger: replacement is **total** — the pipelined
+BiCGStab application (arXiv:1612.01395) resets six quantities, where refreshing only `axnext` leaves
+`ay`/`ap` contaminated, i.e. the shape tested here was wrong — and it costs **+22.1% iterations**
+("delayed convergence"), which is about what 3→2 saves. That cancellation is why both clean arms land at
+~1.10×, from unrelated mechanisms. Their k is also chosen "ad hoc" and "relatively arbitrary", the same
+objection that blocks the θ-trigger's `THETA_REL`.
+
+**Verdict: do not reuse `Ax`.** The honest trade is ~1.10× through `apply_h` for a convergence test that
+must be justified empirically. Both clean arms are also *slower* than the third matvec is expensive once
+their iteration penalty is counted. Unbuilt, and the only thing worth measuring if it is ever reopened:
+**full** replacement (refresh all three images on a rare trigger), the shape the literature actually
+prescribes. Note the dense figures (1.5×) are real — this is wrong for *this* solver's cost profile, not
+wrong in general.
+
+**The canary was decided by luck, and is now a 20-seed sweep.**
+`TestRtolNoneIsDtypeDerived::test_a_float64_literal_rtol_cannot_converge_in_float32` asserts a
+float64-tight `rtol` cannot converge in float32. It ran on `seed=3` only, and **eight broken variants
+passed it** — naive, Kahan, k=8, Kahan+k8, residual-growth, `|κ|`-sorted, signed-κ-sorted and
+cycled-order — because seed 3 is favourable. Both arms now
+`@pytest.mark.parametrize("seed", range(20))`: 40 tests, 0.37 s, and mutation-tested to fail all eight
+(14, 7, 10, 10, 9, 1, 1, 3 of 20 seeds respectively) while both clean arms still pass 40/40. **The margin
+varies a lot** — the two sorted arms fail on only **1 of 20**, so 20 seeds is not generous and a future
+arm could still slip through; the honesty ratio above is the more sensitive instrument and the one to
+reach for when auditing a change here. The generalizable rule: **a canary guarding a silent-wrong-answer
+defect must sweep its fixture, not sample it** — a single draw gave eight broken implementations a ~40%
+chance of clearing the gate, and CLAUDE.md's "sweep `cache_level`, don't sample it" is the same lesson on
+a different axis.
+
+**One reusable mechanical fact:** `lax.cond` restores XLA buffer reuse. The naive variant's +1 vector is a
+*liveness* artifact, not an algorithmic requirement — every arm with a branch on the reuse path measures
+8.00 vectors again.
+
+**Also settled, on the way past:** compensating the solver's O(N) reductions (`⟨x|Ax⟩`, norms) is
+pointless and unshardable. `jnp.sum` is already tree-reduced — relative error ~1.5e-16, flat in N, against
+10–25× worse for naive sequential — and a blocked Kahan `compute_sas` leaves the residual floor
+**bit-identical** (7.8019e-15 at dim=256, 1.9374e-06 at dim=1024) with identical per-seed iteration counts.
+It also *fails* `tests/_sharded_prefilter.py`: compensation needs sequential accumulation over blocks, so
+it reshapes a partitioned axis and `lax.scan` raises `0th dimension of all xs should be replicated. Got
+P('x',)`. **Any compensated reduction here is incompatible with the sharded path**, independent of whether
+it helped. θ's error only rivals `‖r‖` at the floor anyway (4.4e-16 against 1.6e-15), and above it
+contributes nothing.
+
+**And a refinement to the `prefilter_hi` rule.** `pstuermer/LOBPCG` estimates `‖A‖` by 10 power
+iterations — the construct `ground_locg` deleted for returning an excited eigenpair with
+`converged=True`. Not a contradiction: theirs feeds only the residual-norm *denominator*, where
+under-estimating merely tightens the test. The precise rule is that a power-iteration estimate is fine as
+a **convergence-test scale** and unsafe only as a **spectral-filter bound**, which needs a true upper
+bound (Kuczyński–Woźniakowski). Nothing else in that repo transfers: it is block C/OpenMP/MKL, so its
+locking, SVQB, `ortho_drop` and Gram caching all need `m > 1`, and its memory work is manual-allocator
+hygiene (64-byte alignment, `wrk3: 3ns → max(ns, 9s²)`) that a compiler-managed backend does not have.
+Its `project_back` even carries an extra `size × sizeSub` buffer plus a `memcpy` where `ground_locg`
+writes `xnext` directly. Its residual test `‖W‖/(ANorm + |λ|·BNorm)` is, with `B = I`, exactly this
+module's `scale = ‖Ax‖ + |θ|` — independent corroboration of that choice.
+
 ## `precond` was removed; `sqd` defaults to `prefilter=(32, 2)`
 
 2026-08-28, acting on the comparison below.
