@@ -1179,6 +1179,48 @@ class TestIntegerXinitRange:
             )
 
 
+class TestRtolNoneIsDtypeDerived:
+    """``rtol=None`` must resolve against the *promoted* dtype, not a hardcoded float64 constant.
+
+    This is the whole reason ``rtol`` accepts ``None`` while ``atol`` rejects it: the default is the
+    operator dtype's epsilon, which cannot be written as a literal in the signature. Measured on a
+    float32 operator -- ``rtol=None`` converges in 28 iterations, where the float64 literal ``4*eps64``
+    = 8.88e-16 exhausts a 500-iteration cap with ``converged=False``. On float64 the two agree exactly
+    (72 iterations each), so a test at the default dtype alone cannot see the difference.
+    """
+
+    @staticmethod
+    def _operator(dtype, seed=3, dim=24):
+        rng = np.random.default_rng(seed)
+        basis, _ = np.linalg.qr(rng.standard_normal((dim, dim)))
+        mat = basis @ np.diag(np.linspace(-2.0, 3.0, dim)) @ basis.T
+        return (
+            jnp.asarray((mat + mat.T) / 2, dtype=dtype),
+            jnp.asarray(rng.standard_normal(dim), dtype=dtype),
+        )
+
+    def test_a_float64_literal_rtol_cannot_converge_in_float32(self):
+        """The failure a literal default would have caused, asserted directly."""
+        mat, vec = self._operator(jnp.float32)
+        literal = 4.0 * float(np.finfo(np.float64).eps)
+        _eigval, _vec, niter, converged = ground_locg(mat, vec, maxiter=500, rtol=literal)
+        assert not bool(converged), (
+            f"a float64 rtol literal converged on a float32 operator in {int(niter)} iterations -- "
+            "if this now passes, the dtype-derived default is no longer load-bearing and the "
+            "atol/rtol None asymmetry should be revisited"
+        )
+        assert int(niter) == 500, f"expected the iteration cap, got {int(niter)}"
+
+    def test_rtol_none_converges_at_both_precisions(self):
+        """And the derived default does converge, at each dtype, to the same eigenvalue."""
+        for dtype in (jnp.float32, jnp.float64):
+            mat, vec = self._operator(dtype)
+            eigval, _vec, niter, converged = ground_locg(mat, vec, maxiter=500)
+            assert bool(converged), f"rtol=None did not converge at {np.dtype(dtype).name}"
+            assert int(niter) < 500, f"{np.dtype(dtype).name} hit the cap at {int(niter)}"
+            assert eigval == pytest.approx(-2.0, abs=1e-5), f"{np.dtype(dtype).name}: {eigval}"
+
+
 class TestDebugOverloadIsCheckable:
     """A caller must be able to destructure either arity without narrowing first.
 

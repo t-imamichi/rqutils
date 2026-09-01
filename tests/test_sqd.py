@@ -1917,6 +1917,35 @@ class TestAtolAndRtol:
         with pytest.raises(ValueError, match="both 0.0"):
             eigval_of(strings, coeffs, states, atol=0.0, rtol=0.0)
 
+    def test_a_bound_that_reaches_the_operator_norm_raises_on_either_arm(self):
+        """A bound at ``||H||`` accepts anything, so the first iterate "converges" on a wrong answer.
+
+        Every normalized ``v`` satisfies ``||Hv - Ev|| <= ||H||`` (since ``|E| <= ||H||``), so once the
+        bound reaches the operator norm the test carries no information. **Both arms are checked**,
+        because the condition is on the bound and not on which parameter produced it -- an earlier
+        revision guarded only ``rtol``, and ``atol=100`` against ``||H||=17`` was accepted and converged
+        in **one iteration** with ``converged=True``.
+
+        Measured on the superseded ``* n * 10`` rtol scale too: ``rtol=1e-8`` at n=2^20 gave a bound of
+        4.2 against ``||H||=20``. The scale is now ``||Hv|| + |E| <= 2||H||``, so the rtol cutoff is 0.5;
+        the atol cutoff is ``sum|c_k|``, an over-estimate of ``||H||_2`` so it errs toward accepting.
+        """
+        strings, coeffs, states = self._problem()
+        sumabs = float(np.abs(np.asarray(coeffs)).sum())
+        for bad in (0.5, 0.9, 2.0):
+            with pytest.raises(ValueError, match="reach the operator norm"):
+                eigval_of(strings, coeffs, states, rtol=bad)
+        # Strictly inside the rejection region, not exactly on its edge: `sqd` sums the *padded*
+        # coefficient rectangle, so its sum|c_k| differs from this one in the last ulp (measured
+        # 6.473090246765939 here against 6.47309024676594 there) and an `atol == sumabs` arm would be
+        # asserting floating-point associativity rather than the guard.
+        for bad in (sumabs * 1.01, sumabs * 3.0):
+            with pytest.raises(ValueError, match="accepts anything"):
+                eigval_of(strings, coeffs, states, atol=bad, rtol=0.0)
+        # Neither guard may fire on legal input.
+        eigval_of(strings, coeffs, states, rtol=0.49, maxiter=8000)
+        eigval_of(strings, coeffs, states, atol=sumabs * 0.5, rtol=0.0, maxiter=8000)
+
     def test_a_non_numeric_tolerance_raises_typeerror(self):
         """``bool`` is rejected for the reason ``_check_cache_level`` gives: it is an int subclass."""
         strings, coeffs, states = self._problem()
@@ -1960,18 +1989,33 @@ class TestAtolAndRtol:
         )
         assert loose < 1e-4, f"the loose arm should still bound the residual, got {loose:.3e}"
 
-    def test_the_default_pair_scales_with_dimension(self):
-        """``atol=0.0, rtol=None`` is the pre-2026-08-31 relative form: one value, per-N bound.
+    def test_rtol_scales_with_the_operator_and_not_with_dimension(self):
+        """``rtol`` is a fraction of ``||Hv|| + |E|``, so it tracks ``||H||`` and **not** ``N``.
 
-        This is the property a single ``atol`` cannot have, and the reason ``rtol`` exists. The delivered
-        residual must **grow** with N under one unchanged tolerance.
+        Both halves are asserted, because the earlier form conflated them. Scaling the coefficients 100x
+        must move the delivered residual ~100x; growing ``N`` at fixed coefficients must **not** move it
+        materially. A test varying both at once cannot attribute the difference to either -- an earlier
+        revision of this test did exactly that (6 vs 10 qubits *and* 12 vs 200 states) and passed against
+        a formula with no dimension term at all.
         """
-        small = self._problem(num_states=12)
+        strings, coeffs, states = self._problem(num_qubits=8, num_states=40)
+        r_1x = self._residual(strings, coeffs, states, maxiter=8000)
+        r_100x = self._residual(strings, np.asarray(coeffs) * 100.0, states, maxiter=8000)
+        ratio = r_100x / r_1x
+        assert 20.0 < ratio < 500.0, (
+            f"rtol should track ||H||: 100x coefficients moved the residual {ratio:.1f}x, "
+            f"expected ~100x ({r_1x:.3e} -> {r_100x:.3e})"
+        )
+
+        # Same Hamiltonian, ~7x the subspace. The bound is N-independent now, so the residuals must
+        # stay within an order of magnitude -- under the old `* n * 10` scale this was ~7x by construction.
+        small = self._problem(num_qubits=10, num_states=30)
         large = self._problem(num_qubits=10, num_states=200)
-        r_small = self._residual(*small, maxiter=8000)
-        r_large = self._residual(*large, maxiter=8000)
-        assert r_large > r_small, (
-            f"the relative default did not scale with N: small={r_small:.3e} large={r_large:.3e}"
+        r_s = self._residual(*small, maxiter=8000)
+        r_l = self._residual(*large, maxiter=8000)
+        assert 0.1 < r_l / r_s < 10.0, (
+            f"rtol must not scale with N: {len(np.unique(small[2], axis=0))} states gave {r_s:.3e}, "
+            f"{len(np.unique(large[2], axis=0))} gave {r_l:.3e} ({r_l / r_s:.1f}x)"
         )
 
     def test_the_default_converges_and_is_accurate(self):

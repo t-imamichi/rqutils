@@ -166,28 +166,45 @@ orthonormal by construction.
 Iteration
 ---------
 
-- **Convergence threshold.** ``tol`` is an **absolute** bound on the eigen-residual
-  :math:`\|Ax - \theta x\|_2`. The achievable floor is
+- **Convergence threshold.** Two independent tolerances, satisfied by **either**:
+
+  .. math:: \|r\| < \max\bigl(\mathrm{atol},\ \mathrm{rtol}\,(\|Ax\| + |\theta|)\bigr)
+
+  ``atol`` is an absolute bound on :math:`\|Ax - \theta x\|_2`, so a caller whose consumer checks a
+  fixed residual can name it and have it hold at every :math:`n`. ``rtol`` is a *fraction of the
+  operator magnitude* -- the conventional meaning, as in :func:`numpy.allclose` -- and since
+  :math:`\|Ax\| \approx |\theta|` at convergence its bound is :math:`\approx 2\,\mathrm{rtol}\|A\|_2`,
+  independent of the dimension. The ``max`` is what makes the pair strictly more expressive than either
+  alone: a purely relative test cannot name a residual, and a purely absolute one cannot track an
+  operator whose scale the caller does not know.
+
+  The achievable floor is
 
   .. math:: \mathrm{floor}(\|r\|) \approx \varepsilon(\mathrm{dtype}) \cdot \|A\|_2
 
-  with no dependence on the dimension :math:`n` -- measured over :math:`n = 70` to
-  :math:`32768` and :math:`\|A\|_2` over six decades, on both the dense and matrix-free paths and
-  both real and complex coefficients (27 samples: the constant above spans 0.49-1.26 with median
-  0.84, while the :math:`n`-scaled form :math:`\varepsilon\|A\|n` spans 306x).
+  with **no** dependence on :math:`n` -- measured over :math:`n = 70` to :math:`32768` and
+  :math:`\|A\|_2` over six decades, on both the dense and matrix-free paths and both real and complex
+  coefficients (27 samples: the constant spans 0.49-1.26 with median 0.84, while the :math:`n`-scaled
+  form :math:`\varepsilon\|A\|n` spans 306x). ``rtol=None`` targets :math:`8\varepsilon\|A\|_2`, 8x that
+  floor.
 
-  This **replaced a relative test**, :math:`\|r\| < \mathrm{tol}\,(\|Ax\| + |\theta|)\,n \cdot 10`,
-  whose :math:`n \cdot 10` factor was 700x-94600x looser than the floor across that sweep. It was
-  slack rather than a rounding budget, and it is why no single value of the old relative ``tol``
-  could be simultaneously fast and admissible for a caller with a fixed residual requirement: the
-  same ``tol`` meant a different absolute residual at every :math:`n`.
+  **Two earlier forms, both superseded, and the reasons matter.** A relative test
+  :math:`\|r\| < \mathrm{tol}\,(\|Ax\| + |\theta|)\,n \cdot 10` carried an :math:`n \cdot 10` factor that
+  was 700x-94600x looser than the floor -- slack, not a rounding budget -- so one ``tol`` meant a
+  different absolute residual at every :math:`n` and no single value could be both fast and admissible
+  for a caller with a fixed requirement. Replacing it with a *purely* absolute ``tol`` then removed the
+  ability of one value to track the operator at all, and made the default 1.18-1.49x slower. Neither
+  factor of that :math:`n \cdot 10` survives here: folding a dimension count into a "relative"
+  tolerance made it unpredictable and, at large :math:`n`, dangerous -- ``rtol=1e-8`` at
+  :math:`n = 2^{20}` gave a bound of 4.2 against :math:`\|A\| = 20`, so the first iterate reported
+  convergence and returned a wrong answer. :func:`rqutils.sqd.sqd` now rejects ``rtol >= 0.5``.
 
-  Two traps the old form recorded, still worth keeping visible because they constrain any future
-  change here: the natural-looking ``norm(Ax) - theta`` is a difference of two nearly equal large
-  positive numbers for a positive-definite operator and was measured going *negative*, making the
-  test unsatisfiable; and :math:`|\theta|` rather than :math:`+\theta` was needed because for the
-  negative-definite operators typical of a ground-state search :math:`+\theta` cancels in turn.
-  Neither applies to the absolute form, which references no such sum.
+  Two traps the relative form recorded, still worth keeping visible because they constrain any future
+  change to the scale: the natural-looking ``norm(Ax) - theta`` is a difference of two nearly equal
+  large positive numbers for a positive-definite operator and was measured going *negative*, making the
+  test unsatisfiable; and :math:`|\theta|` rather than :math:`+\theta` is needed because for the
+  negative-definite operators typical of a ground-state search :math:`+\theta` cancels in turn. The
+  second still applies -- the scale here is that same sum.
 
 - **Basis orthogonality.** :math:`t` is re-orthogonalized against the new :math:`x` before
   normalization, or :math:`y` drifts into :math:`x` and the standard Rayleigh-Ritz step returns a
@@ -376,8 +393,16 @@ def _check_tols(atol: Any, rtol: Any, opnorm_bound: float, dtype: DTypeLike) -> 
     * ``atol`` is an absolute residual bound. ``None`` is **rejected**: a derived absolute bound is the
       unintuitive construct this pair replaced, and 0.0 already expresses "no absolute arm". Negative is
       rejected; 0.0 is legal and means exactly that.
-    * ``rtol`` is a multiplier on ``(||Ax|| + |theta|) * n * 10``. ``None`` is accepted and resolves to
-      the operator dtype's epsilon (see :func:`ground_locg`). Negative is rejected; 0.0 disables the arm.
+    * ``rtol`` is a fraction of ``||Ax|| + |theta|``, i.e. dimension-independent. ``None`` is accepted
+      and resolves to ``4 * eps`` (see :func:`ground_locg`). Negative is rejected, 0.0 disables the arm,
+      and ``>= 0.5`` is rejected because the bound would then reach ``||A||`` and any vector would pass.
+
+    **Why only one of them takes ``None``**, since the asymmetry invites the question. ``rtol``'s default
+    is the *promoted operator dtype's* epsilon, which cannot be written as a literal in the signature: a
+    hardcoded ``8.88e-16`` is right for float64 and unsatisfiable by 1.3e8x on a float32 problem, which
+    ``tests/test_ground_locg.py`` exercises. ``None`` is the only way to defer that to runtime. ``atol``
+    has no such excuse -- there is no dtype-derived absolute residual a caller would want -- so it takes
+    a plain 0.0 and ``None`` is an error rather than a synonym for it.
 
     **The floor check fires only when ``atol`` is the sole arm.** The achievable residual floor is
     ``eps * ||H||_2``, so a below-floor ``atol`` cannot be met -- but with ``rtol > 0`` the relative arm
@@ -427,7 +452,34 @@ def _check_tols(atol: Any, rtol: Any, opnorm_bound: float, dtype: DTypeLike) -> 
         raise ValueError(
             "atol and rtol are both 0.0, so no residual can satisfy the convergence test and the "
             "solve would exhaust maxiter. Set atol to the residual you need, or rtol=None to use "
-            "the dtype epsilon against the (||Hv|| + |E|) * N * 10 scale."
+            "4*eps as a fraction of (||Hv|| + |E|)."
+        )
+    # A bound that reaches ||H|| is not a tolerance, it is an accept-anything: every normalized vector
+    # satisfies ||Hv - Ev|| <= ||H|| (since |E| <= ||H||), so the first iterate reports convergence and
+    # the returned eigenpair is arbitrary -- with converged=True, the failure mode this module keeps
+    # guarding against. Measured on BOTH arms: atol=100 against ||H||=17 converged in *one* iteration,
+    # and on the superseded `* n * 10` rtol scale, rtol=1e-8 at n=2^20 gave a bound of 4.2 vs ||H||=20.
+    #
+    # The condition is on the bound, not on which parameter produced it, so both arms are checked. For
+    # `rtol` the scale is `||Hv|| + |E| <= 2||H||`, so the cutoff is rtol >= 0.5. For `atol` the bound is
+    # the value itself, compared against `opnorm_bound` -- which is sum|c_k|, an over-estimate of ||H||_2
+    # (measured 1.56-1.90x on 1D XXZ), so this errs toward accepting. Both are deliberately loose: they
+    # catch the accept-anything case without second-guessing a caller who wants a sloppy solve.
+    if rtol is not None and float(rtol) >= 0.5:
+        raise ValueError(
+            f"rtol={float(rtol):.3e} makes the convergence bound reach the operator norm "
+            f"(the scale is ||Hv|| + |E| <= 2||H||, so the bound is up to {2 * float(rtol):.2f}*||H||). "
+            "Every normalized vector satisfies ||Hv - Ev|| <= ||H||, so the first iterate would report "
+            "convergence and the returned eigenpair would be arbitrary. rtol is a *fraction* of the "
+            "operator magnitude: pass something well below 0.5, or use atol for an absolute bound."
+        )
+    if atol >= float(opnorm_bound):
+        raise ValueError(
+            f"atol={atol:.3e} is at or above the operator norm bound sum|c_k|="
+            f"{float(opnorm_bound):.4g}, so it accepts anything: every normalized vector satisfies "
+            "||Hv - Ev|| <= ||H||, and the solve would report convergence on its first iterate with an "
+            "arbitrary eigenpair (measured: atol=100 against ||H||=17 converged in 1 iteration). Pass "
+            "an atol well below the operator scale."
         )
     if atol > 0.0 and rtol_is_zero:
         floor = residual_floor(opnorm_bound, dtype)
@@ -693,39 +745,51 @@ def ground_locg(
             spans 306x). An ``atol`` below that floor is unreachable **when ``rtol`` is zero**;
             :func:`rqutils.sqd.sqd` rejects that combination. With a non-zero ``rtol`` it is harmless,
             because the relative arm can still fire.
-        rtol: **Relative** tolerance, multiplying the scale
+        rtol: **Relative** tolerance -- a fraction of the operator magnitude:
 
-            .. math:: \mathrm{scale} = (\|Ax\| + |\theta|)\,n \cdot 10
+            .. math:: \|r\| < \mathrm{rtol}\,(\|Ax\| + |\theta|)
 
-            so the effective bound is :math:`\mathrm{rtol} \cdot \mathrm{scale}`. If ``None`` (the
-            default), the operator dtype's machine epsilon is used -- :math:`2.22\times10^{-16}` for
-            float64/complex128, giving an effective bound of roughly
-            :math:`20\,\mathrm{eps}\,\|A\|_2\,n` since :math:`\|Ax\| \approx |\theta|` at convergence.
-            Measured, that is 1.9e-11 at :math:`n = 256` and 4.4e-10 at :math:`n = 4096`. Pass ``0.0``
-            to disable the arm.
+            This is the conventional meaning, as in :func:`numpy.allclose` and :mod:`scipy`: ``rtol`` is
+            dimensionless, and :math:`(\|Ax\| + |\theta|)` supplies the units, since :math:`\|r\|` scales
+            with :math:`\|A\|`. Since :math:`\|Ax\| \approx |\theta|` at convergence the bound is
+            :math:`\approx 2\,\mathrm{rtol}\|A\|_2` -- **independent of the dimension**, so one value
+            means the same thing at every :math:`n`.
 
-            :math:`|\theta|` rather than :math:`+\theta` because the sum must not cancel for either
-            sign, and a ground-state search is typically negative-definite; the natural-looking
+            If ``None`` (the default), :math:`4\varepsilon` is used, targeting :math:`8\varepsilon\|A\|_2`
+            -- 8x the measured floor of :math:`\varepsilon\|A\|_2`, the same 3.2x margin over the worst
+            observed floor constant that :func:`residual_floor` applies. Pass ``0.0`` to disable the arm.
+
+            :math:`|\theta|` rather than :math:`+\theta` because the sum must not cancel for either sign,
+            and a ground-state search is typically negative-definite; the natural-looking
             ``norm(Ax) - theta`` was measured going *negative* for a positive-definite operator, which
             makes the test unsatisfiable.
 
-            The point of this arm is that **one value covers several dimensions**. A pipeline solving at
-            :math:`n = 4596` and :math:`n = 2.7\times10^6` in one run gets a per-dimension bound from a
-            single ``rtol``; a single ``atol`` cannot be right for both. The :math:`n \cdot 10` factor is
-            *slack* rather than a rounding budget (the floor above has no :math:`n` term), and it is
-            retained deliberately -- that slack is the scaling property.
+            **An earlier form multiplied this by** :math:`n \cdot 10`, **and that is gone.** Neither
+            factor was a rounding budget -- the floor has no :math:`n` term (measured over
+            :math:`n = 70..32768`: the :math:`\varepsilon\|A\|` constant spans 2.6x where the
+            :math:`n`-scaled form spans 306x) -- and folding a dimension count and a bare 10 into a
+            "relative" tolerance made it unpredictable and, at large :math:`n`, dangerous: ``rtol=1e-8``
+            at :math:`n = 2^{20}` produced a bound of 4.2 against :math:`\|A\| = 20`, so the solve
+            converged on the first iterate and returned a wrong answer with ``converged=True``. The dial
+            also saturated, ``rtol=1e-6`` and ``1e-4`` giving bit-identical results.
 
-            **Convergence is** ``||r|| < max(atol, rtol * scale)`` **-- either arm suffices.** So
-            ``atol=0.0, rtol=None`` (the defaults) is the pre-2026-08-31 relative behaviour exactly;
-            ``atol=x, rtol=0.0`` is the absolute-only behaviour that briefly *was* ``tol``; and setting
-            both takes whichever is looser, which is usually what a caller wants.
+            The cost is real and worth stating: **one ``rtol`` no longer scales itself across
+            dimensions.** A caller that needs a different bound per subspace size sets ``atol`` per call
+            instead. :func:`rqutils.sqd.sqd` rejects ``rtol >= 0.5``, where the bound would reach
+            :math:`\|A\|` and every vector would "converge".
+
+            **Convergence is** ``||r|| < max(atol, rtol * scale)`` **-- either arm suffices**, so
+            ``atol=x, rtol=0.0`` is absolute-only, ``atol=0.0`` with a non-zero ``rtol`` is
+            relative-only, and setting both takes whichever is looser.
 
             .. warning::
 
-               **``tol`` is gone, twice over.** It was relative until 2026-08-31, absolute after, and is
-               now removed in favour of this pair -- a rename with no alias, so ``tol=`` raises
-               ``TypeError`` rather than silently meaning one of the two. A caller who had
-               ``tol=x`` on the *relative* form wants ``rtol=x``; on the *absolute* form, ``atol=x``.
+               **``tol`` is gone, and it had two meanings.** Relative (against an
+               :math:`n`-scaled bound) until 2026-08-31, absolute after. There is no alias:
+               ``tol=`` raises ``TypeError`` rather than silently resolving to one of the pair.
+               From the absolute form, ``tol=x`` becomes ``atol=x``. From the relative form there is
+               **no exact equivalent**, because the :math:`n \cdot 10` factor is not reproduced;
+               ``rtol`` gives per-operator scaling only.
         vspace: Specification (dimension, dtype) of the vector space. Required only when ``mat`` is
             a callable and ``xinit`` is an integer.
         prefilter_hi: Upper bound on :math:`\lambda_{\max}`, used as the filter's upper interval
@@ -1093,17 +1157,30 @@ def _ground_locg_callable(
         # see how much headroom a given `tol` has.
         # Two independent tolerances, satisfied by EITHER -- hence `max`, not `min`:
         #
-        #     ||r|| < max(atol, rtol * (||Ax|| + |theta|) * n * 10)
+        #     ||r|| < max(atol, rtol * (||Ax|| + |theta|))
         #
         # `atol` bounds the residual absolutely, so a caller with a fixed requirement (a downstream
-        # guard at 1e-6) can name it and have it hold at every `n`. `rtol` scales with the operator and
-        # the dimension, so one value covers a pipeline that solves at several `n` in one run -- the
-        # property the pre-2026-08-31 relative form had, and the reason it is back rather than replaced.
+        # guard at 1e-6) can name it and have it hold at every dimension. `rtol` is a *fraction of the
+        # operator magnitude* -- the conventional meaning, as in `np.allclose` and `scipy` -- so it needs
+        # the `(||Ax|| + |theta|)` factor and nothing else: ||r|| has units of ||A||, and dividing by
+        # something with those units is what makes `rtol` dimensionless.
+        #
+        # The pre-2026-08-31 form multiplied this by a further `n * 10`, and that is deliberately gone.
+        # Neither factor was a rounding budget -- the achievable floor is eps*||A|| with no `n` term
+        # (measured over n=70..32768: `floor/(eps||A||)` spans 2.6x where `floor/(eps||A||n)` spans
+        # 306x) -- and folding a dimension count and a bare 10 into a "relative" tolerance made it
+        # unpredictable and, at large `n`, actively dangerous: `rtol=1e-8` at n=2^20 produced a bound of
+        # 4.2 against ||A|| = 20, i.e. 21% of the operator norm, so the solve converged immediately and
+        # returned a wrong answer with `converged=True`. The dial also saturated -- rtol=1e-6 and 1e-4
+        # returned bit-identical answers, the `p_is_zero` route firing before the tolerance did.
+        #
+        # The cost is that one `rtol` no longer scales itself across dimensions; a caller needing that
+        # sets `atol` per dimension instead. `sqd` now rejects an `rtol` whose bound reaches ||A||.
         #
         # `abs(theta)` rather than `+theta`: the sum must not cancel for either sign of theta, and a
         # ground-state search is typically negative-definite. The natural-looking `norm(Ax) - theta` was
         # measured going *negative* for a positive-definite operator, making the test unsatisfiable.
-        reltol = (jnp.linalg.norm(axnext) + jnp.abs(theta)) * xcurr.shape[0] * 10
+        reltol = jnp.linalg.norm(axnext) + jnp.abs(theta)
         # A zeroed search direction means {x, y} already spans the residual: we are at a stationary
         # point of the Rayleigh quotient and no further iteration can lower theta.
         converged = jnp.logical_or(norm_rnext < jnp.maximum(atol, rtol * reltol), p_is_zero)
@@ -1176,10 +1253,15 @@ def _ground_locg_callable(
         # exactly the unintuitive thing this pair replaced -- an absolute residual is either a number the
         # caller wants or it is not wanted at all.
         #
+        # 4*eps, not eps: the scale is now `||Ax|| + |theta|` ~ 2*||A||, so `rtol = eps` would target
+        # 2*eps*||A||, only 2x the measured floor of eps*||A|| -- and that floor's constant spans
+        # 0.49-1.26 over 27 samples, so a 2x target sits inside the noise. 4*eps gives 8x the floor,
+        # which is the same 3.2x margin over the worst observed constant that `residual_floor` uses.
+        #
         # Derive it from the operator dtype, not from the initial guess: a float32 xinit on a complex128
         # problem would otherwise silently loosen this by nine orders of magnitude. `work_dtype` is
         # already that promotion.
-        rtol = float(jnp.finfo(work_dtype).eps)
+        rtol = 4.0 * float(jnp.finfo(work_dtype).eps)
 
     state, diag1 = body_iter1(seed.x, seed.r, seed.ax, rho_init)
     if debug:

@@ -611,31 +611,35 @@ def sqd(
             :math:`\|Hv - Ev\| < 10^{-6}` at **every** :math:`N`, which no relative tolerance can
             express. ``None`` is **rejected** -- pass ``0.0`` to disable the arm, since a *derived*
             absolute bound is the unintuitive construct this pair replaced.
-        rtol: **Relative** tolerance, multiplying :math:`(\|Hv\| + |E|)\,N \cdot 10`. ``None`` (the
-            default) uses the operator dtype's machine epsilon, which is the behaviour this library had
-            before 2026-08-31: an effective bound of roughly :math:`20\,\varepsilon\,\|H\|_2 N`, since
-            :math:`\|Hv\| \approx |E|` at convergence. Measured, that is 1.9e-11 at :math:`N = 256` and
-            4.4e-10 at :math:`N = 4096`. Pass ``0.0`` to disable the arm.
+        rtol: **Relative** tolerance -- a fraction of the operator magnitude,
+            :math:`\|r\| < \mathrm{rtol}\,(\|Hv\| + |E|)`. The conventional meaning, as in
+            :func:`numpy.allclose`: dimensionless, with the bracket supplying the units. Since
+            :math:`\|Hv\| \approx |E|` at convergence the bound is :math:`\approx 2\,\mathrm{rtol}\|H\|_2`
+            -- **independent of** :math:`N`, so one value means the same thing at every subspace size.
 
-            One ``rtol`` covers **several dimensions**, which is its reason for existing: a pipeline
-            solving at :math:`N = 4596` and :math:`N = 2.7\times10^6` in one run gets a per-dimension
-            bound from a single value, where a single ``atol`` cannot be right for both. Note :math:`N`
-            is the **padded** ``states_size``, not the live count, so the bound steps at powers of two.
+            ``None`` (the default) uses :math:`4\varepsilon`, targeting :math:`8\varepsilon\|H\|_2`, 8x
+            the measured achievable floor. Pass ``0.0`` to disable the arm.
 
-            **Convergence is** ``||r|| < max(atol, rtol * scale)`` **-- either arm suffices.** So the
-            defaults (``atol=0.0, rtol=None``) reproduce the pre-2026-08-31 relative behaviour exactly,
-            ``atol=x, rtol=0.0`` gives absolute-only behaviour, and setting both takes whichever is
-            looser -- usually what a caller wants.
+            **Convergence is** ``||r|| < max(atol, rtol * scale)`` **-- either arm suffices.** So
+            ``atol=x, rtol=0.0`` is absolute-only, ``atol=0.0`` with a non-zero ``rtol`` is
+            relative-only, and setting both takes whichever is looser -- usually what a caller wants.
 
             .. warning::
 
-               **``tol`` is removed, and it had two different meanings.** It was *relative* up to
-               2026-08-31 and *absolute* after. There is no alias: ``tol=`` raises ``TypeError`` rather
-               than silently resolving to one of the pair. Migrating from the relative form, ``tol=x``
-               becomes ``rtol=x``; from the absolute form, ``atol=x``. A bare call with neither is the
-               relative form, so the 1.18-1.49x default slowdown the absolute-``tol`` revision
-               introduced is **undone** -- at the cost of a default bound that varies with :math:`N`
-               again, which is precisely the trade this pair exists to let the caller make.
+               **``tol`` is removed, and it had two different meanings.** It was *relative* against an
+               :math:`N`-scaled bound up to 2026-08-31, and *absolute* after. There is no alias:
+               ``tol=`` raises ``TypeError`` rather than silently resolving to one of the pair.
+               From the absolute form, ``tol=x`` becomes ``atol=x``. From the relative form there is
+               **no exact equivalent** -- see below.
+
+            The pre-2026-08-31 relative form multiplied the scale by a further :math:`N \cdot 10`, and
+            that is **not** reproduced. Neither factor was a rounding budget (the floor has no :math:`N`
+            term, measured), and folding a dimension count into a "relative" tolerance made it
+            unpredictable and, at large :math:`N`, dangerous -- ``rtol=1e-8`` at :math:`N = 2^{20}` gave
+            a bound of 4.2 against :math:`\|H\| = 20`, so the solve converged on the first iterate and
+            returned a wrong answer with ``converged=True``. **A caller needing a different bound per
+            subspace size sets ``atol`` per call.** ``rtol >= 0.5`` is rejected, being the range where
+            the bound reaches :math:`\|H\|`.
 
             An ``atol`` below the achievable floor :math:`4\,\varepsilon\sum_k|c_k|` is rejected **only
             when ``rtol`` is zero**, since otherwise the relative arm can still fire. See ``Raises`` and
@@ -751,8 +755,10 @@ def sqd(
             ``prefilter`` entry is negative -- see :func:`rqutils.ground_locg._check_prefilter`, which explains why a
             negative value would otherwise be absorbed as a silent no-op; if ``atol`` is ``None`` or
             either tolerance is negative; if **both** tolerances are zero, leaving no satisfiable
-            criterion; or if ``atol`` is below the achievable eigen-residual floor
-            :math:`4\,\varepsilon\sum_k|c_k|` **while** ``rtol`` is zero, so no arm can fire.
+            criterion; if ``atol`` is below the achievable eigen-residual floor
+            :math:`4\,\varepsilon\sum_k|c_k|` **while** ``rtol`` is zero, so no arm can fire; or if
+            ``rtol`` is at least 0.5, where its bound reaches :math:`\|H\|_2` and any vector would
+            report convergence.
         TypeError: If ``cache_level`` is not a pair of ints, or ``prefilter`` is neither None nor a
             ``(degree, cycles)`` pair of ints.
     """
@@ -853,7 +859,7 @@ def sqd(
             "crossed the threshold at 1091. Loosening a tolerance is the other lever: `atol` is an "
             f"absolute residual bound whose floor for this operator is "
             f"{_residual_floor_of(hamiltonian):.3e}, so any value above that is reachable in "
-            "principle; `rtol` scales with (||Hv|| + |E|) * N * 10 instead. A genuinely "
+            "principle; `rtol` is a fraction of (||Hv|| + |E|) instead. A genuinely "
             "ill-conditioned subspace is the rarer cause."
         )
     if return_eigvec:
@@ -1090,7 +1096,7 @@ def run_sqd(
         maxiter: Maximum LOBPCG iterations, forwarded to :func:`rqutils.ground_locg.ground_locg`.
             Static, as it is there.
         atol: Absolute bound on the eigen-residual ``||Hv - Ev||``; ``rtol``: relative tolerance on
-            ``(||Hv|| + |E|) * N * 10``. Convergence is the ``max`` of the two, so either suffices.
+            ``||Hv|| + |E|``. Convergence is the ``max`` of the two, so either suffices.
             Both forwarded to :func:`rqutils.ground_locg.ground_locg` and validated in :func:`sqd`,
             which is where ``sum|c_k|`` is concrete -- this function is jitted, so it cannot raise.
         prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter, forwarded to
