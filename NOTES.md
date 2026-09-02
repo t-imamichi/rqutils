@@ -2379,6 +2379,76 @@ default (4.60 → 2.49 ms warm, best of 5, N=800). An earlier draft carried over
 `n · 10` default — a different quantity. A tolerance ratio is only meaningful beside the definition it was
 taken under, which is the same trap the requester's own table fell into.
 
+### Davidson vs `ground_locg`: the two regimes split, and memory is the axis that decides it (2026-09-02)
+
+Asked because `diaglib` ships both algorithms, so the paper's headline claim ("Davidson remains the best
+choice for most applications; LOBPCG is competitive, especially when memory is an issue") could be checked
+against this module rather than taken on trust. Comparison is by **matvec count**, not wall-clock — a
+50-line NumPy Davidson against a jitted JAX solver says nothing about time, and matvecs are the currency
+for a matrix-free method anyway.
+
+**Memory, from `diaglib`'s own allocations rather than a benchmark.** `davidson_driver` allocates
+`space(n,lda)` *and* `aspace(n,lda)` with `lda = dim_dav·n_max`, so its footprint is **linear in history
+depth**; `lobpcg_driver` allocates `3·n_max` blocks plus temporaries. Per eigenpair:
+
+| | vectors/eigenpair | at N = 18 360 640, 50 states |
+| --- | --- | --- |
+| Davidson, depth 25 | **51** | 384 GB (paper reports ~356) |
+| `diaglib` LOBPCG | 9 | 68 GB (paper reports ~55) |
+| **`ground_locg`, m=1** | **8 total** | **1.1 GB** |
+
+The model reproduces the paper's published numbers within 8–23% (the gap is their locking shrinking
+`n_act`), so it is sound. `ground_locg` is a further step past `diaglib`'s LOBPCG purely by being
+block-size-1.
+
+**Matvecs at matched memory — the comparison that is not obvious.** Davidson at depth 25 looks dominant,
+but that is 54 O(N) vectors against 8. Sweeping depth, median over 5 seeds, `n=512`, `rtol=1e-10`, all
+arms 5/5 converged:
+
+| | depth 3 (10 vec) | depth 5 (14) | depth 10 (24) | depth 25 (54) | **`ground_locg` (8 vec)** |
+| --- | --- | --- | --- | --- | --- |
+| diagonally dominant | **390** | 311 | 241 | 213 | **731** |
+| dense non-dominant | **580** | 276 | 126 | 103 | **404** |
+
+**The two regimes split, reproducing the paper's conclusion:** at comparable memory Davidson is **1.9×
+better on the diagonally dominant** fixture (390 vs 731 — its Jacobi preconditioner exploits the
+dominance) and **1.4× worse on the non-dominant** one (580 vs 404). Davidson's headline advantage is
+bought with memory, very nearly linearly: on the dense fixture 580 → 103 matvecs (5.6×) costs 10 → 54
+vectors (5.4×).
+
+**Which row applies to `sqd` is the non-dominant one.** The projected `H` is not diagonally dominant —
+that is the structural reason `precond` is closed (see below) — and `N` is the binding constraint. So the
+regime where `ground_locg` wins at matched memory is the regime `sqd` is in. Reassuring rather than
+surprising, but it had never been measured.
+
+**Accuracy: comparable, and `ground_locg` is better at the floor.** Eigenvalue errors agree within ~1.5×
+at usable tolerances. Driving `rtol` to `4·eps`, Davidson reports `conv=False` on both fixtures while
+`ground_locg` converges, reaching a **10× lower true residual** on the dense case (2.42e-14 against
+2.96e-13). That is the fixed 2-pass orthogonalization of the next entry earning its keep.
+
+**A thick restart is the one place `(AV)u` reuse is legitimate, and the distinction is worth stating.**
+The first Davidson written here restarted on a single Ritz vector; `diaglib` re-seeds with `n_max`
+(`dcopy(n_max*n,evec,1,space,1)`). Fixing it to keep the `k` lowest Ritz vectors — `V ← V·S[:,:k]`,
+`AV ← AV·S[:,:k]` — is exact: measured `‖VkᵀVk − I‖ = 1.8e-15` and `‖AVk − A·Vk‖ = 2.4e-14`. This is the
+same `(AV)u` form the reuse investigation above shows corrupting the residual, and it is safe **because
+`S` is orthogonal *and* `V`/`AV` are current, not stale**. Accumulated staleness is the defect, not the
+matmul. `‖u‖ = 1` alone was never the sufficient condition.
+
+**Two negatives worth keeping.** First, the thick restart barely matters at shallow depth (384 vs 394 at
+depth 3, identical at 290 on the dense fixture), so the suspicion that a thin restart handicapped Davidson
+was **wrong** — it only helps at depth 10–25 (263 vs 266, 210 vs 226). Second, `n_keep = max_dav - 1`
+**stalls outright**: the retained Ritz vectors plus one new direction refill the space every iteration, so
+the subspace never grows — measured 6001 matvecs and error **2.3** (wrong answer, non-convergent) at
+`max_dav=3, n_keep=2`, where `n_keep=1` converges in 374. Any thick restart needs `n_keep ≤ max_dav - 2`.
+
+**Caveats on the whole comparison.** Synthetic dense fixtures at `n=512`, not a physical Hamiltonian —
+CLAUDE.md warns a physically-motivated fixture can invert a synthetic conclusion, so the matvec ratios
+should be re-measured on `xxz_krylov` and through `apply_h` before being quoted as load-bearing. The
+Davidson is a faithful-but-minimal reimplementation (no locking, no Cholesky `ortho_cd` with level
+shifting, single eigenpair), which is adequate for counting matvecs and comparing eigenvalue error and
+nothing else. The memory table, being read off `diaglib`'s allocations and cross-checked against the
+paper, does not depend on it.
+
 ### The fixed 2-pass re-orthogonalization beats `diaglib`'s adaptive loop on its own metric (2026-09-02)
 
 `_project_out` runs `_subtract_projections` twice, then twice more; `_reorthogonalize` defaults

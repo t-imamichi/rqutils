@@ -285,6 +285,15 @@ Single-vector (block-size-1) LOBPCG specialization used as `sqd`'s eigensolver, 
 step solved analytically (`eigenpair_2x2`, `eigenpair_3x3` via Cardano) rather than via `eigh`, to keep
 memory down for huge vectors.
 
+**Why LOBPCG rather than Davidson, measured against `diaglib`'s implementation of both.** Davidson's
+footprint is *linear in history depth* (51 vectors/eigenpair at its competitive depth 25, against
+`ground_locg`'s measured 8), and it buys its matvec advantage with that memory almost linearly. At
+*matched* memory the two regimes split: Davidson is ~1.9x better on a diagonally dominant operator, and
+~1.4x worse on a non-dominant one. `sqd`'s projected `H` is **not** diagonally dominant — the same fact
+that closes `precond` — and `N` is the binding constraint, so this is the regime where LOBPCG wins.
+Accuracy is comparable, with `ground_locg` better at the residual floor. Don't switch algorithms without
+redoing that measurement on a physical Hamiltonian.
+
 **Every guard in it is load-bearing and was measured**; `docs/locg.md` catalogues seven defects that each
 failed *silently* (it is stale on scope and line numbers). Don't "simplify" the balancing, the
 re-orthogonalizations or the zero-direction masks, don't unify `body_iter1`'s exclusion bound with
