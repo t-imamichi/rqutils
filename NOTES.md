@@ -2379,6 +2379,55 @@ default (4.60 → 2.49 ms warm, best of 5, N=800). An earlier draft carried over
 `n · 10` default — a different quantity. A tolerance ratio is only meaningful beside the definition it was
 taken under, which is the same trap the requester's own table fell into.
 
+### The fixed 2-pass re-orthogonalization beats `diaglib`'s adaptive loop on its own metric (2026-09-02)
+
+`_project_out` runs `_subtract_projections` twice, then twice more; `_reorthogonalize` defaults
+`passes=2`. Both counts are **fixed**, where the reference implementation for the paper this module
+follows — `diaglib` (Molecolab-Pisa, LGPL, `diaglib.f90`) — iterates *adaptively* on a measured
+orthogonality defect: `ortho(X)` loops `while ‖XᵀX − Id‖ > τ_ortho` and `ortho(X,Y)` loops
+`while ‖YᵀX‖ > τ_ortho`. That is the one idea in arXiv:2305.06668 that is **not** block-only — at
+`m = 1` the criterion is just `|⟨x|y⟩|` — so it needed measuring rather than dismissing.
+
+**The fixed count already over-satisfies their threshold, by two orders of magnitude.** Achieved
+`|⟨x|y⟩|` over the diagonal-shift axis (the one that stresses this: `_reorthogonalize`'s docstring
+records `|⟨x|y⟩| = 1.0` at shift 1e9 *without* it), `dim=64`, 120 iterations each:
+
+| shift | max `\|⟨x\|y⟩\|` | median |
+| --- | --- | --- |
+| 0 | 1.26e-16 | 1.39e-17 |
+| 1e3 | 1.11e-16 | 2.71e-17 |
+| 1e6 | 9.02e-17 | 1.39e-17 |
+| 1e9 | 1.11e-16 | 2.78e-17 |
+| 1e12 | 8.33e-17 | 1.74e-17 |
+
+`diaglib`'s shipped threshold is `tol_ortho = 2·eps ≈ 4.4e-16` (**note: the paper states 1e-14, which
+does not match the code** — 20000× looser than what it ships). So an adaptive loop here would exit at its
+first check on every iteration measured, buying nothing and costing the check: an extra O(N) reduction per
+call, in a routine that already returns its norm specifically so no second reduction is needed. **Do not
+replace the fixed counts with a measured loop.**
+
+**Their growth-factor optimization is real and structurally inapplicable.** `diaglib` avoids the recheck
+the paper calls "wasteful" by *predicting* the defect instead of measuring it: `ortho_cd` accumulates
+`growth = Π‖L⁻¹‖` and estimates `error = eps·κ(L)²`, then `ortho_vs_x` uses `xu_norm = growth·eps` in
+place of a `dgemm`-plus-norm. Good engineering, but the thing it saves is an `m × k` `dgemm`; at `m = 1`
+the overlap is one inner product whose norm `_project_out` already has. Nothing to avoid.
+
+**And 2 cannot be reduced to 1.** The shift sweep above measures *identically* at one pass
+(7.7e-17–1.4e-16), i.e. this fixture cannot see the difference — but the suite fails immediately on
+`TestProjectOut::test_orthogonal_vector_is_not_normalized_to_unity` (`Norm 0.0 dropped below 0.99`). A
+worked instance of CLAUDE.md's "fixture too small" trap: the defect is in a branch a well-conditioned
+operator never reaches, so measure the *invariant the tests assert*, not just the quantity of interest.
+
+**One transferable observation about tolerance design.** `diaglib`'s residual test is
+`‖r‖/√n < tol .AND. max|r| < 10·tol` — **conjunctive**, and the `1/√n` makes the permitted `‖r‖` grow with
+dimension (at their own full-CI size, 18 360 640 determinants, `tol=1e-9` permits `‖r‖ = 4.3e-6`, 4300×
+looser than at `n=1000`). That looks like the exact defect the entry above records for `rtol`'s deleted
+`n·10` factor, and it is **not**, because `max|r| ≥ ‖r‖/√n` always, so the dimension-*independent* arm is
+binding at every size checked. The rule is therefore sharper than "no `n` in a tolerance": a
+dimension-dependent arm is harmless in a **conjunction** (it can only tighten) and fatal in a
+**disjunction** (it becomes accept-anything). `ground_locg` uses `max(atol, rtol·scale)` — a disjunction —
+which is why the `n` factor had to go there.
+
 ### Reusing `Ax` to cut the matvec count is closed, and the canary that should have caught it was one seed (2026-09-02)
 
 Opened from Nottoli/Giannì/Levitt/Lipparini, *Theor. Chem. Acc.* **142**:69 (2023) (= arXiv:2305.06668),

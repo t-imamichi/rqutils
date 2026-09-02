@@ -290,6 +290,12 @@ failed *silently* (it is stale on scope and line numbers). Don't "simplify" the 
 re-orthogonalizations or the zero-direction masks, don't unify `body_iter1`'s exclusion bound with
 `body()`'s, and don't reintroduce the one-matmul `_compute_sas` form.
 
+**The re-orthogonalization pass counts are fixed at 2 deliberately — don't make them adaptive.** Measured
+`|⟨x|y⟩| ≤ 1.3e-16` across diagonal shifts 0–1e12, against the `diaglib` reference implementation's
+`tol_ortho = 2·eps ≈ 4.4e-16`: a measured loop would exit at its first check every iteration and cost an
+extra O(N) reduction to learn that. Nor can 2 drop to 1 — a well-conditioned fixture cannot tell them
+apart, but `TestProjectOut` fails at once.
+
 **Sharding-transparent only if the `mat` callable preserves output sharding** — that contract is why
 every `apply_*` in `sqd.py` passes `out_sharding=jax.typeof(vec).sharding`.
 
@@ -301,7 +307,10 @@ every `apply_*` in `sqd.py` passes `out_sharding=jax.typeof(vec).sharding`.
   **`None` is accepted** and resolves to `4·eps` of the *promoted* dtype, which cannot be a literal: a
   hardcoded float64 value exhausts a 500-iteration cap at float32.
 - **Do not put an `n` factor in `rtol`'s scale.** It makes the bound exceed `‖A‖` at large `n`, so the
-  first iterate reports convergence on an arbitrary eigenpair.
+  first iterate reports convergence on an arbitrary eigenpair. The reason is the **disjunction**: a
+  dimension-dependent arm is fatal here because either arm suffices, but harmless in a conjunction, where
+  it can only tighten. `diaglib` ships `‖r‖/√n < tol AND max|r| < 10·tol` and is safe for exactly that
+  reason — don't read its `√n` as licence for one here.
 - **Both arms are guarded against accept-anything** (`rtol >= 0.5`, `atol >= Σ|c_k|`), and a below-floor
   `atol` raises **only when `rtol == 0`** — with a live relative arm it is harmless, and rejecting it
   would fire on correct input. The floor is `4·eps·Σ|c_k|`, exposed as `residual_floor`.
