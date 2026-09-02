@@ -1342,6 +1342,19 @@ def _subtract_projections(basis, vector):
 
 
 def _project_out(basis, vector):
+    # Interspersing the normalization with the subtraction, rather than subtracting twice and then
+    # normalizing, is Algorithm 5 ("Modified orthogonalization procedure") of Duersch, Shao, Yang &
+    # Gu, *A Robust and Efficient Implementation of LOBPCG*, arXiv:1704.07458 -- its loop likewise
+    # alternates `U -= V (V^T M U)` with an orthonormalization pass. The block form there needs SVQB
+    # to resolve rank deficiency across columns; at block size 1 `normalize` is the whole content.
+    #
+    # Two passes rather than a convergence test is the "twice is enough" criterion, due to Kahan and
+    # analyzed in Parlett, *The Symmetric Eigenvalue Problem* (1980), Sec. 6.9. SLEPc technical
+    # report STR-1, "Orthogonalization Routines in SLEPc" (Hernandez, Roman, Tomas & Vidal, 2007),
+    # is the practical treatment and makes the same attribution; note its URL now redirects -- reach
+    # it from the "SLEPc Technical Reports" section of https://slepc.upv.es/documentation/ rather
+    # than the older /documentation/reports/str1.pdf path. `_reorthogonalize`'s pass count is fixed
+    # at 2 for the same reason, measured; see its docstring and CLAUDE.md.
     for _ in range(2):
         vector = normalize(_subtract_projections(basis, vector))
 
