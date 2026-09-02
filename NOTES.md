@@ -2443,11 +2443,89 @@ the subspace never grows — measured 6001 matvecs and error **2.3** (wrong answ
 
 **Caveats on the whole comparison.** Synthetic dense fixtures at `n=512`, not a physical Hamiltonian —
 CLAUDE.md warns a physically-motivated fixture can invert a synthetic conclusion, so the matvec ratios
-should be re-measured on `xxz_krylov` and through `apply_h` before being quoted as load-bearing. The
+should be re-measured on `xxz_krylov` and through `apply_h` before being quoted as load-bearing.
+**That re-measurement is now done** — see the `xxz_krylov` entry below, which confirms the matched-memory
+conclusion on a physical fixture and adds that the prefilter *regresses* every Davidson arm. The
 Davidson is a faithful-but-minimal reimplementation (no locking, no Cholesky `ortho_cd` with level
 shifting, single eigenpair), which is adequate for counting matvecs and comparing eigenvalue error and
 nothing else. The memory table, being read off `diaglib`'s allocations and cross-checked against the
 paper, does not depend on it.
+
+### Davidson vs `ground_locg` on `xxz_krylov` through `apply_h`, prefilter on both arms (2026-09-02)
+
+Closes the caveat the entry above left open: its ratios are synthetic dense fixtures at n=512 with no
+filter. Here the operator is a periodic XXZ chain (`XX + YY + delta*ZZ` per bond, transverse `Bx` per
+site — `Bx` is load-bearing, since without it magnetization is conserved, the hop-generated subspace is
+closed under `H`, and the projection is trivially block-diagonal) projected onto `poc12`'s `xxz_krylov`
+subspace and applied through `apply_h` at `cache_level=(1, 2)`. n=24, rungs=6, cap=8000 so the cap bites
+and each seed is a *distinct* subspace, N=8000 (padded 8192), 5 seeds, `rtol=1e-10`, all arms 5/5
+converged, every energy within 6e-13 of `eigsh(tol=0)`.
+
+**The filter goes to both arms, and that is the whole design of the comparison.** `_chebyshev_prefilter`
+is an operator-agnostic start-vector transform — nothing about it is LOBPCG-specific, so handing it to
+one arm measures the filter, not the algorithm. Both arms get the identical filtered vector and are
+charged the identical `cycles*(degree+1) = 66` matvecs.
+
+**Matvec counts, median over 5 seeds, excluding the shared 66:**
+
+| | vectors | plain (delta=1.0) | filtered | plain (delta=0.2) | filtered |
+| --- | --- | --- | --- | --- | --- |
+| **`ground_locg`** | **8** | 156 | **57** | 129 | **48** |
+| Davidson depth 2 | 8 | **112** | 67 | **125** | 68 |
+| Davidson depth 3 | 10 | 68 | 40 | 74 | 40 |
+| Davidson depth 10 | 24 | 47 | 24 | 49 | 25 |
+| Davidson depth 25 | 54 | 41 | 23 | 42 | 23 |
+
+**At matched memory the filter is what separates them, and it separates them in `ground_locg`'s favour.**
+Depth 2 is the only Davidson arm holding 8 vectors, and unfiltered it is a near-tie (112 vs 156;
+125 vs 129 on the non-dominant fixture). Filtered, `ground_locg` wins both (57 vs 67, 48 vs 68). Reading
+any deeper Davidson column as a win is the mistake the entry above warns about — depth 3 already buys
+its 68 with 10 vectors, and depth 25 with 54.
+
+**The filter helps LOBPCG and *hurts* Davidson, which is the finding worth keeping.** Speedup in matvecs
+including the filter's own 66, median over seeds:
+
+| | delta=1.0 | delta=0.2 |
+| --- | --- | --- |
+| `ground_locg` | **1.27x** (1.09-2.03) | **1.11x** (1.00-1.74) |
+| Davidson depth 2 | 0.90x | 0.96x |
+| Davidson depth 3 | 0.65x | 0.69x |
+| Davidson depth 25 | 0.46x | 0.47x |
+
+Every Davidson arm is a *regression*. The mechanism is not mysterious and is the same Amdahl argument
+that caps the Bloom filter: Davidson converges in 41-125 matvecs, so a fixed 66-matvec precompute cannot
+pay for itself no matter how much it improves the start. `ground_locg` needs 129-156, so the same 66 does.
+**This makes the filter a poor discriminator between the algorithms and a good one between operating
+points** — it is worth having exactly when the solver is iteration-hungry, which is the regime the
+single-vector method is in by construction.
+
+**A regime caveat that inverts the fixture choice, and it is measured, not assumed.** CLAUDE.md warns a
+physical fixture can invert a synthetic conclusion; here it partly does, but not via the axis expected.
+Diagonal dominance of the projected `H`, measured on the assembled sparse matrix: `delta=1.0` gives 45%
+dominant rows at a median `|d|/offsum` of **1.00** — borderline, not the non-dominant regime `sqd` is
+claimed to be in — while `delta=0.2, Bx=2.0` gives 0.1% and **0.20**. So the anisotropy, not the
+subspace, is what selects the regime, and a default `delta=1.0` XXZ is *not* a non-dominant fixture.
+The matched-memory conclusion holds on both, which is the reassuring part.
+
+**Two measurement traps hit here, both silent.**
+
+- **A Python-level counting wrapper cannot count matvecs through this module.** `body` runs under
+  `jax.lax.while_loop` and the prefilter under `jax.lax.scan`, so a counting closure is invoked once per
+  *trace*: measured **7 against a true 429**, and 3 against the prefilter's 66. It does not error and the
+  numbers look plausible. Counts must be analytic — `body_iter0` is 1 matvec, `body_iter1` 2, `body()` 3,
+  and `niter` counts `body()` calls only, so **matvecs = 3 + 3*niter** (verified by a `maxiter=0,1,2,5`
+  sweep, where `niter` returns exactly `maxiter`).
+- **`cap` must actually bite or the seed does nothing.** At rungs=3 the reachable set is smaller than the
+  cap, so every seed returned a bit-identical subspace and the same energy — a "median over 5 seeds" over
+  one fixture repeated 5 times. The tell was identical `N=489 E=-26.7560572683` on every row.
+
+Caveats. Single-device CPU, one Hamiltonian family, one subspace size; matvec counts only, no wall clock
+(a numpy Davidson against a jitted JAX solver says nothing about time, as the entry above notes). The
+Davidson is the same faithful-but-minimal reimplementation — Jacobi preconditioner, thick restart at
+`n_keep = max_dav - 2`, no locking, no `ortho_cd`, single eigenpair — so it is adequate for counting
+matvecs and eigenvalue error and nothing else. Its Jacobi preconditioner reads the diagonal off the
+assembled sparse operator, which a matrix-free caller would have to get from `get_diagonal`'s
+identity-X group; that is free in `sqd` but is not counted as a matvec here.
 
 ### The fixed 2-pass re-orthogonalization beats `diaglib`'s adaptive loop on its own metric (2026-09-02)
 
