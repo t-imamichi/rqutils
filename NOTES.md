@@ -2764,6 +2764,73 @@ Its `project_back` even carries an extra `size × sizeSub` buffer plus a `memcpy
 writes `xnext` directly. Its residual test `‖W‖/(ANorm + |λ|·BNorm)` is, with `B = I`, exactly this
 module's `scale = ‖Ax‖ + |θ|` — independent corroboration of that choice.
 
+### The zeroed-`p` restart question is closed: the branch is only reachable at `n = 2` (2026-09-02)
+
+Prompted by reading two Julia LOBPCGs (`JuliaMolSim/LOBPCGEigensolver.jl`, i.e. DFTK's, and
+`venkovic/julia-lobpcg`). DFTK's `ortho!` handles a collapsed direction by **randomizing** the
+small-norm column, where `_project_out` zeroes it and `body()` reports convergence. That is the exact
+fork `docs/locg.md` I7 left open ("the alternative is to restart with a fresh random `p`... has not been
+settled"). Settled now, and not by measuring which is better: **the alternative is unreachable.**
+
+**Reachability first, because the suite already recorded that no fixture reaches this branch**
+(`TestGroundLocg`'s class docstring, and `TestZeroSearchDirection`'s "they do not cover `body()`'s own
+`p_is_zero` branch, and cannot"). Measured by patching `_project_out` in a fresh subprocess to report
+its norm through `jax.debug.callback` — the norm *before* the 0.99 cut, so the threshold cannot hide
+anything. Real and complex, 60 seeds each, `maxiter=80`:
+
+| n | zeroed / `body()` calls | min raw \|p\| |
+| --- | --- | --- |
+| **2** | **120 / 120** | 3.5e-34 |
+| 3 | 0 / 124 | 1 |
+| 4 | 0 / 1491 | 1 |
+| 5–200 | 0 / 24 000+ | 1 |
+
+**`n = 2` always, nothing else ever.** And it is structural, not a threshold artifact: at `n = 2` the raw
+norms are ~1e-31 (max 2.2e-31 over 30 seeds), not marginal values near 0.99, because `span{x, y}` *is*
+the whole space — `r` has nowhere orthogonal to go. At `n ≥ 3` the norm is exactly 1 every time. So the
+`0.99` postcondition is doing no work in selecting these cases; a threshold anywhere in `(1e-30, 1)`
+gives the same partition.
+
+**Which makes a restart strictly worse, not merely unnecessary.** At `n = 2` the early exit is already
+exact: over 200 seeds, **0 wrong** at rel > 1e-13, with eigenvalue error 0.0–2.1e-15 and `‖r‖` at the
+rounding floor (3.1e-17–2.0e-15) at the moment the branch fires, `niter = 1`. A fresh random `p` at
+`n = 2` is necessarily a linear combination of `x` and `y`, so it would re-enter Rayleigh–Ritz with a
+rank-deficient basis and buy iterations to rediscover a converged answer. **The branch is not a
+premature exit; it is a proof that the space is exhausted.**
+
+**Why DFTK needs the opposite behaviour, which is the whole of the difference.** It converges `m`
+eigenpairs, so a dead column must be replaced or the block loses rank and one eigenpair stops
+converging. At `m = 1` a dead direction means the single eigenpair is *done*. Same numerical event,
+opposite correct response — the block-size-1 specialization is what flips it, not a disagreement about
+numerics.
+
+**`docs/locg.md` I7's open question can be marked closed**, with the caveat that this closes it for
+`ground_locg`'s block-size-1 form only. It says nothing about a future block variant, where DFTK's
+randomization would become the right answer.
+
+**Nothing else from either repo transfers, for the reason already recorded above for the block C
+implementation**: SVQB with eigenvalue-floor regularization (Stathopoulos–Wu, up to 36 inner passes),
+level-shifted `safe_cholesky` with SVD fallback, skip-ortho's `norm(VtV·hX)` trigger (Duersch 2018),
+and locking all act on an `m × m` Gram matrix that does not exist at `m = 1`. Two independent
+corroborations are worth keeping, though:
+
+- **DFTK reuses matvecs "only with orthogonal transformations"** (`new_AX = AY·cX`, `cX` from `syevd`)
+  and **never reuses the residual** — `new_R = new_AX − new_BX·λ'` is always formed fresh. That is
+  precisely the line the `Ax`-reuse entry above draws between a legitimate `(AV)u` thick restart and the
+  rejected in-loop reuse: safe requires `S` orthogonal **and** `V`/`AV` current. DFTK protects exactly
+  the quantity the honesty metric measures. Independent support for a decision made here by measurement.
+- **`safe_cholesky`'s a-posteriori error estimate** (`eps(κ(R)²)`, read off the factor it already has,
+  rather than computing `‖X'X − I‖`) is the standard escape from the "adaptive costs an extra O(N)
+  reduction" objection that fixes the re-orthogonalization passes at 2. It does not apply here: at
+  `m = 1` there is no factor to read a condition number from, and `_project_out` already returns its
+  norm so callers avoid a second reduction. **The 2-pass rule now has a second reason** — not just that
+  a measured loop would exit at its first check, but that the cheap-adaptivity trick that would make
+  such a loop affordable has no substrate at block size 1.
+
+One deviation shows even a careful implementation carves out unproven exceptions: DFTK reuses the `B`
+matrix without the orthogonality justification, commenting that it "seems to be OK even with very badly
+conditioned B matrices". Not applicable at `B = I`.
+
 ## `precond` was removed; `sqd` defaults to `prefilter=(32, 2)`
 
 2026-08-28, acting on the comparison below.

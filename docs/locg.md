@@ -319,9 +319,13 @@ Fix: mask that diagonal so it cannot be selected, and treat the condition as con
 $P$ means $\{x, y\}$ already spans the residual, so no new search direction exists and further
 iterations cannot lower $\theta$.
 
-**Open design question.** Treating this as converged is a judgement call; the alternative is to
-restart with a fresh random $p$. Which is preferable depends on the `sqd.py` use case and has not
-been settled.
+**Settled 2026-09-02: treating this as converged is correct, because the alternative is
+unreachable.** `body()`'s zeroed-$p$ branch fires *only* at $n = 2$ (120/120 calls; 0 of 24 000+ at
+$n = 3\ldots200$), where $\mathrm{span}\{x, y\}$ is the whole space, so a fresh random $p$ is
+necessarily a combination of $x$ and $y$. Raw $\lvert p\rvert \approx 10^{-31}$ there, not a
+marginal value near the 0.99 cut, and the exit is already exact (0/200 wrong, error
+$\le 2.1\times10^{-15}$). Closed for the block-size-1 form only: a block variant would need DFTK's
+randomization instead. See `NOTES.md`.
 
 ## S1. Redundant matrix-vector product
 
