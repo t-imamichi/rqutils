@@ -2831,6 +2831,127 @@ One deviation shows even a careful implementation carves out unproven exceptions
 matrix without the orthogonality justification, commenting that it "seems to be OK even with very badly
 conditioned B matrices". Not applicable at `B = I`.
 
+### Multi-node, one GPU per node: five failures in a row, none of them the library (2026-09-04)
+
+A 4-node cluster with a single GPU per node. `mpirun` is not optional there -- it is the only way to
+reach 4 GPUs -- and every POC in `examples/scaling/` assumed a single process owning several local
+GPUs. Five distinct failures, in the order they appeared, each hidden behind the previous one. The
+library needed **no change**; see the entry below for why.
+
+**1. `jax.distributed.initialize` is the whole difference, and its absence is not an error.** Under
+`mpirun -n 4` without it, each rank comes up as an *independent* JAX client that sees all 4 GPUs, so
+`jax.devices()` prints `[CudaDevice(0..3)]` four times and everything looks right. `examples/sqd.py`
+already had the fix (`--gpus mpi` → `initialize(cluster_detection_method="mpi4py")`); the scaling POCs
+never got it. Now `_scaling_common.init_devices` covers all three modes and **raises** when a launcher
+put several ranks in the job without `--devices mpi`, because the symptom otherwise arrives minutes
+later as failure 2.
+
+**2. `jax.make_mesh` rejects multi-slice topologies outright** -- and it does so *after* `initialize`
+has correctly formed the cluster, which makes it read as an initialization problem. Reading its source
+settles it: it routes through `mesh_utils.create_device_mesh`, then raises whenever the chosen devices
+carry more than one distinct `slice_index`. **One GPU per node means one slice per node**, so an
+N-node job hits this unconditionally. Its message names `create_hybrid_device_mesh`, which wants a
+`dcn_mesh_shape` split.
+
+For a **1-D** mesh none of that is needed: `create_device_mesh`'s topology optimization exists to order
+devices for *multi-dimensional* meshes on a torus, and a 1-D mesh has no ordering choice -- every
+device is one axis element. `_scaling_common.make_1d_mesh` constructs `Mesh` directly over
+`jax.devices()`, verified bit-identical to `make_mesh` on a single slice (same devices, shape,
+axis_types, and `Mesh` equality) so it is a drop-in.
+
+**3. A module-scope `jnp` call initializes the backend at import**, after which `initialize` refuses
+with "must be called before any JAX calls that might initialise the XLA backend". `poc14` had
+`SENTINEL = jnp.uint64(0xFFFFFFFFFFFFFFFF)` at module level. The fix is `np.uint64`, not a bare Python
+int -- `0xFFFFFFFFFFFFFFFF` exceeds int64 and `jnp.where` raises `OverflowError` on the untyped
+literal, which is how the first attempt failed. Pinned by asserting `xla_bridge._backends` is empty
+after importing the module.
+
+**4. Closing over a sharded array is legal single-process and illegal across processes.** A rank
+addresses only its own shard, so a `functools.partial` over globally-sharded arrays raises "Closing
+over jax.Array that spans non-addressable (non process local) devices". `poc9` built its own partial
+over `apply_h`; the fix is `ground_locg`'s `args`, which it splats as `matvec(vec, *args)`. Note this
+is the *same* split `run_sqd` already uses for a different reason (`cache_level` must stay static or
+the kernel retraces every matvec) -- the library's performance requirement and multi-process
+correctness happen to want the identical shape.
+
+**5. Getting a sharded array to the host took three tries, and each fix exposed the next constraint.**
+This is the one worth reading before touching any gather:
+
+- `np.asarray` on a globally-sharded array raises "Fetching value for jax.Array that spans
+  non-addressable devices".
+- `process_allgather`'s **default `tiled=False` stacks a *fully addressable* array into a new leading
+  axis** -- `(4, 2)` becomes `(1, 4, 2)`. Single-process, that silently made `np.array_equal` against
+  the reference return False, and `poc14`'s exactness flipped True → False at `d=2`. The docstring
+  distinguishes the addressable and non-addressable cases; only the latter ignores `tiled`.
+- `process_allgather` **still fails on a sub-mesh**. `poc14` sweeps `jax.devices()[:num_shards]`, so at
+  `d=2` on a 4-process job ranks 2 and 3 hold no shard at all and its internal `addressable_data(0)`
+  raises `FullyReplicatedShard: Array has no addressable shards`. Measured: ranks 0-1 printed `True`,
+  ranks 2-3 crashed, then the shutdown barrier timed out at **2/4 tasks**.
+
+The working form is a **non-collective** gather: concatenate `addressable_shards` sorted by global
+index (`sh.index[0].start`), and return None off-mesh so a rank with nothing to say skips the
+comparison instead of asserting on an absent value. Sorting matters -- shard arrival order is not
+global order.
+
+**Two diagnostic notes.** Output from 4 ranks interleaves, so a single failure appears four times and a
+partial failure (2 of 4) is easy to misread as a flake -- count the tracebacks. And the gRPC "failed to
+connect to ... Connection refused" noise at the end of a failed run is the coordination service being
+torn down, *downstream* of the real error; it is never the cause.
+
+### The multi-node correctness result, and the wall clock that came with it (2026-09-04)
+
+`poc7_sharding.py` passed in full on **4 real GPUs across 4 nodes**: all six `cache_level` cells, every
+`N mod mesh.size` in 0-3, and the `return_eigvec` reshard round trip, worst `|sharded - single|` =
+**4.441e-16** and `‖Hv-ev‖/‖v‖` = 2.670e-15. `poc9`'s Claim 3 also passed, asserting the output *spec*
+`P('x',)` rather than only the value -- which is the point, since a silently replicated run agrees with
+single-device to exactly 0.0. Multi-node sharding **correctness** for `sqd` is settled; the six-cell
+sweep matters because two sharding bugs once hid in the `cache_level[0] == 0` cells and the first
+masked the second.
+
+**The speed is another matter: 9010 ms sharded against 279 ms single-device, 32x SLOWER**, at
+*identical* iteration counts (298 plain, 253 prefiltered). Identical counts mean this is pure
+communication, not a different computation. At `N = 2^20` each device holds ~262k elements while every
+LOBPCG iteration's `O(N)` reductions cross a **network** rather than NVLink.
+
+Two things this does and does not say. It is a real measurement of the pessimistic topology, and it
+locates the crossover far above this size -- but it is **one size on one interconnect**, and per
+`CLAUDE.md` a quantity measured at one size is not a law. It says nothing about several GPUs in one
+box, where the same collectives run over NVLink. Record which interconnect produced any such figure.
+`poc15_sqd_multinode.py` exists to sweep device count at fixed `N` and report per-device
+`bytes_in_use` beside the wall clock, so the memory question can be answered even where the speed
+answer is bad -- the replicated-`states` term (`13 * N` per device) should stay flat while the solver
+vectors halve, and per `CLAUDE.md` that must be asked of XLA rather than derived from a formula.
+
+Also measured while writing that script, first-hand: **omitting
+`jax.config.update("jax_enable_x64", True)` moved the 1-device energy from -23.782182463507 to
+-23.782182693481** and fired its cross-device assertion at 3.8e-06, reading exactly like a sharding
+bug. With x64 the spread is 3.6e-15 across 1/2/4 devices. The rule is in `CLAUDE.md`; this is what
+breaking it looks like from the inside.
+
+### The library needed no multi-process fix, and that is worth knowing (2026-09-04)
+
+Checked rather than assumed, because the natural conclusion from five POC failures is that the library
+must share the defect. It does not: `rqutils/` contains **zero** references to `process_count`,
+`process_index`, `addressable`, or `process_allgather`, and needs none.
+
+- **Arrays reach the kernel through `args`, not a closure.** `run_sqd` binds only `cache_level` (a
+  static int tuple) via `functools.partial` and passes `args = (scanned, states_u, ...)`. Failure 4
+  above is precisely what that avoids.
+- **Nothing is pulled to the host while still sharded.** `run_sqd` reshards `eigvec` and `states_u` to
+  `PartitionSpec(None)` before returning, so the `np.array`/`np.asarray` in `sqd`'s return path
+  operates on replicated -- therefore addressable -- data. `poc7c` confirms it on real nodes.
+- Every other `np.asarray` in the library is on caller-supplied numpy (validation helpers) or host-side
+  circuit construction in `svsim`. None touch a device-sharded result.
+
+**The POCs broke because they reached *around* the library.** `poc9` built its own matvec over
+`apply_h` instead of going through `run_sqd`; `poc14` is prototype code for something not in the
+library at all. Worth stating explicitly, because "the examples all broke" invites a library change
+that would be wrong.
+
+Still unverified on real nodes: `hproj` (inherently host-side, returns a scipy `csr_array`) and
+`svsim` multi-process, whose `mesh.size | 2^num_qubits` constraint has only been exercised on virtual
+devices.
+
 ### The GPU prefilter sweep: the peak transfers, its location does not (2026-09-04)
 
 `examples/scaling/poc9_prefilter_gpu.py` on one CUDA device, `n=26`, `N=1048576`, `J=30`. Full table in
