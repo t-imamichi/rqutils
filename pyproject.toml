@@ -32,4 +32,4 @@ docs = ["sphinx", "sphinx-rtd-theme"]
 [project.urls]
 Homepage = "https://github.com/UTokyo-ICEPP/rqutils"
 Issues = "https://github.com/UTokyo-ICEPP/rqutils/issues"
-Documentation = "https://rqutils.readthedocs.io/en/latest/index.html"
+Documentation = "https://rqutils.readthedocs.io/en/stable/index.html"
