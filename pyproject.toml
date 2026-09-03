@@ -28,6 +28,7 @@ dependencies = [
 mpl = ["matplotlib"]
 qutip = ["qutip"]
 qiskit = ["qiskit[visualization]"]
+mpi = ["mpi4py"]
 docs = ["sphinx", "sphinx-rtd-theme"]
 dev = ["pytest", "pytest-xdist", "pytest-sugar", "ruff", "ty"]
 
