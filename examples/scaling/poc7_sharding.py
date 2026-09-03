@@ -55,8 +55,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import numpy as np
-from _scaling_common import header, init_devices, make_problem
-from jax.sharding import AxisType
+from _scaling_common import header, init_devices, make_1d_mesh, make_problem
 
 from rqutils.sqd import hproj, sqd
 
@@ -76,7 +75,7 @@ def check_single_vs_sharded():
         eig_single = float(sqd(p.hamiltonian, p.states, return_eigvec=False))
 
         # Sharded run.
-        mesh = jax.make_mesh((jax.device_count(),), ("x",), (AxisType.Explicit,))
+        mesh = make_1d_mesh()
         with jax.set_mesh(mesh):
             eig_sharded = float(sqd(p.hamiltonian, p.states, return_eigvec=False))
 
@@ -115,7 +114,7 @@ def check_all_cache_levels(problem, eig_dense):
     )
     print()
     p = problem
-    mesh = jax.make_mesh((jax.device_count(),), ("x",), (AxisType.Explicit,))
+    mesh = make_1d_mesh()
 
     worst = 0.0
     print(
@@ -143,7 +142,7 @@ def check_mesh_padding():
     print("unreachable single-device. Feed it deliberately awkward lengths and check the answer")
     print("is unchanged, since padding must be transparent.")
     print()
-    mesh = jax.make_mesh((jax.device_count(),), ("x",), (AxisType.Explicit,))
+    mesh = make_1d_mesh()
     nd = jax.device_count()
     for extra in range(nd):
         # Choose N so N % mesh.size == extra, hitting each residue including 0.
@@ -165,7 +164,7 @@ def check_eigvec_path():
     print("(sqd.py:497-499). Check the returned vector is a genuine eigenvector, not just that the")
     print("call succeeds: ||Hv - ev|| / ||v|| against the dense projection.")
     print()
-    mesh = jax.make_mesh((jax.device_count(),), ("x",), (AxisType.Explicit,))
+    mesh = make_1d_mesh()
     for num_qubits, num_states in [(14, 600), (16, 2000)]:
         p = make_problem(num_qubits, num_states, num_terms=40, seed=73)
         with jax.set_mesh(mesh):

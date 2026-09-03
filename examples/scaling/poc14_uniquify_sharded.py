@@ -82,19 +82,23 @@ options = parser.parse_args()
 
 import jax
 import numpy as np
-from _scaling_common import init_devices
+from _scaling_common import init_devices, make_1d_mesh
 
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
-from jax.sharding import AxisType
 from jax.sharding import PartitionSpec as P
 
 from rqutils.sqd import _pack_state_words, uniquify_states
 
 # Sorts above every real packed word, so a padding slot never compares equal to real data. The
 # packed rows carry a zero pad bit at position 0 (see `sqd`), so all-ones is unreachable.
-SENTINEL = jnp.uint64(0xFFFFFFFFFFFFFFFF)
+# np.uint64, NOT jnp.uint64: a jnp constructor at module scope initializes the XLA backend at import,
+# after which jax.distributed.initialize refuses with "must be called before any JAX calls that might
+# initialise the XLA backend" -- which is how the 4-node run failed. A bare Python int is not a fix
+# either: 0xFFFFFFFFFFFFFFFF exceeds int64, so jnp.where raises OverflowError on the untyped literal.
+# numpy carries the unsigned dtype without touching XLA.
+SENTINEL = np.uint64(0xFFFFFFFFFFFFFFFF)
 NUM_QUBITS = options.num_qubits
 
 
@@ -364,7 +368,7 @@ def main():
     print("\n1. exactness across shard counts")
     print(f"   {'d':>3} {'cap1':>8} {'cap2':>8} {'unique':>8} {'ovf':>7} {'exact':>6}")
     for num_shards in shard_counts():
-        mesh = jax.make_mesh((num_shards,), ("x",), axis_types=(AxisType.Explicit,))
+        mesh = make_1d_mesh(devices=jax.devices()[:num_shards])
         trimmed = states[: (len(states) // num_shards) * num_shards]
         r = run(mesh, num_shards, trimmed, states_size)
         print(
@@ -377,7 +381,7 @@ def main():
 
     print("\n2. the overflow guard fires when either round is undersized")
     widest = shard_counts()[-1]
-    mesh = jax.make_mesh((widest,), ("x",), axis_types=(AxisType.Explicit,))
+    mesh = make_1d_mesh(devices=jax.devices()[:widest])
     trimmed = states[: (len(states) // widest) * widest]
     print(f"   {'slack':>7} {'ovf':>8} {'exact':>6}")
     for slack in (1.35, 0.30):
@@ -402,7 +406,7 @@ def main():
 
     widest = shard_counts()[-1]
     trimmed = states[: (len(states) // widest) * widest]
-    mesh = jax.make_mesh((widest,), ("x",), axis_types=(AxisType.Explicit,))
+    mesh = make_1d_mesh(devices=jax.devices()[:widest])
     print(f"   {'arm':>28} {'ms':>9} {'per-device states':>18}")
     for label, thunk, per_device in (
         (

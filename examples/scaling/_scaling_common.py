@@ -305,6 +305,38 @@ def init_devices(devices: str | None, host_devices: int = 4) -> str:
     return f"{ndev} {kind} {backend} device(s){over}"
 
 
+def make_1d_mesh(axis: str = "x", devices: "list | None" = None):
+    """Build a 1-D mesh over every device, including across a multi-slice (multi-node) topology.
+
+    ``jax.make_mesh`` **rejects multi-slice topologies outright**: it routes through
+    ``mesh_utils.create_device_mesh`` and then raises "does not support multi-slice topologies" when
+    the chosen devices carry more than one distinct ``slice_index``. One GPU per node means one slice
+    per node, so a 4-node job hits that unconditionally -- and it does so *after*
+    ``jax.distributed.initialize`` has correctly formed the cluster, which makes the failure look
+    like an initialization problem rather than a mesh-construction one. Measured: 4 processes
+    reporting ``process_count() == 4`` still failed here.
+
+    ``create_device_mesh``'s topology optimization exists to order devices well for
+    **multi-dimensional** meshes on a torus interconnect. For a 1-D mesh there is no ordering choice
+    to make -- every device is one axis element -- so constructing ``Mesh`` directly over
+    ``jax.devices()`` is equivalent and works irrespective of slice count.
+
+    Args:
+        axis: Mesh axis name.
+        devices: Devices to include; defaults to all of ``jax.devices()``.
+
+    Returns:
+        A ``jax.sharding.Mesh`` with one ``AxisType.Explicit`` axis, matching what the POCs and
+        ``rqutils``' implicit-mesh convention expect.
+    """
+    import jax
+    import numpy as _np
+    from jax.sharding import AxisType, Mesh
+
+    devs = list(jax.devices()) if devices is None else list(devices)
+    return Mesh(_np.asarray(devs), (axis,), axis_types=(AxisType.Explicit,))
+
+
 def header(title: str) -> None:
     print()
     print("=" * 78)

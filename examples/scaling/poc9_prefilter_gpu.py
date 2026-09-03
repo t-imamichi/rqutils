@@ -67,8 +67,8 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import numpy as np
-from _scaling_common import fmt_ratio, header, init_devices, make_problem, timeit
-from jax.sharding import AxisType, PartitionSpec
+from _scaling_common import fmt_ratio, header, init_devices, make_1d_mesh, make_problem, timeit
+from jax.sharding import PartitionSpec
 
 from rqutils.ground_locg import ground_locg
 from rqutils.sqd import apply_h, get_diagonal, get_xsource, uniquify_states
@@ -176,7 +176,7 @@ def main():
         return
 
     header("Claim 3: sharding on real devices")
-    mesh = jax.make_mesh((len(jax.devices()),), ("x",), axis_types=(AxisType.Explicit,))
+    mesh = make_1d_mesh()
     with jax.sharding.set_mesh(mesh):
         sharded_sources = jax.device_put(
             sources, jax.sharding.NamedSharding(mesh, PartitionSpec(None, "x"))
