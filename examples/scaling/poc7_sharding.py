@@ -38,25 +38,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # this preamble is duplicated per script rather than living in `_scaling_common` -- that module
 # imports jax.
 parser = argparse.ArgumentParser()
-parser.add_argument("--devices", help='Comma-separated GPU ids, e.g. "0,1,2,3".')
+parser.add_argument(
+    "--devices",
+    help='Comma-separated GPU ids, e.g. "0,1,2,3", or "mpi" for one GPU per MPI rank.',
+)
 parser.add_argument(
     "--host-devices", type=int, default=4, help="Virtual CPU devices when no --devices."
 )
 options = parser.parse_args()
 
-if options.devices:
-    os.environ["CUDA_VISIBLE_DEVICES"] = options.devices
-else:
-    os.environ.setdefault(
-        "XLA_FLAGS", f"--xla_force_host_platform_device_count={options.host_devices}"
-    )
+# CUDA_VISIBLE_DEVICES / XLA_FLAGS / jax.distributed.initialize all have to precede backend
+# initialization, so device setup is deferred to init_devices, called first thing in main().
 
 import jax
 
 jax.config.update("jax_enable_x64", True)
 
 import numpy as np
-from _scaling_common import header, make_problem
+from _scaling_common import header, init_devices, make_problem
 from jax.sharding import AxisType
 
 from rqutils.sqd import hproj, sqd
@@ -186,10 +185,11 @@ def check_eigvec_path():
 
 
 def main():
+    desc = init_devices(options.devices, options.host_devices)
     ndev = jax.device_count()
     backend = jax.devices()[0].platform
     virtual = backend == "cpu"
-    print(f"JAX devices: {ndev} ({backend}{', virtual' if virtual else ''})")
+    print(f"JAX devices: {desc}")
     if options.devices and virtual:
         # CUDA_VISIBLE_DEVICES was set but the backend came up as CPU, so there is no CUDA device
         # here and the flag did nothing. Say so: otherwise a CPU result reads as a GPU result.

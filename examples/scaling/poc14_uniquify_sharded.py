@@ -62,28 +62,27 @@ Run on real GPUs, which is the only way the routing-cost question can be answere
 
 import argparse
 import functools
-import os
 
 # `argparse` before `import jax`, as in poc8/poc9: CUDA_VISIBLE_DEVICES and XLA_FLAGS are both read
 # at backend initialization, so neither can be set after jax is imported. That is also why this
 # preamble is duplicated per script rather than living in `_scaling_common` -- that module imports jax.
 parser = argparse.ArgumentParser()
-parser.add_argument("--devices", help='Comma-separated GPU ids, e.g. "0,1,2,3".')
+parser.add_argument(
+    "--devices",
+    help='Comma-separated GPU ids, e.g. "0,1,2,3", or "mpi" for one GPU per MPI rank.',
+)
 parser.add_argument("--num-qubits", type=int, default=100)
 parser.add_argument(
     "--host-devices", type=int, default=4, help="Virtual CPU devices when no --devices."
 )
 options = parser.parse_args()
 
-if options.devices:
-    os.environ["CUDA_VISIBLE_DEVICES"] = options.devices
-else:
-    os.environ.setdefault(
-        "XLA_FLAGS", f"--xla_force_host_platform_device_count={options.host_devices}"
-    )
+# CUDA_VISIBLE_DEVICES / XLA_FLAGS / jax.distributed.initialize all have to precede backend
+# initialization, so device setup is deferred to init_devices, called first thing in main().
 
 import jax
 import numpy as np
+from _scaling_common import init_devices
 
 jax.config.update("jax_enable_x64", True)
 
@@ -344,6 +343,7 @@ def backend_note():
 
 
 def main():
+    init_devices(options.devices, options.host_devices)
     print("POC 14: sharded uniquify_states, two routing rounds\n")
     print(f"running on {backend_note()}; sweeping shard counts {shard_counts()}")
     if jax.default_backend() == "cpu":

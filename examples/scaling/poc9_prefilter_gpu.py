@@ -58,9 +58,8 @@ parser.add_argument(
 parser.add_argument("--cycles", default="2,4,8", help="Comma-separated cycle counts to sweep.")
 options = parser.parse_args()
 
-if options.devices:
-    os.environ["CUDA_VISIBLE_DEVICES"] = options.devices
-
+# CUDA_VISIBLE_DEVICES / XLA_FLAGS / jax.distributed.initialize all have to precede backend
+# initialization, so device setup is deferred to init_devices, called first thing in main().
 import functools
 
 import jax
@@ -68,7 +67,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import numpy as np
-from _scaling_common import fmt_ratio, header, make_problem, timeit
+from _scaling_common import fmt_ratio, header, init_devices, make_problem, timeit
 from jax.sharding import AxisType, PartitionSpec
 
 from rqutils.ground_locg import ground_locg
@@ -101,7 +100,7 @@ def assemble(problem):
 
 
 def main():
-    print(f"backend={jax.default_backend()}  devices={jax.devices()}")
+    print(f"devices: {init_devices(options.devices)}")
     if jax.default_backend() == "cpu":
         print(
             "\n*** THIS IS A CPU RUN. Every number below is already in "

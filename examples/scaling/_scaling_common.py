@@ -21,6 +21,7 @@ benchmark arm; treat it as the order of magnitude to expect, not a constant for 
 on the per-run spread that ``timeit`` actually reports.)
 """
 
+import os
 import statistics
 import time
 from collections.abc import Callable
@@ -217,6 +218,91 @@ def fmt_ratio(baseline: Timing, candidate: Timing, noise_floor: float | None = N
 def max_abs_diff(a, b) -> float:
     """Max absolute difference, for correctness gates."""
     return float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
+
+
+def init_devices(devices: str | None, host_devices: int = 4) -> str:
+    """Bring up the JAX backend for a POC and return a one-line description of what it got.
+
+    Three launch modes, because each node in the target cluster has a **single** GPU:
+
+    - ``devices="mpi"`` -- multi-process. Calls ``jax.distributed.initialize`` so the ranks form one
+      JAX program: each process owns its local GPU and ``jax.devices()`` reports all of them
+      globally. **This is the only way to reach N GPUs when they sit on N nodes.**
+    - ``devices="0,1"`` -- single-process, several local GPUs, via ``CUDA_VISIBLE_DEVICES``.
+    - ``devices=None`` -- virtual CPU devices, correctness only.
+
+    Without the ``initialize`` call, ``mpirun -n 4`` gives four **independent** clients that each see
+    every GPU. That topology is multi-slice, and ``jax.make_mesh`` rejects it with "does not support
+    multi-slice topologies. Please use jax.experimental.mesh_utils.create_hybrid_device_mesh" -- a
+    message naming a replacement API rather than the missing initialization. Measured: four ranks
+    each ran a complete prefilter sweep and then all four died at ``make_mesh``, so the failure
+    arrives minutes in, four times interleaved, with gRPC "failed to connect" noise from the
+    coordination service the ranks never joined.
+
+    Must be called **before** the first ``jax.devices()``/``jax.device_count()``, since
+    ``jax.distributed.initialize`` has to precede backend initialization.
+
+    Args:
+        devices: ``"mpi"``, a ``CUDA_VISIBLE_DEVICES`` list, or None for virtual CPU devices.
+        host_devices: Virtual CPU device count when ``devices`` is None.
+
+    Returns:
+        A description such as ``"4 real gpu device(s) over 4 processes"``, for the script to print.
+
+    Raises:
+        RuntimeError: If ``devices="mpi"`` but ``mpi4py`` is missing, or if a launcher put several
+            ranks in the job without ``devices="mpi"`` -- the case that produces the multi-slice
+            error above.
+    """
+    ranks = next(
+        (
+            int(v)
+            for v in (
+                os.environ.get("OMPI_COMM_WORLD_SIZE"),
+                os.environ.get("PMI_SIZE"),
+                os.environ.get("SLURM_NTASKS"),
+            )
+            if v and v.isdigit()
+        ),
+        1,
+    )
+
+    if devices == "mpi":
+        try:
+            import mpi4py  # noqa: F401
+        except ImportError as exc:
+            # Undeclared dependency, per CLAUDE.md: install it manually for the multi-process path.
+            raise RuntimeError(
+                "--devices mpi needs mpi4py, which this project deliberately does not declare. "
+                "Install it into the venv first: uv pip install mpi4py"
+            ) from exc
+        import jax
+
+        jax.distributed.initialize(cluster_detection_method="mpi4py")
+    else:
+        if ranks > 1:
+            raise RuntimeError(
+                f"Launched with {ranks} ranks but --devices is {devices!r}, so each rank would come "
+                "up as an independent JAX client seeing every GPU. That topology is multi-slice and "
+                "jax.make_mesh rejects it with a message about create_hybrid_device_mesh that does "
+                "not name this cause.\n\nFor one GPU per node, pass --devices mpi so the ranks "
+                "form a single distributed program:\n"
+                "    mpirun -n 4 uv run --extra qiskit python <script> --devices mpi"
+            )
+        if devices:
+            os.environ["CUDA_VISIBLE_DEVICES"] = devices
+        else:
+            os.environ.setdefault(
+                "XLA_FLAGS", f"--xla_force_host_platform_device_count={host_devices}"
+            )
+
+    import jax
+
+    ndev, nproc = jax.device_count(), jax.process_count()
+    backend = jax.devices()[0].platform
+    kind = "virtual" if backend == "cpu" else "real"
+    over = f" over {nproc} processes" if nproc > 1 else ""
+    return f"{ndev} {kind} {backend} device(s){over}"
 
 
 def header(title: str) -> None:
