@@ -83,6 +83,7 @@ options = parser.parse_args()
 import jax
 import numpy as np
 from _scaling_common import init_devices, make_1d_mesh
+from jax.experimental.multihost_utils import process_allgather
 
 jax.config.update("jax_enable_x64", True)
 
@@ -318,7 +319,16 @@ def run(mesh, num_shards, states, states_size, slack=1.35):
             256,
             mesh,
         )
-        got = np.asarray(got)
+        # Multi-process: np.asarray on a globally-sharded array raises "Fetching value for
+        # jax.Array that spans non-addressable (non process local) devices". process_allgather
+        # replicates it to every rank.
+        #
+        # tiled=True is REQUIRED, not a tuning choice. With the default tiled=False a *fully
+        # addressable* array (the single-process case) is stacked into a new leading axis --
+        # (4, 2) becomes (1, 4, 2) -- so np.array_equal against the reference silently returned
+        # False. Measured: exactness flipped True -> False at d=2 until this was set. tiled=True
+        # concatenates instead, matching np.asarray's shape in both regimes.
+        got, counts, overflow = process_allgather((got, counts, overflow), tiled=True)
     return {
         "exact": np.array_equal(reference, got),
         "unique": int(np.asarray(counts).sum()),

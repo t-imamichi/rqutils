@@ -184,18 +184,33 @@ def main():
         sharded_diagonals = jax.device_put(
             diagonals, jax.sharding.NamedSharding(mesh, PartitionSpec(None, "x"))
         )
-        sharded_matvec = functools.partial(
-            apply_h, xsources=sharded_sources, diagonals=sharded_diagonals
-        )
+
+        # Multi-process: a functools.partial closing over these arrays raises "Closing over jax.Array
+        # that spans non-addressable (non process local) devices". Each rank addresses only its own
+        # shard, so a globally-sharded array must arrive as an *argument*. ground_locg splats
+        # matvec(vec, *args), so `args` is that channel -- and apply_h being keyword-only (CLAUDE.md)
+        # is why this takes a positional adapter rather than another partial.
+        def sharded_matvec(vec, xsources, diagonals):
+            return apply_h(vec, xsources=xsources, diagonals=diagonals)
+
+        margs = (sharded_sources, sharded_diagonals)
         sharded_init = jax.device_put(xinit, jax.sharding.NamedSharding(mesh, PartitionSpec("x")))
         for label, prefilter in (("plain", None), ("prefiltered", (16, 4))):
             result = ground_locg(
-                sharded_matvec, sharded_init, prefilter=prefilter, prefilter_hi=prefilter_hi
+                sharded_matvec,
+                sharded_init,
+                args=margs,
+                prefilter=prefilter,
+                prefilter_hi=prefilter_hi,
             )
             timing = timeit(
                 lambda p=prefilter: jax.block_until_ready(
                     ground_locg(
-                        sharded_matvec, sharded_init, prefilter=p, prefilter_hi=prefilter_hi
+                        sharded_matvec,
+                        sharded_init,
+                        args=margs,
+                        prefilter=p,
+                        prefilter_hi=prefilter_hi,
                     )
                 ),
                 label,
