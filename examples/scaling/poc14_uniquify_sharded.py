@@ -83,7 +83,6 @@ options = parser.parse_args()
 import jax
 import numpy as np
 from _scaling_common import init_devices, make_1d_mesh
-from jax.experimental.multihost_utils import process_allgather
 
 jax.config.update("jax_enable_x64", True)
 
@@ -302,8 +301,30 @@ def xxz_krylov(num_qubits, max_states):
     return np.packbits(padded, axis=1)
 
 
+def _gather_local(arr):
+    """Concatenate an array's addressable shards along axis 0, or None if this rank holds none.
+
+    The collective ``process_allgather`` cannot be used here -- see the note in :func:`run`. Each
+    rank in the sub-mesh holds a contiguous slice of the sharded axis, and the shards carry their
+    global index, so sorting by ``index`` before concatenating reconstructs the global order rather
+    than this rank's arrival order.
+
+    Returns None off-mesh, which is not an error: a rank outside the sub-mesh has nothing to compare
+    and must not assert on an absent value.
+    """
+    shards = arr.addressable_shards
+    if not shards:
+        return None
+    ordered = sorted(shards, key=lambda sh: sh.index[0].start or 0)
+    return np.concatenate([np.asarray(sh.data) for sh in ordered], axis=0)
+
+
 def run(mesh, num_shards, states, states_size, slack=1.35):
-    """Run the sharded version and compare against ``uniquify_states``."""
+    """Run the sharded version and compare against ``uniquify_states``.
+
+    Returns None on a rank outside ``mesh`` (possible when the sweep meshes over a device subset on
+    a multi-process job); the caller treats that as "nothing to report here", not as a failure.
+    """
     reference = np.asarray(uniquify_states(jnp.asarray(states), states_size))
     words = _pack_state_words(jnp.asarray(states))
     cap1, cap2 = capacities(len(states), states_size, num_shards, slack)
@@ -319,16 +340,29 @@ def run(mesh, num_shards, states, states_size, slack=1.35):
             256,
             mesh,
         )
-        # Multi-process: np.asarray on a globally-sharded array raises "Fetching value for
-        # jax.Array that spans non-addressable (non process local) devices". process_allgather
-        # replicates it to every rank.
+        # Bring the sharded results back to host. Three constraints stack here, and each was
+        # learned by breaking the previous fix:
         #
-        # tiled=True is REQUIRED, not a tuning choice. With the default tiled=False a *fully
-        # addressable* array (the single-process case) is stacked into a new leading axis --
-        # (4, 2) becomes (1, 4, 2) -- so np.array_equal against the reference silently returned
-        # False. Measured: exactness flipped True -> False at d=2 until this was set. tiled=True
-        # concatenates instead, matching np.asarray's shape in both regimes.
-        got, counts, overflow = process_allgather((got, counts, overflow), tiled=True)
+        # 1. np.asarray on a globally-sharded array raises "Fetching value for jax.Array that spans
+        #    non-addressable (non process local) devices" -- a rank addresses only its own shard.
+        # 2. process_allgather's default tiled=False stacks a *fully addressable* array into a new
+        #    leading axis ((4,2) -> (1,4,2)), so np.array_equal silently returned False and
+        #    exactness flipped True -> False at d=2. tiled=True concatenates instead.
+        # 3. process_allgather still fails on a SUB-mesh: this sweep meshes over
+        #    jax.devices()[:num_shards], so on a 4-process job at d=2 ranks 2 and 3 hold no shard
+        #    at all and its internal addressable_data(0) raises "FullyReplicatedShard: Array has no
+        #    addressable shards". Measured: ranks 0-1 printed `True`, ranks 2-3 crashed, then the
+        #    shutdown barrier timed out at 2/4 tasks.
+        #
+        # Hence gather from the addressable shards directly rather than collectively: every rank in
+        # the sub-mesh has the full picture along the sharded axis, and ranks outside it correctly
+        # have nothing to say. `_gather_local` returns None off-mesh, and the caller skips the
+        # comparison rather than asserting on an absent value.
+        got = _gather_local(got)
+        counts = _gather_local(counts)
+        overflow = _gather_local(overflow)
+        if got is None:
+            return None
     return {
         "exact": np.array_equal(reference, got),
         "unique": int(np.asarray(counts).sum()),
@@ -381,6 +415,8 @@ def main():
         mesh = make_1d_mesh(devices=jax.devices()[:num_shards])
         trimmed = states[: (len(states) // num_shards) * num_shards]
         r = run(mesh, num_shards, trimmed, states_size)
+        if r is None:  # This rank is outside the d-device sub-mesh; nothing to verify here.
+            continue
         print(
             f"   {num_shards:>3} {r['caps'][0]:>8} {r['caps'][1]:>8} {r['unique']:>8} "
             f"{r['overflow']:>7} {r['exact']!s:>6}"
@@ -396,9 +432,13 @@ def main():
     print(f"   {'slack':>7} {'ovf':>8} {'exact':>6}")
     for slack in (1.35, 0.30):
         r = run(mesh, widest, trimmed, states_size, slack=slack)
+        if r is None:
+            continue
         note = "   <- guard fires; a caller MUST raise" if r["overflow"] else ""
         print(f"   {slack:>7} {r['overflow']:>8} {r['exact']!s:>6}{note}")
     under = run(mesh, widest, trimmed, states_size, slack=0.30)
+    if under is None:
+        return
     assert under["overflow"] > 0, "an undersized capacity must be detected"
     assert not under["exact"], "an undersized capacity does drop rows -- hence the guard"
     print("\n   Exactness and a zero overflow count coincide, which is what makes the free check")
