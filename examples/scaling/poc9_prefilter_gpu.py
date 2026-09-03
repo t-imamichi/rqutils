@@ -129,9 +129,9 @@ def main():
 
     baseline = timeit(lambda: jax.block_until_ready(ground_locg(matvec, xinit)), "plain")
     plain = ground_locg(matvec, xinit)
-    # Keep only the scalars. Every ground_locg return holds an O(N) eigenvector, and on a GPU the
-    # sweep OOMed at (32, 4) with eight prior configs' vectors still reachable -- the sweep must not
-    # accumulate what it has already reduced to a number.
+    # Keep only the scalars: an O(N) eigenvector per config has no reason to outlive the number it
+    # is reduced to. This alone did NOT fix the GPU OOM below -- freeing eight vectors left the
+    # failure at the same config -- so it is hygiene, not the cure.
     reference, plain_iters = float(plain[0]), int(plain[2])
     del plain
     print(
@@ -141,6 +141,13 @@ def main():
     for degree in DEGREES:
         for cycles in CYCLES:
             prefilter = (degree, cycles)
+            # Each (degree, cycles) is static, so ground_locg retraces and the process retains one
+            # more CUBIN per config. On a 71 GB GPU the 8th config failed to *load its module*
+            # (RESOURCE_EXHAUSTED / "Failed to load in-memory CUBIN"), not to allocate a tensor.
+            # Measured: HLO size and temp_size_in_bytes are identical across all nine configs
+            # (1836504 B; degree and cycles are lax.scan trip counts and change neither), so the
+            # boundary is cumulative executables, not this config's demand. Hence clear the cache.
+            jax.clear_caches()
             # Per-config isolation: one OOM used to abort the sweep, so the configs after the
             # failure were reported as nothing at all rather than as unrun. A skipped row is data.
             try:
