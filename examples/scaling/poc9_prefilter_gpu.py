@@ -120,6 +120,9 @@ def main():
 
     sources, diagonals, dim = assemble(problem)
     matvec = functools.partial(apply_h, xsources=sources, diagonals=diagonals)
+    # A callable mat cannot yield a bound on lambda_max from matvecs alone (Kuczynski-Wozniakowski),
+    # so ground_locg requires it explicitly. sum|c_k| is the bound sqd itself passes; loose is safe.
+    prefilter_hi = float(np.abs(problem.hamiltonian.c).sum())
     rng = np.random.default_rng(0)
     xinit = jax.numpy.asarray(rng.normal(size=dim))
     xinit = xinit / jax.numpy.linalg.norm(xinit)
@@ -134,9 +137,11 @@ def main():
     for degree in DEGREES:
         for cycles in CYCLES:
             prefilter = (degree, cycles)
-            result = ground_locg(matvec, xinit, prefilter=prefilter)
+            result = ground_locg(matvec, xinit, prefilter=prefilter, prefilter_hi=prefilter_hi)
             timing = timeit(
-                lambda p=prefilter: jax.block_until_ready(ground_locg(matvec, xinit, prefilter=p)),
+                lambda p=prefilter: jax.block_until_ready(
+                    ground_locg(matvec, xinit, prefilter=p, prefilter_hi=prefilter_hi)
+                ),
                 f"({degree},{cycles})",
             )
             # ~11 matvecs for the lambda_max estimate, plus cycles*(degree+1) for the filter.
@@ -165,10 +170,14 @@ def main():
         )
         sharded_init = jax.device_put(xinit, jax.sharding.NamedSharding(mesh, PartitionSpec("x")))
         for label, prefilter in (("plain", None), ("prefiltered", (16, 4))):
-            result = ground_locg(sharded_matvec, sharded_init, prefilter=prefilter)
+            result = ground_locg(
+                sharded_matvec, sharded_init, prefilter=prefilter, prefilter_hi=prefilter_hi
+            )
             timing = timeit(
                 lambda p=prefilter: jax.block_until_ready(
-                    ground_locg(sharded_matvec, sharded_init, prefilter=p)
+                    ground_locg(
+                        sharded_matvec, sharded_init, prefilter=p, prefilter_hi=prefilter_hi
+                    )
                 ),
                 label,
             )
