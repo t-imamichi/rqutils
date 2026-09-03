@@ -1,4 +1,4 @@
-"""POC 7: multi-device sharding correctness, on virtual CPU devices.
+"""POC 7: multi-device sharding correctness, on virtual CPU devices or real GPUs.
 
 ``CLAUDE.md`` records that nothing in the test suite exercises a multi-device mesh, so
 ``ground_locg``'s ``out_sharding`` contract, ``sqd``'s mesh-size padding, and ``svsim``'s
@@ -12,17 +12,44 @@ mesh-size padding in ``sqd`` -- without a GPU. What it does **not** give is any 
 virtual devices share one physical CPU, so timings here are meaningless and none are reported. This
 tests correctness only, which is the part that was never tested at all.
 
-Run (the flag is mandatory -- without it this reports a single device and skips):
+Run on virtual CPU devices (the default is 4, so no flag is needed)::
 
-    XLA_FLAGS=--xla_force_host_platform_device_count=4 \
-        uv run --extra qiskit python examples/scaling/poc7_sharding.py
+    uv run --extra qiskit python examples/scaling/poc7_sharding.py
+
+Run on real GPUs, which exercises the same assertions against real kernels and interconnect::
+
+    uv run --extra qiskit python examples/scaling/poc7_sharding.py --devices 0,1,2,3
+
+``--devices`` sets ``CUDA_VISIBLE_DEVICES``, a **filter** over the devices the driver already exposes:
+it cannot split one GPU into several, and ``--xla_force_host_platform_device_count`` is host-platform
+only, so there is no way to fake a second GPU. Two physical GPUs are required for the GPU path.
+Correctness transfers from either mode; **timings do not**, and this script reports none in either.
 """
 
+import argparse
 import itertools
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# `argparse` before `import jax`, as in poc8/poc9/poc13/poc14: CUDA_VISIBLE_DEVICES and XLA_FLAGS are
+# both read at backend initialization, so neither can be set after jax is imported. That is also why
+# this preamble is duplicated per script rather than living in `_scaling_common` -- that module
+# imports jax.
+parser = argparse.ArgumentParser()
+parser.add_argument("--devices", help='Comma-separated GPU ids, e.g. "0,1,2,3".')
+parser.add_argument(
+    "--host-devices", type=int, default=4, help="Virtual CPU devices when no --devices."
+)
+options = parser.parse_args()
+
+if options.devices:
+    os.environ["CUDA_VISIBLE_DEVICES"] = options.devices
+else:
+    os.environ.setdefault(
+        "XLA_FLAGS", f"--xla_force_host_platform_device_count={options.host_devices}"
+    )
 
 import jax
 
@@ -160,17 +187,55 @@ def check_eigvec_path():
 
 def main():
     ndev = jax.device_count()
-    print(f"JAX devices: {ndev} ({jax.devices()[0].platform})")
+    backend = jax.devices()[0].platform
+    virtual = backend == "cpu"
+    print(f"JAX devices: {ndev} ({backend}{', virtual' if virtual else ''})")
+    if options.devices and virtual:
+        # CUDA_VISIBLE_DEVICES was set but the backend came up as CPU, so there is no CUDA device
+        # here and the flag did nothing. Say so: otherwise a CPU result reads as a GPU result.
+        print()
+        print("WARNING: --devices was passed but the backend is CPU -- there is no CUDA device")
+        print("visible, so the flag had NO effect and nothing below is a GPU measurement.")
     if ndev < 2:
         print()
-        print("SKIPPED: this script needs >= 2 devices. Re-run with")
-        print("  XLA_FLAGS=--xla_force_host_platform_device_count=4 \\")
-        print("      uv run --extra qiskit python examples/scaling/poc7_sharding.py")
+        print("SKIPPED: this script needs >= 2 devices. Either:")
+        print("  uv run --extra qiskit python examples/scaling/poc7_sharding.py --host-devices 4")
+        print("  uv run --extra qiskit python examples/scaling/poc7_sharding.py --devices 0,1")
+        if virtual and "xla_force_host_platform_device_count" not in os.environ.get(
+            "XLA_FLAGS", ""
+        ):
+            # `setdefault` above yields to any pre-existing XLA_FLAGS, so an unrelated flag (say
+            # --xla_dump_to) silently suppresses the device count and this skips for a reason that
+            # is nowhere on screen. Name it.
+            print()
+            print("NOTE: XLA_FLAGS is set without --xla_force_host_platform_device_count, which")
+            print("takes precedence over --host-devices, so only one device was created. Add the")
+            print(
+                f'flag to XLA_FLAGS yourself: XLA_FLAGS="{os.environ.get("XLA_FLAGS", "")} '
+                '--xla_force_host_platform_device_count=4"'
+            )
+        if not virtual:
+            # --devices filters CUDA_VISIBLE_DEVICES, so it cannot create a device that is not
+            # there; poc8 records the same trap. Say so rather than let the flag look broken.
+            print()
+            print("NOTE: --devices sets CUDA_VISIBLE_DEVICES, which only NARROWS the devices the")
+            print(
+                "driver exposes -- it cannot split one GPU into several. This needs >= 2 physical"
+            )
+            print("GPUs, and --xla_force_host_platform_device_count is host-platform only.")
         return 1
 
     print()
-    print("NOTE: virtual CPU devices exercise the sharding CODE PATHS but share one physical CPU.")
-    print("No timings are reported here -- they would be meaningless. Correctness only.")
+    if virtual:
+        print(
+            "NOTE: virtual CPU devices exercise the sharding CODE PATHS but share one physical CPU."
+        )
+        print("No timings are reported here -- they would be meaningless. Correctness only.")
+    else:
+        # Correctness-only holds on real GPUs too: this script asserts values and specs, and adding
+        # timings would need the A/B discipline CLAUDE.md requires (both arms warm, whole calls).
+        print(f"NOTE: {ndev} real {backend} devices, so the sharding paths run on real kernels and")
+        print("interconnect. Still correctness only -- this script reports no timings.")
 
     res, (problem, eig_dense) = check_single_vs_sharded()
     worst_cache = check_all_cache_levels(problem, eig_dense)
