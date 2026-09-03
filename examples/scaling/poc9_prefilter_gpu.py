@@ -129,26 +129,39 @@ def main():
 
     baseline = timeit(lambda: jax.block_until_ready(ground_locg(matvec, xinit)), "plain")
     plain = ground_locg(matvec, xinit)
-    reference = float(plain[0])
+    # Keep only the scalars. Every ground_locg return holds an O(N) eigenvector, and on a GPU the
+    # sweep OOMed at (32, 4) with eight prior configs' vectors still reachable -- the sweep must not
+    # accumulate what it has already reduced to a number.
+    reference, plain_iters = float(plain[0]), int(plain[2])
+    del plain
     print(
-        f"\nN(padded)={dim}  plain: {baseline.min_s * 1e3:.1f}ms  {int(plain[2])} iters  E={reference:.12f}"
+        f"\nN(padded)={dim}  plain: {baseline.min_s * 1e3:.1f}ms  {plain_iters} iters  E={reference:.12f}"
     )
     print(f"{'degree':>7} {'cycles':>7} {'extra mv':>9} {'iters':>6} {'ms':>9} {'|dE|':>10}  ratio")
     for degree in DEGREES:
         for cycles in CYCLES:
             prefilter = (degree, cycles)
-            result = ground_locg(matvec, xinit, prefilter=prefilter, prefilter_hi=prefilter_hi)
-            timing = timeit(
-                lambda p=prefilter: jax.block_until_ready(
-                    ground_locg(matvec, xinit, prefilter=p, prefilter_hi=prefilter_hi)
-                ),
-                f"({degree},{cycles})",
-            )
+            # Per-config isolation: one OOM used to abort the sweep, so the configs after the
+            # failure were reported as nothing at all rather than as unrun. A skipped row is data.
+            try:
+                result = ground_locg(matvec, xinit, prefilter=prefilter, prefilter_hi=prefilter_hi)
+                iters, dE = int(result[2]), abs(float(result[0]) - reference)
+                del result
+                timing = timeit(
+                    lambda p=prefilter: jax.block_until_ready(
+                        ground_locg(matvec, xinit, prefilter=p, prefilter_hi=prefilter_hi)
+                    ),
+                    f"({degree},{cycles})",
+                )
+            except jax.errors.JaxRuntimeError as exc:
+                first = str(exc).strip().splitlines()[0][:60]
+                print(f"{degree:>7} {cycles:>7} {'':>9} {'--':>6} {'SKIPPED':>9}  {first}")
+                continue
             # ~11 matvecs for the lambda_max estimate, plus cycles*(degree+1) for the filter.
             extra = cycles * (degree + 1) + 11
             print(
-                f"{degree:>7} {cycles:>7} {extra:>9} {int(result[2]):>6} "
-                f"{timing.min_s * 1e3:>9.2f} {abs(float(result[0]) - reference):>10.1e}"
+                f"{degree:>7} {cycles:>7} {extra:>9} {iters:>6} "
+                f"{timing.min_s * 1e3:>9.2f} {dE:>10.1e}"
                 f"  {fmt_ratio(baseline, timing)}"
             )
 
