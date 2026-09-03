@@ -179,9 +179,56 @@ Practical recipe:
    The filter cannot change the answer — every convergence test reads the true residual — but that is
    the assertion worth making once.
 
-**Caveat.** All of this is single-device CPU. The ordering could shift on a GPU, where the
-matvec-to-bookkeeping cost ratio differs; `examples/scaling/poc9_prefilter_gpu.py` sweeps this grid for
-exactly that reason.
+**Caveat.** All of the above is single-device CPU. The ordering *does* shift on a GPU -- measured, and
+the recipe above is CPU-specific.
+
+### 3.2 The same grid on a GPU (2026-09-04)
+
+One CUDA device, `n=26`, `N=1048576` padded, `J=30`, via `examples/scaling/poc9_prefilter_gpu.py`.
+Unfiltered baseline 298 iterations / 280.7 ms. Ratios below a ~1% noise floor are reported as
+unresolved rather than as wins or losses.
+
+| degree | cycles | extra mv | iters | ratio |
+|-------:|-------:|---------:|------:|------:|
+| 8 | 2 | 29 | 292 | 1.005x unresolved |
+| 8 | 4 | 47 | 284 | 1.000x unresolved |
+| 8 | 8 | 83 | 255 | 1.07x |
+| 16 | 2 | 45 | 285 | 0.997x unresolved |
+| 16 | 4 | 79 | 253 | 1.08x |
+| 16 | 8 | 147 | 191 | 1.28x |
+| 32 | 2 | 77 | 256 | 1.07x |
+| 32 | 4 | 143 | 181 | **1.34x** |
+| 32 | 8 | 275 | 138 | **1.38x** |
+
+**The peak transfers; its location does not.** GPU tops out at 1.38x against the CPU median of 1.36x,
+so the prefilter pays about as well -- but CPU peaks near `(16, 4)` while on GPU that same setting gives
+only **1.08x**, and reaching 1.38x takes `(32, 8)`. The CPU recipe's "do not exceed `cycles ~ 4`" is
+therefore a CPU statement: on GPU, `cycles = 8` is where the wins are. This is the predicted mechanism
+(a GPU's gather-heavy matvec against bandwidth-bound `O(N)` bookkeeping shifts the trade) resolving
+toward "keep paying matvecs for longer", not toward "the trade stops working".
+
+Wall-clock returns flatten while iterations keep falling: `(32,4)` -> `(32,8)` drops iterations 181 ->
+138 (-24%) for +3% wall clock, so the optimum is near `(32, 8)`. Where it turns over is unmeasured --
+the sweep ends there.
+
+**`sqd`'s default `(32, 2)` measures 1.07x here**, under a fifth of the 1.38x available. Two reasons not
+to read that as a refutation of the documented 1.49x default: this harness drives `ground_locg` on
+`apply_h` directly and excludes the setup `sqd`'s end-to-end figure includes, and this is one
+Hamiltonian at one size. Changing the default needs the end-to-end `sqd` measurement across sizes, which
+has not been run on a GPU.
+
+Claim 1 of that script -- that the *iteration* reduction is backend-independent -- holds: counts are
+stable to <=1 iteration across four runs and `|dE|` against the unfiltered reference is 0.0-1.8e-15
+throughout, so the filter returns the same eigenpair on both backends.
+
+**Sweeping this grid in one process needs `jax.clear_caches()` between configurations.** `prefilter` is
+a static argument, so each `(degree, cycles)` retains its own executable; the 8th one failed to *load
+its module* on a 71 GB GPU (`RESOURCE_EXHAUSTED` / "Failed to load in-memory CUBIN") while the device
+held under 1 GB of tensors. It is not a per-config memory limit -- compiled HLO size and
+`temp_size_in_bytes` are identical (1836504 B) across all nine, `degree` and `cycles` being `lax.scan`
+trip counts. `(32,4)` and `(32,8)` are the two fastest configurations *and* were the two that appeared
+to exhaust the GPU. This affects sweeps only: `sqd` forwards one `prefilter` value and its cache stays
+at one entry across repeated calls (measured).
 
 Correctness, every case: energy agrees with `scipy.sparse.linalg.eigsh(tol=0)` to **1.8e-15–2.8e-14**,
 eigenvector overlap with the unfiltered `ground_locg` result is **1.0000000**, and `converged` is

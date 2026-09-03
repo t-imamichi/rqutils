@@ -2831,6 +2831,68 @@ One deviation shows even a careful implementation carves out unproven exceptions
 matrix without the orthogonality justification, commenting that it "seems to be OK even with very badly
 conditioned B matrices". Not applicable at `B = I`.
 
+### The GPU prefilter sweep: the peak transfers, its location does not (2026-09-04)
+
+`examples/scaling/poc9_prefilter_gpu.py` on one CUDA device, `n=26`, `N=1048576`, `J=30`. Full table in
+`docs/locg-chebyshev-prefilter.md` §3.2. Headline: **1.38x at `(32, 8)`** against the CPU median of
+1.36x, so the prefilter pays about as well on GPU as on CPU — but CPU peaks near `(16, 4)` and that same
+setting gives only **1.08x** here. The CPU recipe's "do not exceed `cycles ≈ 4`" is a CPU statement.
+`sqd`'s `(32, 2)` default measures 1.07x, under a fifth of what is available; changing it needs the
+end-to-end `sqd` measurement, which this harness does not perform (it drives `ground_locg` on `apply_h`
+and excludes setup).
+
+Two process lessons, both about reading a truncated result:
+
+- **A sweep that dies partway invites the wrong conclusion, and I drew it.** With `(32,4)` and `(32,8)`
+  missing I concluded "the CPU 1.36x does not transfer" and "only `(16,8)` clears 1.28x". Both were
+  wrong, and wrong in the *optimistic-for-my-hypothesis* direction: the two absent configurations were
+  the two best in the grid. The measurement had no error in it — the inference from a grid with a hole
+  did. **A per-item `try` that prints a SKIPPED row is worth more than the rows it saves**, because it
+  makes the hole visible as a hole.
+- **The two configurations that looked like they exhausted the GPU are the two fastest.** Believing the
+  failure was about their cost would have removed exactly the settings worth using.
+
+### Sweeping a static argument in one process exhausts the GPU on compiled modules, not tensors (2026-09-04)
+
+`prefilter` is a `static_argnames` entry on `ground_locg` and `run_sqd`, so each `(degree, cycles)`
+retraces and the process retains one more executable. The 8th configuration in poc9's 3x3 grid failed on
+a **71 GB** GPU with `RESOURCE_EXHAUSTED: Failed to load in-memory CUBIN`, while the device held under
+1 GB of tensors. `jax.clear_caches()` between configurations fixes it; `timeit`'s single warmup absorbs
+the forced recompile (ratios within noise of the pre-fix run, iteration counts identical).
+
+**What made the diagnosis, and two wrong turns before it:**
+
+- **Wrong turn 1: retention.** Every `ground_locg` return holds an `O(N)` eigenvector and eight were
+  reachable at the failure, which is a real defect and was fixed — but freeing them **left the failure at
+  exactly the same configuration**. A *reproducible* boundary is not a leak; a leak creeps. Fixing a real
+  problem that is not *the* problem is the trap: the fix looked justified and the symptom was unmoved.
+- **Wrong turn 2: graph growth.** Plausible because `degree` bounds a Chebyshev recurrence. Refuted by
+  measurement: **compiled HLO size and `temp_size_in_bytes` are identical across all nine configurations
+  (1836504 B, HLO within 2 characters)**, because both parameters are `lax.scan` trip counts and change
+  neither graph size nor working set. Per `CLAUDE.md`, ask XLA rather than a formula — that applies to
+  *excluding* a hypothesis, not only to sizing.
+- **The error message named the layer and I read past it.** "Failed to load in-memory **CUBIN**" is a
+  module load, not an allocation. The solve never began.
+
+**Scope: sweeps only, not the library.** Measured with `run_sqd._cache_size()`: five `sqd` calls at the
+default `prefilter` hold the cache at **1**; six distinct values grow it 1→6. The `(32,2)` step does not
+increment, since an earlier default call already created that entry — growth tracks *distinct static
+values*, not call count. Generic to every static argname (`cache_level`, `maxiter`, `states_size`,
+`xcache_groups`), not to `prefilter`. `poc23_caching.py` is not exposed: it builds cache variants as
+arrays and hand-assembles matvecs rather than passing `cache_level` through a jit boundary.
+
+### `poc8`'s re-run: the `lax.sort` leak still does not reproduce, and two claims stay open (2026-09-04)
+
+The non-reproduction is already stated in `get_xsource`'s docstring from the GH200 run; this second CUDA
+device reproduces that non-reproduction (flat at +0.000 GB retained and +0.000 GB drift across 5 reps in
+both arms, 0.950 GB live and identical between them) and needs no separate record.
+
+**Still open from that script.** Its Claim 2 (searchsorted vs the legacy sort) reports 16.0x/14.6x/10.8x
+at `N=200k/1M/5M`, but the two larger sizes carry the script's own not-kernel-dominated warning — the
+sort arm grew 1.03x and 1.23x for a 5x `N` increase, against a fixed ~1.46 s floor. A floor that
+dominates *suppresses* the ratio, so those are lower bounds on an unmeasured value and **should not be
+quoted** until the floor is identified. Claim 3 (multi-GPU speed) is unrun: one physical device.
+
 ## `precond` was removed; `sqd` defaults to `prefilter=(32, 2)`
 
 2026-08-28, acting on the comparison below.
