@@ -858,16 +858,18 @@ def ground_locg(
             full ``maxiter`` iterations with no early exit; rows past convergence are
             post-convergence noise.
         log_level: Verbosity level.
-        batch_matvec: Send the steady-state iteration's two *independent* operator applications as one
-            stacked ``(2, n)`` array instead of two ``(n,)`` calls, so ``mat`` is invoked once per
-            iteration for the pair. Requires ``mat`` to broadcast over a leading batch axis and to
-            return a matching ``(2, n)``; :mod:`rqutils.sqd`'s matvecs do, since they index with
-            ``vec.at[..., xsource]`` and scale elementwise. Ignored -- and rejected with a
-            ``ValueError`` -- when ``mat`` is an array, whose matvec this function builds itself.
-            Default ``False``, because an arbitrary callable need not accept a batch. Measured
-            1.61-1.81x on the pair with bit-identical results, and on a 4-device mesh it halves the
-            all-gathers (6 to 3) by paying the operator's gather once for both vectors. With
-            ``debug=True`` the three diagnostic applications batch too, and there the ``sas`` and ``y``
+        batch_matvec: Send each group of *independent* operator applications as one stacked
+            ``(k, n)`` array instead of ``k`` separate ``(n,)`` calls, so ``mat`` is invoked once per
+            group. Requires ``mat`` to broadcast over a leading axis of **any** size and to return a
+            matching ``(k, n)`` -- not just ``k = 2``: the steady-state iteration sends a pair, and
+            ``debug=True``'s diagnostics send three, so an operator that hardcodes 2 breaks on the
+            debug path. :mod:`rqutils.sqd`'s matvecs satisfy this, since they index with
+            ``vec.at[..., xsource]`` and scale elementwise, both of which are width-agnostic.
+            Ignored -- and rejected with a ``ValueError`` -- when ``mat`` is an array, whose matvec
+            this function builds itself. Default ``False``, because an arbitrary callable need not
+            accept a batch. Measured 1.61-1.81x on the pair with bit-identical results, and on a
+            4-device mesh it halves the all-gathers (6 to 3) by paying the operator's gather once for
+            both vectors. On the ``debug=True`` path the ``sas`` and ``y``
             diagnostics are **not** bit-identical to the unbatched arm -- batching reassociates the
             operator's summation, and ``sas`` row/col 2 derives from ``tmp_p``, whose direction is
             ill-conditioned once ``||r||`` approaches its floor. ``theta`` is unaffected (measured
@@ -933,9 +935,10 @@ def ground_locg(
             batch_matvec=batch_matvec,
         )
     if batch_matvec:
-        # Silently ignoring it would be the bad failure: a caller who set it would read the unchanged
-        # timing as "batching does not help this operator" rather than "it was never applied". The
-        # array path builds its own `mat @ v` matvec, so there is nothing for a caller to batch.
+        # Rejected rather than ignored for the reason the `Raises:` entry gives. Not merely "there is
+        # no caller-supplied matvec": the one this path builds is a `jax.lax.dot`, which rejects a
+        # rank-2 rhs outright ("dimension_numbers must be specified when not performing simple
+        # un-batched ... products"), so batching here needs a different contraction, not a flag.
         raise ValueError("`batch_matvec` applies only when `mat` is a callable, not an array")
     return _ground_locg_matrix(
         mat,
@@ -1189,12 +1192,19 @@ def _ground_locg_callable(
         # known -- three matvecs per iteration instead of four.
         #
         # The two remaining applications are independent, so they go out as one (2, N) batch when
-        # `batch_matvec` is set. This is a pure win where the operator broadcasts over leading axes
-        # (`rqutils.sqd`'s does): measured 1.61-1.81x on the pair, bit-identical, and on a 4-device
+        # `batch_matvec` is set. Measured 1.61-1.81x on the pair, bit-identical, and on a 4-device
         # mesh it halves the all-gathers, 6 -> 3, because the gather inside the operator is paid once
         # for the pair instead of twice. `jnp.stack` of a `P('x')` vector is `P(None, 'x')` -- the
         # batch axis is replicated and the partitioned axis keeps its position, so nothing reshards.
         # Off by default because an arbitrary `mat` callable need not accept a batch.
+        #
+        # The `jnp.stack` is a real materialization, not a view, so whether it costs memory depends on
+        # the operator -- and the two regimes have opposite signs, which is why this is measured rather
+        # than reasoned about. Against an elementwise operator (no gather to save) temp rises one
+        # vector. Against `sqd`'s, temp *falls* a flat -16.00 B/slot -- one f64 complex slot, measured
+        # across N=4000..60000, 0.942x -- because the unbatched arm holds two separate gather results
+        # live where the batched arm holds one (2, N) buffer. So it is not a time-for-memory trade in
+        # the configuration that ships; don't "restore" the two-call form to save memory.
         if batch_matvec:
             aycurr, ap = matvec(jnp.stack((ycurr, tmp_p)), *args)
         else:

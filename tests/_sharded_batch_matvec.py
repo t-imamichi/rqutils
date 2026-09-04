@@ -19,6 +19,9 @@ resharding bug here would show up as an all-gather (a slowdown, not a wrong answ
 it, so the flag has no other reachable call site.
 """
 
+import os
+import sys
+
 import jax
 
 # Must precede the first array creation, exactly as conftest.py does for the suite.
@@ -27,42 +30,41 @@ jax.config.update("jax_enable_x64", True)
 import numpy as np
 from jax.sharding import AxisType
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from conftest import real_pauli_strings, unique_states
+
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import run_sqd
 
-# N mod 4 != 0, so the mesh-size rounding in `run_sqd` is exercised rather than skipped.
-NUM_QUBITS, NUM_STATES, NUM_TERMS, MESH_SIZE = 8, 37, 6, 4
+# 37 genuine states pad to 64, which the 4-device mesh divides. `STATES_SIZE` is a constant rather
+# than `sqd`'s `bit_length` formula, for the reason `_sharded_sqd_prefilter.py` gives: a second copy
+# of that formula could drift from the original.
+NUM_QUBITS, NUM_STATES, NUM_TERMS, STATES_SIZE, MESH_SIZE = 8, 37, 6, 64, 4
 
 
 def main() -> None:
     rng = np.random.default_rng(23)
-    # I/X/Z only: an even Y count keeps the folded phase real, so `.c` stays float64 and the run
-    # exercises the real-symmetric path a physical Hamiltonian takes.
-    labels = ["".join(rng.choice(list("IXZ"), size=NUM_QUBITS)) for _ in range(NUM_TERMS)]
+    # `real_pauli_strings` keeps the Y count even, so the folded phase stays real, `.c` narrows to
+    # float64, and the run exercises the real-symmetric path a physical Hamiltonian takes.
+    labels = real_pauli_strings(NUM_QUBITS, NUM_TERMS, rng)
     coeffs = rng.normal(size=NUM_TERMS).tolist()
     hamiltonian = PauliSumXZ.from_paulisum((labels, coeffs))
-    states = np.unique(rng.integers(0, 2, size=(NUM_STATES, NUM_QUBITS), dtype=np.uint8), axis=0)
+    states = unique_states(NUM_STATES, NUM_QUBITS, rng)
+    # Padded up to STATES_SIZE here because this calls `run_sqd` directly: `sqd` is what normally
+    # does this, and 255 is the filler for the reason `uniquify_states` uses it -- an all-ones row
+    # sorts to the end and its high bit in byte 0 is what `_is_filler` tests.
     states_p = PauliSumXZ.pack_states(states)
-    states_size = 1 << (int(states.shape[0] - 1).bit_length())
+    padding = np.full((STATES_SIZE - states_p.shape[0], states_p.shape[1]), 255, dtype=np.uint8)
+    states_p = np.append(states_p, padding, axis=0)
 
     mesh = jax.make_mesh((MESH_SIZE,), ("x",), (AxisType.Explicit,))
 
-    def run(batch: bool, sharded: bool) -> float:
-        kwargs = {
-            "hamiltonian": hamiltonian,
-            "states_p": states_p,
-            "states_size": states_size,
-            "return_eigvec": False,
-            "batch_matvec": batch,
-        }
-        if not sharded:
-            return float(run_sqd(**kwargs)[0])
-        with jax.set_mesh(mesh):
-            return float(run_sqd(**kwargs)[0])
-
+    args = (hamiltonian, states_p, STATES_SIZE, False)
     for batch in (False, True):
-        single = run(batch, sharded=False)
-        sharded = run(batch, sharded=True)
+        single = float(run_sqd(*args, batch_matvec=batch)[0])
+        with jax.set_mesh(mesh):
+            sharded = float(run_sqd(*args, batch_matvec=batch)[0])
         print(f"energy {int(batch)} {single!r} {sharded!r}")
 
     # The spec check, which is the half a value comparison cannot make. A stacked pair must keep the
@@ -71,7 +73,7 @@ def main() -> None:
     # dropped -- both of which agree with single-device to exactly 0.0.
     with jax.set_mesh(mesh):
         vec = jax.device_put(
-            jax.numpy.arange(float(states_size)), jax.NamedSharding(mesh, jax.P("x"))
+            jax.numpy.arange(float(STATES_SIZE)), jax.NamedSharding(mesh, jax.P("x"))
         )
         stacked = jax.numpy.stack((vec, vec))
         print(

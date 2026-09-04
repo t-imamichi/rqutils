@@ -369,6 +369,22 @@ implementations use it exactly that way.
 2.43× dense wall-clock or the 5.02× iteration count. `ground_locg` defaults to `None`, since it cannot
 derive a bound from a callable.
 
+**`batch_matvec` stacks each group of independent applications into one `(k, n)` call** — the
+steady-state iteration's pair, and `debug=True`'s three diagnostics. Needs no kernel change: `sqd`'s
+`apply_xgrp` indexes `vec.at[..., xsource]` and scales elementwise, both width-agnostic. 1.15–1.21×
+end-to-end at `cache_level=(1, 0)` (1.61–1.81× on the pair alone), and it **halves the sharded
+all-gathers**, 6 → 3, because the operator's gather is paid once per group — `jnp.stack` on a `P('x')`
+vector gives `P(None, 'x')`, so the data axis keeps its partitioning. `run_sqd` defaults to `True`;
+`ground_locg` to `False`, since an arbitrary callable need not accept a batch, and an **array** `mat`
+raises — its matvec is a `jax.lax.dot`, which rejects a rank-2 rhs. The contract is "broadcasts over a
+leading axis of *any* size", not just 2. **Memory depends on the operator and the two regimes have
+opposite signs** — measured, not reasoned: against `sqd`'s matvec, whole-`run_sqd` temp *falls* a flat
+−16.00 B/slot (0.942×, N=4000–60000), because the unbatched arm holds two gather results live where the
+batched arm holds one `(2, N)` buffer; against an elementwise operator with no gather to save, it rises
+a vector. So it is not a time-for-memory trade as shipped. Generalizing this is the lever for any site applying one
+operator to several independent vectors; the Chebyshev prefilter is **not** one (its terms are
+sequential), nor is `body()`'s third matvec (downstream of the Rayleigh–Ritz result).
+
 **`debug=True` runs the full `maxiter`** — it switches `while_loop` to `scan`, so it does *not* stop at
 convergence, and appends a dict of per-iteration diagnostics (`x`, `y`, `r`, `theta`, `rho`, `kappa`,
 `sas`, `rtol_scale`, `converged`; 2 extra leading rows for the seed steps). With `atol=rtol=0` that makes
@@ -503,6 +519,11 @@ in it.
   needs no re-pack — which also removes a hazard, `pack_states` not being idempotent. A caller comparing
   the result against an unpacked array breaks loudly on the shape mismatch. Both overloads annotate
   `StateList`, which cannot express the width, so **`ty` will not catch a caller assuming the wrong one**.
+- **`sqd()` does not forward `batch_matvec`**, so a public-API caller gets `run_sqd`'s `True` with no
+  dial. Harmless for every in-tree operator — the kernels are width-agnostic by construction — but a
+  caller wrapping their own matvec through `run_sqd` and hardcoding rank 1 gets a shape error from
+  inside a jitted solver. Call `run_sqd` directly with `batch_matvec=False` to opt out. Unlike the
+  `precond` gap this is not a deliberate deletion, just an unexposed dial.
 - **`tol` is gone**, replaced by `atol`/`rtol` (see `ground_locg.py` above). `tol=` raises `TypeError`
   with no alias, deliberately: it meant *relative* in one revision and *absolute* in the next, so
   silently resolving it to one of the pair would be the worst option. `tol=x` on the absolute form is
