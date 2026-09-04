@@ -4,6 +4,10 @@ This note reviews `rqutils/sqd.py` and `rqutils/ground_locg.py` for credible opp
 speed, memory, scaling, or accuracy. It is a proposal list, not a benchmark report. Measurements quoted
 below come from `NOTES.md`; unmeasured ideas are labelled as such.
 
+**Section 1 has since been implemented**, and its plan was wrong in the specifics — the interface it
+proposed measured worse than the alternative it explicitly ruled out. Treat every unmeasured
+prescription here as a hypothesis about *mechanism* rather than a design to follow.
+
 The strongest opportunities are in SQD's operator representation and distributed data flow.
 `ground_locg` is already close to the algorithmic memory floor of its three-dimensional
 Rayleigh--Ritz basis, and several attractive-looking solver changes have measured poorly or harmed
@@ -11,37 +15,65 @@ residual reliability.
 
 ## Priorities
 
-### 1. Add a paired-RHS matvec path
+### 1. Add a paired-RHS matvec path — **DONE, and the prescription below was wrong**
 
-Each steady-state LOCG iteration evaluates the operator on `ycurr`, `tmp_p`, and then `xnext` in
-`ground_locg.py`. For SQD, the first two calls independently repeat the same per-X-group preparation:
-source lookup when it is uncached, diagonal construction when it is uncached, and a scan over every X
-group.
+Implemented 2026-09-05 as `batch_matvec` (`ground_locg`, forwarded by `run_sqd`). Two of this section's
+three prescriptions were falsified by measurement, so read the outcome rather than the plan:
 
-A specialized optional interface could expose
+- **The proposed `matvec_pair(ycurr, tmp_p, *args) -> (ay, ap)` interface was built and rejected.** It
+  worked, but needed a whole new `_apply_h_pair_kernel` in `sqd.py` and measured only **1.14--1.21x**
+  end-to-end.
+- **"Carry two separate output vectors rather than materializing a stacked `(2, N)` array" is backwards.**
+  The stacked form is the one that shipped: **1.61--1.81x on the matvec pair**, 1.15--1.21x end-to-end,
+  and it needs **no kernel change at all** — `apply_xgrp` already indexes `vec.at[..., xsource]` and
+  scales elementwise, so leading-axis broadcast is implicit. The whole change is ~9 lines in `sqd.py`.
+- **"May turn three operator-setup sweeps into two" understates it.** The larger win is fusing the
+  *gather*: on a 4-device mesh the all-gathers drop **6 to 3**, because the operator's gather is paid
+  once per group instead of twice. That is why the stacked form beats the paired-callable one, and why
+  the benefit grows with device count. `jnp.stack` on a `P('x')` vector gives `P(None, 'x')`, so the data
+  axis keeps its partitioning and nothing reshards.
 
-```python
-matvec_pair(ycurr, tmp_p, *args) -> (ay, ap)
-```
+The section was right that the third application must stay fresh, and it is: `xnext` is downstream of
+the Rayleigh--Ritz result, so 3 matvecs become 2 calls and never 1.
 
-and let SQD scan each X group once, prepare its source indices and diagonal once, then apply those data
-to both vectors. The implementation should carry two separate output vectors through the scan rather
-than materializing a stacked `(2, N)` array. Ordinary `ground_locg` callers would retain the existing
-single-vector callable.
+**Measured across the full grid** (whole warm `run_sqd` calls, interleaved arms, energies gated to
+~1e-16 first). The prediction that `(0, 0)`, `(0, 2)` and `(1, 0)` benefit most is roughly right, but the
+grid also found the one level where batching **loses**:
 
-The likely benefit is largest for `(0, 0)`, `(0, 2)`, and `(1, 0)`, where source or diagonal setup is
-recomputed for every matvec. It may turn three operator-setup sweeps per LOCG iteration into two.
+| `cache_level` | ratio (N=2k) | note |
+|---|---|---|
+| `(0, 0)` | 1.24x | |
+| `(0, 1)` | 1.24x | |
+| `(0, 2)` | 1.22x | |
+| `(1, 0)` | 1.20x | the default |
+| `(1, 1)` | 1.22x | |
+| `(1, 2)` | **0.93x** | see below |
 
-The third application, `matvec(xnext)`, must remain fresh. Reconstructing it from previous images is the
-closed `Ax`-reuse investigation: it produced a reported residual up to 59 times smaller than the true
-one in float32 and thereby allowed false convergence.
+`(1, 2)` caches both source indices *and* diagonals, so there is no per-matvec setup left to share and
+only the stack cost remains. It is size-dependent, not a flat regression: 0.94x at N=2k, then 1.04x at
+N=8k and 1.04--1.09x at N=30k as the fixed cost amortizes. `run_sqd` defaults `batch_matvec=True`
+regardless, since `(1, 2)` is the rarest level (it needs the full diagonal cache resident) and the loss
+is confined to small subspaces.
 
-Validation should:
+Two findings worth carrying forward, both of which contradicted an initial reading:
 
-- measure warm, whole solves across all six cache levels rather than timing the predicate alone;
-- use XLA `memory_analysis()` to ensure the paired path does not increase peak live vectors;
-- compare the reported residual with an independently evaluated `H @ x`;
-- run `examples/scaling/poc7_sharding.py` and inspect output shardings and collectives.
+- **Memory has opposite signs by operator.** Through `run_sqd` temp *falls* a flat -16.00 B/slot (0.942x,
+  N=4000--60000), because the unbatched arm holds two gather results live where the batched arm holds one
+  `(2, N)` buffer. Against an elementwise operator with no gather to save, it rises a vector. So this is
+  neither a "pure win" nor a memory-for-speed trade; the sign depends on the fixture.
+- **Bit-identity depends on `mat`, and only `theta` is worth comparing.** XLA may contract a `(k, N)`
+  operand in a different order than an `(N,)`. An elementwise operator gives exactly 0.0 on every
+  diagnostic; a dense `einsum` moves `y` by 1.1e-9. The magnitude carries no information — on a
+  near-degenerate subspace `y` moved 0.56 while `theta` agreed to 2.2e-15, the eigenvector being free to
+  rotate within an invariant subspace.
+
+The contract is that `mat` broadcasts over a leading axis of **any** size, not just 2: `debug=True`'s
+diagnostics send three. `ground_locg` defaults to `False` (an arbitrary callable need not batch) and an
+array `mat` raises, its matvec being a `jax.lax.dot` that rejects a rank-2 rhs. See `CLAUDE.md`'s
+`ground_locg` section, and `tests/_sharded_batch_matvec.py` for the sharding case.
+
+**Not batchable, checked:** the Chebyshev prefilter (its terms are a sequential recurrence) and
+`body()`'s third matvec (downstream of Rayleigh--Ritz).
 
 ### 2. Implement the measured partial diagonal cache
 
@@ -240,11 +272,15 @@ The following have already been measured or ruled out structurally:
 - Bloom-filter acceleration of the one-off source precompute;
 - `cache_level[1] == 1`, which is slower than level 0 and often larger than level 2;
 - replacing `compute_sas` with a stacked one-matmul form;
-- switching to Davidson at the same memory budget.
+- switching to Davidson at the same memory budget;
+- a `matvec_pair`-style paired-callable interface for the two independent matvecs — built and measured
+  at 1.14--1.21x against plain `(2, N)` batching's larger win, and it needed a second kernel (section 1).
 
 ## Recommended order
 
-1. Prototype the paired-RHS matvec and measure whole solves.
+1. ~~Prototype the paired-RHS matvec and measure whole solves.~~ **Done** — shipped as
+   `batch_matvec`, though as a stacked `(2, N)` call rather than the paired-callable form this note
+   proposed; see section 1.
 2. Implement the already-measured partial diagonal cache.
 3. Add a distributed/device return path.
 4. Run end-to-end GPU prefilter tuning.

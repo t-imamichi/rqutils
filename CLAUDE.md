@@ -391,7 +391,10 @@ end-to-end at `cache_level=(1, 0)` (1.61–1.81× on the pair alone), and it **h
 all-gathers**, 6 → 3, because the operator's gather is paid once per group — `jnp.stack` on a `P('x')`
 vector gives `P(None, 'x')`, so the data axis keeps its partitioning. `run_sqd` defaults to `True`;
 `ground_locg` to `False`, since an arbitrary callable need not accept a batch, and an **array** `mat`
-raises — its matvec is a `jax.lax.dot`, which rejects a rank-2 rhs. The contract is "broadcasts over a
+raises — its matvec is a `jax.lax.dot`, which rejects a rank-2 rhs. **`(1, 2)` is the one level that can
+lose**: both axes cached leaves no per-matvec setup to share, so only the stack cost remains — 0.93× at
+N=2k, recovering to 1.04–1.09× by N=8k–30k as it amortizes. Every other level measured 1.20–1.24×. Left
+on by default anyway: `(1, 2)` needs the whole diagonal cache resident, so it is the rarest level. The contract is "broadcasts over a
 leading axis of *any* size", not just 2. **Memory depends on the operator and the two regimes have
 opposite signs** — measured, not reasoned: against `sqd`'s matvec, whole-`run_sqd` temp *falls* a flat
 −16.00 B/slot (0.942×, N=4000–60000), because the unbatched arm holds two gather results live where the
