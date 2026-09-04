@@ -33,7 +33,7 @@ state that subspace is built to span, so the solve is the one a real SKQD workfl
 
 Run on a multi-node cluster with one GPU per node (the only way to reach N GPUs on N nodes)::
 
-    mpirun -n 4 uv run --extra qiskit python examples/scaling/poc15_sqd_multinode.py --devices mpi
+    mpirun -n 4 uv run --extra mpi python examples/scaling/poc15_sqd_multinode.py --devices mpi
 
 Run on one node holding several GPUs::
 
@@ -229,7 +229,7 @@ def main():
     if len(sizes) < 2:
         print(
             "\nOnly one device, so there is no scaling curve to measure -- this script needs >= 2.\n"
-            "  mpirun -n 4 uv run --extra qiskit python <this script> --devices mpi   # 1 GPU/node\n"
+            "  mpirun -n 4 uv run --extra mpi python <this script> --devices mpi   # 1 GPU/node\n"
             "  uv run --extra qiskit python <this script> --devices 0,1,2,3           # 1 node\n"
             "poc7_sharding.py covers single-device-vs-sharded correctness; this covers memory/speed."
         )

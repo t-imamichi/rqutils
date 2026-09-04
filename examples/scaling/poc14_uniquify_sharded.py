@@ -58,6 +58,12 @@ Run on virtual CPU devices (the default -- correctness only)::
 Run on real GPUs, which is the only way the routing-cost question can be answered::
 
     uv run python examples/scaling/poc14_uniquify_sharded.py --devices 0,1,2,3
+
+Across nodes, one GPU each (needs the ``mpi`` extra). This is also the only mode that exercises the
+multi-process gather -- ``addressable_shards`` holds every shard when one process owns the mesh and only
+this rank's when it does not, so single-process runs cannot distinguish the two::
+
+    mpirun -n 4 uv run --extra mpi python examples/scaling/poc14_uniquify_sharded.py --devices mpi
 """
 
 import argparse

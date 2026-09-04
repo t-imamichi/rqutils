@@ -290,7 +290,7 @@ def init_devices(devices: str | None, host_devices: int = 4) -> str:
                 "jax.make_mesh rejects it with a message about create_hybrid_device_mesh that does "
                 "not name this cause.\n\nFor one GPU per node, pass --devices mpi so the ranks "
                 "form a single distributed program:\n"
-                "    mpirun -n 4 uv run --extra qiskit python <script> --devices mpi"
+                "    mpirun -n 4 uv run --extra mpi python <script> --devices mpi"
             )
         if devices:
             os.environ["CUDA_VISIBLE_DEVICES"] = devices

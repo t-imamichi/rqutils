@@ -20,6 +20,11 @@ Run on real GPUs, which exercises the same assertions against real kernels and i
 
     uv run --extra qiskit python examples/scaling/poc7_sharding.py --devices 0,1,2,3
 
+Run across nodes, one GPU each -- the only mode that exercises **multi-process** paths, where a rank
+addresses only its own shard (needs the ``mpi`` extra)::
+
+    mpirun -n 4 uv run --extra mpi python examples/scaling/poc7_sharding.py --devices mpi
+
 ``--devices`` sets ``CUDA_VISIBLE_DEVICES``, a **filter** over the devices the driver already exposes:
 it cannot split one GPU into several, and ``--xla_force_host_platform_device_count`` is host-platform
 only, so there is no way to fake a second GPU. Two physical GPUs are required for the GPU path.

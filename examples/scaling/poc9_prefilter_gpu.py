@@ -37,6 +37,10 @@ Run on a CUDA box::
 
     uv run --extra qiskit python examples/scaling/poc9_prefilter_gpu.py
     uv run --extra qiskit python examples/scaling/poc9_prefilter_gpu.py --devices 0,1,2,3
+
+Across nodes, one GPU each (needs the ``mpi`` extra)::
+
+    mpirun -n 4 uv run --extra mpi python examples/scaling/poc9_prefilter_gpu.py --devices mpi
 """
 
 import argparse
