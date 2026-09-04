@@ -1,0 +1,297 @@
+/home/r42024/.bash_profile: line 10: bind: warning: line editing not enabled
+/home/r42024/.bash_profile: line 11: bind: warning: line editing not enabled
+POC 15: sqd at scale on a real mesh
+
+running on 1 real gpu device(s)
+
+==============================================================================
+fixture: 1D XXZ n=26 Jz=0.8 cache_level=(1, 0)
+==============================================================================
+  N=400000 states (unpacked, unsorted -- sqd uniquifies internally)
+  J=27 X-groups, maxK=26, dtype=float64, sum|c_k|=72.8000
+
+Only one device, so there is no scaling curve to measure -- this script needs >= 2.
+  mpirun -n 4 uv run --extra mpi python <this script> --devices mpi   # 1 GPU/node
+  uv run python <this script> --devices 0,1,2,3                         # 1 node
+poc7_sharding.py covers single-device-vs-sharded correctness; this covers memory/speed.
+W0905 00:26:45.610415 3252933 pjrt_client.cc:1599] WatchTasksAsync failed for task 0: CANCELLED: CANCELLED
+Additional GRPC error information from remote target coordination_service while calling /xla.coordination.CoordinationService/WatchTasks:
+:CANCELLED:CANCELLED [type.googleapis.com/tensorflow.DerivedStatus='']
+=== Source Location Trace: === 
+external/xla+/xla/tsl/distributed_runtime/rpc/grpc_util.h:89
+
+--------------------------------------------------------------------------
+Primary job  terminated normally, but 1 process returned
+a non-zero exit code. Per user-direction, the job has been aborted.
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+mpirun detected that one or more processes exited with non-zero status, thus causing
+the job to be terminated. The first process to do so was:
+
+  Process name: [[9225,1],0]
+  Exit code:    1
+--------------------------------------------------------------------------
+POC 15: sqd at scale on a real mesh
+
+running on 2 real gpu device(s) over 2 processes
+POC 15: sqd at scale on a real mesh
+
+running on 2 real gpu device(s) over 2 processes
+
+==============================================================================
+fixture: 1D XXZ n=26 Jz=0.8 cache_level=(1, 0)
+==============================================================================
+  N=400000 states (unpacked, unsorted -- sqd uniquifies internally)
+  J=27 X-groups, maxK=26, dtype=float64, sum|c_k|=72.8000
+
+MULTI-PROCESS: measuring the 2-device point only. A sub-mesh would
+exclude whole processes, which then hold no shard of the array `sqd` gathers -- measured,
+that raises FullyReplicatedShard inside process_allgather on exactly the excluded ranks.
+For the curve, run this once per rank count and compare rows:
+  for n in 1 2 4; do mpirun -n $n uv run --extra mpi python <this script> --devices mpi; done
+
+==============================================================================
+Claim 1+2: per-device memory and wall clock against device count
+==============================================================================
+Each row adds devices at FIXED N. A replicated term stays flat as devices double; a
+sharded one halves. Speedup is against the 1-device arm, both warm. The energy is
+asserted, not printed for inspection: a broken arm does less work and posts a better time.
+
+ devices  baseline MB   solve MB  delta MB        ms       |dE|  speedup
+
+==============================================================================
+fixture: 1D XXZ n=26 Jz=0.8 cache_level=(1, 0)
+==============================================================================
+  N=400000 states (unpacked, unsorted -- sqd uniquifies internally)
+  J=27 X-groups, maxK=26, dtype=float64, sum|c_k|=72.8000
+
+MULTI-PROCESS: measuring the 2-device point only. A sub-mesh would
+exclude whole processes, which then hold no shard of the array `sqd` gathers -- measured,
+that raises FullyReplicatedShard inside process_allgather on exactly the excluded ranks.
+For the curve, run this once per rank count and compare rows:
+  for n in 1 2 4; do mpirun -n $n uv run --extra mpi python <this script> --devices mpi; done
+
+==============================================================================
+Claim 1+2: per-device memory and wall clock against device count
+==============================================================================
+Each row adds devices at FIXED N. A replicated term stays flat as devices double; a
+sharded one halves. Speedup is against the 1-device arm, both warm. The energy is
+asserted, not printed for inspection: a broken arm does less work and posts a better time.
+
+ devices  baseline MB   solve MB  delta MB        ms       |dE|  speedup
+       2          0.0        0.0       0.0     961.8    0.0e+00  baseline
+
+==============================================================================
+VERDICT
+==============================================================================
+  energy invariant across (2,) devices: max |dE| within assertion bound.
+  READ THE MEMORY COLUMN AS A CURVE, not as two points: `states` is replicated today
+  (13*N per device, the term the (0,0) floor cannot shed) while the solver's O(N)
+  vectors shard, so the honest expectation is a falling-but-not-halving delta.
+  A FLAT delta means nothing sharded -- check the spec, not just the energy.
+
+  Multi-NODE topology: these collectives crossed a network, not NVLink. A ratio
+  measured here is the pessimistic case and does NOT transfer to several GPUs in
+  one box -- the interconnect is the variable under test, so record which one.
+       2          0.0        0.0       0.0     961.8    0.0e+00  baseline
+
+==============================================================================
+VERDICT
+==============================================================================
+  energy invariant across (2,) devices: max |dE| within assertion bound.
+  READ THE MEMORY COLUMN AS A CURVE, not as two points: `states` is replicated today
+  (13*N per device, the term the (0,0) floor cannot shed) while the solver's O(N)
+  vectors shard, so the honest expectation is a falling-but-not-halving delta.
+  A FLAT delta means nothing sharded -- check the spec, not just the energy.
+
+  Multi-NODE topology: these collectives crossed a network, not NVLink. A ratio
+  measured here is the pessimistic case and does NOT transfer to several GPUs in
+  one box -- the interconnect is the variable under test, so record which one.
+W0905 00:27:08.962662 3255573 pjrt_client.cc:1599] WatchTasksAsync failed for task 0: CANCELLED: CANCELLED
+Additional GRPC error information from remote target coordination_service while calling /xla.coordination.CoordinationService/WatchTasks:
+:CANCELLED:CANCELLED [type.googleapis.com/tensorflow.DerivedStatus='']
+=== Source Location Trace: === 
+external/xla+/xla/tsl/distributed_runtime/rpc/grpc_util.h:89
+
+W0905 00:27:08.962883  718167 pjrt_client.cc:1599] WatchTasksAsync failed for task 1: UNAVAILABLE: failed to connect to all addresses; last error: UNKNOWN: ipv4:172.17.1.28:64868: Failed to connect to remote host: Connection refused
+Additional GRPC error information from remote target coordination_service while calling /xla.coordination.CoordinationService/WatchTasks:
+:UNAVAILABLE:failed to connect to all addresses; last error: UNKNOWN: ipv4:172.17.1.28:64868: Failed to connect to remote host: Connection refused
+=== Source Location Trace: === 
+external/xla+/xla/tsl/distributed_runtime/rpc/grpc_util.h:89
+
+POC 15: sqd at scale on a real mesh
+
+running on 4 real gpu device(s) over 4 processes
+POC 15: sqd at scale on a real mesh
+
+running on 4 real gpu device(s) over 4 processes
+POC 15: sqd at scale on a real mesh
+
+running on 4 real gpu device(s) over 4 processes
+POC 15: sqd at scale on a real mesh
+
+running on 4 real gpu device(s) over 4 processes
+
+==============================================================================
+fixture: 1D XXZ n=26 Jz=0.8 cache_level=(1, 0)
+==============================================================================
+  N=400000 states (unpacked, unsorted -- sqd uniquifies internally)
+  J=27 X-groups, maxK=26, dtype=float64, sum|c_k|=72.8000
+
+MULTI-PROCESS: measuring the 4-device point only. A sub-mesh would
+exclude whole processes, which then hold no shard of the array `sqd` gathers -- measured,
+that raises FullyReplicatedShard inside process_allgather on exactly the excluded ranks.
+For the curve, run this once per rank count and compare rows:
+  for n in 1 2 4; do mpirun -n $n uv run --extra mpi python <this script> --devices mpi; done
+
+==============================================================================
+Claim 1+2: per-device memory and wall clock against device count
+==============================================================================
+Each row adds devices at FIXED N. A replicated term stays flat as devices double; a
+sharded one halves. Speedup is against the 1-device arm, both warm. The energy is
+asserted, not printed for inspection: a broken arm does less work and posts a better time.
+
+ devices  baseline MB   solve MB  delta MB        ms       |dE|  speedup
+
+==============================================================================
+fixture: 1D XXZ n=26 Jz=0.8 cache_level=(1, 0)
+==============================================================================
+  N=400000 states (unpacked, unsorted -- sqd uniquifies internally)
+  J=27 X-groups, maxK=26, dtype=float64, sum|c_k|=72.8000
+
+MULTI-PROCESS: measuring the 4-device point only. A sub-mesh would
+exclude whole processes, which then hold no shard of the array `sqd` gathers -- measured,
+that raises FullyReplicatedShard inside process_allgather on exactly the excluded ranks.
+For the curve, run this once per rank count and compare rows:
+  for n in 1 2 4; do mpirun -n $n uv run --extra mpi python <this script> --devices mpi; done
+
+==============================================================================
+Claim 1+2: per-device memory and wall clock against device count
+==============================================================================
+Each row adds devices at FIXED N. A replicated term stays flat as devices double; a
+sharded one halves. Speedup is against the 1-device arm, both warm. The energy is
+asserted, not printed for inspection: a broken arm does less work and posts a better time.
+
+ devices  baseline MB   solve MB  delta MB        ms       |dE|  speedup
+
+==============================================================================
+fixture: 1D XXZ n=26 Jz=0.8 cache_level=(1, 0)
+==============================================================================
+  N=400000 states (unpacked, unsorted -- sqd uniquifies internally)
+  J=27 X-groups, maxK=26, dtype=float64, sum|c_k|=72.8000
+
+MULTI-PROCESS: measuring the 4-device point only. A sub-mesh would
+exclude whole processes, which then hold no shard of the array `sqd` gathers -- measured,
+that raises FullyReplicatedShard inside process_allgather on exactly the excluded ranks.
+For the curve, run this once per rank count and compare rows:
+  for n in 1 2 4; do mpirun -n $n uv run --extra mpi python <this script> --devices mpi; done
+
+==============================================================================
+Claim 1+2: per-device memory and wall clock against device count
+==============================================================================
+Each row adds devices at FIXED N. A replicated term stays flat as devices double; a
+sharded one halves. Speedup is against the 1-device arm, both warm. The energy is
+asserted, not printed for inspection: a broken arm does less work and posts a better time.
+
+ devices  baseline MB   solve MB  delta MB        ms       |dE|  speedup
+
+==============================================================================
+fixture: 1D XXZ n=26 Jz=0.8 cache_level=(1, 0)
+==============================================================================
+  N=400000 states (unpacked, unsorted -- sqd uniquifies internally)
+  J=27 X-groups, maxK=26, dtype=float64, sum|c_k|=72.8000
+
+MULTI-PROCESS: measuring the 4-device point only. A sub-mesh would
+exclude whole processes, which then hold no shard of the array `sqd` gathers -- measured,
+that raises FullyReplicatedShard inside process_allgather on exactly the excluded ranks.
+For the curve, run this once per rank count and compare rows:
+  for n in 1 2 4; do mpirun -n $n uv run --extra mpi python <this script> --devices mpi; done
+
+==============================================================================
+Claim 1+2: per-device memory and wall clock against device count
+==============================================================================
+Each row adds devices at FIXED N. A replicated term stays flat as devices double; a
+sharded one halves. Speedup is against the 1-device arm, both warm. The energy is
+asserted, not printed for inspection: a broken arm does less work and posts a better time.
+
+ devices  baseline MB   solve MB  delta MB        ms       |dE|  speedup
+       4          0.0        0.0       0.0    1728.6    0.0e+00  baseline
+
+==============================================================================
+VERDICT
+==============================================================================
+  energy invariant across (4,) devices: max |dE| within assertion bound.
+  READ THE MEMORY COLUMN AS A CURVE, not as two points: `states` is replicated today
+  (13*N per device, the term the (0,0) floor cannot shed) while the solver's O(N)
+  vectors shard, so the honest expectation is a falling-but-not-halving delta.
+  A FLAT delta means nothing sharded -- check the spec, not just the energy.
+
+  Multi-NODE topology: these collectives crossed a network, not NVLink. A ratio
+  measured here is the pessimistic case and does NOT transfer to several GPUs in
+  one box -- the interconnect is the variable under test, so record which one.
+       4          0.0        0.0       0.0    1728.5    0.0e+00  baseline
+
+==============================================================================
+VERDICT
+==============================================================================
+  energy invariant across (4,) devices: max |dE| within assertion bound.
+  READ THE MEMORY COLUMN AS A CURVE, not as two points: `states` is replicated today
+  (13*N per device, the term the (0,0) floor cannot shed) while the solver's O(N)
+  vectors shard, so the honest expectation is a falling-but-not-halving delta.
+  A FLAT delta means nothing sharded -- check the spec, not just the energy.
+
+  Multi-NODE topology: these collectives crossed a network, not NVLink. A ratio
+  measured here is the pessimistic case and does NOT transfer to several GPUs in
+  one box -- the interconnect is the variable under test, so record which one.
+       4          0.0        0.0       0.0    1728.5    0.0e+00  baseline
+
+==============================================================================
+VERDICT
+==============================================================================
+  energy invariant across (4,) devices: max |dE| within assertion bound.
+  READ THE MEMORY COLUMN AS A CURVE, not as two points: `states` is replicated today
+  (13*N per device, the term the (0,0) floor cannot shed) while the solver's O(N)
+  vectors shard, so the honest expectation is a falling-but-not-halving delta.
+  A FLAT delta means nothing sharded -- check the spec, not just the energy.
+       4          0.0        0.0       0.0    1728.5    0.0e+00  baseline
+
+==============================================================================
+VERDICT
+==============================================================================
+  energy invariant across (4,) devices: max |dE| within assertion bound.
+  READ THE MEMORY COLUMN AS A CURVE, not as two points: `states` is replicated today
+  (13*N per device, the term the (0,0) floor cannot shed) while the solver's O(N)
+  vectors shard, so the honest expectation is a falling-but-not-halving delta.
+  A FLAT delta means nothing sharded -- check the spec, not just the energy.
+
+  Multi-NODE topology: these collectives crossed a network, not NVLink. A ratio
+  measured here is the pessimistic case and does NOT transfer to several GPUs in
+
+  Multi-NODE topology: these collectives crossed a network, not NVLink. A ratio
+  measured here is the pessimistic case and does NOT transfer to several GPUs in
+  one box -- the interconnect is the variable under test, so record which one.
+  one box -- the interconnect is the variable under test, so record which one.
+W0905 00:27:37.168225 3258688 pjrt_client.cc:1599] WatchTasksAsync failed for task 0: CANCELLED: CANCELLED
+Additional GRPC error information from remote target coordination_service while calling /xla.coordination.CoordinationService/WatchTasks:
+:CANCELLED:CANCELLED [type.googleapis.com/tensorflow.DerivedStatus='']
+=== Source Location Trace: ===
+external/xla+/xla/tsl/distributed_runtime/rpc/grpc_util.h:89
+
+W0905 00:27:37.168347  721143 pjrt_client.cc:1599] WatchTasksAsync failed for task 1: CANCELLED: CANCELLED
+Additional GRPC error information from remote target coordination_service while calling /xla.coordination.CoordinationService/WatchTasks:
+:CANCELLED:CANCELLED [type.googleapis.com/tensorflow.DerivedStatus='']
+=== Source Location Trace: === 
+external/xla+/xla/tsl/distributed_runtime/rpc/grpc_util.h:89
+
+W0905 00:27:37.168451 1767267 pjrt_client.cc:1599] WatchTasksAsync failed for task 2: CANCELLED: CANCELLED
+Additional GRPC error information from remote target coordination_service while calling /xla.coordination.CoordinationService/WatchTasks:
+:CANCELLED:CANCELLED [type.googleapis.com/tensorflow.DerivedStatus='']
+=== Source Location Trace: === 
+external/xla+/xla/tsl/distributed_runtime/rpc/grpc_util.h:89
+
+W0905 00:27:37.168520 3891545 pjrt_client.cc:1599] WatchTasksAsync failed for task 3: UNAVAILABLE: failed to connect to all addresses; last error: UNKNOWN: ipv4:172.17.1.28:62212: Failed to connect to remote host: Connection refused
+Additional GRPC error information from remote target coordination_service while calling /xla.coordination.CoordinationService/WatchTasks:
+:UNAVAILABLE:failed to connect to all addresses; last error: UNKNOWN: ipv4:172.17.1.28:62212: Failed to connect to remote host: Connection refused
+=== Source Location Trace: === 
+external/xla+/xla/tsl/distributed_runtime/rpc/grpc_util.h:89
+

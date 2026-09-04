@@ -95,7 +95,7 @@ from _scaling_common import fmt_ratio, header, init_devices, make_1d_mesh, timei
 from qiskit.quantum_info import SparsePauliOp
 
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import sqd
+from rqutils.sqd import _host_scalar, run_sqd, sqd
 
 CACHE_LEVEL = tuple(int(x) for x in options.cache_level.split(","))
 
@@ -186,18 +186,55 @@ def per_device_bytes() -> dict:
     return out
 
 
-def solve(hamiltonian, states, mesh=None):
+def solve(hamiltonian, states, mesh=None, retain=False):
     """One whole ``sqd`` solve, on ``mesh`` if given. Returns the eigenvalue as a float.
 
     The mesh is set around the call rather than passed in: ``rqutils`` reads
     ``jax.sharding.get_abstract_mesh()``, so establishing it is the caller's job and the *same* call
     serves both arms. Any divergence between them is therefore a sharding effect, not a different
     computation.
+
+    ``retain=True`` goes through ``run_sqd`` instead and hands back its **device** arrays, so a caller
+    can read the allocator while they are still referenced. Both halves of that are load-bearing:
+
+    * Sampling around a call that returns only a scalar reads the *resting* allocator value twice, so
+      the delta is structurally 0.0 whatever the truth -- which is exactly what the first 2- and 4-GPU
+      rows printed. ``poc8``'s docstring records the identical defect.
+    * ``sqd`` cannot serve this, because it converts on the way out: ``np.array(eigvec[...])`` and
+      ``np.asarray(basis_states)``. Holding *those* keeps no device memory alive, so routing
+      ``return_eigvec=True`` through ``sqd`` looks like a fix and measures the same 0.0. ``run_sqd`` is
+      the innermost layer whose outputs are still ``jax.Array``.
+
+    Do not "simplify" either half back.
     """
+    if not retain:
+        if mesh is None:
+            return float(sqd(hamiltonian, states, return_eigvec=False, cache_level=CACHE_LEVEL))
+        with jax.sharding.set_mesh(mesh):
+            return float(sqd(hamiltonian, states, return_eigvec=False, cache_level=CACHE_LEVEL))
+
+    # `run_sqd` takes packed states and a static size, which `sqd` would otherwise derive. Mirrors
+    # `sqd`'s own defaulting (power-of-two bucketing, then the mesh round-up) so the measured arm is
+    # the same shape the normal path would solve.
+    states_p = PauliSumXZ.pack_states(states)
+    states_size = 1 << max((states_p.shape[0] - 1).bit_length(), 1)
+    if mesh is not None and (resid := states_size % mesh.size) != 0:
+        states_size += mesh.size - resid
+    if (deficit := states_size - states_p.shape[0]) > 0:
+        states_p = np.append(
+            states_p, np.full((deficit, states_p.shape[1]), 255, dtype=np.uint8), axis=0
+        )
+
+    def run():
+        # eigval, eigvec, basis, subspace_dim, converged -- every one a live jax.Array.
+        out = run_sqd(hamiltonian, states_p, states_size, True, cache_level=CACHE_LEVEL)
+        assert bool(_host_scalar(out[-1])), "run_sqd did not converge"
+        return float(_host_scalar(out[0])), out[1], out[2]
+
     if mesh is None:
-        return float(sqd(hamiltonian, states, return_eigvec=False, cache_level=CACHE_LEVEL))
+        return run()
     with jax.sharding.set_mesh(mesh):
-        return float(sqd(hamiltonian, states, return_eigvec=False, cache_level=CACHE_LEVEL))
+        return run()
 
 
 def mesh_sizes(total: int) -> tuple:
@@ -224,9 +261,24 @@ def mesh_sizes(total: int) -> tuple:
 def main():
     desc = init_devices(options.devices, options.host_devices)
     virtual = jax.devices()[0].platform == "cpu"
-    print(f"POC 15: sqd at scale on a real mesh\n\nrunning on {desc}")
+
+    # Rank 0 prints; every other rank stays silent. Without this, `mpirun -n 4` emitted four copies of
+    # every header and table, and two ranks' VERDICT blocks interleaved mid-line into text that read as
+    # one mangled paragraph -- the 4-GPU log is the record. `examples/svsim.py` gates on
+    # `jax.process_index()` the same way, and this follows it rather than inventing a second
+    # convention. Bound to distinct names (`emit`/`section`) rather than shadowing the builtin, which
+    # ruff rejects as a forward reference in this scope, and *not* pushed into
+    # `_scaling_common.header`, which every other (single-process) script shares.
+    #
+    # Printing only, never computation: every rank still runs the whole solve and the assertion. A
+    # collective inside a rank-0 branch would deadlock, which is why the gate wraps output alone.
+    rank0 = jax.process_index() == 0
+    emit = print if rank0 else lambda *a, **kw: None
+    section = header if rank0 else lambda title: None
+
+    emit(f"POC 15: sqd at scale on a real mesh\n\nrunning on {desc}")
     if virtual:
-        print(
+        emit(
             "\n*** VIRTUAL CPU DEVICES: correctness is meaningful, TIMINGS ARE NOT (they share one\n"
             "physical backend, per CLAUDE.md) and are suppressed below. Pass --devices to measure. ***"
         )
@@ -234,8 +286,8 @@ def main():
     hamiltonian = xxz_hamiltonian(options.num_qubits, options.jz)
     states = xxz_krylov_states(options.num_qubits, options.max_states)
     coeff_sum = float(np.abs(hamiltonian.c).sum())
-    header(f"fixture: 1D XXZ n={options.num_qubits} Jz={options.jz} cache_level={CACHE_LEVEL}")
-    print(
+    section(f"fixture: 1D XXZ n={options.num_qubits} Jz={options.jz} cache_level={CACHE_LEVEL}")
+    emit(
         f"  N={len(states)} states (unpacked, unsorted -- sqd uniquifies internally)\n"
         f"  J={hamiltonian.x.shape[0]} X-groups, maxK={hamiltonian.z.shape[1]}, "
         f"dtype={hamiltonian.c.dtype}, sum|c_k|={coeff_sum:.4f}"
@@ -249,7 +301,7 @@ def main():
     multiprocess = jax.process_count() > 1
     sizes = (jax.device_count(),) if multiprocess else mesh_sizes(jax.device_count())
     if multiprocess:
-        print(
+        emit(
             f"\nMULTI-PROCESS: measuring the {jax.device_count()}-device point only. A sub-mesh would\n"
             "exclude whole processes, which then hold no shard of the array `sqd` gathers -- measured,\n"
             "that raises FullyReplicatedShard inside process_allgather on exactly the excluded ranks.\n"
@@ -258,7 +310,7 @@ def main():
             "--devices mpi; done"
         )
     if len(sizes) < 2 and not multiprocess:
-        print(
+        emit(
             "\nOnly one device, so there is no scaling curve to measure -- this script needs >= 2.\n"
             "  mpirun -n 4 uv run --extra mpi python <this script> --devices mpi   # 1 GPU/node\n"
             "  uv run python <this script> --devices 0,1,2,3                         # 1 node\n"
@@ -266,13 +318,13 @@ def main():
         )
         return 1
 
-    header("Claim 1+2: per-device memory and wall clock against device count")
-    print(
+    section("Claim 1+2: per-device memory and wall clock against device count")
+    emit(
         "Each row adds devices at FIXED N. A replicated term stays flat as devices double; a\n"
         "sharded one halves. Speedup is against the 1-device arm, both warm. The energy is\n"
         "asserted, not printed for inspection: a broken arm does less work and posts a better time."
     )
-    print(
+    emit(
         f"\n{'devices':>8} {'baseline MB':>12} {'solve MB':>10} {'delta MB':>9} "
         f"{'ms':>9} {'|dE|':>10}  speedup"
     )
@@ -283,9 +335,16 @@ def main():
 
         # Baseline before the solve, so `delta` isolates what this solve allocated from whatever the
         # process already held. Read on this rank only -- see per_device_bytes.
+        #
+        # `after` must be read while the solve's arrays are STILL REFERENCED, which is why this asks
+        # for the eigenvector and basis and holds them in `live` across the reading. Bracketing a
+        # `return_eigvec=False` call reads the resting value twice and reports 0.0 whatever the truth
+        # -- measured, that is what the first 2- and 4-GPU rows printed. See `solve`'s docstring and
+        # `poc8`'s, which records the identical defect.
         before = per_device_bytes()
-        eigval = solve(hamiltonian, states, mesh)
+        eigval, *live = solve(hamiltonian, states, mesh, retain=True)
         after = per_device_bytes()
+        del live
 
         if reference is None:
             reference = eigval
@@ -303,10 +362,19 @@ def main():
         have_mem = local is not None and local in after
         base_s = f"{before[local] / 2**20:.1f}" if have_mem else "n/a"
         solve_s = f"{after[local] / 2**20:.1f}" if have_mem else "n/a"
-        delta_s = f"{(after[local] - before[local]) / 2**20:.1f}" if have_mem else "n/a"
+        if not have_mem:
+            delta_s = "n/a"
+        else:
+            delta_b = after[local] - before[local]
+            # An exactly-zero delta is reported as `0?` rather than `0.0`, because the two causes are
+            # not distinguishable from the number and only one of them is a finding. A real solve
+            # allocates O(N) vectors, so a true 0 B means the reading missed them -- the defect this
+            # script shipped with. The VERDICT's advice was "a FLAT delta means nothing sharded", which
+            # cannot catch this: flat and absent both print 0.0. Any nonzero value is a measurement.
+            delta_s = "0?" if delta_b == 0 else f"{delta_b / 2**20:.1f}"
 
         if virtual:
-            print(
+            emit(
                 f"{size:>8} {base_s:>12} {solve_s:>10} {delta_s:>9} "
                 f"{'--':>9} {dE:>10.1e}  (timings suppressed)"
             )
@@ -318,32 +386,30 @@ def main():
             verdict = "baseline"
         else:
             verdict = fmt_ratio(base_timing, timing)
-        print(
+        emit(
             f"{size:>8} {base_s:>12} {solve_s:>10} {delta_s:>9} "
             f"{timing.min_s * 1e3:>9.1f} {dE:>10.1e}  {verdict}"
         )
 
-    header("VERDICT")
-    print(f"  energy invariant across {sizes} devices: max |dE| within assertion bound.")
+    section("VERDICT")
+    emit(f"  energy invariant across {sizes} devices: max |dE| within assertion bound.")
     if virtual:
-        print("  Memory numbers above are CPU-allocator numbers and the timings were suppressed.")
-        print(
+        emit("  Memory numbers above are CPU-allocator numbers and the timings were suppressed.")
+        emit(
             "  Re-run with --devices (or --devices mpi) for the measurement this script exists for."
         )
     else:
-        print(
-            "  READ THE MEMORY COLUMN AS A CURVE, not as two points: `states` is replicated today"
-        )
-        print("  (13*N per device, the term the (0,0) floor cannot shed) while the solver's O(N)")
-        print("  vectors shard, so the honest expectation is a falling-but-not-halving delta.")
-        print("  A FLAT delta means nothing sharded -- check the spec, not just the energy.")
+        emit("  READ THE MEMORY COLUMN AS A CURVE, not as two points: `states` is replicated today")
+        emit("  (13*N per device, the term the (0,0) floor cannot shed) while the solver's O(N)")
+        emit("  vectors shard, so the honest expectation is a falling-but-not-halving delta.")
+        emit("  A FLAT delta means nothing sharded -- check the spec, not just the energy.")
+        emit("  A `0?` delta means the reading MISSED the arrays, not that nothing was allocated:")
+        emit("  a real solve allocates O(N) vectors, so an exact 0 B is an instrument failure.")
         if options.devices == "mpi":
-            print()
-            print("  Multi-NODE topology: these collectives crossed a network, not NVLink. A ratio")
-            print(
-                "  measured here is the pessimistic case and does NOT transfer to several GPUs in"
-            )
-            print("  one box -- the interconnect is the variable under test, so record which one.")
+            emit()
+            emit("  Multi-NODE topology: these collectives crossed a network, not NVLink. A ratio")
+            emit("  measured here is the pessimistic case and does NOT transfer to several GPUs in")
+            emit("  one box -- the interconnect is the variable under test, so record which one.")
     return 0
 
 
