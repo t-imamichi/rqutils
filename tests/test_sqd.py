@@ -38,6 +38,7 @@ from conftest import (
 
 from rqutils.sqd import (
     _MAX_STATES,
+    _host_scalar,
     _is_lex_sorted,
     _pack_scanned,
     _pack_state_keys,
@@ -2658,6 +2659,76 @@ class TestShardedCacheLevels:
             assert single == pytest.approx(sharded, abs=1e-12), (
                 f"cache_level={cache_level}: sharded {sharded} disagrees with single-device {single}"
             )
+
+
+class TestHostScalar:
+    """``_host_scalar`` must accept every scalar form ``sqd`` can hand it, sharded or not.
+
+    The defect it fixes is only reachable **multi-process**: ``float(result[0])`` raised "Fetching
+    value for `jax.Array` that spans non-addressable (non process local) devices" on a 4-node mesh, on
+    the default ``return_eigvec=False`` path. Virtual devices are one process, so every device is
+    addressable and *that error cannot be produced here at all*.
+
+    **Mutation-verified as NOT pinning the fix, and kept anyway.** Replacing the whole body with
+    ``return value`` -- undoing the fix completely -- leaves all three of these green, because
+    single-process ``float()`` succeeds either way. So this class pins the helper's *contract* (it must
+    accept a device scalar, a Python float, a bool and a numpy scalar, and must not perturb the value)
+    and its *premise* (the scalar really is fully replicated, so reading one shard is exact rather than
+    partial). The defect itself is only catchable on a real multi-process run; recorded here so nobody
+    reads a green suite as multi-node coverage.
+
+    A reduction over a partitioned vector is the shape that matters: a rank-0 array whose sharding
+    still names the whole mesh. ``jax.reshard`` is not the fix (its spec is already ``P()``), so the
+    assertion worth making is that the value survives the local-shard read exactly -- a replicated
+    scalar holds the same number on every device, so this is exact rather than approximate.
+    """
+
+    def test_passes_through_host_scalars_unchanged(self):
+        # A plain float, a bool and a numpy scalar must survive untouched: `sqd` reaches this helper
+        # on the single-device path too, where `result[0]` may already be host-side.
+        assert float(_host_scalar(3.5)) == 3.5
+        assert bool(_host_scalar(True)) is True
+        assert float(_host_scalar(np.float64(1.25))) == 1.25
+
+    def test_reads_a_device_scalar_exactly(self):
+        # Rank-0 outputs of reductions, which is the shape run_sqd returns for eigval and converged.
+        vec = jax.numpy.arange(8.0)
+        assert float(_host_scalar(jax.numpy.sum(vec))) == 28.0
+        assert bool(_host_scalar(jax.numpy.all(vec >= 0.0))) is True
+
+    def test_the_scalar_it_reads_is_fully_replicated(self):
+        # The premise the helper rests on. If a future change made `eigval` genuinely partitioned,
+        # reading one shard would silently return part of the answer -- so pin the premise, not just
+        # the behaviour.
+        total = jax.numpy.sum(jax.numpy.arange(8.0))
+        assert total.is_fully_replicated
+        assert len({float(shard.data) for shard in total.addressable_shards}) == 1
+
+
+class TestShardedEigvecRoundtrip:
+    """``return_eigvec=True`` on a mesh must return a genuine eigenvector of its own basis.
+
+    Runs as a subprocess for the same reason as ``TestShardedCacheLevels``: the virtual device count
+    has to be set before jax initializes.
+
+    **The gap this closes.** Every other ``tests/_sharded_*.py`` calls ``sqd`` with
+    ``return_eigvec=False``, so the branch that reshards ``eigvec`` and ``states_u`` back to
+    ``PartitionSpec(None)`` had no coverage at all -- only
+    ``examples/scaling/poc7_sharding.py``'s POC 7c, which is measured at 59.7 s subprocessed against
+    ~1 s here. The POC stays the thorough arm; this is the distilled one.
+
+    **It asserts the eigenvector equation, not shapes.** A reshard that dropped or reordered rows
+    still returns an array of the right shape and dtype, and the eigenvalue is computed separately --
+    so ``‖H v - E v‖ / ‖v‖`` against a dense projection *of the returned basis* is what couples the
+    two arrays, which are resharded independently and would otherwise each look plausible alone. The
+    eigenvalue is checked against the dense minimum as well, since a residual test alone is satisfied
+    by any eigenpair, including an excited one.
+    """
+
+    def test_returned_eigenvector_satisfies_its_own_projection(self):
+        stdout = run_sharded_child("_sharded_eigvec_roundtrip.py", "sqd")
+        assert "OK" in stdout, stdout
+        assert "FAIL" not in stdout, stdout
 
 
 class TestShardedPartialXCache:
