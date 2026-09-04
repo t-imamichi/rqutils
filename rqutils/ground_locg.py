@@ -655,6 +655,7 @@ def ground_locg(
     prefilter_hi: float | None = ...,
     debug: Literal[False] = ...,
     log_level: int = ...,
+    batch_matvec: bool = ...,
 ) -> _Result: ...
 
 
@@ -672,6 +673,7 @@ def ground_locg(
     *,
     debug: Literal[True],
     log_level: int = ...,
+    batch_matvec: bool = ...,
 ) -> _DebugResult: ...
 
 
@@ -688,6 +690,7 @@ def ground_locg(
     prefilter_hi: float | None,
     debug: Literal[True],
     log_level: int = ...,
+    batch_matvec: bool = ...,
 ) -> _DebugResult: ...
 
 
@@ -704,6 +707,7 @@ def ground_locg(
     prefilter_hi: float | None = ...,
     debug: bool = ...,
     log_level: int = ...,
+    batch_matvec: bool = ...,
 ) -> _Result | _DebugResult: ...
 
 
@@ -719,6 +723,7 @@ def ground_locg(
     prefilter_hi: float | None = None,
     debug: bool = False,
     log_level: int = logging.WARNING,
+    batch_matvec: bool = False,
 ) -> _Result | _DebugResult:
     r"""Single-vector LOBPCG.
 
@@ -853,6 +858,21 @@ def ground_locg(
             full ``maxiter`` iterations with no early exit; rows past convergence are
             post-convergence noise.
         log_level: Verbosity level.
+        batch_matvec: Send the steady-state iteration's two *independent* operator applications as one
+            stacked ``(2, n)`` array instead of two ``(n,)`` calls, so ``mat`` is invoked once per
+            iteration for the pair. Requires ``mat`` to broadcast over a leading batch axis and to
+            return a matching ``(2, n)``; :mod:`rqutils.sqd`'s matvecs do, since they index with
+            ``vec.at[..., xsource]`` and scale elementwise. Ignored -- and rejected with a
+            ``ValueError`` -- when ``mat`` is an array, whose matvec this function builds itself.
+            Default ``False``, because an arbitrary callable need not accept a batch. Measured
+            1.61-1.81x on the pair with bit-identical results, and on a 4-device mesh it halves the
+            all-gathers (6 to 3) by paying the operator's gather once for both vectors. With
+            ``debug=True`` the three diagnostic applications batch too, and there the ``sas`` and ``y``
+            diagnostics are **not** bit-identical to the unbatched arm -- batching reassociates the
+            operator's summation, and ``sas`` row/col 2 derives from ``tmp_p``, whose direction is
+            ill-conditioned once ``||r||`` approaches its floor. ``theta`` is unaffected (measured
+            <=1.8e-14 across a full 40-iteration trajectory to ``||r|| = 2e-6``, while ``sas`` moved
+            8e-9), so this matters only to a caller diffing raw diagnostics across the flag.
 
     Returns:
         ``(eigval, eigvec, niter, converged)`` -- the smallest eigenvalue, its eigenvector, the
@@ -881,6 +901,10 @@ def ground_locg(
             ``iota == xinit``, so such an index matches nothing and yields the **zero vector**, from
             which the solver returns ``0.0`` with ``converged=True`` -- measured ``xinit=16`` on a
             dimension-16 operator whose true minimum was -1.5.
+
+            Also if ``batch_matvec`` is set while ``mat`` is an array. There is no caller-supplied
+            matvec to batch on that path, and silently ignoring the flag would make an unchanged
+            timing read as "batching does not help" rather than "batching never happened".
     """
     _check_prefilter(prefilter)
     # Host-side: inside jit the index is traced and cannot raise. Negative is equally wrong -- iota is
@@ -906,7 +930,13 @@ def ground_locg(
             prefilter_hi=prefilter_hi,
             debug=debug,
             log_level=log_level,
+            batch_matvec=batch_matvec,
         )
+    if batch_matvec:
+        # Silently ignoring it would be the bad failure: a caller who set it would read the unchanged
+        # timing as "batching does not help this operator" rather than "it was never applied". The
+        # array path builds its own `mat @ v` matvec, so there is nothing for a caller to batch.
+        raise ValueError("`batch_matvec` applies only when `mat` is a callable, not an array")
     return _ground_locg_matrix(
         mat,
         xinit,
@@ -972,6 +1002,7 @@ def _ground_locg_matrix(
         "prefilter",
         "debug",
         "log_level",
+        "batch_matvec",
     ]
 )
 def _ground_locg_callable(
@@ -986,6 +1017,7 @@ def _ground_locg_callable(
     prefilter_hi: jax.Array | float | None = None,
     debug: bool = False,
     log_level: int = logging.WARNING,
+    batch_matvec: bool = False,
 ):
     if jnp.issubdtype(xinit.dtype, jnp.integer):
         if vspace is None:
@@ -1015,9 +1047,25 @@ def _ground_locg_callable(
         return sas
 
     def diagnostics(xcurr, ycurr, rcurr, theta, kappa=None, scale=None, converged=None):
-        sas = compute_sas(
-            (xcurr, ycurr, rcurr), tuple(matvec(v, *args) for v in (xcurr, ycurr, rcurr))
-        )
+        # Three independent applications, so they batch exactly as body()'s pair does -- see the
+        # comment there for why stacking preserves sharding. Worth doing despite this being the
+        # `debug=True` path only: it runs the full `maxiter` with no early exit, so it is the most
+        # matvec-heavy path in the module.
+        #
+        # This is the one place batching is NOT bit-identical, and the reason is conditioning rather
+        # than a defect. Batching reassociates the operator's own summation, which perturbs `tmp_p` --
+        # the normalized projected-out residual, whose direction becomes arbitrary as ||r|| -> 0 -- and
+        # `sas` row/col 2 is built from it. Measured against the unbatched arm with atol=rtol=0 so the
+        # residual trajectory runs to the floor: `sas` diverges *inversely* with ||r||, 2.5e-14 at
+        # ||r||=3.9e-2 rising to 8.0e-9 at ||r||=2.2e-6, while `theta` holds at <=1.8e-14 the whole way
+        # because it comes from the well-conditioned 2x2 x/y block. So the eigenvalue is unaffected and
+        # only the search-direction bookkeeping moves. Don't "fix" this with compensated summation: the
+        # whole family is closed (see the module docstring and NOTES.md).
+        if batch_matvec:
+            mvs = tuple(matvec(jnp.stack((xcurr, ycurr, rcurr)), *args))
+        else:
+            mvs = tuple(matvec(v, *args) for v in (xcurr, ycurr, rcurr))
+        sas = compute_sas((xcurr, ycurr, rcurr), mvs)
         # rho is <x|Ax>, which compute_sas has just computed as the [0, 0] entry. Recomputing it
         # here cost a fourth matvec that XLA did not eliminate.
         rho = sas[0, 0].real
@@ -1139,9 +1187,19 @@ def _ground_locg_callable(
         tmp_p = normalize(tmp_p, norm_p)
         # Projected eigensolve. xcurr is the previous iteration's xnext, so its image is already
         # known -- three matvecs per iteration instead of four.
-        sas = compute_sas(
-            (xcurr, ycurr, tmp_p), (axcurr, matvec(ycurr, *args), matvec(tmp_p, *args))
-        )
+        #
+        # The two remaining applications are independent, so they go out as one (2, N) batch when
+        # `batch_matvec` is set. This is a pure win where the operator broadcasts over leading axes
+        # (`rqutils.sqd`'s does): measured 1.61-1.81x on the pair, bit-identical, and on a 4-device
+        # mesh it halves the all-gathers, 6 -> 3, because the gather inside the operator is paid once
+        # for the pair instead of twice. `jnp.stack` of a `P('x')` vector is `P(None, 'x')` -- the
+        # batch axis is replicated and the partitioned axis keeps its position, so nothing reshards.
+        # Off by default because an arbitrary `mat` callable need not accept a batch.
+        if batch_matvec:
+            aycurr, ap = matvec(jnp.stack((ycurr, tmp_p)), *args)
+        else:
+            aycurr, ap = matvec(ycurr, *args), matvec(tmp_p, *args)
+        sas = compute_sas((xcurr, ycurr, tmp_p), (axcurr, aycurr, ap))
         # A zeroed tmp_p leaves sas row/col 2 empty, and for a positive-definite A the resulting
         # zero diagonal is the smallest eigenvalue, so Rayleigh-Ritz would pick the null direction
         # and the normalizations below would divide by zero. Lift it out of contention; the

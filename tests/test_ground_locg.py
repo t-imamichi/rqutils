@@ -1138,6 +1138,86 @@ class TestChebyshevPrefilter:
                 )
 
 
+class TestBatchedMatvec:
+    """``batch_matvec`` stacks ``body()``'s two independent applications into one ``(2, n)`` call.
+
+    The defect it guards is a *silent* one: the batched and unbatched paths differ only in how the
+    operator is invoked, so a batching bug that transposed, swapped or dropped one row would return a
+    plausible finite eigenvalue rather than raise -- the same failure class as a dropped Hamiltonian
+    term. So the reference is the unbatched arm at the same tolerance, and the eigenvector is checked
+    against the dense operator independently rather than only against the other arm.
+    """
+
+    @staticmethod
+    def _operator(rng, dim=24, complex_=True):
+        mat = jnp.asarray(herm(dim, rng, complex_=complex_))
+        calls = []
+
+        def matvec(vec):
+            # Records the shape it was handed, which is how the "batching never happened" case -- a
+            # silently ignored flag -- is distinguished from a real speedup-free result.
+            calls.append(vec.shape)
+            return jnp.einsum("ij,...j->...i", mat, vec)
+
+        return mat, matvec, calls
+
+    @pytest.mark.parametrize("complex_", [False, True])
+    def test_batched_matches_unbatched(self, complex_):
+        rng = np.random.default_rng(20260905)
+        dim = 24
+        mat, matvec, _ = self._operator(rng, dim, complex_)
+        xinit = jnp.asarray(rng.normal(size=dim) + (1j * rng.normal(size=dim) if complex_ else 0.0))
+
+        plain = ground_locg(matvec, xinit, maxiter=300, rtol=1e-12)
+        batched = ground_locg(matvec, xinit, maxiter=300, rtol=1e-12, batch_matvec=True)
+        assert bool(plain[3]) and bool(batched[3]), "both arms must converge for the comparison"
+        assert float(batched[0]) == pytest.approx(float(plain[0]), abs=1e-11)
+        # Independent check: the returned pair must satisfy the dense operator, not merely agree.
+        assert rel_resid(np.asarray(mat), float(batched[0]), batched[1]) < 1e-10
+        assert float(batched[0]) == pytest.approx(lowest(np.asarray(mat)), abs=1e-10)
+        # Batching changes only *how* the operator is called, never the trajectory, so the iteration
+        # counts must match exactly. This is the assertion with teeth: a batched arm that fed the wrong
+        # vector into the search direction (e.g. reusing `ycurr`'s image for `tmp_p`) still converges to
+        # the correct eigenvalue on a well-conditioned fixture -- measured 55 iterations against 50 at
+        # dim=24, and 137 against 117 at dim=256 -- so an energy comparison alone passes the mutant.
+        assert int(batched[2]) == int(plain[2]), (
+            f"batched took {int(batched[2])} iterations against {int(plain[2])} unbatched; the two "
+            f"paths must trace the same trajectory, so a difference means a vector was swapped, "
+            f"duplicated or dropped in the stack/unstack"
+        )
+
+    def test_the_operator_actually_receives_a_batch(self):
+        """A "does batching change the answer?" test needs an arm where batching truly happened.
+
+        Without this, a `batch_matvec` that was quietly dropped on the floor would pass the equality
+        test above trivially -- both arms would be the unbatched path.
+        """
+        rng = np.random.default_rng(4)
+        dim = 16
+        _, matvec, calls = self._operator(rng, dim)
+        xinit = jnp.asarray(rng.normal(size=dim) + 1j * rng.normal(size=dim))
+
+        calls.clear()
+        ground_locg(matvec, xinit, maxiter=50, rtol=1e-12, batch_matvec=True)
+        batched_shapes = [shape for shape in calls if len(shape) == 2]
+        assert batched_shapes, f"no (2, n) call was made; operator saw only {set(calls)}"
+        assert all(shape == (2, dim) for shape in batched_shapes), set(calls)
+
+        calls.clear()
+        ground_locg(matvec, xinit, maxiter=50, rtol=1e-12)
+        assert all(len(shape) == 1 for shape in calls), (
+            f"the default path must not batch, saw {set(calls)}"
+        )
+
+    def test_array_mat_rejects_the_flag(self):
+        """Silently ignoring it would make an unchanged timing read as "batching does not help"."""
+        rng = np.random.default_rng(7)
+        mat = jnp.asarray(herm(12, rng, complex_=False))
+        xinit = jnp.asarray(rng.normal(size=12))
+        with pytest.raises(ValueError, match="only when `mat` is a callable"):
+            ground_locg(mat, xinit, batch_matvec=True)
+
+
 class TestIntegerXinitRange:
     """An out-of-range integer ``xinit`` must raise, not return a converged ``0.0``.
 

@@ -2614,6 +2614,61 @@ class TestShardedSqdPrefilter:
             )
 
 
+class TestShardedBatchMatvec:
+    """``batch_matvec`` must give the same answer sharded, and must keep the data axis partitioned.
+
+    Batching stacks ``ground_locg``'s two independent per-iteration vectors into one ``(2, N)`` array,
+    which moves the partitioned axis from position 0 to position 1. That is safe because ``jnp.stack``
+    on a ``P('x')`` vector yields ``P(None, 'x')`` -- the new batch axis is replicated and the data axis
+    keeps its partitioning -- so no resharding and no collective is introduced. Measured on a 4-device
+    mesh: all-gathers drop 6 to 3 against the two-call path, because the gather inside the operator is
+    paid once for the pair instead of twice.
+
+    **The spec assertion is the half a value comparison cannot make.** A stack that partitioned the
+    batch axis instead (``P('x', None)``), or one that silently replicated the whole array, both agree
+    with the single-device answer to exactly 0.0 -- the first would be wrong for a mesh that does not
+    divide 2, the second correct but unsharded. So the child prints the spec and this checks it.
+
+    Goes through ``run_sqd`` rather than ``sqd``: the public entry point does not forward
+    ``batch_matvec``, so there is no other reachable call site.
+    """
+
+    def test_batched_and_unbatched_agree_sharded(self):
+        stdout = run_sharded_child("_sharded_batch_matvec.py", "sqd batch_matvec")
+
+        energies, specs = {}, None
+        for line in stdout.strip().splitlines():
+            parts = line.split(maxsplit=1)
+            if parts[0] == "energy":
+                batch, single, sharded = parts[1].split()
+                energies[int(batch)] = (float(single), float(sharded))
+            elif parts[0] == "spec":
+                specs = parts[1]
+
+        # Assert both arms ran before checking values: a child that died after the unbatched arm would
+        # otherwise pass on the one line it managed to print.
+        assert sorted(energies) == [0, 1], (
+            f"expected both batch_matvec arms, got {sorted(energies)}:\n{stdout[-2000:]}"
+        )
+        for batch, (single, sharded) in sorted(energies.items()):
+            assert single == pytest.approx(sharded, abs=1e-12), (
+                f"batch_matvec={bool(batch)}: single-device {single} against sharded {sharded}"
+            )
+        # Batching must not change the answer on either topology.
+        assert energies[0][0] == pytest.approx(energies[1][0], abs=1e-12), (
+            f"single-device: batched {energies[1][0]} against unbatched {energies[0][0]}"
+        )
+        assert energies[0][1] == pytest.approx(energies[1][1], abs=1e-12), (
+            f"sharded: batched {energies[1][1]} against unbatched {energies[0][1]}"
+        )
+        assert specs is not None, f"child printed no spec line:\n{stdout[-2000:]}"
+        assert specs == "('x',) (None, 'x')", (
+            f"stacking must leave the data axis partitioned and replicate the batch axis, got {specs}"
+            f" -- P('x', None) would partition the batch axis, and an all-None spec would mean "
+            f"sharding was dropped; both agree with single-device to exactly 0.0"
+        )
+
+
 class TestShardedCacheLevels:
     """Every ``cache_level`` must give the same answer sharded as single-device.
 

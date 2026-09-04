@@ -1147,6 +1147,7 @@ def _spread_seed(
         "maxiter",
         "prefilter",
         "log_level",
+        "batch_matvec",
     ]
 )
 def run_sqd(
@@ -1161,6 +1162,7 @@ def run_sqd(
     rtol: float | None = None,
     prefilter: tuple[int, int] | None = (32, 2),
     log_level: int = logging.INFO,
+    batch_matvec: bool = True,
 ) -> tuple[float, bool] | tuple[float, jax.Array, jax.Array, int, bool]:
     """JIT-compiled part of the SQD function.
 
@@ -1182,6 +1184,12 @@ def run_sqd(
             :func:`rqutils.ground_locg.ground_locg`. Static, as it is there -- passed by keyword, so
             unlike ``cache_level`` it needs no :func:`functools.partial` binding. See :func:`sqd` on
             why this option's published speedups do not transfer to this path.
+        batch_matvec: Apply the operator to the steady-state iteration's two independent vectors as one
+            stacked ``(2, N)`` call. Every kernel here already broadcasts over a leading batch axis, so
+            this needs no separate paired kernel and is bit-identical; ``False`` restores the two-call
+            path and exists to keep the A/B runnable. Default ``True``, unlike
+            :func:`rqutils.ground_locg.ground_locg`'s ``False``, which cannot assume an arbitrary
+            callable accepts a batch. Static, being forwarded by keyword.
     """
     # `cache_level` is static, so this is a concrete tuple at trace time and the check runs once per
     # trace rather than once per call. `sqd` validates too; this covers the direct callers, which are
@@ -1401,6 +1409,7 @@ def run_sqd(
         prefilter=prefilter,
         prefilter_hi=prefilter_hi,
         log_level=log_level,
+        batch_matvec=batch_matvec,
     )
     result = (eigval,)
     if return_eigvec:
