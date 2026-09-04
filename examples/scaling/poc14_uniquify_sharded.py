@@ -315,8 +315,20 @@ def _gather_local(arr):
     shards = arr.addressable_shards
     if not shards:
         return None
-    ordered = sorted(shards, key=lambda sh: sh.index[0].start or 0)
-    return np.concatenate([np.asarray(sh.data) for sh in ordered], axis=0)
+    if len(shards) == arr.sharding.num_devices:
+        # Every shard is local (single process, or a mesh wholly inside this one): concatenate in
+        # GLOBAL order, which is not arrival order -- hence the sort on the shard's own index.
+        ordered = sorted(shards, key=lambda sh: sh.index[0].start or 0)
+        return np.concatenate([np.asarray(sh.data) for sh in ordered], axis=0)
+    # Multi-process: this rank addresses only its OWN shard, so concatenating what is local returns a
+    # FRACTION of the array with no error raised. Measured on 4 nodes: unique counts came back 50782
+    # and 106269 against a true 157051, differing per rank, with `exact` False -- a silently wrong
+    # answer, which is worse than the crash this replaced. Reconstructing the global array therefore
+    # needs a real collective; jax.jit with out_shardings=P() replicates it inside the sub-mesh, and
+    # only ranks in that mesh reach this line, so it cannot deadlock the ones that skipped.
+    with jax.set_mesh(arr.sharding.mesh):
+        replicated = jax.jit(lambda a: a, out_shardings=P())(arr)
+    return np.asarray(replicated.addressable_shards[0].data)
 
 
 def run(mesh, num_shards, states, states_size, slack=1.35):
