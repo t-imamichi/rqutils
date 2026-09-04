@@ -206,7 +206,7 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import PartitionSpec, get_abstract_mesh
+from jax.sharding import NamedSharding, PartitionSpec, get_abstract_mesh
 from numpy.typing import DTypeLike, NDArray
 from scipy.sparse import coo_array, csr_array
 
@@ -543,7 +543,19 @@ def _host_scalar(value: jax.Array | float | bool) -> jax.Array | float | bool:
     # The collective is safe here because `sqd` is not inside a conditional -- every rank that calls it
     # reaches this line. Do not copy this shape into a branch some ranks skip; see the sub-mesh gather
     # in examples/scaling/poc14_uniquify_sharded.py for the non-collective form that case needs.
-    replicated = jax.jit(lambda x: x, out_shardings=PartitionSpec())(value)
+    #
+    # `out_shardings` takes a **Sharding built from the array's own mesh**, not a bare `PartitionSpec`.
+    # A PartitionSpec is resolved against the *context* mesh, so it raises "jit requires a non-empty
+    # mesh in context" wherever the caller is outside `set_mesh` -- measured on 4 nodes at poc15's
+    # 1-device row, which calls `sqd` with no mesh set. The array carries its mesh regardless of
+    # context, which is why reading it off `value.sharding` works in both places.
+    sharding = value.sharding
+    mesh = getattr(sharding, "mesh", None)
+    if mesh is None:
+        # A SingleDeviceSharding has no mesh and is fully addressable by definition, so there is
+        # nothing to replicate: this rank already holds the value.
+        return value
+    replicated = jax.jit(lambda x: x, out_shardings=NamedSharding(mesh, PartitionSpec()))(value)
     return replicated.addressable_shards[0].data
 
 

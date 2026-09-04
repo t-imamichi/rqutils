@@ -2751,6 +2751,14 @@ class TestHostScalar:
             f"branching on a per-rank property: {branch_lines}. Ranks that can see the value would "
             "skip the collective the others enter, and the job hangs."
         )
+        # `out_shardings` must carry a Sharding built from the array's own mesh. A bare PartitionSpec
+        # resolves against the *context* mesh and raises "jit requires a non-empty mesh in context"
+        # wherever the caller sits outside `set_mesh` -- which poc15's 1-device row does, measured on
+        # 4 nodes.
+        assert "NamedSharding" in source, (
+            "out_shardings needs a Sharding from value.sharding.mesh, not a bare PartitionSpec: the "
+            "latter needs a context mesh and raises when the caller is outside set_mesh"
+        )
 
     def test_the_scalar_it_reads_is_fully_replicated(self):
         # The premise the helper rests on. If a future change made `eigval` genuinely partitioned,
