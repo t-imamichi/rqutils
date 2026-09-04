@@ -134,6 +134,10 @@ initializes); the leading underscore keeps them uncollected, as do the scratchpa
   Hamiltonian's own structure; `examples/scaling/poc12`'s `xxz_krylov` is the pattern. And **check the
   fixture exercises the thing under test** — a hop on qubits 0-1 gives a band-limited subspace a 0% hit
   rate, so the search is never called.
+- **For a change that must not alter the trajectory, assert the iteration count, not the energy.** A
+  batched matvec reusing the wrong vector still converges to the correct eigenvalue on a
+  well-conditioned fixture — measured 55 iterations against 50 at dim=24, 137 against 117 at dim=256 —
+  so `pytest.approx` on the eigenvalue passes the mutant while `int(a[2]) == int(b[2])` kills it.
 - **Don't assert an exact float boundary against a separately computed value.** Two summation orders
   over the same numbers differ in the last ulp, so an `x == threshold` arm tests floating-point
   associativity rather than the code. Test strictly inside the region.
@@ -208,6 +212,17 @@ Four reasons a mutant survives that are *not* missing coverage:
 - **A broken arm flatters its own benchmark.** An undersized capacity, a dropped term, a truncated
   candidate list all do *less work* and so report a *better* number. Verify the output before quoting
   the time.
+- **A single noisy arm can make a real win unresolvable — interleave the arms instead of raising
+  `trials`.** `fmt_ratio`'s noise floor is the *max* of the two spreads, so one outlier in either arm
+  suppresses the verdict however many trials you add: a 1.21× win sat at "UNRESOLVED, noise floor
+  66.6%" across three re-runs, the ON arm tight at 1.4% and OFF dragging a tail. Alternating the two in
+  one loop and reporting min/median plus a paired win count settled it at 1.21×, 25/25 rounds. Add the
+  paired count to any A/B whose spreads straddle the effect.
+- **A memory delta's *sign* can depend on the operator, so name the operator with the number.**
+  Batching `ground_locg`'s matvec pair measured −16.00 B/slot through `run_sqd` (the gather is paid once
+  instead of twice) and *+1 vector* against an elementwise operator with no gather to save — same code,
+  same method, opposite conclusions. When two measurements of one quantity disagree, suspect the fixture
+  differs before deciding either is wrong.
 - **Verify the referent of a cross-reference, not just that it resolves.**
 
 ## Architecture
