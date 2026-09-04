@@ -2751,13 +2751,19 @@ class TestHostScalar:
             f"branching on a per-rank property: {branch_lines}. Ranks that can see the value would "
             "skip the collective the others enter, and the job hangs."
         )
-        # `out_shardings` must carry a Sharding built from the array's own mesh. A bare PartitionSpec
-        # resolves against the *context* mesh and raises "jit requires a non-empty mesh in context"
-        # wherever the caller sits outside `set_mesh` -- which poc15's 1-device row does, measured on
-        # 4 nodes.
-        assert "NamedSharding" in source, (
-            "out_shardings needs a Sharding from value.sharding.mesh, not a bare PartitionSpec: the "
-            "latter needs a context mesh and raises when the caller is outside set_mesh"
+        # The multi-process read must go through process_allgather, not a hand-rolled
+        # jit(out_shardings=...). Both hand-rolled forms failed on real nodes: a bare PartitionSpec
+        # needs a context mesh ("jit requires a non-empty mesh in context"), and a NamedSharding from
+        # value.sharding.mesh replicates only across that array's own mesh -- one device on a 1-device
+        # solve, so the result still had no addressable shard on 3 of 4 ranks and `[0]` raised
+        # IndexError.
+        assert "process_allgather" in source, (
+            "the multi-process read must use process_allgather, which handles the mesh-in-context and "
+            "array-mesh-scope cases that broke two hand-rolled jit(out_shardings=...) attempts"
+        )
+        assert "tiled=True" in source, (
+            "process_allgather's default tiled=False stacks a fully addressable input into a new "
+            "leading axis, so a rank-0 array comes back with shape (1,) instead of a scalar"
         )
 
     def test_the_scalar_it_reads_is_fully_replicated(self):

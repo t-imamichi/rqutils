@@ -206,7 +206,8 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import NamedSharding, PartitionSpec, get_abstract_mesh
+from jax.experimental.multihost_utils import process_allgather
+from jax.sharding import PartitionSpec, get_abstract_mesh
 from numpy.typing import DTypeLike, NDArray
 from scipy.sparse import coo_array, csr_array
 
@@ -503,8 +504,10 @@ def _host_scalar(value: jax.Array | float | bool) -> jax.Array | float | bool:
     nor read its own convergence flag, on the *default* ``return_eigvec=False`` path.
 
     ``jax.reshard`` does not help: the spec is already ``P()``, so the problem is addressability rather
-    than layout. Multi-process therefore takes a real collective (``jit`` with
-    ``out_shardings=PartitionSpec()``) to put the value on every process before reading it.
+    than layout. Multi-process therefore goes through
+    :func:`jax.experimental.multihost_utils.process_allgather`, which puts the value on every process
+    irrespective of the mesh in context or the mesh the array came from -- both of which broke
+    hand-rolled ``jit(out_shardings=...)`` attempts (see the comments in the body).
 
     **The branch is on ``jax.process_count()``, deliberately, not on this rank's view of the array.**
     Whether a given rank can see the value is a per-rank property -- measured on 4 nodes, two ranks read
@@ -544,19 +547,18 @@ def _host_scalar(value: jax.Array | float | bool) -> jax.Array | float | bool:
     # reaches this line. Do not copy this shape into a branch some ranks skip; see the sub-mesh gather
     # in examples/scaling/poc14_uniquify_sharded.py for the non-collective form that case needs.
     #
-    # `out_shardings` takes a **Sharding built from the array's own mesh**, not a bare `PartitionSpec`.
-    # A PartitionSpec is resolved against the *context* mesh, so it raises "jit requires a non-empty
-    # mesh in context" wherever the caller is outside `set_mesh` -- measured on 4 nodes at poc15's
-    # 1-device row, which calls `sqd` with no mesh set. The array carries its mesh regardless of
-    # context, which is why reading it off `value.sharding` works in both places.
-    sharding = value.sharding
-    mesh = getattr(sharding, "mesh", None)
-    if mesh is None:
-        # A SingleDeviceSharding has no mesh and is fully addressable by definition, so there is
-        # nothing to replicate: this rank already holds the value.
-        return value
-    replicated = jax.jit(lambda x: x, out_shardings=NamedSharding(mesh, PartitionSpec()))(value)
-    return replicated.addressable_shards[0].data
+    # `process_allgather` rather than a hand-rolled `jit(out_shardings=...)`. Three attempts at the
+    # latter each failed on a topology detail this handles already:
+    #
+    # * a bare `PartitionSpec` is resolved against the *context* mesh, so it raises "jit requires a
+    #   non-empty mesh in context" wherever the caller sits outside `set_mesh`;
+    # * a `NamedSharding` built from `value.sharding.mesh` fixes that but replicates only across **that
+    #   array's** mesh, which on a 1-device solve is one device -- so the result still had no
+    #   addressable shard on 3 of 4 ranks and the `[0]` raised `IndexError`.
+    #
+    # `tiled=True` is required: the default stacks a fully addressable input into a new leading axis,
+    # which for a rank-0 array yields shape (1,) instead of a scalar.
+    return np.asarray(process_allgather(value, tiled=True))
 
 
 # Overloads so a caller destructuring the 3-tuple does not have to narrow first. `return_eigvec` is a
