@@ -35,6 +35,16 @@ Run on a multi-node cluster with one GPU per node (the only way to reach N GPUs 
 
     mpirun -n 4 uv run --extra mpi python examples/scaling/poc15_sqd_multinode.py --devices mpi
 
+**Multi-process measures one point, not a curve.** Every rank has to take part in every mesh, so a
+sub-mesh over ``jax.devices()[:k]`` is not available: with one GPU per node it would exclude whole
+processes, and those ranks then call ``sqd`` on a mesh they hold no shard of -- measured on 4 nodes, the
+2-device row raised ``FullyReplicatedShard: Array has no addressable shards`` from inside
+``process_allgather``, on exactly the 2 excluded ranks. Get the curve from one job per rank count::
+
+    for n in 1 2 4; do
+        mpirun -n $n uv run --extra mpi python examples/scaling/poc15_sqd_multinode.py --devices mpi
+    done
+
 Run on one node holding several GPUs::
 
     uv run --extra qiskit python examples/scaling/poc15_sqd_multinode.py --devices 0,1,2,3
@@ -195,6 +205,14 @@ def mesh_sizes(total: int) -> tuple:
 
     Doubling is what makes the memory curve readable: a replicated term stays flat while a sharded
     one halves, and a non-power-of-two step confounds the two.
+
+    **Single process only.** A sub-mesh over ``jax.devices()[:k]`` is fine when one process owns every
+    device, and impossible across processes: with one GPU per node, device count equals process count,
+    so a mesh of size ``k < total`` excludes ``total - k`` processes entirely -- and those ranks then
+    call ``sqd`` on a mesh they hold no shard of. Measured on 4 nodes: the 2-device row raised
+    ``FullyReplicatedShard: Array has no addressable shards`` from *inside* ``process_allgather``, on
+    exactly the 2 ranks left out. The multi-process path therefore measures **one** point, and the
+    sweep comes from launching separate jobs -- see :func:`main`.
     """
     sizes, size = [], 1
     while size <= total:
@@ -225,12 +243,25 @@ def main():
     if hamiltonian.x.shape[0] == 0:
         raise RuntimeError("empty Hamiltonian -- the fixture is broken, not the solver")
 
-    sizes = mesh_sizes(jax.device_count())
-    if len(sizes) < 2:
+    # Multi-process cannot sweep: every rank must participate in every mesh, so the only mesh available
+    # is the full one. Sweeping is done by launching one job per rank count (mpirun -n 1, -n 2, -n 4)
+    # and comparing the single rows they print.
+    multiprocess = jax.process_count() > 1
+    sizes = (jax.device_count(),) if multiprocess else mesh_sizes(jax.device_count())
+    if multiprocess:
+        print(
+            f"\nMULTI-PROCESS: measuring the {jax.device_count()}-device point only. A sub-mesh would\n"
+            "exclude whole processes, which then hold no shard of the array `sqd` gathers -- measured,\n"
+            "that raises FullyReplicatedShard inside process_allgather on exactly the excluded ranks.\n"
+            "For the curve, run this once per rank count and compare rows:\n"
+            "  for n in 1 2 4; do mpirun -n $n uv run --extra mpi python <this script> "
+            "--devices mpi; done"
+        )
+    if len(sizes) < 2 and not multiprocess:
         print(
             "\nOnly one device, so there is no scaling curve to measure -- this script needs >= 2.\n"
             "  mpirun -n 4 uv run --extra mpi python <this script> --devices mpi   # 1 GPU/node\n"
-            "  uv run --extra qiskit python <this script> --devices 0,1,2,3           # 1 node\n"
+            "  uv run python <this script> --devices 0,1,2,3                         # 1 node\n"
             "poc7_sharding.py covers single-device-vs-sharded correctness; this covers memory/speed."
         )
         return 1
