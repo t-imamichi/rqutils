@@ -271,10 +271,12 @@ def init_devices(devices: str | None, host_devices: int = 4) -> str:
         try:
             import mpi4py  # noqa: F401
         except ImportError as exc:
-            # Undeclared dependency, per CLAUDE.md: install it manually for the multi-process path.
+            # mpi4py is a required dependency now, so reaching this means the install is broken rather
+            # than incomplete -- most likely it could not build against the host MPI.
             raise RuntimeError(
-                "--devices mpi needs mpi4py, which this project deliberately does not declare. "
-                "Install it into the venv first: uv pip install mpi4py"
+                "--devices mpi needs mpi4py, which is a required dependency, so this import failing "
+                "means the install is broken -- usually a build against the host MPI. Try "
+                "`uv sync --reinstall-package mpi4py` with an MPI compiler on PATH."
             ) from exc
         import jax
 

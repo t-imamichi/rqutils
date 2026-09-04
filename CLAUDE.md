@@ -10,10 +10,17 @@ When a rule needs evidence, it points there rather than restating it.
 ## Environment
 
 - **Always `uv run python`**, never bare `python` — the venv at `.venv` is managed by uv.
-- **Extras are not installed by default**: `mpl`, `qutip`, `qiskit`, `docs`, `dev` (pytest + ruff + ty).
-  Pull them in per invocation: `uv run --extra qiskit python examples/sqd.py 8 --num-paulis 10`.
-  `mpi4py` is imported by `examples/` but declared nowhere — install it manually for the
-  multi-process path.
+- **`qiskit` and `mpi4py` are required dependencies**; `mpl`, `qutip`, `docs` and `dev`
+  (pytest + ruff + ty) are extras and are **not** installed by default. Pull those in per invocation:
+  `uv run --extra mpl python examples/bench.py`. `qiskit` is required because it is a public *input*
+  type (`PauliSumXZ.from_paulisum` takes a `SparsePauliOp`, `svsim` takes a `QuantumCircuit`) — the
+  `HAS_QISKIT` guards stay regardless, since they turn a broken install into a `RuntimeError` at the
+  call site rather than an `ImportError` at `import rqutils`. `mpi4py` is required only so the
+  multi-process example paths work from a bare install; nothing under `rqutils/` imports it, and it
+  needs a working host MPI to build.
+- **The `qiskit` and `mpi` extras still exist as empty aliases**, so the `--extra qiskit` invocations
+  throughout this file, `NOTES.md`, `docs/` and the `examples/scaling/` docstrings keep resolving.
+  They install nothing.
 - **No `timeout` on macOS** (it is GNU coreutils) — use the Bash tool's own timeout.
 - **The shell is fish: quote grep globs** (`--include="*.py"`). Unquoted, fish fails with
   `(eval):1: no matches found` *before* grep runs, which reads as "no results" rather than an error.
@@ -82,9 +89,10 @@ uv run --extra dev pytest              # whole suite
 uv run --extra dev pytest -v -x        # verbose, stop at first failure
 ```
 
-**Run the full extras** — `--extra dev --extra qiskit --extra mpl --extra qutip` — or 23 tests
-**silently skip**, including the qiskit reference comparisons this file treats as the trustworthy
-oracle. A fresh worktree gets a bare venv, so this bites there first.
+**Run the full extras** — `--extra dev --extra mpl --extra qutip` — or tests **silently skip**. The
+qiskit reference comparisons this file treats as the trustworthy oracle no longer need an extra, since
+`qiskit` is a required dependency; `mpl` and `qutip` still do. A fresh worktree gets a bare venv, so
+this bites there first.
 
 **Don't run the suite for a markdown-only change.** `testpaths = ["tests"]` and
 `python_files = ["test_*.py"]`, so pytest never looks at `*.md` — the result is known before it runs, and
