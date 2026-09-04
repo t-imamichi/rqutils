@@ -20,6 +20,7 @@ initial-vector bugs affected all six kernels identically, so a consistency-only 
 passed while every kernel returned the same wrong number.
 """
 
+import inspect
 import warnings
 
 import jax
@@ -2695,6 +2696,30 @@ class TestHostScalar:
         vec = jax.numpy.arange(8.0)
         assert float(_host_scalar(jax.numpy.sum(vec))) == 28.0
         assert bool(_host_scalar(jax.numpy.all(vec >= 0.0))) is True
+
+    def test_an_unaddressable_value_is_not_returned_unchanged(self):
+        """The empty-``addressable_shards`` case, which the first version of the fix got wrong.
+
+        On a multi-process mesh ``jit`` can leave a scalar on devices this process does not own, so
+        ``addressable_shards`` is **empty**. The original ``if not shards: return value`` read that as
+        "already host-side" and returned the array untouched, so the caller's ``float()`` raised the very
+        error the helper exists to prevent -- seen on a 4-node run *after* that fix shipped.
+
+        Single-process cannot construct that state (one process addresses every device), so what is
+        assertable here is the **guard's condition**, not the collective behind it: an array that is not
+        both fully replicated and locally held must not take the cheap local-read path. Read straight
+        off the source so a future edit that reinstates the fall-through fails here.
+        """
+        source = inspect.getsource(_host_scalar)
+        # The bug was a bare `if not shards: return value`. Its absence is the invariant.
+        assert "if not shards" not in source, (
+            "reinstating a bare `if not shards: return value` returns an unreadable array unchanged, "
+            "which is the 4-node failure this helper exists to prevent"
+        )
+        assert "is_fully_replicated" in source, (
+            "the local-read path must be gated on full replication: reading shard 0 of a *partitioned* "
+            "array silently returns part of the answer"
+        )
 
     def test_the_scalar_it_reads_is_fully_replicated(self):
         # The premise the helper rests on. If a future change made `eigval` genuinely partitioned,

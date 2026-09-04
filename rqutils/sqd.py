@@ -514,11 +514,24 @@ def _host_scalar(value: jax.Array | float | bool) -> jax.Array | float | bool:
     Returns:
         Something ``float()`` or ``bool()`` accepts.
     """
-    shards = getattr(value, "addressable_shards", None)
-    if not shards:
-        # Already host-side, or single-process where the value is directly fetchable.
+    if not isinstance(value, jax.Array):
+        # Already a Python or numpy scalar.
         return value
-    return shards[0].data
+    if value.is_fully_replicated and value.addressable_shards:
+        # Cheapest correct path: the value is identical on every device and this rank holds one, so a
+        # local read is exact and costs no communication.
+        return value.addressable_shards[0].data
+    # Otherwise this rank cannot see the value: `addressable_shards` is **empty** when jit assigned the
+    # scalar to devices this process does not own, which is what an earlier version of this function
+    # mistook for "already host-side" -- it returned the array unchanged and the caller's float() raised
+    # the very error this exists to prevent, on a 4-node run.
+    #
+    # A collective is required to fix that, and is safe *here* specifically because `sqd` is not inside
+    # a conditional: every rank that calls it reaches this line, so none can be left waiting at the
+    # barrier. Do not copy this shape to a branch some ranks skip -- see the sub-mesh gather in
+    # examples/scaling/poc14_uniquify_sharded.py for the non-collective form that case needs.
+    replicated = jax.jit(lambda x: x, out_shardings=PartitionSpec())(value)
+    return replicated.addressable_shards[0].data
 
 
 # Overloads so a caller destructuring the 3-tuple does not have to narrow first. `return_eigvec` is a
