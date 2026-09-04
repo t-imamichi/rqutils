@@ -556,9 +556,20 @@ def _host_scalar(value: jax.Array | float | bool) -> jax.Array | float | bool:
     #   array's** mesh, which on a 1-device solve is one device -- so the result still had no
     #   addressable shard on 3 of 4 ranks and the `[0]` raised `IndexError`.
     #
-    # `tiled=True` is required: the default stacks a fully addressable input into a new leading axis,
-    # which for a rank-0 array yields shape (1,) instead of a scalar.
-    return np.asarray(process_allgather(value, tiled=True))
+    # `tiled=True` is required for the non-addressable case -- `process_allgather` rejects
+    # `tiled=False` there outright.
+    #
+    # **The result's shape depends on addressability, so normalize it rather than trusting it.** The two
+    # branches inside `process_allgather` disagree for the same rank-0 input: a non-addressable array is
+    # replicated and comes back as a scalar, while a *fully addressable* one is expanded to `(1,)` and
+    # gathered to `(process_count,)` -- its `ndim == 0` test forces the expansion even under
+    # `tiled=True`. Measured on 4 nodes: the 1-device row is fully addressable, returned shape (4,), and
+    # `float()` raised "only 0-dimensional arrays can be converted to Python scalars".
+    #
+    # Every entry is the same number, since all ranks computed the same scalar, so `.reshape(-1)[0]`
+    # is exact for both shapes -- and does not branch on addressability, which is the per-rank property
+    # this function already learned not to test.
+    return np.asarray(process_allgather(value, tiled=True)).reshape(-1)[0]
 
 
 # Overloads so a caller destructuring the 3-tuple does not have to narrow first. `return_eigvec` is a

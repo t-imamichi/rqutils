@@ -2762,8 +2762,16 @@ class TestHostScalar:
             "array-mesh-scope cases that broke two hand-rolled jit(out_shardings=...) attempts"
         )
         assert "tiled=True" in source, (
-            "process_allgather's default tiled=False stacks a fully addressable input into a new "
-            "leading axis, so a rank-0 array comes back with shape (1,) instead of a scalar"
+            "process_allgather rejects tiled=False for a non-fully-addressable array outright"
+        )
+        # The return shape depends on addressability -- process_allgather replicates a
+        # non-addressable rank-0 array to a scalar but expands a fully addressable one to
+        # (process_count,). Measured on 4 nodes: the 1-device row returned (4,) and float() raised
+        # "only 0-dimensional arrays can be converted to Python scalars".
+        assert "reshape(-1)" in source, (
+            "the gathered result must be flattened before indexing: process_allgather returns a "
+            "scalar for a non-addressable input and shape (process_count,) for an addressable one, "
+            "and branching on which would branch on a per-rank property"
         )
 
     def test_the_scalar_it_reads_is_fully_replicated(self):
