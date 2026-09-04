@@ -493,6 +493,34 @@ def _check_states_shape(states: Any, num_qubits: int, packed: bool = False) -> S
     return states
 
 
+def _host_scalar(value: jax.Array | float | bool) -> jax.Array | float | bool:
+    """Return a replicated scalar in a form the host can read, on any process topology.
+
+    ``float()``/``bool()`` on a ``jax.Array`` fetch its value, which **raises across processes**:
+    "Fetching value for `jax.Array` that spans non-addressable (non process local) devices". A
+    reduction over a partitioned vector produces exactly that -- a rank-0 array whose sharding still
+    names the whole mesh -- so on a multi-process mesh ``sqd`` could not return its own eigenvalue,
+    nor read its own convergence flag, on the *default* ``return_eigvec=False`` path.
+
+    ``jax.reshard`` does not help: the spec is already ``P()``. The problem is addressability, not
+    layout. But a replicated scalar holds the identical value on every device (verified:
+    ``is_fully_replicated`` is True and all four shards read equal), so its own **addressable shard**
+    is the exact answer and needs no collective -- which matters because a collective here would
+    deadlock any rank that took a different branch.
+
+    Args:
+        value: A rank-0 ``jax.Array``, or an already-host scalar (returned unchanged).
+
+    Returns:
+        Something ``float()`` or ``bool()`` accepts.
+    """
+    shards = getattr(value, "addressable_shards", None)
+    if not shards:
+        # Already host-side, or single-process where the value is directly fetchable.
+        return value
+    return shards[0].data
+
+
 # Overloads so a caller destructuring the 3-tuple does not have to narrow first. `return_eigvec` is a
 # plain bool, so without these the declared return is the full union and every
 # `eigval, eigvec, subdims = sqd(...)` reads as unpacking a `float`. Annotation only -- the
@@ -837,7 +865,7 @@ def sqd(
         prefilter=prefilter,
     )
     LOG.info("Found ground eigenpair in %f seconds.", time.time() - start)
-    eigval = float(result[0])
+    eigval = float(_host_scalar(result[0]))
     # The convergence flag used to be discarded here, and a non-converged run still returns
     # `state.theta` -- a valid variational *upper bound*, so finite, real, and above the true minimum,
     # i.e. indistinguishable from a correct answer by inspection. docs/locg.md records that this
@@ -846,7 +874,7 @@ def sqd(
     #
     # Raised here rather than in `run_sqd` because that function is @jax.jit-wrapped, so `converged`
     # is a traced boolean there and cannot be branched on at trace time.
-    if not bool(result[-1]):
+    if not bool(_host_scalar(result[-1])):
         raise RuntimeError(
             f"LOBPCG did not converge in maxiter={maxiter} iterations (atol={atol!r}, "
             f"rtol={rtol!r}). The value it "
