@@ -2929,6 +2929,42 @@ Also measured while writing that script, first-hand: **omitting
 bug. With x64 the spread is 3.6e-15 across 1/2/4 devices. The rule is in `CLAUDE.md`; this is what
 breaking it looks like from the inside.
 
+### `poc15` on real nodes: the scaling is negative, and the memory column was never measured (2026-09-05)
+
+First real multi-node run of `poc15_sqd_multinode.py`, 1D XXZ `n=26`, `Jz=0.8`, N=400000 (J=27,
+maxK=26, float64), `cache_level=(1, 0)`, one GPU per node via `--devices mpi`:
+
+| devices | ms | vs 2-device |
+| --- | --- | --- |
+| 2 | 961.8 | -- |
+| 4 | 1728.6 | **1.80x SLOWER** |
+
+`|dE| = 0.0e+00` at both points, so this is pure communication -- the same conclusion as the 32x figure
+above, now with a *slope*: doubling devices at fixed `N` costs 1.80x. Two caveats. The 1-device arm never
+ran (its rank exited non-zero and `mpirun` aborted the job), so the ratio is computed across separate
+runs rather than reported by the script, and every printed `speedup` column said "baseline" because each
+rank count is its own job. And this is again a network, not NVLink.
+
+**This is the measurement `docs/sqd-locg-improvement-ideas.md` §3 was gated on, and it says do not
+integrate.** Routing hash-partitioned state lookup adds `all_to_all` on top of a solve already losing
+1.80x per doubling on this interconnect. It also promotes §8-rescoped: where 4 devices are 1.80x slower
+than 2, cutting 7 of the 13 per-iteration `all-reduce` ops is no longer a micro-optimization.
+
+**The memory columns all read `0.0`, and that was an instrument failure, not a finding.** The probe
+bracketed a `solve()` that returned `float(sqd(...))`, so every device array was freed before the second
+reading and both samples took the resting allocator value -- structurally zero on any backend. The
+script's own VERDICT could not catch it: its advice was "a FLAT delta means nothing sharded", and flat
+and absent both print `0.0`. Fixed by sampling while the arrays are still referenced, which `poc8`'s
+docstring already recorded as the fix for the identical defect.
+
+One trap inside that fix, hit before it was right: routing `return_eigvec=True` through **`sqd`** does
+not work, because `sqd` converts on the way out (`np.array(eigvec[...])`, `np.asarray(basis_states)`), so
+holding those keeps no device memory alive and the delta stays `0.0` with more machinery in the way.
+`run_sqd` is the innermost layer whose outputs are still `jax.Array`. An exact zero now prints `0?`, since
+a real solve allocates `O(N)` vectors and 0 B can only mean the reading missed them. **Claim 1 is still
+unanswered on real hardware** -- the fix is verified under virtual devices, where the CPU backend has no
+allocator accounting and correctly reports `n/a`.
+
 ### `sqd` could not return its own eigenvalue multi-process, and I audited past it once (2026-09-04)
 
 `sqd.py`'s `eigval = float(result[0])` raises **"Fetching value for `jax.Array` that spans

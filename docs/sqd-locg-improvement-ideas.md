@@ -126,6 +126,14 @@ See `NOTES.md`, "A partial *diagonal* cache works" and "The diagonal split at la
 
 ### 3. Integrate the distributed-state prototypes after real-interconnect measurement
 
+**Gated measurement is in: DO NOT INTEGRATE (2026-09-05).** `poc15` ran on real nodes, 1D XXZ n=26,
+N=400000, one GPU per node: **961.8 ms on 2 devices against 1728.6 ms on 4 -- 1.80x slower per
+doubling**, at `|dE| = 0.0e+00`, so pure communication. This is the real-interconnect measurement this
+section made itself conditional on, and it answers against integration: routed lookup adds `all_to_all`
+on top of a solve that already loses 1.80x per doubling. Still a network rather than NVLink, so the
+in-one-box question remains genuinely open -- but nothing here should be built until that is measured.
+See `NOTES.md`, "poc15 on real nodes".
+
 **Verified: accurate, but roughly half of this section restates `CLAUDE.md`'s `sqd` section**, which
 already says states-replication is not fundamental, that whole-key hashing is required, that
 `uniquify_states` needs range partitioning, that the diagonal path shards with zero collectives, and that
@@ -356,6 +364,12 @@ boundary, which blocks the combiner from folding it into its neighbours. So:
 `compute_sas` half of the section is already answered -- XLA has combined them, so there is nothing to
 design there.
 
+**Promoted 2026-09-05 by the `poc15` multi-node run**, which measured 4 devices at **1.80x slower** than
+2 at fixed `N` with identical energies. On a topology where adding devices costs that much, cutting 7 of
+13 per-iteration `all-reduce` ops stops being a micro-optimization -- this becomes the highest-value item
+for multi-node, ahead of section 2. Section 2 remains first if the binding constraint is single-device
+memory.
+
 ### 9. Re-evaluate the GPU prefilter operating point end to end
 
 A recent GPU sweep over `ground_locg` driven by `apply_h` found `(32, 8)` at 1.38x versus only 1.07x for
@@ -447,7 +461,9 @@ dropped, and one section's own instruction ("first count collectives in HLO") is
    performance question, so unlike everything else distributed it needs no interconnect to justify *or* to
    fix, and section 3's memory relief is pointless while the return path re-replicates. Measured: +7
    all-gathers and `P(None)` on both outputs.
-3. **Section 8, rescoped -- make the norms combinable.** Not the `hypot` identity (1 of 13 ops, and it
+3. **Section 8, rescoped -- make the norms combinable.** *(First instead, if the target is multi-node:
+   `poc15` measured 4 devices at 1.80x slower than 2, which makes the collective count the binding
+   constraint there rather than memory.)* Not the `hypot` identity (1 of 13 ops, and it
    puts the convergence test at risk) but the finding underneath it: 7 of 13 `all-reduce` ops are
    single-scalar `jnp.linalg.norm` calls whose jit boundary blocks XLA's combiner, which has already
    merged every neighbouring sum. Same residual semantics, ~7x the target.
