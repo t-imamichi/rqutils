@@ -502,11 +502,16 @@ def _host_scalar(value: jax.Array | float | bool) -> jax.Array | float | bool:
     names the whole mesh -- so on a multi-process mesh ``sqd`` could not return its own eigenvalue,
     nor read its own convergence flag, on the *default* ``return_eigvec=False`` path.
 
-    ``jax.reshard`` does not help: the spec is already ``P()``. The problem is addressability, not
-    layout. But a replicated scalar holds the identical value on every device (verified:
-    ``is_fully_replicated`` is True and all four shards read equal), so its own **addressable shard**
-    is the exact answer and needs no collective -- which matters because a collective here would
-    deadlock any rank that took a different branch.
+    ``jax.reshard`` does not help: the spec is already ``P()``, so the problem is addressability rather
+    than layout. Multi-process therefore takes a real collective (``jit`` with
+    ``out_shardings=PartitionSpec()``) to put the value on every process before reading it.
+
+    **The branch is on ``jax.process_count()``, deliberately, not on this rank's view of the array.**
+    Whether a given rank can see the value is a per-rank property -- measured on 4 nodes, two ranks read
+    it successfully while two raised from the same call -- and branching on that would send some ranks
+    into the collective and let others return early, hanging the job at the barrier. ``process_count()``
+    is identical on every rank, so every rank takes the same path. Single process short-circuits, since
+    it addresses every device and no communication is required.
 
     Args:
         value: A rank-0 ``jax.Array``, or an already-host scalar (returned unchanged).
@@ -517,19 +522,27 @@ def _host_scalar(value: jax.Array | float | bool) -> jax.Array | float | bool:
     if not isinstance(value, jax.Array):
         # Already a Python or numpy scalar.
         return value
-    if value.is_fully_replicated and value.addressable_shards:
-        # Cheapest correct path: the value is identical on every device and this rank holds one, so a
-        # local read is exact and costs no communication.
-        return value.addressable_shards[0].data
-    # Otherwise this rank cannot see the value: `addressable_shards` is **empty** when jit assigned the
-    # scalar to devices this process does not own, which is what an earlier version of this function
-    # mistook for "already host-side" -- it returned the array unchanged and the caller's float() raised
-    # the very error this exists to prevent, on a 4-node run.
+    if jax.process_count() == 1:
+        # Single process addresses every device, so `float()` works directly and no collective is
+        # needed. This is also the only branch a CPU test suite can reach -- see TestHostScalar.
+        return value
+
+    # Multi-process. Replicate onto every process before reading, unconditionally.
     #
-    # A collective is required to fix that, and is safe *here* specifically because `sqd` is not inside
-    # a conditional: every rank that calls it reaches this line, so none can be left waiting at the
-    # barrier. Do not copy this shape to a branch some ranks skip -- see the sub-mesh gather in
-    # examples/scaling/poc14_uniquify_sharded.py for the non-collective form that case needs.
+    # **The branch must not depend on this rank's view of the array.** An earlier version returned
+    # early when `addressable_shards` was non-empty, which is a *per-rank* property: measured on 4
+    # nodes, two ranks printed a result while two raised "spans non-addressable devices" from the same
+    # call. Had those two returned early while the others entered the collective below, the job would
+    # have hung at the barrier instead of failing -- strictly worse. `jax.process_count()` is the same
+    # on every rank, so every rank takes the same path.
+    #
+    # (The version before *that* one was worse still: `if not shards: return value` read an empty
+    # `addressable_shards` as "already host-side" and handed the unreadable array to the caller's
+    # `float()`, which raised the very error this function exists to prevent.)
+    #
+    # The collective is safe here because `sqd` is not inside a conditional -- every rank that calls it
+    # reaches this line. Do not copy this shape into a branch some ranks skip; see the sub-mesh gather
+    # in examples/scaling/poc14_uniquify_sharded.py for the non-collective form that case needs.
     replicated = jax.jit(lambda x: x, out_shardings=PartitionSpec())(value)
     return replicated.addressable_shards[0].data
 

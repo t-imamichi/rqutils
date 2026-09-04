@@ -20,7 +20,9 @@ initial-vector bugs affected all six kernels identically, so a consistency-only 
 passed while every kernel returned the same wrong number.
 """
 
+import ast
 import inspect
+import textwrap
 import warnings
 
 import jax
@@ -2697,28 +2699,57 @@ class TestHostScalar:
         assert float(_host_scalar(jax.numpy.sum(vec))) == 28.0
         assert bool(_host_scalar(jax.numpy.all(vec >= 0.0))) is True
 
-    def test_an_unaddressable_value_is_not_returned_unchanged(self):
-        """The empty-``addressable_shards`` case, which the first version of the fix got wrong.
+    def test_the_multi_process_branch_does_not_depend_on_this_rank(self):
+        """The branch must be rank-uniform, or the ranks disagree and the job hangs.
 
-        On a multi-process mesh ``jit`` can leave a scalar on devices this process does not own, so
-        ``addressable_shards`` is **empty**. The original ``if not shards: return value`` read that as
-        "already host-side" and returned the array untouched, so the caller's ``float()`` raised the very
-        error the helper exists to prevent -- seen on a 4-node run *after* that fix shipped.
+        Two earlier versions were wrong in different ways, both only visible on real nodes:
 
-        Single-process cannot construct that state (one process addresses every device), so what is
-        assertable here is the **guard's condition**, not the collective behind it: an array that is not
-        both fully replicated and locally held must not take the cheap local-read path. Read straight
-        off the source so a future edit that reinstates the fall-through fails here.
+        1. ``if not shards: return value`` read an **empty** ``addressable_shards`` as "already
+           host-side" and handed the unreadable array back, so the caller's ``float()`` raised the very
+           error the helper exists to prevent.
+        2. Gating the fast path on ``is_fully_replicated and addressable_shards`` fixed that but
+           branched on a **per-rank** property. Measured on 4 nodes, two ranks read the value while two
+           raised from the same call -- so that gate would have sent two ranks into a collective and let
+           two return early, hanging at the barrier instead of failing. Strictly worse.
+
+        Single-process cannot construct either state, so what is assertable here is the guard's
+        *condition*, read off the source: the multi-process decision must come from
+        ``jax.process_count()``, which is identical on every rank, and must not consult this rank's
+        shards. Not a substitute for a real multi-process run.
         """
-        source = inspect.getsource(_host_scalar)
-        # The bug was a bare `if not shards: return value`. Its absence is the invariant.
-        assert "if not shards" not in source, (
-            "reinstating a bare `if not shards: return value` returns an unreadable array unchanged, "
-            "which is the 4-node failure this helper exists to prevent"
+        # Strip the docstring and comments: both *quote* the historical wrong forms in order to warn
+        # about them, so a naive substring search matches the explanation rather than the code. This
+        # test caught itself doing exactly that.
+        full = inspect.getsource(_host_scalar)
+        tree = ast.parse(textwrap.dedent(full))
+        func = tree.body[0]
+        assert isinstance(func, ast.FunctionDef)
+        if (
+            func.body
+            and isinstance(func.body[0], ast.Expr)
+            and isinstance(func.body[0].value, ast.Constant)
+        ):
+            del func.body[0]  # the docstring
+        source = ast.unparse(func)
+        assert "process_count()" in source, (
+            "the multi-process branch must be decided by jax.process_count(), which is the same on "
+            "every rank; a per-rank condition makes the ranks disagree and hang at the barrier"
         )
-        assert "is_fully_replicated" in source, (
-            "the local-read path must be gated on full replication: reading shard 0 of a *partitioned* "
-            "array silently returns part of the answer"
+        assert "if not shards" not in source, (
+            "a bare `if not shards: return value` returns an unreadable array unchanged, which is the "
+            "4-node failure this helper exists to prevent"
+        )
+        # The fast/slow decision must not be gated on a per-rank view of the array. `addressable_shards`
+        # may still appear -- it is how the value is finally read -- but not as the branch condition.
+        branch_lines = [
+            line
+            for line in source.splitlines()
+            if line.strip().startswith(("if ", "elif "))
+            and ("addressable_shards" in line or "is_fully_replicated" in line)
+        ]
+        assert not branch_lines, (
+            f"branching on a per-rank property: {branch_lines}. Ranks that can see the value would "
+            "skip the collective the others enter, and the job hangs."
         )
 
     def test_the_scalar_it_reads_is_fully_replicated(self):
