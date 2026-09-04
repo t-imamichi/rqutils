@@ -19,6 +19,18 @@ source venv/bin/activate
 cd rqutils/examples
 mpirun python sqd.py 32 --gpus mpi
 ----------------------------------------
+
+``--gpus mpi`` requires the **mpi** extra (``uv sync --extra mpi``, or ``pip install 'rqutils[mpi]'``).
+It is not a default dependency because ``mpi4py`` builds against the host MPI, which would make every
+install depend on a system MPI; nothing in ``rqutils`` itself imports it. Without it,
+``jax.distributed.initialize(cluster_detection_method='mpi4py')`` below raises. The other ``--gpus``
+forms and the single-process default need nothing extra.
+
+**One process per node, not one per GPU**: ``initialize`` is what makes the ranks a single JAX program,
+so each owns its local device and ``jax.devices()`` reports all of them globally. Launched without it,
+every rank instead comes up as an independent client seeing every GPU, which is a *multi-slice*
+topology -- and ``jax.make_mesh`` rejects those outright, minutes later, with a message about
+``create_hybrid_device_mesh`` that names neither the launcher nor the missing call.
 """
 
 import logging

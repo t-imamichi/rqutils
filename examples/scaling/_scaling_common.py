@@ -269,14 +269,15 @@ def init_devices(devices: str | None, host_devices: int = 4) -> str:
 
     if devices == "mpi":
         try:
-            import mpi4py  # noqa: F401
+            # `mpi` extra, not a default dependency -- so `ty` cannot resolve it on a plain install.
+            import mpi4py  # noqa: F401  # ty: ignore[unresolved-import]
         except ImportError as exc:
-            # mpi4py is a required dependency now, so reaching this means the install is broken rather
-            # than incomplete -- most likely it could not build against the host MPI.
+            # mpi4py lives in the `mpi` extra rather than the default dependencies: it builds against
+            # the host MPI, and nothing under rqutils/ imports it.
             raise RuntimeError(
-                "--devices mpi needs mpi4py, which is a required dependency, so this import failing "
-                "means the install is broken -- usually a build against the host MPI. Try "
-                "`uv sync --reinstall-package mpi4py` with an MPI compiler on PATH."
+                "--devices mpi needs mpi4py, which is in the `mpi` extra rather than the default "
+                "dependencies. Install it with `uv sync --extra mpi` (an MPI compiler must be on "
+                "PATH, since mpi4py builds against the host MPI)."
             ) from exc
         import jax
 

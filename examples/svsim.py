@@ -16,6 +16,10 @@ source venv/bin/activate
 cd rqutils/examples
 mpirun python svsim.py 32 --gpus mpi
 ----------------------------------------
+
+``--gpus mpi`` requires the **mpi** extra (``uv sync --extra mpi``, or ``pip install 'rqutils[mpi]'``):
+``mpi4py`` builds against the host MPI, so it is not a default dependency and nothing in ``rqutils``
+imports it. The other ``--gpus`` forms need nothing extra.
 """
 
 import logging
@@ -94,7 +98,9 @@ logger.info("Verified GHZ state: amplitudes %s", np.asarray(amplitudes))
 # Write the output
 if options.gpus == "mpi":
     # Writing array shards from multiple processes requires synchronization. Output path
-    from mpi4py import MPI
+    # Needs the `mpi` extra; see this module's docstring. Suppressed because mpi4py is deliberately
+    # not a default dependency, so `ty` cannot resolve it on a plain install.
+    from mpi4py import MPI  # ty: ignore[unresolved-import]
 
     if (proc_id := jax.process_index()) == 0:
         # Head process creates the file and defines the dataset

@@ -27,22 +27,20 @@ dependencies = [
     # keeps a broken qiskit install a RuntimeError at the call site rather than an ImportError at
     # `import rqutils`.
     "qiskit",
-    # Examples-only: nothing under rqutils/ imports mpi4py. Here so the multi-process example paths
-    # (`examples/sqd.py --gpus mpi`, `examples/scaling/*.py --devices mpi`) work from a bare install.
-    # Note it needs a working MPI implementation on the host to build, so this makes the install
-    # depend on the system MPI even for callers who never run those examples.
-    "mpi4py",
 ]
 
 [project.optional-dependencies]
 mpl = ["matplotlib"]
 qutip = ["qutip"]
-# Kept as empty aliases rather than deleted: `qiskit` and `mpi4py` moved to the required dependencies
-# above, but `uv run --extra qiskit ...` appears throughout CLAUDE.md, NOTES.md, docs/ and every
-# examples/scaling/ docstring. Deleting the names would make all of those fail with "unknown extra"
-# for no benefit; as empty lists they resolve and install nothing.
+# `qiskit` moved to the required dependencies above, but `uv run --extra qiskit ...` appears throughout
+# CLAUDE.md, NOTES.md, docs/ and every examples/scaling/ docstring; deleting the name would make all of
+# those fail with "unknown extra" for no benefit, so it stays as an empty alias that installs nothing.
 qiskit = []
-mpi = []
+# mpi4py stays an extra deliberately: it needs a working host MPI to build, so requiring it would make
+# every install depend on the system MPI -- and nothing under rqutils/ imports it. Only the
+# multi-process example paths need it (`examples/sqd.py --gpus mpi`, `examples/scaling/*.py
+# --devices mpi`).
+mpi = ["mpi4py"]
 docs = ["sphinx", "sphinx-rtd-theme"]
 dev = ["pytest", "pytest-xdist", "pytest-sugar", "ruff", "ty"]
 

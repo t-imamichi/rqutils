@@ -10,17 +10,20 @@ When a rule needs evidence, it points there rather than restating it.
 ## Environment
 
 - **Always `uv run python`**, never bare `python` — the venv at `.venv` is managed by uv.
-- **`qiskit` and `mpi4py` are required dependencies**; `mpl`, `qutip`, `docs` and `dev`
-  (pytest + ruff + ty) are extras and are **not** installed by default. Pull those in per invocation:
+- **`qiskit` is a required dependency**; `mpl`, `qutip`, `mpi`, `docs` and `dev` (pytest + ruff + ty)
+  are extras and are **not** installed by default. Pull those in per invocation:
   `uv run --extra mpl python examples/bench.py`. `qiskit` is required because it is a public *input*
   type (`PauliSumXZ.from_paulisum` takes a `SparsePauliOp`, `svsim` takes a `QuantumCircuit`) — the
   `HAS_QISKIT` guards stay regardless, since they turn a broken install into a `RuntimeError` at the
-  call site rather than an `ImportError` at `import rqutils`. `mpi4py` is required only so the
-  multi-process example paths work from a bare install; nothing under `rqutils/` imports it, and it
-  needs a working host MPI to build.
-- **The `qiskit` and `mpi` extras still exist as empty aliases**, so the `--extra qiskit` invocations
-  throughout this file, `NOTES.md`, `docs/` and the `examples/scaling/` docstrings keep resolving.
-  They install nothing.
+  call site rather than an `ImportError` at `import rqutils`. The `qiskit` extra survives as an **empty
+  alias** so the `--extra qiskit` invocations throughout this file, `NOTES.md`, `docs/` and the
+  `examples/scaling/` docstrings keep resolving; it installs nothing.
+- **Every multi-process run needs `--extra mpi`.** `mpi4py` is an extra rather than a dependency because
+  it builds against the host MPI, so requiring it would make every install depend on a system MPI, and
+  nothing under `rqutils/` imports it — only `examples/sqd.py --gpus mpi` and
+  `examples/scaling/*.py --devices mpi` do, via
+  `jax.distributed.initialize(cluster_detection_method="mpi4py")`. `mpirun … --devices mpi` without the
+  extra raises at that call.
 - **No `timeout` on macOS** (it is GNU coreutils) — use the Bash tool's own timeout.
 - **The shell is fish: quote grep globs** (`--include="*.py"`). Unquoted, fish fails with
   `(eval):1: no matches found` *before* grep runs, which reads as "no results" rather than an error.
@@ -66,9 +69,15 @@ uv run --extra dev ruff format rqutils/ tests/ examples/    # format (line width
 uv run --extra dev ty check rqutils/ tests/ examples/       # type check
 ```
 
-All three are clean; keep them that way. Config is in `[tool.ruff]` / `[tool.ty.rules]` in
-`pyproject.toml`, and every suppression carries the reason it exists — read those comments before adding
-another. Pre-commit runs only whitespace/EOF/YAML/large-file hooks, not ruff or ty. Notebooks are
+All three are clean; keep them that way — **from a venv without the `mpi` extra**, which is what those
+commands give. The two `# ty: ignore[unresolved-import]` on `mpi4py` are required there and are reported
+as *unused* if `mpi4py` happens to be installed, so `ty check` cannot be clean in both states and the
+no-`mpi` one is the contract. Don't "fix" that warning by deleting the suppressions: it breaks `ty` for
+every normal install. (A global `unused-ignore-comment = "ignore"` is the wrong trade too — that rule is
+what flags the other six suppressions going stale.)
+
+Config is in `[tool.ruff]` / `[tool.ty.rules]` in `pyproject.toml`, and every suppression carries the
+reason it exists — read those comments before adding another. Pre-commit runs only whitespace/EOF/YAML/large-file hooks, not ruff or ty. Notebooks are
 excluded from both: they get names from IPython magics that static analysis cannot see.
 
 - **A global ignore hides real defects; prefer a per-line `# ty: ignore[rule]`.** Several `ty` rules are
