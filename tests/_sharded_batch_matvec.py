@@ -37,9 +37,13 @@ from conftest import real_pauli_strings, unique_states
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import run_sqd
 
-# 37 genuine states pad to 64, which the 4-device mesh divides. `STATES_SIZE` is a constant rather
-# than `sqd`'s `bit_length` formula, for the reason `_sharded_sqd_prefilter.py` gives: a second copy
-# of that formula could drift from the original.
+# `NUM_STATES` is the draw count, not the row count: `unique_states` collapses duplicates, so this
+# fixture yields 34 rows (29-37 over 200 seeds) and `STATES_SIZE = 64` bounds it with room to spare.
+# The 64 is a constant rather than `sqd`'s `bit_length` formula, for the reason
+# `_sharded_sqd_prefilter.py` gives: a second copy of that formula could drift from the original. That
+# makes it independent of `NUM_STATES`, so the padding below asserts the bound rather than trusting it
+# -- raising `NUM_STATES` past 64 would otherwise hand `np.full` a negative dimension inside a
+# subprocess whose stderr the caller truncates.
 NUM_QUBITS, NUM_STATES, NUM_TERMS, STATES_SIZE, MESH_SIZE = 8, 37, 6, 64, 4
 
 
@@ -55,8 +59,13 @@ def main() -> None:
     # does this, and 255 is the filler for the reason `uniquify_states` uses it -- an all-ones row
     # sorts to the end and its high bit in byte 0 is what `_is_filler` tests.
     states_p = PauliSumXZ.pack_states(states)
-    padding = np.full((STATES_SIZE - states_p.shape[0], states_p.shape[1]), 255, dtype=np.uint8)
-    states_p = np.append(states_p, padding, axis=0)
+    deficit = STATES_SIZE - states_p.shape[0]
+    assert deficit >= 0, (
+        f"{states_p.shape[0]} unique rows exceed STATES_SIZE={STATES_SIZE}; raise the constant"
+    )
+    states_p = np.append(
+        states_p, np.full((deficit, states_p.shape[1]), 255, dtype=np.uint8), axis=0
+    )
 
     mesh = jax.make_mesh((MESH_SIZE,), ("x",), (AxisType.Explicit,))
 

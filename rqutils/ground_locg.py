@@ -869,12 +869,15 @@ def ground_locg(
             this function builds itself. Default ``False``, because an arbitrary callable need not
             accept a batch. Measured 1.61-1.81x on the pair with bit-identical results, and on a
             4-device mesh it halves the all-gathers (6 to 3) by paying the operator's gather once for
-            both vectors. On the ``debug=True`` path the ``sas`` and ``y``
-            diagnostics are **not** bit-identical to the unbatched arm -- batching reassociates the
-            operator's summation, and ``sas`` row/col 2 derives from ``tmp_p``, whose direction is
-            ill-conditioned once ``||r||`` approaches its floor. ``theta`` is unaffected (measured
-            <=1.8e-14 across a full 40-iteration trajectory to ``||r|| = 2e-6``, while ``sas`` moved
-            8e-9), so this matters only to a caller diffing raw diagnostics across the flag.
+            both vectors. The eigen*value* is unaffected, but the returned eigen*vector* need
+            not be bit-identical to the unbatched arm, and the cause is ``mat`` rather than this
+            function: XLA may contract a ``(k, n)`` operand in a different order than an ``(n,)`` one,
+            so a batched call is not obliged to round identically. Measured at ``dim=32`` with
+            ``debug=True``: an elementwise operator gives exactly 0.0 on every diagnostic, while a
+            dense ``einsum`` moves ``y`` by 1.1e-9. The size of that difference carries no
+            information -- on a near-degenerate subspace ``y`` moved 0.56 while ``theta`` still agreed
+            to 2.2e-15, the eigenvector being free to rotate within an invariant subspace -- so
+            compare eigenvalues, not vector norms, when A/B-ing this flag.
 
     Returns:
         ``(eigval, eigvec, niter, converged)`` -- the smallest eigenvalue, its eigenvector, the
@@ -1055,15 +1058,9 @@ def _ground_locg_callable(
         # `debug=True` path only: it runs the full `maxiter` with no early exit, so it is the most
         # matvec-heavy path in the module.
         #
-        # This is the one place batching is NOT bit-identical, and the reason is conditioning rather
-        # than a defect. Batching reassociates the operator's own summation, which perturbs `tmp_p` --
-        # the normalized projected-out residual, whose direction becomes arbitrary as ||r|| -> 0 -- and
-        # `sas` row/col 2 is built from it. Measured against the unbatched arm with atol=rtol=0 so the
-        # residual trajectory runs to the floor: `sas` diverges *inversely* with ||r||, 2.5e-14 at
-        # ||r||=3.9e-2 rising to 8.0e-9 at ||r||=2.2e-6, while `theta` holds at <=1.8e-14 the whole way
-        # because it comes from the well-conditioned 2x2 x/y block. So the eigenvalue is unaffected and
-        # only the search-direction bookkeeping moves. Don't "fix" this with compensated summation: the
-        # whole family is closed (see the module docstring and NOTES.md).
+        # Batching here cannot change the trajectory: `diagnostics` is `scan`'s *output*, never part of
+        # its carry, so nothing it computes feeds back. Any `debug=True` divergence therefore comes from
+        # `body()`'s batched pair, not from this call -- see the note there.
         if batch_matvec:
             mvs = tuple(matvec(jnp.stack((xcurr, ycurr, rcurr)), *args))
         else:
@@ -1205,6 +1202,17 @@ def _ground_locg_callable(
         # across N=4000..60000, 0.942x -- because the unbatched arm holds two separate gather results
         # live where the batched arm holds one (2, N) buffer. So it is not a time-for-memory trade in
         # the configuration that ships; don't "restore" the two-call form to save memory.
+        #
+        # `theta` is bit-identical, but the carried *vectors* need not be, and the cause is the operator
+        # rather than this code: XLA may pick a different contraction order for a (k, N) operand than
+        # for an (N,), so a batched call is not required to round identically. Measured with
+        # atol=rtol=0 and `debug=True` at dim=32: an elementwise-diagonal operator gives exactly 0.0 on
+        # every diagnostic, while a dense einsum/matmul moves `y` by 1.1e-9 -- same fixture, same code,
+        # so the discriminator is the contraction, not a defect here. The divergence has no useful
+        # magnitude: on a near-degenerate `sqd` subspace `y` moved 0.56 while `theta` still agreed to
+        # 2.2e-15, because the eigenvector is free to rotate inside an invariant subspace. Judge this
+        # by `theta`, never by a vector norm. Don't reach for compensated summation -- that family is
+        # closed (module docstring and NOTES.md).
         if batch_matvec:
             aycurr, ap = matvec(jnp.stack((ycurr, tmp_p)), *args)
         else:
