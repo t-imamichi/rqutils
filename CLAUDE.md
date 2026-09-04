@@ -147,6 +147,20 @@ Four reasons a mutant survives that are *not* missing coverage:
 
 - **Multi-device paths are testable on CPU** via `--xla_force_host_platform_device_count=4`. Correctness
   only — timings under virtual devices are meaningless.
+- **Virtual devices cannot test multi-*process* at all** — they are one process, so every device is
+  addressable and the entire class of "spans non-addressable devices" errors is unreachable. That is how
+  `sqd` shipped unable to return its own eigenvalue on a 4-node mesh (`float()` on a rank-0 array whose
+  sharding names the whole mesh). **Anything reading a device value on the host needs a real
+  multi-process run**, or `_host_scalar`-style handling by construction. `NOTES.md` has the four wrong
+  gathers this produced.
+- **`addressable_shards` is topology-dependent, so assert its length.** It holds *every* shard when one
+  process owns the mesh and only *this rank's* when it does not, so concatenating it is exact
+  single-process and **silently partial** across processes — measured, 50782 rows against a true 157051,
+  no error raised. Compare against `sharding.num_devices` before trusting it.
+- **A collective inside a conditional deadlocks.** `process_allgather` is whole-world, so a rank that
+  skipped the branch never arrives and the job dies on a shutdown barrier at `2/4 tasks`. Prefer a local
+  read, or scope the collective to the sub-mesh (`jax.jit(out_shardings=P())` under
+  `jax.set_mesh(arr.sharding.mesh)`).
 - **Assert the sharding *spec*, not just the values.** A replicated run agrees with single-device to
   exactly 0.0, so "correct but silently unsharded" is invisible to value comparison.
 - **A guard on a sharding decision may be invisible single-device.** If a change touches resharding, add
@@ -359,6 +373,14 @@ leading `i` and the convention's `(-i)^{x·z}` phase, and narrowing it silently 
 and so every transpiled circuit. `cz` is only decomposed on the `QuantumCircuit` path, and is correct
 only up to a uniform `exp(iπ/4)`.
 
+**`examples/svsim.py` is the repo's reference for a correct multi-process path**, and the only one that
+was tested on real nodes before 2026-09-04: it writes `final_state.addressable_shards` per rank with
+`h5py`, serialized by `MPI.COMM_WORLD` token-passing and gated on `jax.process_index()`, never fetching a
+global array. Follow it rather than inventing a second convention. The asymmetry that let `sqd`'s bug
+survive is worth remembering — `svsim` returns a large distributed array, so addressability had to be
+confronted to write it out at all, while `sqd` returns a **scalar** that looks innocuous. **The dangerous
+return type is the small one.**
+
 ### `qprint.py`
 
 Pretty-printer with two orthogonal axes: `fmt` picks the content class (`QPrintBraKet` / `QPrintPauli` /
@@ -469,6 +491,12 @@ in it.
   silently resolving it to one of the pair would be the worst option. `tol=x` on the absolute form is
   `atol=x, rtol=0.0`; on the relative form there is **no exact equivalent**. Also an **arity** change —
   `ground_locg`'s positional signature gained a slot.
+- **Multi-process host reads go through `_host_scalar`.** `float(eigval)`/`bool(converged)` raise
+  "spans non-addressable devices" on a multi-process mesh, because a reduction over a partitioned vector
+  is a rank-0 array whose sharding still names the whole mesh. Fixed, but the shape recurs: `jax.reshard`
+  does **not** help (the spec is already `P()` — the problem is addressability, not layout), and the fix
+  must stay non-collective so a rank on another branch cannot deadlock. `main` and `metal` still carry the
+  unfixed line (`product` predates the module and has no `sqd.py`).
 - **`apply_h` with a real `vec` and complex128 coefficients raises** on the scan carry dtype.
   Pre-existing and reproduces single-device: an undocumented contract that `vec` be promotable to `.c`'s
   dtype.

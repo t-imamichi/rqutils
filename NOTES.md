@@ -2831,12 +2831,13 @@ One deviation shows even a careful implementation carves out unproven exceptions
 matrix without the orthogonality justification, commenting that it "seems to be OK even with very badly
 conditioned B matrices". Not applicable at `B = I`.
 
-### Multi-node, one GPU per node: five failures in a row, none of them the library (2026-09-04)
+### Multi-node, one GPU per node: five harness failures before the library's own surfaced (2026-09-04)
 
 A 4-node cluster with a single GPU per node. `mpirun` is not optional there -- it is the only way to
 reach 4 GPUs -- and every POC in `examples/scaling/` assumed a single process owning several local
 GPUs. Five distinct failures, in the order they appeared, each hidden behind the previous one. The
-library needed **no change**; see the entry below for why.
+library's own defect took one more run to surface -- a scalar host read, recorded below -- so read
+these five as the *harness* failures they were, not as evidence the library was clean.
 
 **1. `jax.distributed.initialize` is the whole difference, and its absence is not an error.** Under
 `mpirun -n 4` without it, each rank comes up as an *independent* JAX client that sees all 4 GPUs, so
@@ -2928,29 +2929,94 @@ Also measured while writing that script, first-hand: **omitting
 bug. With x64 the spread is 3.6e-15 across 1/2/4 devices. The rule is in `CLAUDE.md`; this is what
 breaking it looks like from the inside.
 
-### The library needed no multi-process fix, and that is worth knowing (2026-09-04)
+### `sqd` could not return its own eigenvalue multi-process, and I audited past it once (2026-09-04)
 
-Checked rather than assumed, because the natural conclusion from five POC failures is that the library
-must share the defect. It does not: `rqutils/` contains **zero** references to `process_count`,
-`process_index`, `addressable`, or `process_allgather`, and needs none.
+`sqd.py`'s `eigval = float(result[0])` raises **"Fetching value for `jax.Array` that spans
+non-addressable (non process local) devices"** on a multi-process mesh, and `bool(result[-1])` on the
+next line does too. This is the **default** `return_eigvec=False` path: the library could not hand back
+a scalar it had correctly computed. `main` and `metal` carry the identical line (`product` predates the
+module entirely and has no `sqd.py`), and `main` is a strict ancestor of `dev`
+(`git merge-base --is-ancestor`), so no branch ever fixed this.
+
+**I concluded the opposite first, from two true observations.** The `return_eigvec=True` branch *does*
+reshard `eigvec` and `states_u` to `PartitionSpec(None)`, and every `np.asarray` in the library *is* on
+caller-supplied numpy or host-side circuit construction. Both hold. Neither covers `eigval`, which is
+`ground_locg`'s scalar and never resharded -- a reduction over a partitioned vector yields a rank-0
+array whose sharding still names the whole mesh. **Auditing the paths I already suspected verified those
+paths, not the claim.** The claim needed the one thing virtual devices cannot produce: a genuinely
+non-addressable array. Four multi-node runs had already passed `poc7` without touching this, because
+`poc7` reads energies via `float(sqd(...))` at `return_eigvec=False`... on fixtures where it worked
+single-process. The gap was found by running, not by reading.
+
+**`jax.reshard` is not the fix.** The spec is already `P()`; the problem is *addressability*, not
+layout. A replicated scalar holds the identical value on every device (`is_fully_replicated` True, all
+four shards equal when checked), so `_host_scalar` reads its own **addressable shard** -- exact, and
+deliberately **non-collective**, because a collective there would deadlock any rank that took a
+different branch.
+
+**Why this survived: the multi-node testing that was done covered `svsim`, not `sqd`.** `f15a02e`
+(2026-07-17) added `examples/svsim.py`'s distributed path, and it is a *correct* implementation of this
+exact hazard -- `jax.distributed.initialize(cluster_detection_method='mpi4py')`, then writing
+**`final_state.addressable_shards` per rank** with `h5py`, serialized by `MPI.COMM_WORLD` token-passing
+and gated on `jax.process_index()`, never fetching a global array. The asymmetry is the lesson:
+`svsim` returns a large distributed array, so its author had to confront addressability to write it out
+at all. `sqd` returns a **scalar**, which looks innocuous and silently is not. **The dangerous return
+type is the small one**, because nothing about it prompts the question.
+
+`_host_scalar` uses the same `addressable_shards` mechanism as that `svsim` code rather than inventing
+a second convention. One thing `svsim` can do that `sqd` cannot: gate work on `process_index() == 0`.
+Every rank needs the eigenvalue back, so a local read of a replicated value is the only shape available.
+
+### What multi-process *does not* require of the library, and why the POCs still broke (2026-09-04)
+
+Two properties the library already had, both for unrelated reasons, and both load-bearing here:
 
 - **Arrays reach the kernel through `args`, not a closure.** `run_sqd` binds only `cache_level` (a
-  static int tuple) via `functools.partial` and passes `args = (scanned, states_u, ...)`. Failure 4
-  above is precisely what that avoids.
-- **Nothing is pulled to the host while still sharded.** `run_sqd` reshards `eigvec` and `states_u` to
-  `PartitionSpec(None)` before returning, so the `np.array`/`np.asarray` in `sqd`'s return path
-  operates on replicated -- therefore addressable -- data. `poc7c` confirms it on real nodes.
-- Every other `np.asarray` in the library is on caller-supplied numpy (validation helpers) or host-side
-  circuit construction in `svsim`. None touch a device-sharded result.
+  static int tuple) via `functools.partial` and passes `args = (scanned, states_u, ...)`. Closing over
+  a globally-sharded array is illegal across processes; the library avoids it because a traced
+  `cache_level` would retrace the kernel every matvec. A performance requirement and a correctness
+  requirement wanting the same shape is luck, not design -- worth knowing before anyone "simplifies" it.
+- **`eigvec` and `states_u` are resharded to replicated before host conversion**, so `sqd`'s
+  `np.array`/`np.asarray` operate on addressable data. `poc7c` confirms it on real nodes.
 
-**The POCs broke because they reached *around* the library.** `poc9` built its own matvec over
-`apply_h` instead of going through `run_sqd`; `poc14` is prototype code for something not in the
-library at all. Worth stating explicitly, because "the examples all broke" invites a library change
-that would be wrong.
+**The POCs broke by reaching *around* the library**, which is why "the examples all broke" was still the
+wrong reason to change it -- `poc9` built its own matvec over `apply_h` instead of going through
+`run_sqd`, and `poc14` is prototype code for something not in the library at all. The library's *own*
+defect was the scalar read above, a different failure entirely.
 
 Still unverified on real nodes: `hproj` (inherently host-side, returns a scipy `csr_array`) and
-`svsim` multi-process, whose `mesh.size | 2^num_qubits` constraint has only been exercised on virtual
-devices.
+`svsim`'s `mesh.size | 2^num_qubits` constraint, exercised only on virtual devices.
+
+### A local gather is not a gather: `addressable_shards` means something different per topology (2026-09-04)
+
+`poc14`'s host read went through three wrong forms before a right one, and the third was the worst
+because it **did not raise**. Recorded in full because the shape recurs anywhere a sharded array reaches
+the host:
+
+1. `np.asarray` on a globally-sharded array -- raises "spans non-addressable devices".
+2. `process_allgather` with its default `tiled=False` -- **restacks a fully addressable array** into a
+   new leading axis (`(4,2)` -> `(1,4,2)`), so `np.array_equal` against the reference returned False and
+   exactness flipped True -> False at `d=2`. Single-process only; the docstring separates the
+   addressable and non-addressable cases and only the latter ignores `tiled`.
+3. `process_allgather` on a **sub-mesh** -- the sweep meshes over `jax.devices()[:num_shards]`, so at
+   `d=2` on a 4-process job ranks 2 and 3 hold no shard and its internal `addressable_data(0)` raises
+   `FullyReplicatedShard: Array has no addressable shards`. Ranks 0-1 printed `True`, ranks 2-3 died,
+   shutdown barrier timed out at 2/4.
+4. Concatenating `addressable_shards` -- correct single-process, **silently partial across processes**.
+   `addressable_shards` holds *every* shard when one process owns the mesh and only *this rank's* shard
+   when it does not, so the concatenation returned a fraction with no error: unique counts came back
+   **50782 and 106269 against a true 157051, differing per rank**. A crash traded for a wrong answer.
+
+The working form branches on `len(shards) == arr.sharding.num_devices`: concatenate locally when every
+shard is addressable (sorting by `sh.index[0].start`, since arrival order is not global order),
+otherwise replicate **inside the sub-mesh** with `jax.jit(out_shardings=P())`. Scoping to
+`arr.sharding.mesh` is what makes it safe -- only ranks in that mesh reach the line, so it cannot
+deadlock the ranks that skipped, which is precisely why the whole-world `process_allgather` could not
+serve.
+
+**The transferable rule: `addressable_shards` is topology-dependent, so any code reading it must assert
+how many shards it expected.** A length check is the whole difference between exact and silently
+partial.
 
 ### The GPU prefilter sweep: the peak transfers, its location does not (2026-09-04)
 
