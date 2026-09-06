@@ -612,10 +612,8 @@ class TestUniquifyStates:
         rows[:, nbytes - 1] = [9, 3, 7, 1]
         got = np.asarray(uniquify_states(rows, rows.shape[0]))
 
-        assert sorted(int(r[nbytes - 1]) for r in got) == [1, 3, 7, 9], (
-            f"every input row must survive, got {[int(r[nbytes - 1]) for r in got]}"
-        )
         tails = [int(r[nbytes - 1]) for r in got]
+        assert sorted(tails) == [1, 3, 7, 9], f"every input row must survive, got {tails}"
         assert tails == sorted(tails), (
             f"output must be lex-sorted, got trailing bytes {tails} -- the lexsort is not keyed on "
             "every packed word, so rows sharing the leading word come back unordered and "
@@ -1691,9 +1689,13 @@ class TestConvergenceIsReported:
         strings = real_pauli_strings(6, 8, rng)
         coeffs = rng.normal(size=len(strings))
         states = unique_states(20, 6, rng)
-        got = eigval_of(strings, coeffs, states)
         expected = lowest_projected(strings, coeffs, states)
-        assert abs(got - expected) < 1e-6
+        # Both the default cap and a generous one: this fixture converges well inside either, so a
+        # loose `maxiter` must be accepted and must not perturb the answer.
+        for maxiter in (None, 2000):
+            kwargs = {} if maxiter is None else {"maxiter": maxiter}
+            got = eigval_of(strings, coeffs, states, **kwargs)
+            assert abs(got - expected) < 1e-6, f"maxiter={maxiter} gave {got}, expected {expected}"
 
     def test_near_degenerate_subspace_needs_maxiter_above_the_default(self):
         """A `maxiter=1000` non-convergence can mean a small gap, NOT an ill-conditioned subspace.
@@ -1773,15 +1775,6 @@ class TestConvergenceIsReported:
         assert got == pytest.approx(float(spectrum[0]), abs=1e-10), (
             f"got {got}, expected {spectrum[0]} with a generous maxiter"
         )
-
-    def test_a_generous_maxiter_is_accepted(self):
-        rng = np.random.default_rng(20260825)
-        strings = real_pauli_strings(6, 8, rng)
-        coeffs = rng.normal(size=len(strings))
-        states = unique_states(20, 6, rng)
-        got = eigval_of(strings, coeffs, states, maxiter=2000)
-        expected = lowest_projected(strings, coeffs, states)
-        assert abs(got - expected) < 1e-6
 
     def test_a_loose_atol_converges_sooner_without_changing_the_answer(self):
         """``atol`` must be plumbed through, not accepted and ignored."""

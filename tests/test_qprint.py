@@ -29,6 +29,8 @@ import rqutils.qprint as q
 # single fixture exercises sign handling, phase handling, and the amplitude cutoff at once.
 MIXED_VECTOR = np.array([1.0 + 0.0j, 1.0j, -1.0, 0.5, 1e-9, 0.0, 0.0, 0.0])
 DIAGONAL_MATRIX = np.diag([1.0, 2.0, 3.0, 4.0]).astype(np.complex128)
+# Two amplitudes with equal magnitude and opposite phase, so a phase renders as a multiple of pi.
+PHASE_VECTOR = np.array([1.0 + 1.0j, 1.0 - 1.0j]) / np.sqrt(2.0)
 FORMATS = ["braket", "pauli", "matrix"]
 
 
@@ -254,25 +256,19 @@ class TestNormalization:
 
     def test_phase_norm_default_is_pi(self):
         """Phases print as multiples of pi by default, via the ``(np.pi, 'π')`` default."""
-        vector = np.array([1.0 + 1.0j, 1.0 - 1.0j]) / np.sqrt(2.0)
-        rendered = text_of(vector)
-        assert "π" in rendered
+        assert "π" in text_of(PHASE_VECTOR)
 
     def test_phase_norm_none_prints_radians(self):
-        vector = np.array([1.0 + 1.0j, 1.0 - 1.0j]) / np.sqrt(2.0)
-        rendered = text_of(vector, phase_norm=None)
-        assert "π" not in rendered
+        assert "π" not in text_of(PHASE_VECTOR, phase_norm=None)
 
     def test_global_phase_mean_is_accepted(self):
-        vector = np.array([1.0 + 1.0j, 1.0 - 1.0j]) / np.sqrt(2.0)
-        assert text_of(vector, global_phase="mean")
+        assert text_of(PHASE_VECTOR, global_phase="mean")
 
     def test_global_phase_numeric_is_accepted(self):
         """A complex-typed default: ``global_phase`` was annotated ``numbers.Number``, an ABC that
         ``float`` does not statically satisfy, until the annotations were corrected to ``complex``.
         """
-        vector = np.array([1.0 + 1.0j, 1.0 - 1.0j]) / np.sqrt(2.0)
-        assert text_of(vector, global_phase=np.pi / 4.0)
+        assert text_of(PHASE_VECTOR, global_phase=np.pi / 4.0)
 
 
 class TestQutipInput:

@@ -535,6 +535,8 @@ class TestArraysNamedTuple:
         assert x is ham.x and z is ham.z and c is ham.c
         assert len(ham.arrays) == 3
         assert ham.arrays[0] is ham.x
+        assert ham.arrays[1] is ham.z
+        assert ham.arrays[2] is ham.c
 
     def test_survives_a_lax_scan_as_a_named_type(self):
         """The load-bearing property: ``scan`` must hand the body a named instance, not a raw tuple.
@@ -610,14 +612,6 @@ class TestBinaryStateValidation:
 class TestDataclass:
     """``PauliSumXZ`` is a frozen, JAX-registered dataclass."""
 
-    def test_arrays_property_returns_the_three_fields(self):
-        hamiltonian = PauliSumXZ.from_paulisum((["XX"], [1.0]))
-        arrays = hamiltonian.arrays
-        assert len(arrays) == 3
-        assert arrays[0] is hamiltonian.x
-        assert arrays[1] is hamiltonian.z
-        assert arrays[2] is hamiltonian.c
-
     def test_is_frozen(self):
         hamiltonian = PauliSumXZ.from_paulisum((["XX"], [1.0]))
         with pytest.raises((AttributeError, TypeError)):
@@ -630,8 +624,6 @@ class TestDataclass:
         ``sqd`` passes one straight into a jitted function, so this is load-bearing rather than
         incidental.
         """
-        import jax
-
         hamiltonian = PauliSumXZ.from_paulisum((["XX", "ZZ"], [1.0, 2.0]))
         leaves, treedef = jax.tree.flatten(hamiltonian)
         assert len(leaves) == 3, "x, z, c are leaves; num_qubits is static metadata"

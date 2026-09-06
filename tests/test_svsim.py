@@ -12,8 +12,11 @@ step had 1e-16.
 The reference is ``conftest.simulate_dense``: dense Kronecker-product gate matrices applied by
 matrix multiplication, sharing no code with the symplectic ``CircuitXZ`` representation or the
 ``lax.scan`` kernel under test. Every gate unitary it builds was validated against
-``qiskit.quantum_info.Operator`` before being trusted, but the tests themselves need no qiskit,
-which is only an optional extra here. The qiskit-dependent tests are marked and skip cleanly.
+``qiskit.quantum_info.Operator`` before being trusted, but the reference itself needs no qiskit. The
+qiskit-dependent comparisons below import it unguarded: it is a required dependency, so a missing or
+broken qiskit must fail here rather than skip, which is what an ``importorskip`` would have made of
+it. :meth:`TestCircuitInputIsCheckable.test_module_imports_and_runs_without_qiskit` is the deliberate
+exception, and blocks the import in a subprocess.
 
 A note on global phases. Most assertions here are *exact*, not up-to-phase: a global phase stops
 being global the moment a caller superposes two simulations, and skqd.md's whole point is that a
@@ -326,7 +329,6 @@ class TestCz:
         expectation values SKQD needs; asserted up-to-phase here so the limitation is explicit
         rather than a surprise, and so a change in its magnitude is still caught.
         """
-        pytest.importorskip("qiskit")
         from qiskit import QuantumCircuit
 
         circuit = QuantumCircuit(2)
@@ -357,7 +359,6 @@ class TestAgainstQiskit:
         nonzero states were ``00000`` and ``00001``, not ``00000`` and ``11111``, and the overlap
         with Qiskit was 0.5. Assert the actual states and an exact overlap, not just the count.
         """
-        pytest.importorskip("qiskit")
         from qiskit import QuantumCircuit, transpile
         from qiskit.quantum_info import Statevector
 
@@ -381,7 +382,6 @@ class TestAgainstQiskit:
         the phase gave 0.9999999999999991. This is the SKQD workload, so it is the test that decides
         whether the module is usable for it.
         """
-        pytest.importorskip("qiskit")
         from qiskit import QuantumCircuit, transpile
         from qiskit.quantum_info import Statevector
 
@@ -406,7 +406,6 @@ class TestAgainstQiskit:
     @pytest.mark.parametrize("name", ["x", "y", "z", "rx", "ry", "rz"])
     def test_single_gates_match_qiskit_exactly(self, name):
         """Gate-by-gate, including phase: the conventions must agree, not merely be similar."""
-        pytest.importorskip("qiskit")
         from qiskit import QuantumCircuit
         from qiskit.quantum_info import Statevector
 
@@ -525,7 +524,6 @@ class TestCircuitInputIsCheckable:
     """
 
     def test_quantumcircuit_is_an_accepted_arm(self):
-        pytest.importorskip("qiskit")
         assert_type_checks(
             "from qiskit.circuit import QuantumCircuit\n"
             "from rqutils.svsim import CircuitInput\n"

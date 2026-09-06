@@ -50,9 +50,7 @@ def xxz_terms(num_qubits, odd_y):
 
 
 def hamiltonian(num_qubits, odd_y):
-    """Build a ``PauliSumXZ`` without requiring qiskit -- this script runs in the dev extra only."""
-    from rqutils.paulis.symplectic import PauliSumXZ as _P  # noqa: F401  (import-time check)
-
+    """Build a ``PauliSumXZ`` for the XXZ chain, or ``None`` if qiskit is unavailable."""
     labels, coeffs = xxz_terms(num_qubits, odd_y)
     try:
         from qiskit.quantum_info import SparsePauliOp
