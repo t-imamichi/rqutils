@@ -148,3 +148,6 @@ uv.lock
 # Claude
 .superpowers/
 .claude/worktrees/
+
+# mpi
+*.o[0-9]*
