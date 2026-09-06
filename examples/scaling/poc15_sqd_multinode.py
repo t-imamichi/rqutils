@@ -11,8 +11,19 @@ cost model -- ``states`` is replicated today at ``13 * N`` bytes per device, the
 floor cannot shed, while the solver's ``O(N)`` vectors and the diagonal cache do shard. Those are
 *predictions from a formula*, and per ``CLAUDE.md`` memory should be asked of XLA rather than derived:
 byte-count formulas have predicted a saving where the measured peak **rose**. Here the mesh is swept
-over ``1, 2, 4, ...`` devices at fixed ``N`` and ``bytes_in_use`` is read per device, so the answer is
-a measured curve. A replicated term shows as a flat component; a sharded one halves per doubling.
+over ``1, 2, 4, ...`` devices at fixed ``N``. A replicated term shows as a flat component; a sharded
+one halves per doubling.
+
+**Read the ``temp MB`` column for this claim, not ``delta MB``.** Two instruments, and only one can
+answer it. ``delta MB`` brackets the call with ``bytes_in_use``, so it can only see arrays that outlive
+it -- i.e. what ``run_sqd`` *returns* -- and both of those come back ``P(None,)`` / ``P(None, None)``,
+**replicated**. It is therefore flat in device count by construction: measured at N=400000 it read
+exactly 6.00 MB on both 2 and 4 GPUs, which is ``eigvec`` float64[524288] = 4.00 MB plus ``basis``
+uint8[524288,4] = 2.00 MB. That flatness is not evidence about sharding, and the VERDICT's original
+advice ("a FLAT delta means nothing sharded") misfired on its own instrument. ``temp MB`` is
+``temp_size_in_bytes`` from ``memory_analysis()``, the per-device scratch peak where the solver's
+``O(N)`` working set actually lives; on an n=14 fixture it falls 0.52 -> 0.32 -> 0.23 MB across 1/2/4
+devices (2.23x), the shape the cost model predicts. For the sharding itself, assert the **spec**.
 
 **Claim 2: is the sharded solve faster, and where does it stop being faster?** ``poc7``'s docstring is
 explicit that virtual devices "cannot speak to interconnect cost, per-device memory limits, or whether
@@ -44,6 +55,26 @@ processes, and those ranks then call ``sqd`` on a mesh they hold no shard of -- 
     for n in 1 2 4; do
         mpirun -n $n uv run --extra mpi python examples/scaling/poc15_sqd_multinode.py --devices mpi
     done
+
+Because each job measures one mesh size, **the energy check needs the reference passed in**. Without
+it a single-row job compares its eigenvalue to itself, ``|dE|`` is zero by construction, and the
+assertion passes vacuously -- both real multi-node logs printed that ``0.0e+00`` while checking
+nothing. The ``-n 1`` job prints its eigenvalue; hand it to the rest::
+
+    mpirun -n 1 ... --devices mpi                              # prints E_ref
+    mpirun -n 4 ... --devices mpi --reference-energy <E_ref>   # asserts against it
+
+A row with no second arm prints ``n/a`` in the ``|dE|`` column rather than ``0.0e+00``, and the VERDICT
+says the invariance was not checked. Note the ``-n 1`` job is a sweep point and exits 0: it used to
+exit 1 through the "only one device" bail-out, which aborted the whole ``mpirun`` on the first
+iteration of the loop above.
+
+**Paste the reference at full precision.** The VERDICT prints it via ``repr``; a fixed ``.12f`` is not
+enough. Measured under 2 and 4 local MPI ranks at n=14, N=2000: the truncated ``-22.986068174156``
+reported ``|dE|`` = 4.0e-13 at both rank counts -- the rounding error of the *printed string*, ~450x
+above the 4.441e-16 ``poc7`` measures, and nothing to do with sharding. The full
+``-22.986068174155598`` reports 0.0e+00 (2 ranks, bit-identical to 1 rank) and 3.6e-15 (4 ranks). A
+figure near 1e-13 with a hand-shortened reference is that artifact, not a finding.
 
 Run on one node holding several GPUs::
 
@@ -79,6 +110,13 @@ parser.add_argument(
     "--cache-level",
     default="1,0",
     help="cache_level as 'a,b'. Default (1,0) is sqd's own default.",
+)
+parser.add_argument(
+    "--reference-energy",
+    type=float,
+    help="Eigenvalue from the 1-device job, to assert this job's energy against. Multi-process "
+    "measures one mesh size, so without this the check compares a row to itself and passes "
+    "vacuously; the 1-device job prints the value to paste here.",
 )
 options = parser.parse_args()
 
@@ -184,6 +222,47 @@ def per_device_bytes() -> dict:
         if stats and "bytes_in_use" in stats:
             out[str(dev)] = stats["bytes_in_use"]
     return out
+
+
+def peak_temp_bytes(hamiltonian, states, mesh=None) -> int | None:
+    """XLA's per-device scratch high-water mark for one whole ``run_sqd``, or None if unavailable.
+
+    **This is the number Claim 1 is actually about**, and the allocator probe cannot see it. The
+    solver's ``O(N)`` working set -- ``ground_locg``'s 7 carried vectors, the term that *does* shard --
+    lives and dies inside the jitted call, so it is already freed by the time `per_device_bytes` reads
+    `bytes_in_use` after the call returns. What survives to be sampled is only what `run_sqd` returns.
+
+    Measured, that mattered: the 2- and 4-GPU rows both printed a flat delta of exactly 6.00 MB at
+    N=400000, which decomposes as ``eigvec`` float64[524288] = 4.00 MB plus ``basis`` uint8[524288,4] =
+    2.00 MB -- both of which come back ``P(None,)`` / ``P(None, None)``, i.e. **replicated**, so the
+    figure is flat in device count by construction and says nothing about sharding either way. The
+    VERDICT's advice ("a FLAT delta means nothing sharded") therefore misfired on its own instrument.
+
+    ``temp_size_in_bytes`` is per-device and comes from the compiler rather than a byte formula, which
+    is what ``CLAUDE.md`` prescribes for memory. On the same fixture at n=14 it falls 0.52 -> 0.32 ->
+    0.23 MB across 1/2/4 devices (2.23x), the falling-but-not-halving shape the cost model predicts.
+    """
+    states_p = PauliSumXZ.pack_states(states)
+    states_size = 1 << max((states_p.shape[0] - 1).bit_length(), 1)
+    if mesh is not None and (resid := states_size % mesh.size) != 0:
+        states_size += mesh.size - resid
+    if (deficit := states_size - states_p.shape[0]) > 0:
+        states_p = np.append(
+            states_p, np.full((deficit, states_p.shape[1]), 255, dtype=np.uint8), axis=0
+        )
+    fn = jax.jit(lambda h, s: run_sqd(h, s, states_size, True, cache_level=CACHE_LEVEL))
+    try:
+        if mesh is None:
+            return int(
+                fn.lower(hamiltonian, states_p).compile().memory_analysis().temp_size_in_bytes
+            )
+        with jax.sharding.set_mesh(mesh):
+            return int(
+                fn.lower(hamiltonian, states_p).compile().memory_analysis().temp_size_in_bytes
+            )
+    except (AttributeError, RuntimeError, NotImplementedError):
+        # Some backends expose no memory_analysis; absent is not zero, so say so with None.
+        return None
 
 
 def solve(hamiltonian, states, mesh=None, retain=False):
@@ -298,8 +377,16 @@ def main():
     # Multi-process cannot sweep: every rank must participate in every mesh, so the only mesh available
     # is the full one. Sweeping is done by launching one job per rank count (mpirun -n 1, -n 2, -n 4)
     # and comparing the single rows they print.
+    # `--devices mpi` is a sweep *point*, whatever its rank count: the documented curve is one job per
+    # count, and its `-n 1` job is the 1-device reference the other jobs are read against. So the
+    # single-device bail-out below must not fire for it -- keyed on the launch mode rather than on
+    # `process_count() > 1`, which is False under `mpirun -n 1` and made the documented
+    # `for n in 1 2 4` loop exit 1 on its first iteration and abort the whole mpirun.
+    launched_mpi = options.devices == "mpi"
     multiprocess = jax.process_count() > 1
-    sizes = (jax.device_count(),) if multiprocess else mesh_sizes(jax.device_count())
+    sizes = (
+        (jax.device_count(),) if (multiprocess or launched_mpi) else mesh_sizes(jax.device_count())
+    )
     if multiprocess:
         emit(
             f"\nMULTI-PROCESS: measuring the {jax.device_count()}-device point only. A sub-mesh would\n"
@@ -309,7 +396,16 @@ def main():
             "  for n in 1 2 4; do mpirun -n $n uv run --extra mpi python <this script> "
             "--devices mpi; done"
         )
-    if len(sizes) < 2 and not multiprocess:
+    if len(sizes) == 1 and launched_mpi and not multiprocess:
+        emit(
+            f"\nSINGLE RANK under --devices mpi: measuring the {jax.device_count()}-device point, which\n"
+            "is a sweep row like any other -- and the one the other jobs take as reference. Not a\n"
+            "failure: exits 0 so the documented `for n in 1 2 4` loop reaches the multi-rank jobs."
+        )
+    elif len(sizes) < 2 and not multiprocess and not launched_mpi:
+        # Both guards matter: under `--devices mpi` *every* job measures a single size (a sub-mesh
+        # would exclude ranks), so a bare `len(sizes) < 2` bail-out would reject the -n 2 and -n 4
+        # sweep jobs too -- which is a regression this branch introduced and the decision table caught.
         emit(
             "\nOnly one device, so there is no scaling curve to measure -- this script needs >= 2.\n"
             "  mpirun -n 4 uv run --extra mpi python <this script> --devices mpi   # 1 GPU/node\n"
@@ -326,10 +422,10 @@ def main():
     )
     emit(
         f"\n{'devices':>8} {'baseline MB':>12} {'solve MB':>10} {'delta MB':>9} "
-        f"{'ms':>9} {'|dE|':>10}  speedup"
+        f"{'temp MB':>9} {'ms':>9} {'|dE|':>10}  speedup"
     )
 
-    reference, base_timing = None, None
+    reference, base_timing, self_ref = None, None, False
     for size in sizes:
         mesh = make_1d_mesh(devices=jax.devices()[:size]) if size > 1 else None
 
@@ -346,13 +442,24 @@ def main():
         after = per_device_bytes()
         del live
 
+        # The `delta` columns above can only see what `run_sqd` RETURNS, and both of those arrays come
+        # back replicated -- so they are flat in device count whatever the sharding does. `temp MB` is
+        # the working set that actually shards, read from the compiler. See `peak_temp_bytes`.
+        temp_b = peak_temp_bytes(hamiltonian, states, mesh)
+
+        # In multi-process mode `sizes` holds ONE size, so a reference taken from this loop is this
+        # row's own energy and `dE` is |x - x| == 0 by construction -- the assertion then passes
+        # vacuously and prints 0.0e+00, which reads exactly like a verified invariance. Both real
+        # multi-node logs printed that. `--reference-energy` carries the 1-device job's value in so
+        # the check is against another arm; without it a single-row job says `n/a`, never 0.0e+00.
         if reference is None:
-            reference = eigval
+            reference = options.reference_energy if options.reference_energy is not None else eigval
+        self_ref = len(sizes) == 1 and options.reference_energy is None
         dE = abs(eigval - reference)
         # Assert rather than report. The tolerance is loose in absolute terms but the observed
         # agreement on 4 real GPUs was 4.441e-16 (poc7), so anything near this bound is a real defect.
-        assert dE < 1e-9 * max(abs(reference), 1.0), (
-            f"{size} devices: energy moved by {dE:.3e} from the 1-device result {reference:.12f}. "
+        assert self_ref or dE < 1e-9 * max(abs(reference), 1.0), (
+            f"{size} devices: energy moved by {dE:.3e} from the 1-device result {reference!r}. "
             "A sharding bug, not a tolerance question -- poc7 measures 4.441e-16 here."
         )
 
@@ -373,10 +480,15 @@ def main():
             # cannot catch this: flat and absent both print 0.0. Any nonzero value is a measurement.
             delta_s = "0?" if delta_b == 0 else f"{delta_b / 2**20:.1f}"
 
+        # `n/a` where the only reference available was this row itself: a printed 0.0e+00 there claims
+        # an invariance that was never tested. Only a comparison against another arm earns a number.
+        dE_s = "n/a" if self_ref else f"{dE:.1e}"
+        temp_s = "n/a" if temp_b is None else f"{temp_b / 2**20:.2f}"
+
         if virtual:
             emit(
-                f"{size:>8} {base_s:>12} {solve_s:>10} {delta_s:>9} "
-                f"{'--':>9} {dE:>10.1e}  (timings suppressed)"
+                f"{size:>8} {base_s:>12} {solve_s:>10} {delta_s:>9} {temp_s:>9} "
+                f"{'--':>9} {dE_s:>10}  (timings suppressed)"
             )
             continue
 
@@ -387,24 +499,47 @@ def main():
         else:
             verdict = fmt_ratio(base_timing, timing)
         emit(
-            f"{size:>8} {base_s:>12} {solve_s:>10} {delta_s:>9} "
-            f"{timing.min_s * 1e3:>9.1f} {dE:>10.1e}  {verdict}"
+            f"{size:>8} {base_s:>12} {solve_s:>10} {delta_s:>9} {temp_s:>9} "
+            f"{timing.min_s * 1e3:>9.1f} {dE_s:>10}  {verdict}"
         )
 
     section("VERDICT")
-    emit(f"  energy invariant across {sizes} devices: max |dE| within assertion bound.")
+    # Only claim the invariance that was actually checked. This line read "energy invariant across
+    # (2,) devices" on a run whose only reference was that same row -- the strongest-sounding sentence
+    # in the output, backed by |x - x|.
+    if reference is not None and not self_ref:
+        emit(f"  energy invariant across {sizes} devices: max |dE| within assertion bound.")
+    else:
+        emit(f"  energy NOT cross-checked: {sizes} is one mesh size and no --reference-energy was")
+        emit("  given, so there was no second arm to compare against. This row's eigenvalue is")
+        # `repr`, not a fixed number of decimals. This value exists to be pasted into the next job's
+        # --reference-energy, and `.12f` truncates it: measured, the 2- and 4-rank rows then reported
+        # |dE| = 4.0e-13 -- the rounding error of the printed string, ~450x above the 4.441e-16 poc7
+        # measures and entirely an artifact of this line. With the full repr the same runs report
+        # 0.0e+00 and 3.6e-15. A reference the script itself prints must not blunt the comparison it
+        # exists to sharpen, so never reformat this to a fixed precision.
+        emit(f"  {reference!r} -- pass it to the other jobs in the sweep to make the check real:")
+        emit(f"    mpirun -n <k> ... --devices mpi --reference-energy {reference!r}")
     if virtual:
         emit("  Memory numbers above are CPU-allocator numbers and the timings were suppressed.")
         emit(
             "  Re-run with --devices (or --devices mpi) for the measurement this script exists for."
         )
     else:
-        emit("  READ THE MEMORY COLUMN AS A CURVE, not as two points: `states` is replicated today")
-        emit("  (13*N per device, the term the (0,0) floor cannot shed) while the solver's O(N)")
-        emit("  vectors shard, so the honest expectation is a falling-but-not-halving delta.")
-        emit("  A FLAT delta means nothing sharded -- check the spec, not just the energy.")
-        emit("  A `0?` delta means the reading MISSED the arrays, not that nothing was allocated:")
-        emit("  a real solve allocates O(N) vectors, so an exact 0 B is an instrument failure.")
+        emit("  READ `temp MB` FOR CLAIM 1, NOT `delta MB`. `temp MB` is the compiler's per-device")
+        emit("  scratch high-water mark, which is where the solver's O(N) working set lives -- the")
+        emit("  term that actually shards. Expect falling-but-not-halving: `states` is replicated")
+        emit("  today (13*N per device, the term the (0,0) floor cannot shed).")
+        emit("  `delta MB` CANNOT answer Claim 1 and a flat value there is not a finding: it sees")
+        emit("  only what run_sqd returns, and eigvec/basis come back P(None,)/P(None,None) --")
+        emit(
+            "  replicated -- so it is flat in device count however well the solve shards. Measured"
+        )
+        emit(
+            "  at N=400000 it read exactly 6.00 MB on both 2 and 4 GPUs = eigvec 4.00 + basis 2.00."
+        )
+        emit("  A `0?` delta still means the reading MISSED even those, which is a real instrument")
+        emit("  failure. For the sharding itself, assert the spec (CLAUDE.md), not any byte count.")
         if options.devices == "mpi":
             emit()
             emit("  Multi-NODE topology: these collectives crossed a network, not NVLink. A ratio")
