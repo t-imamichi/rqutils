@@ -126,13 +126,17 @@ See `NOTES.md`, "A partial *diagonal* cache works" and "The diagonal split at la
 
 ### 3. Integrate the distributed-state prototypes after real-interconnect measurement
 
-**Gated measurement is in: DO NOT INTEGRATE (2026-09-05).** `poc15` ran on real nodes, 1D XXZ n=26,
-N=400000, one GPU per node: **961.8 ms on 2 devices against 1728.6 ms on 4 -- 1.80x slower per
-doubling**, at `|dE| = 0.0e+00`, so pure communication. This is the real-interconnect measurement this
-section made itself conditional on, and it answers against integration: routed lookup adds `all_to_all`
-on top of a solve that already loses 1.80x per doubling. Still a network rather than NVLink, so the
-in-one-box question remains genuinely open -- but nothing here should be built until that is measured.
-See `NOTES.md`, "poc15 on real nodes".
+**Gated measurement is in: DO NOT INTEGRATE (2026-09-05, anchored 2026-09-07).** `poc15` ran on real
+nodes, 1D XXZ n=26, N=400000, one GPU per node. The anchored three-point sweep: **367.7 ms on 1 device,
+871.5 on 2, 1491.2 on 4 -- 4.06x slower at 4 devices**, at `|dE| = 7.1e-15`, so pure communication. This
+is the real-interconnect measurement this section made itself conditional on, and it answers against
+integration: routed lookup adds `all_to_all` to a solve already 4.06x underwater.
+
+The cost is **not** a per-device slope (the first reading, from the 2- and 4-device points alone, put it
+at 1.80x per doubling). 1->2 is 2.37x and 2->4 only 1.71x, so the expensive event is crossing the network
+at all -- meaning collective **count** dominates, which is precisely what `all_to_all` adds. Still a
+network rather than NVLink, so the in-one-box question remains genuinely open -- but nothing here should
+be built until that is measured. See `NOTES.md`, "poc15 anchored".
 
 **Verified: accurate, but roughly half of this section restates `CLAUDE.md`'s `sqd` section**, which
 already says states-replication is not fundamental, that whole-key hashing is required, that
@@ -364,11 +368,12 @@ boundary, which blocks the combiner from folding it into its neighbours. So:
 `compute_sas` half of the section is already answered -- XLA has combined them, so there is nothing to
 design there.
 
-**Promoted 2026-09-05 by the `poc15` multi-node run**, which measured 4 devices at **1.80x slower** than
-2 at fixed `N` with identical energies. On a topology where adding devices costs that much, cutting 7 of
-13 per-iteration `all-reduce` ops stops being a micro-optimization -- this becomes the highest-value item
-for multi-node, ahead of section 2. Section 2 remains first if the binding constraint is single-device
-memory.
+**Promoted 2026-09-05 by the `poc15` multi-node run, reinforced by its 2026-09-07 anchor**, which
+measured 4 devices at **4.06x slower** than 1 at fixed `N` with identical energies -- and, crucially,
+that the 1->2 hop (2.37x) costs more than 2->4 (1.71x). Collective **count** is therefore the binding
+term, not payload per device, so cutting 7 of 13 per-iteration `all-reduce` ops is aimed directly at the
+measured cause rather than being a micro-optimization. Highest-value item for multi-node, ahead of
+section 2. Section 2 remains first if the binding constraint is single-device memory.
 
 ### 9. Re-evaluate the GPU prefilter operating point end to end
 
@@ -462,8 +467,8 @@ dropped, and one section's own instruction ("first count collectives in HLO") is
    fix, and section 3's memory relief is pointless while the return path re-replicates. Measured: +7
    all-gathers and `P(None)` on both outputs.
 3. **Section 8, rescoped -- make the norms combinable.** *(First instead, if the target is multi-node:
-   `poc15` measured 4 devices at 1.80x slower than 2, which makes the collective count the binding
-   constraint there rather than memory.)* Not the `hypot` identity (1 of 13 ops, and it
+   `poc15` measured 4 devices at 4.06x slower than 1, with the first hop dearer than the second, which
+   makes the collective count the binding constraint there rather than memory.)* Not the `hypot` identity (1 of 13 ops, and it
    puts the convergence test at risk) but the finding underneath it: 7 of 13 `all-reduce` ops are
    single-scalar `jnp.linalg.norm` calls whose jit boundary blocks XLA's combiner, which has already
    merged every neighbouring sum. Same residual semantics, ~7x the target.

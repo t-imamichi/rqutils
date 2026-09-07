@@ -25,6 +25,10 @@ advice ("a FLAT delta means nothing sharded") misfired on its own instrument. ``
 ``O(N)`` working set actually lives; on an n=14 fixture it falls 0.52 -> 0.32 -> 0.23 MB across 1/2/4
 devices (2.23x), the shape the cost model predicts. For the sharding itself, assert the **spec**.
 
+**Claim 1 is answered on real GPUs (2026-09-07):** the n=26 N=400000 fixture measured 87.02 -> 48.28 ->
+27.16 MB across 1/2/4 nodes, a 3.20x fall, with the excess over ideal halving flat at ~+5 MB -- the
+replicated ``states`` term, not a leak. See ``NOTES.md``, "poc15 anchored".
+
 **Claim 2: is the sharded solve faster, and where does it stop being faster?** ``poc7``'s docstring is
 explicit that virtual devices "cannot speak to interconnect cost, per-device memory limits, or whether
 the sharded solve is actually *faster*". On a **multi-node** mesh the collectives cross a network

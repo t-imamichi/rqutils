@@ -2929,6 +2929,43 @@ Also measured while writing that script, first-hand: **omitting
 bug. With x64 the spread is 3.6e-15 across 1/2/4 devices. The rule is in `CLAUDE.md`; this is what
 breaking it looks like from the inside.
 
+### `poc15` anchored: memory shards 3.2x, wall clock is 4.06x underwater, first hop is the dear one (2026-09-07)
+
+Same fixture as the 2026-09-05 entry below (1D XXZ `n=26`, `Jz=0.8`, N=400000, J=27, maxK=26, float64,
+`cache_level=(1, 0)`, one GPU per node, `--devices mpi`), now the full `for n in 1 2 4` sweep in one job
+with `--reference-energy` threaded from the 1-device row. Both instrument fixes held: the 1-device rank
+exits 0 so the loop completes, and `temp MB` reports real numbers.
+
+| devices | temp MB | vs 1-dev | ideal | excess | ms | vs 1-dev | vs prev |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 87.02 | -- | 87.02 | -- | 367.7 | -- | -- |
+| 2 | 48.28 | 1.80x | 43.51 | +4.77 | 871.5 | 2.37x slower | 2.37x |
+| 4 | 27.16 | **3.20x** | 21.75 | +5.41 | 1491.2 | **4.06x slower** | 1.71x |
+
+`|dE| = 7.1e-15` at both multi-rank points against the 1-device reference, so the energy is right and
+every millisecond of the regression is communication.
+
+**Claim 1 is answered, affirmatively: the working set shards.** `temp MB` falls 3.20x over 4 devices --
+"falling but not halving", as the script predicts. The excess over ideal is **flat at ~+5 MB** rather
+than growing, which is the signature of the known replicated `states` term (`13 * N` per device, the one
+the `(0,0)` floor cannot shed) and not of a leak. Read `temp MB` for this; `delta MB` sat at exactly 6.00
+on every row because it sees only what `run_sqd` returns and `eigvec`/`basis` come back replicated.
+
+**Claim 2's slope was wrong, and the correction changes which lever to pull.** The entry below reads
+1.80x per doubling from its 2- and 4-device points. With the 1-device anchor the cost is **not** a
+per-device slope: 1->2 is 2.37x and 2->4 only 1.71x. The expensive event is *crossing the network at
+all*, not each subsequent device -- so the term that dominates is collective **count**, not payload per
+device or hop count.
+
+That sharpens both pending decisions rather than reversing them. `docs/sqd-locg-improvement-ideas.md`
+§3 (routing hash-partitioned state lookup) stays **do not integrate** -- it adds `all_to_all` to a solve
+already 4.06x underwater. §8 (cutting 7 of the 13 per-iteration `all-reduce` ops) is now the *only*
+lever aimed at the measured cause, since more than half the collectives per iteration would go.
+
+Unchanged caveat: multi-**node** over a network, the pessimistic topology. Says nothing about several
+GPUs in one box over NVLink, and per `CLAUDE.md` one fixture at one size is not a law -- `N` is fixed
+across all three rows here, so this is a device-count curve, not a scaling law.
+
 ### `poc15` on real nodes: the scaling is negative, and the memory column was never measured (2026-09-05)
 
 First real multi-node run of `poc15_sqd_multinode.py`, 1D XXZ `n=26`, `Jz=0.8`, N=400000 (J=27,
@@ -2944,6 +2981,10 @@ above, now with a *slope*: doubling devices at fixed `N` costs 1.80x. Two caveat
 ran (its rank exited non-zero and `mpirun` aborted the job), so the ratio is computed across separate
 runs rather than reported by the script, and every printed `speedup` column said "baseline" because each
 rank count is its own job. And this is again a network, not NVLink.
+
+**Superseded by the anchored sweep below**, which adds the 1-device point and answers Claim 1. Both
+numbers above stand as measured; the *slope* reading does not, since 2->4 turns out to be the cheaper
+of the two doublings.
 
 **This is the measurement `docs/sqd-locg-improvement-ideas.md` §3 was gated on, and it says do not
 integrate.** Routing hash-partitioned state lookup adds `all_to_all` on top of a solve already losing
@@ -2961,9 +3002,10 @@ One trap inside that fix, hit before it was right: routing `return_eigvec=True` 
 not work, because `sqd` converts on the way out (`np.array(eigvec[...])`, `np.asarray(basis_states)`), so
 holding those keeps no device memory alive and the delta stays `0.0` with more machinery in the way.
 `run_sqd` is the innermost layer whose outputs are still `jax.Array`. An exact zero now prints `0?`, since
-a real solve allocates `O(N)` vectors and 0 B can only mean the reading missed them. **Claim 1 is still
-unanswered on real hardware** -- the fix is verified under virtual devices, where the CPU backend has no
-allocator accounting and correctly reports `n/a`.
+a real solve allocates `O(N)` vectors and 0 B can only mean the reading missed them. Claim 1 was still
+unanswered on real hardware at this point -- the fix was verified only under virtual devices, where the
+CPU backend has no allocator accounting and correctly reports `n/a`. **The 2026-09-07 entry above
+answers it on GPUs: 3.20x over 4 devices.**
 
 ### `sqd` could not return its own eigenvalue multi-process, and I audited past it once (2026-09-04)
 
