@@ -54,6 +54,11 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 # Not `auto`, which oversubscribes and is slower. `-n0` to override.
 addopts = "-n 4"
+# Applied automatically by `conftest.pytest_collection_modifyitems` to every test that subprocesses a
+# `_sharded_*.py` child, which is ~9 s of a ~19 s suite. `-m "not sharded"` gets that back for an
+# edit-run loop; do not make it the default -- those tests cover the defects that are invisible
+# single-device (see the hook's docstring and CLAUDE.md's "Sharding tests").
+markers = ["sharded: spawns a virtual-multi-device subprocess"]
 
 [tool.ruff]
 line-length = 100

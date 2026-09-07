@@ -20,6 +20,7 @@ stream position depend on fixture ordering, which is invisible at the call site 
 Please keep new fixtures as plain functions taking ``rng``.
 """
 
+import inspect
 import os
 import shutil
 import subprocess
@@ -48,6 +49,29 @@ jax.config.update("jax_enable_x64", True)
 
 import numpy as np
 import pytest
+
+
+def pytest_collection_modifyitems(items):
+    """Mark every test that subprocesses a ``_sharded_*.py`` child as ``sharded``.
+
+    Applied here rather than as eight hand-written ``@pytest.mark.sharded`` decorators so the marker
+    cannot drift from the thing it describes: the criterion *is* "calls :func:`run_sharded_child`", so
+    it is read off the test's own source. A ninth child added later is marked automatically, whereas a
+    forgotten decorator would silently leave a 1-4 s subprocess in the fast path.
+
+    Deselecting them (``-m "not sharded"``) takes the suite from ~19 s to ~10 s, which is worth having
+    for an edit-run loop on a machine with no GPU. It is **opt-in-to-skip**, never the default: per
+    ``CLAUDE.md`` these are the only tests that can see an entire class of defect (a wrong gather, a
+    dropped partitioning, a collective inside a conditional), all of which are invisible
+    single-device. ``-m "not sharded"`` is a statement that you are not touching sharding.
+    """
+    for item in items:
+        try:
+            source = inspect.getsource(item.function)
+        except (OSError, TypeError, AttributeError):
+            continue
+        if "run_sharded_child(" in source:
+            item.add_marker(pytest.mark.sharded)
 
 
 def herm(n, rng, complex_=True):

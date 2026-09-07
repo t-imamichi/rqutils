@@ -22,6 +22,9 @@ passed while every kernel returned the same wrong number.
 
 import ast
 import inspect
+import os
+import subprocess
+import sys
 import textwrap
 import warnings
 
@@ -2659,6 +2662,56 @@ class TestShardedBatchMatvec:
             f"stacking must leave the data axis partitioned and replicate the batch axis, got {specs}"
             f" -- P('x', None) would partition the batch axis, and an all-None spec would mean "
             f"sharding was dropped; both agree with single-device to exactly 0.0"
+        )
+
+
+class TestShardedMarker:
+    """The ``sharded`` marker must land on exactly the tests that subprocess a child.
+
+    ``conftest.pytest_collection_modifyitems`` applies it by looking for ``run_sharded_child(`` in each
+    test's source, so ``-m "not sharded"`` can skip the ~9 s of subprocess tests during an edit-run
+    loop. Both directions of that fail **silently**, which is why this is a test rather than a comment:
+
+    * Under-marking (the helper is renamed, or a new child is called through a wrapper) leaves a 1-4 s
+      subprocess in the supposedly-fast path -- no failure, just a slow "fast" run.
+    * Over-marking (the substring appears in an unrelated test) drops real coverage from the default
+      run, and per ``CLAUDE.md`` a replicated run agrees with single-device to exactly 0.0, so the
+      tests that would have caught it are precisely the ones deselected.
+
+    Asserts against the call sites in the tree rather than a hardcoded count, so adding a ninth child
+    does not require editing a number here.
+    """
+
+    def test_the_marker_matches_the_call_sites(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        # Every `_sharded_*.py` script must be driven by exactly one marked test. Counting the scripts
+        # rather than grepping for the helper name keeps this test's own prose (which necessarily
+        # mentions the helper) out of the count -- a substring sweep over the test sources counted 10
+        # for 8 real call sites, this file's docstring being two of them.
+        children = [n for n in os.listdir(here) if n.startswith("_sharded_") and n.endswith(".py")]
+        assert len(children) >= 8, f"expected at least the 8 known children, found {children}"
+
+        collected = subprocess.run(
+            [sys.executable, "-m", "pytest", "-n0", "-q", "-m", "sharded", "--collect-only"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=os.path.dirname(here),
+        )
+        assert collected.returncode == 0, f"collection failed:\n{collected.stderr[-2000:]}"
+        # One node id per line. Counting `::` occurrences instead double-counts, because the reporter
+        # echoes the ids again around the summary -- measured 16 for the 8 real tests.
+        marked = len(
+            [
+                line
+                for line in collected.stdout.splitlines()
+                if line.startswith("tests/") and "::" in line
+            ]
+        )
+        assert marked == len(children), (
+            f"the sharded marker is on {marked} tests but {len(children)} `_sharded_*.py` children "
+            f"exist -- under-marking leaves a subprocess in the supposedly-fast path, over-marking "
+            f"drops sharding coverage from the default run:\n{collected.stdout[-2000:]}"
         )
 
 
