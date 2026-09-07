@@ -46,18 +46,25 @@ def main() -> None:
     coeffs = rng.normal(size=NUM_TERMS).tolist()
     states = rng.integers(0, 2, size=(NUM_STATES, NUM_QUBITS)).astype(np.uint8)
 
+    # Hoisted out of the mesh loop: the single-device arm has no `num_devices` dependence, so
+    # computing it inside cost three identical solves per cache level (18 where 6 suffice).
+    singles = {
+        cache_level: float(
+            sqd(
+                (strings, coeffs),
+                states,
+                return_eigvec=False,
+                cache_level=cache_level,
+                prefilter=PREFILTER,
+            )
+        )
+        for cache_level in CACHE_LEVELS
+    }
+
     for num_devices in MESH_SIZES:
         mesh = jax.make_mesh((num_devices,), ("x",), (AxisType.Explicit,))
         for cache_level in CACHE_LEVELS:
-            single = float(
-                sqd(
-                    (strings, coeffs),
-                    states,
-                    return_eigvec=False,
-                    cache_level=cache_level,
-                    prefilter=PREFILTER,
-                )
-            )
+            single = singles[cache_level]
             with jax.set_mesh(mesh):
                 sharded = float(
                     sqd(
