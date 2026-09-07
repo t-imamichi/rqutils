@@ -20,7 +20,6 @@ stream position depend on fixture ordering, which is invisible at the call site 
 Please keep new fixtures as plain functions taking ``rng``.
 """
 
-import inspect
 import os
 import shutil
 import subprocess
@@ -49,49 +48,6 @@ jax.config.update("jax_enable_x64", True)
 
 import numpy as np
 import pytest
-
-# Slow == spawns a subprocess: 8 `sharded` ~9 s + 9 others ~16 s, against ~5 s for the other 674. So the
-# split is that property, not a wall-clock threshold.
-_SUBPROCESS_HELPERS = {
-    "run_sharded_child(": ("subprocess", "sharded"),
-    "assert_type_checks(": ("subprocess", "typecheck"),
-    "assert_imports_without(": ("subprocess", "optdeps"),
-    "subprocess.run(": ("subprocess",),
-}
-_SKIPPED_NOTICES = {
-    "sharded": 'SHARDED TESTS DESELECTED -- run `pytest -m ""` before committing sharding changes',
-    "subprocess": 'SUBPROCESS TESTS DESELECTED -- run `pytest -m ""` before committing',
-}
-
-
-def pytest_terminal_summary(terminalreporter, exitstatus, config):
-    """Warn when a marker group was deselected.
-
-    There is no CI here, so the default run is the only thing that runs and a silent skip turns a green
-    run into evidence of something it never checked. Not ``pytest_report_header``: ``-q`` suppresses it.
-    """
-    expression = config.getoption("-m") or ""
-    for marker, notice in _SKIPPED_NOTICES.items():
-        if f"not {marker}" in expression:
-            terminalreporter.write_sep("!", notice, yellow=True, bold=True)
-
-
-def pytest_collection_modifyitems(items):
-    """Mark each test by the subprocess helper its source calls.
-
-    Read off the source rather than hand-written decorators so the marker cannot drift, and a new probe
-    is covered automatically. Each gets ``subprocess`` (the speed axis) plus what it covers, so
-    ``-m sharded`` need not pay for the ``ty`` probes.
-    """
-    for item in items:
-        try:
-            source = inspect.getsource(item.function)
-        except (OSError, TypeError, AttributeError):
-            continue
-        for helper, markers in _SUBPROCESS_HELPERS.items():
-            if helper in source:
-                for marker in markers:
-                    item.add_marker(getattr(pytest.mark, marker))
 
 
 def herm(n, rng, complex_=True):

@@ -53,19 +53,7 @@ Documentation = "https://rqutils.readthedocs.io/en/latest/index.html"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 # Not `auto`, which oversubscribes and is slower. `-n0` to override.
-#
-# Slow == spawns a subprocess (~25 s of a ~30 s serial suite), so that property is the fast/slow split.
-# `pytest -m ""` runs everything and is REQUIRED before committing; there is no CI, so this default is
-# the only thing that runs. `conftest.pytest_terminal_summary` warns when a group is deselected.
-addopts = "-n 4 -m 'not subprocess'"
-# Applied by `conftest.pytest_collection_modifyitems` from the helper each test calls, so a marker
-# cannot drift. `subprocess` is the speed axis; the rest name coverage, so `-m sharded` skips the rest.
-markers = [
-  "subprocess: spawns a subprocess (the slow group); deselected by default",
-  "sharded: spawns a virtual-multi-device child; the only coverage of sharding defects",
-  "typecheck: re-runs `ty` with a rule forced to error",
-  "optdeps: re-imports a module with an optional dependency blocked",
-]
+addopts = "-n 4"
 
 [tool.ruff]
 line-length = 100
