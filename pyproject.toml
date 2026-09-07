@@ -52,6 +52,8 @@ Documentation = "https://rqutils.readthedocs.io/en/latest/index.html"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+# Not `auto`, which oversubscribes and is slower. `-n0` to override.
+addopts = "-n 4"
 
 [tool.ruff]
 line-length = 100
