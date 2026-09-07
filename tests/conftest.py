@@ -50,50 +50,48 @@ jax.config.update("jax_enable_x64", True)
 import numpy as np
 import pytest
 
-_SHARDED_SKIPPED_NOTICE = (
-    'SHARDED TESTS DESELECTED -- run `pytest -m ""` before committing anything touching sharding'
-)
+# Slow == spawns a subprocess: 8 `sharded` ~9 s + 9 others ~16 s, against ~5 s for the other 674. So the
+# split is that property, not a wall-clock threshold.
+_SUBPROCESS_HELPERS = {
+    "run_sharded_child(": ("subprocess", "sharded"),
+    "assert_type_checks(": ("subprocess", "typecheck"),
+    "assert_imports_without(": ("subprocess", "optdeps"),
+    "subprocess.run(": ("subprocess",),
+}
+_SKIPPED_NOTICES = {
+    "sharded": 'SHARDED TESTS DESELECTED -- run `pytest -m ""` before committing sharding changes',
+    "subprocess": 'SUBPROCESS TESTS DESELECTED -- run `pytest -m ""` before committing',
+}
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
-    """Warn whenever the ``sharded`` tests were deselected, including under ``-q``.
+    """Warn when a marker group was deselected.
 
-    ``addopts`` carries ``-m "not sharded"`` so the edit-run loop is ~10 s instead of ~19 s. That trade
-    is only safe if the skip is *visible*: there is no CI in this repo, so the default invocation is the
-    only thing that ever runs, and the deselected tests are the only ones that can see a wrong gather, a
-    dropped partitioning or a collective inside a conditional. A silent deselection turns a green run
-    into evidence of something it never checked.
-
-    In the terminal summary rather than ``pytest_report_header`` because ``-q`` suppresses the header,
-    and ``-q`` is the invocation in ``CLAUDE.md`` and in every habit -- a warning that vanishes under
-    the common flag is not a warning. This writes unconditionally rather than via ``.write_line``'s
-    verbosity gating, so it survives ``-q`` too.
+    There is no CI here, so the default run is the only thing that runs and a silent skip turns a green
+    run into evidence of something it never checked. Not ``pytest_report_header``: ``-q`` suppresses it.
     """
-    if "not sharded" in (config.getoption("-m") or ""):
-        terminalreporter.write_sep("!", _SHARDED_SKIPPED_NOTICE, yellow=True, bold=True)
+    expression = config.getoption("-m") or ""
+    for marker, notice in _SKIPPED_NOTICES.items():
+        if f"not {marker}" in expression:
+            terminalreporter.write_sep("!", notice, yellow=True, bold=True)
 
 
 def pytest_collection_modifyitems(items):
-    """Mark every test that subprocesses a ``_sharded_*.py`` child as ``sharded``.
+    """Mark each test by the subprocess helper its source calls.
 
-    Applied here rather than as eight hand-written ``@pytest.mark.sharded`` decorators so the marker
-    cannot drift from the thing it describes: the criterion *is* "calls :func:`run_sharded_child`", so
-    it is read off the test's own source. A ninth child added later is marked automatically, whereas a
-    forgotten decorator would silently leave a 1-4 s subprocess in the fast path.
-
-    Deselecting them (``-m "not sharded"``) takes the suite from ~19 s to ~10 s, which is worth having
-    for an edit-run loop on a machine with no GPU. It is **opt-in-to-skip**, never the default: per
-    ``CLAUDE.md`` these are the only tests that can see an entire class of defect (a wrong gather, a
-    dropped partitioning, a collective inside a conditional), all of which are invisible
-    single-device. ``-m "not sharded"`` is a statement that you are not touching sharding.
+    Read off the source rather than hand-written decorators so the marker cannot drift, and a new probe
+    is covered automatically. Each gets ``subprocess`` (the speed axis) plus what it covers, so
+    ``-m sharded`` need not pay for the ``ty`` probes.
     """
     for item in items:
         try:
             source = inspect.getsource(item.function)
         except (OSError, TypeError, AttributeError):
             continue
-        if "run_sharded_child(" in source:
-            item.add_marker(pytest.mark.sharded)
+        for helper, markers in _SUBPROCESS_HELPERS.items():
+            if helper in source:
+                for marker in markers:
+                    item.add_marker(getattr(pytest.mark, marker))
 
 
 def herm(n, rng, complex_=True):

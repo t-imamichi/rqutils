@@ -94,23 +94,26 @@ excluded from both: they get names from IPython magics that static analysis cann
 ## Testing
 
 ```bash
-uv run --extra dev pytest              # fast path, ~10 s -- sharded tests DESELECTED
-uv run --extra dev pytest -m ""        # whole suite, ~19 s -- required before committing
+uv run --extra dev pytest              # fast path -- subprocess tests DESELECTED
+uv run --extra dev pytest -m ""        # whole suite; required before committing
+uv run --extra dev pytest -m sharded   # just the multi-device group
 uv run --extra dev pytest -v -x        # verbose, stop at first failure
 ```
 
-**`pytest` alone is no longer the whole suite.** `addopts` carries `-m "not sharded"`, which deselects
-the eight tests that subprocess a `_sharded_*.py` child — ~9 s of a ~19 s run, each spawning a fresh
-interpreter for virtual devices. **`pytest -m ""` before any commit**, and non-negotiably before one
-touching sharding, resharding, a collective, or a host read of a device value: those defects are
-invisible single-device, and a replicated run agrees with single-device to *exactly* 0.0, so nothing
-else catches them. There is no CI, so the default invocation is the only thing that runs.
+**`pytest` alone is no longer the whole suite.** `addopts` carries `-m "not subprocess"`. Every slow
+test is slow for one reason — it spawns a subprocess — so that property is the split rather than a
+wall-clock threshold: `sharded` (a `_sharded_*.py` child), `typecheck` (a `ty` run), `optdeps` (an
+import with a dependency blocked).
 
-Every default run prints `SHARDED TESTS DESELECTED` in the summary (in `pytest_terminal_summary`, not
-`pytest_report_header`, because `-q` suppresses the header). The marker is applied by
-`conftest.pytest_collection_modifyitems` from each test's own source, so it cannot drift and a ninth
-child is covered automatically; `TestShardedMarker` pins both the count and the notice, mutation-tested
-in both directions.
+**`pytest -m ""` before any commit**, non-negotiably before one touching sharding, resharding, a
+collective, or a host read of a device value: those defects are invisible single-device, and a
+replicated run agrees to *exactly* 0.0, so nothing else catches them. There is no CI, so the default is
+the only thing that runs — every deselecting run prints a `DESELECTED` warning in the summary (not
+`pytest_report_header`, which `-q` suppresses).
+
+Markers are applied by `conftest.pytest_collection_modifyitems` from each test's own source, so they
+cannot drift and a new child is covered automatically; `TestSubprocessMarkers` pins every group and the
+notice, mutation-tested in both directions.
 
 **Run the full extras** — `--extra dev --extra mpl --extra qutip` — or tests **silently skip**. The
 qiskit reference comparisons this file treats as the trustworthy oracle no longer need an extra, since

@@ -23,7 +23,6 @@ passed while every kernel returned the same wrong number.
 import ast
 import inspect
 import os
-import re
 import subprocess
 import sys
 import textwrap
@@ -2666,39 +2665,125 @@ class TestShardedBatchMatvec:
         )
 
 
-class TestShardedMarker:
-    """The ``sharded`` marker must land on exactly the tests that subprocess a child.
+# Literal names, independent of `conftest._SUBPROCESS_HELPERS`: reading that dict made both sides of
+# `TestSubprocessMarkers`' comparison move together, and two helper-rename mutants survived.
+_MARKER_GROUPS = {
+    "sharded": "run_sharded_child",
+    "typecheck": "assert_type_checks",
+    "optdeps": "assert_imports_without",
+}
 
-    ``conftest.pytest_collection_modifyitems`` applies it by looking for ``run_sharded_child(`` in each
-    test's source, so ``-m "not sharded"`` can skip the ~9 s of subprocess tests during an edit-run
-    loop. Both directions of that fail **silently**, which is why this is a test rather than a comment:
 
-    * Under-marking (the helper is renamed, or a new child is called through a wrapper) leaves a 1-4 s
-      subprocess in the supposedly-fast path -- no failure, just a slow "fast" run.
-    * Over-marking (the substring appears in an unrelated test) drops real coverage from the default
-      run, and per ``CLAUDE.md`` a replicated run agrees with single-device to exactly 0.0, so the
-      tests that would have caught it are precisely the ones deselected.
+class TestSubprocessMarkers:
+    """The auto-applied markers must match the tests that really spawn subprocesses.
 
-    Asserts against the call sites in the tree rather than a hardcoded count, so adding a ninth child
-    does not require editing a number here.
-
-    Also pins the deselection notice. ``addopts`` deselects these tests by default for speed, and with
-    no CI in this repo the default invocation is the only thing that runs -- so the warning that they
-    were skipped is the whole safety margin, and it must survive ``-q``.
+    Both directions fail silently: under-marking leaves a multi-second subprocess in the fast path,
+    over-marking drops coverage from the default run -- worst for ``sharded``, whose defects are
+    invisible single-device (``CLAUDE.md``).
     """
 
-    def test_the_default_deselects_exactly_the_children_and_says_so(self):
-        here = os.path.dirname(os.path.abspath(__file__))
-        # Every `_sharded_*.py` script must be driven by exactly one marked test. Counting the scripts
-        # rather than grepping for the helper name keeps this test's own prose (which necessarily
-        # mentions the helper) out of the count -- a substring sweep over the test sources counted 10
-        # for 8 real call sites, this file's docstring being two of them.
-        children = [n for n in os.listdir(here) if n.startswith("_sharded_") and n.endswith(".py")]
-        assert len(children) >= 8, f"expected at least the 8 known children, found {children}"
+    def test_every_group_is_marked_exactly(self):
+        """Cross-check each marker group against an AST walk of the test files.
 
-        # Two collections, not three: the default run's output carries both facts this test needs (the
-        # deselected count and the notice), so the `-m sharded` arm is redundant. Each collection costs
-        # ~1.5 s, which is charged against the ~9 s the deselection saves -- keep this at two.
+        AST, not a substring sweep: this class *names* every helper in its own source, so a text scan
+        marks it too (measured -- it self-marked as ``sharded``). Walks the files rather than
+        ``session.items`` so the counts hold when only this file is run.
+        """
+        here = os.path.dirname(os.path.abspath(__file__))
+        calls = {marker: set() for marker in _MARKER_GROUPS}
+        for name in sorted(os.listdir(here)):
+            if not (name.startswith("test_") and name.endswith(".py")):
+                continue
+            with open(os.path.join(here, name), encoding="utf-8") as handle:
+                tree = ast.parse(handle.read())
+            # Class-qualified: two tests share `test_every_cache_level_agrees_sharded_and_single_device`
+            # in different classes, and a `<file>::<test>` key collapsed them into 7 for 8.
+            scopes: list[tuple[str, list[ast.stmt]]] = [(name, tree.body)]
+            scopes += [
+                (f"{name}::{c.name}", c.body) for c in tree.body if isinstance(c, ast.ClassDef)
+            ]
+            for prefix, body in scopes:
+                for node in body:
+                    if not (isinstance(node, ast.FunctionDef) and node.name.startswith("test_")):
+                        continue
+                    called = {
+                        sub.func.id
+                        for sub in ast.walk(node)
+                        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                    }
+                    for marker, helper in _MARKER_GROUPS.items():
+                        if helper in called:
+                            calls[marker].add(f"{prefix}::{node.name}")
+
+        collected = subprocess.run(
+            [sys.executable, "-m", "pytest", "-n0", "-q", "--collect-only", "-m", ""],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=os.path.dirname(here),
+        )
+        assert collected.returncode == 0, f"collection failed:\n{collected.stderr[-2000:]}"
+
+        for marker, helper in sorted(_MARKER_GROUPS.items()):
+            assert calls[marker], f"nothing calls {helper}, so `{marker}` cannot be verified"
+            marked = subprocess.run(
+                [sys.executable, "-m", "pytest", "-n0", "-q", "--collect-only", "-m", marker],
+                capture_output=True,
+                text=True,
+                check=False,
+                cwd=os.path.dirname(here),
+            )
+            assert marked.returncode == 0, f"`-m {marker}` failed:\n{marked.stderr[-2000:]}"
+            ids = {
+                line.strip().split("/")[-1]
+                for line in marked.stdout.splitlines()
+                if line.startswith("tests/") and "::" in line
+            }
+            assert ids == calls[marker], (
+                f"`-m {marker}` selected {len(ids)} tests but {len(calls[marker])} call {helper}; "
+                f"marked-only={sorted(ids - calls[marker])} "
+                f"source-only={sorted(calls[marker] - ids)}"
+            )
+
+        children = [n for n in os.listdir(here) if n.startswith("_sharded_")]
+        assert len(calls["sharded"]) == len(children), (
+            f"{len(children)} `_sharded_*.py` children but {len(calls['sharded'])} `sharded` tests"
+        )
+
+        # Every group must also carry `subprocess`, or the default run still pays for it.
+        slow = subprocess.run(
+            [sys.executable, "-m", "pytest", "-n0", "-q", "--collect-only", "-m", "subprocess"],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=os.path.dirname(here),
+        )
+        assert slow.returncode == 0, f"`-m subprocess` failed:\n{slow.stderr[-2000:]}"
+        marked_slow = {
+            line.strip().split("/")[-1]
+            for line in slow.stdout.splitlines()
+            if line.startswith("tests/") and "::" in line
+        }
+        for marker in sorted(_MARKER_GROUPS):
+            assert calls[marker] <= marked_slow, (
+                f"`{marker}` tests missing the `subprocess` marker, so the default run still spawns "
+                f"them: {sorted(calls[marker] - marked_slow)}"
+            )
+        # The remainder are this class's own two, which call `subprocess.run` directly rather than a
+        # named helper. Anything else means `subprocess` is on a test that spawns nothing.
+        extra = marked_slow - set().union(*calls.values())
+        assert extra == {
+            "test_sqd.py::TestSubprocessMarkers::test_every_group_is_marked_exactly",
+            "test_sqd.py::TestSubprocessMarkers::test_the_deselection_notice_survives_q",
+        }, f"unexpected `subprocess` tests calling no known helper: {sorted(extra)}"
+
+    def test_the_deselection_notice_survives_q(self):
+        """The default run must announce the skip; a full run must not.
+
+        With no CI the notice is all that separates a fast run from a false green. Checked under ``-q``:
+        ``pytest_report_header``, the obvious home, is suppressed by it.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         runs = {}
         for label, extra in (("default", []), ("full", ["-m", ""])):
             proc = subprocess.run(
@@ -2706,38 +2791,21 @@ class TestShardedMarker:
                 capture_output=True,
                 text=True,
                 check=False,
-                cwd=os.path.dirname(here),
+                cwd=root,
             )
             assert proc.returncode == 0, f"{label} collection failed:\n{proc.stderr[-2000:]}"
             runs[label] = proc.stdout
 
-        # `N/M tests collected (K deselected)`. Parsed rather than counting node-id lines because `-q`
-        # prints none; counting `::` occurrences double-counts anyway, the reporter echoing the ids
-        # around the summary -- measured 16 for the 8 real tests.
-        match = re.search(r"\((\d+) deselected\)", runs["default"])
-        assert match is not None, (
-            f"the default run deselected nothing, so the marker is not applied:\n{runs['default'][-1500:]}"
+        assert "SUBPROCESS TESTS DESELECTED" in runs["default"], (
+            "the default run deselects the subprocess tests but printed no warning under -q; with no "
+            f"CI in this repo that silently hides the skip:\n{runs['default'][-1500:]}"
         )
-        deselected = int(match.group(1))
-        assert deselected == len(children), (
-            f"the default run deselected {deselected} tests but {len(children)} `_sharded_*.py` "
-            f"children exist -- under-marking leaves a subprocess in the supposedly-fast path, "
-            f"over-marking drops sharding coverage from the default run:\n{runs['default'][-1500:]}"
+        assert "DESELECTED" not in runs["full"], (
+            'a full `-m ""` run ran everything but still warned something was skipped, which trains '
+            f"the reader to ignore the notice:\n{runs['full'][-1500:]}"
         )
         assert "deselected" not in runs["full"], (
             f'`-m ""` must run everything, but it deselected tests:\n{runs["full"][-1500:]}'
-        )
-
-        # The notice, under `-q` specifically: `pytest_report_header` is suppressed by `-q`, which is
-        # the invocation CLAUDE.md documents, so the obvious home for this hid it. Both arms asserted --
-        # a notice that always prints is as useless as one that never does.
-        assert "SHARDED TESTS DESELECTED" in runs["default"], (
-            "the default run deselects the sharded tests but printed no warning under -q; with no CI "
-            f"in this repo that silently hides the skip:\n{runs['default'][-1500:]}"
-        )
-        assert "SHARDED TESTS DESELECTED" not in runs["full"], (
-            'a full `-m ""` run ran the sharded tests but still warned they were skipped, which '
-            f"trains the reader to ignore the notice:\n{runs['full'][-1500:]}"
         )
 
 
