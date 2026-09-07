@@ -53,12 +53,18 @@ Documentation = "https://rqutils.readthedocs.io/en/latest/index.html"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 # Not `auto`, which oversubscribes and is slower. `-n0` to override.
-addopts = "-n 4"
-# Applied automatically by `conftest.pytest_collection_modifyitems` to every test that subprocesses a
-# `_sharded_*.py` child, which is ~9 s of a ~19 s suite. `-m "not sharded"` gets that back for an
-# edit-run loop; do not make it the default -- those tests cover the defects that are invisible
-# single-device (see the hook's docstring and CLAUDE.md's "Sharding tests").
-markers = ["sharded: spawns a virtual-multi-device subprocess"]
+#
+# `-m "not sharded"` is the default for the edit-run loop: the eight tests that subprocess a
+# `_sharded_*.py` child are ~9 s of a ~19 s suite, each spawning a fresh interpreter to get virtual
+# devices. `pytest -m ""` runs everything and is REQUIRED before any commit touching sharding,
+# resharding, a collective, or a host read of a device value -- those defects are invisible
+# single-device, and per CLAUDE.md a replicated run agrees with single-device to exactly 0.0, so no
+# other test catches them. `conftest.pytest_report_header` prints a warning whenever they are skipped,
+# because there is no CI here: this default is the only thing that runs unless someone overrides it.
+addopts = "-n 4 -m 'not sharded'"
+# Applied automatically by `conftest.pytest_collection_modifyitems` to every test whose source calls
+# `run_sharded_child`, so the marker cannot drift from the property it describes.
+markers = ["sharded: spawns a virtual-multi-device subprocess; deselected by default"]
 
 [tool.ruff]
 line-length = 100

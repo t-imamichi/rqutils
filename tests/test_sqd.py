@@ -23,6 +23,7 @@ passed while every kernel returned the same wrong number.
 import ast
 import inspect
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -2680,9 +2681,13 @@ class TestShardedMarker:
 
     Asserts against the call sites in the tree rather than a hardcoded count, so adding a ninth child
     does not require editing a number here.
+
+    Also pins the deselection notice. ``addopts`` deselects these tests by default for speed, and with
+    no CI in this repo the default invocation is the only thing that runs -- so the warning that they
+    were skipped is the whole safety margin, and it must survive ``-q``.
     """
 
-    def test_the_marker_matches_the_call_sites(self):
+    def test_the_default_deselects_exactly_the_children_and_says_so(self):
         here = os.path.dirname(os.path.abspath(__file__))
         # Every `_sharded_*.py` script must be driven by exactly one marked test. Counting the scripts
         # rather than grepping for the helper name keeps this test's own prose (which necessarily
@@ -2691,27 +2696,48 @@ class TestShardedMarker:
         children = [n for n in os.listdir(here) if n.startswith("_sharded_") and n.endswith(".py")]
         assert len(children) >= 8, f"expected at least the 8 known children, found {children}"
 
-        collected = subprocess.run(
-            [sys.executable, "-m", "pytest", "-n0", "-q", "-m", "sharded", "--collect-only"],
-            capture_output=True,
-            text=True,
-            check=False,
-            cwd=os.path.dirname(here),
+        # Two collections, not three: the default run's output carries both facts this test needs (the
+        # deselected count and the notice), so the `-m sharded` arm is redundant. Each collection costs
+        # ~1.5 s, which is charged against the ~9 s the deselection saves -- keep this at two.
+        runs = {}
+        for label, extra in (("default", []), ("full", ["-m", ""])):
+            proc = subprocess.run(
+                [sys.executable, "-m", "pytest", "-n0", "-q", "--collect-only", *extra],
+                capture_output=True,
+                text=True,
+                check=False,
+                cwd=os.path.dirname(here),
+            )
+            assert proc.returncode == 0, f"{label} collection failed:\n{proc.stderr[-2000:]}"
+            runs[label] = proc.stdout
+
+        # `N/M tests collected (K deselected)`. Parsed rather than counting node-id lines because `-q`
+        # prints none; counting `::` occurrences double-counts anyway, the reporter echoing the ids
+        # around the summary -- measured 16 for the 8 real tests.
+        match = re.search(r"\((\d+) deselected\)", runs["default"])
+        assert match is not None, (
+            f"the default run deselected nothing, so the marker is not applied:\n{runs['default'][-1500:]}"
         )
-        assert collected.returncode == 0, f"collection failed:\n{collected.stderr[-2000:]}"
-        # One node id per line. Counting `::` occurrences instead double-counts, because the reporter
-        # echoes the ids again around the summary -- measured 16 for the 8 real tests.
-        marked = len(
-            [
-                line
-                for line in collected.stdout.splitlines()
-                if line.startswith("tests/") and "::" in line
-            ]
+        deselected = int(match.group(1))
+        assert deselected == len(children), (
+            f"the default run deselected {deselected} tests but {len(children)} `_sharded_*.py` "
+            f"children exist -- under-marking leaves a subprocess in the supposedly-fast path, "
+            f"over-marking drops sharding coverage from the default run:\n{runs['default'][-1500:]}"
         )
-        assert marked == len(children), (
-            f"the sharded marker is on {marked} tests but {len(children)} `_sharded_*.py` children "
-            f"exist -- under-marking leaves a subprocess in the supposedly-fast path, over-marking "
-            f"drops sharding coverage from the default run:\n{collected.stdout[-2000:]}"
+        assert "deselected" not in runs["full"], (
+            f'`-m ""` must run everything, but it deselected tests:\n{runs["full"][-1500:]}'
+        )
+
+        # The notice, under `-q` specifically: `pytest_report_header` is suppressed by `-q`, which is
+        # the invocation CLAUDE.md documents, so the obvious home for this hid it. Both arms asserted --
+        # a notice that always prints is as useless as one that never does.
+        assert "SHARDED TESTS DESELECTED" in runs["default"], (
+            "the default run deselects the sharded tests but printed no warning under -q; with no CI "
+            f"in this repo that silently hides the skip:\n{runs['default'][-1500:]}"
+        )
+        assert "SHARDED TESTS DESELECTED" not in runs["full"], (
+            'a full `-m ""` run ran the sharded tests but still warned they were skipped, which '
+            f"trains the reader to ignore the notice:\n{runs['full'][-1500:]}"
         )
 
 

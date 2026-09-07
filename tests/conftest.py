@@ -50,6 +50,28 @@ jax.config.update("jax_enable_x64", True)
 import numpy as np
 import pytest
 
+_SHARDED_SKIPPED_NOTICE = (
+    'SHARDED TESTS DESELECTED -- run `pytest -m ""` before committing anything touching sharding'
+)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Warn whenever the ``sharded`` tests were deselected, including under ``-q``.
+
+    ``addopts`` carries ``-m "not sharded"`` so the edit-run loop is ~10 s instead of ~19 s. That trade
+    is only safe if the skip is *visible*: there is no CI in this repo, so the default invocation is the
+    only thing that ever runs, and the deselected tests are the only ones that can see a wrong gather, a
+    dropped partitioning or a collective inside a conditional. A silent deselection turns a green run
+    into evidence of something it never checked.
+
+    In the terminal summary rather than ``pytest_report_header`` because ``-q`` suppresses the header,
+    and ``-q`` is the invocation in ``CLAUDE.md`` and in every habit -- a warning that vanishes under
+    the common flag is not a warning. This writes unconditionally rather than via ``.write_line``'s
+    verbosity gating, so it survives ``-q`` too.
+    """
+    if "not sharded" in (config.getoption("-m") or ""):
+        terminalreporter.write_sep("!", _SHARDED_SKIPPED_NOTICE, yellow=True, bold=True)
+
 
 def pytest_collection_modifyitems(items):
     """Mark every test that subprocesses a ``_sharded_*.py`` child as ``sharded``.
