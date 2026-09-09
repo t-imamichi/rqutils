@@ -6,10 +6,13 @@ produces float32/complex64 and every tolerance in this suite is wrong by nine or
 ``conftest.py`` is the only file pytest guarantees to import before the test modules, which is why
 this cannot move to a plain helper module.
 
-Two caches are also pointed at writable directories below, purely for speed -- measured 53.3 s ->
-31.5 s -> 10.4 s on this suite (5.1x). Unlike the x64 flag these are **not** load-bearing: nothing
-here depends on them, both defer to a value the caller already set, and a cache miss only costs
-time. See the comments at each for what they buy and why the default is wrong for this repo.
+Two caches are also pointed at ``~/.cache`` below, purely for speed: a cold suite takes several
+times as long as a warm one, the JAX cache accounting for the larger share. Wall-clock figures are
+deliberately not recorded here -- they vary with whatever else the machine is running, so a stale
+absolute reads as a regression. Re-measure if you need one. Unlike the x64 flag these are **not**
+load-bearing: nothing here depends on them, both defer to a value the caller already set, and a
+cache miss only costs time. See the comments at each for what they buy and why the default is wrong
+for this repo.
 
 Seeds are constructed *inside each test body*, deliberately, and there are no ``@pytest.fixture``
 state generators in this suite. Several tests pick a specific seed to produce a specific pathology
@@ -29,17 +32,20 @@ import tempfile
 # Both of the following must be set BEFORE jax/matplotlib are imported, which is what puts them
 # above the `import jax` line rather than in a fixture.
 #
+# Both live under `~/.cache`, not a temp dir: `/tmp` (and macOS's `/var/folders/...`) is swept on
+# reboot or by systemd-tmpfiles, so a temp-dir cache pays its warm-up again after every wipe, and a
+# fixed name there is shared across users on a multi-user host. Neither needs a version in the path
+# -- JAX's cache key already covers jax/jaxlib and the backend, and matplotlib stamps its own. If
+# `~/.cache` is unwritable both degrade to warning-and-recompute: slower, never wrong.
+_cache_root = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
 # matplotlib rebuilds its font cache from scratch on every interpreter start when MPLCONFIGDIR is
-# unwritable -- ~24 s, paid by `import rqutils.qprint` (which imports pyplot eagerly) and so by
-# tests/test_qprint.py. `~/.matplotlib` is not writable in a sandboxed session, and matplotlib's
-# own fallback is a fresh temp dir per process, which never warms. A stable temp dir does.
-os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "rqutils-mplconfig"))
-# JAX recompiles all ~250 XLA kernels every run without a persistent cache (~23 s of the suite).
-# MIN_COMPILE_TIME_SECS is required alongside the directory: the default 1.0 s threshold excludes
-# nearly every kernel here, the largest single compile being ~0.44 s, so the cache would stay empty.
-os.environ.setdefault(
-    "JAX_COMPILATION_CACHE_DIR", os.path.join(tempfile.gettempdir(), "rqutils-jaxcache")
-)
+# unwritable, paid by `import rqutils.qprint` (which imports pyplot eagerly) and so by
+# tests/test_qprint.py. matplotlib's own fallback is a fresh temp dir per process, which never warms.
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(_cache_root, "rqutils-mplconfig"))
+# JAX recompiles all ~250 XLA kernels every run without a persistent cache. MIN_COMPILE_TIME_SECS is
+# required alongside the directory: every kernel here compiles in well under the default 1.0 s
+# threshold, so it would exclude nearly all of them and the cache would stay empty.
+os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", os.path.join(_cache_root, "rqutils-jaxcache"))
 os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
 
 import jax

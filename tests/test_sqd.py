@@ -810,9 +810,9 @@ class TestInt32Ceiling:
     on ``uniquify_states``' static ``states_size``, which fires at trace time and costs nothing.
 
     Putting it there is also what makes **both** sides of the boundary cheap to test. Reaching the
-    guard through ``hproj`` cost 23 s (the passing case runs the O(N) sortedness scan over 2^31 rows),
-    which is why the accept side was previously left unpinned and recorded as a known gap. Through
-    ``jax.eval_shape`` the guard traces without allocating: measured ~5 ms per side.
+    guard through ``hproj`` was slow enough to be impractical (the passing case runs the O(N)
+    sortedness scan over 2^31 rows), which is why the accept side was previously left unpinned and
+    recorded as a known gap. Through ``jax.eval_shape`` the guard traces without allocating.
     """
 
     def test_oversized_states_size_raises_at_the_source(self):
@@ -844,7 +844,7 @@ class TestHproj:
 
         The guard's *placement* matters as much as its presence: it sits before the O(N) sortedness
         scan and the ``np.unique``, so a doomed call reports the real problem instead of spending time
-        first. Measured on this test: 0.23 s with the check first, 23 s with it after the scan.
+        first -- this test is where that shows up, since the scan would run over all 2^31 rows.
         """
         states = np.broadcast_to(np.zeros(2, dtype=np.uint8), (2**31, 2))
         with pytest.raises(ValueError, match="exceeds the .* limit imposed by int32"):

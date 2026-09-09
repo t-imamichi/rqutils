@@ -1009,8 +1009,8 @@ def hproj(
     # Same int32 ceiling sqd() enforces, since hproj reaches get_xsource too and its returned
     # positions are int32 with -1 as the absent marker. Checked here, before the O(N) sortedness scan
     # and the np.unique below: it is an O(1) look at a shape, so it costs nothing to do first and
-    # reports the real problem rather than letting a doomed call spend time first (measured on the
-    # test that reaches it: 0.23 s with the check first, 23 s when it sits after the scan).
+    # reports the real problem rather than letting a doomed call spend time first: after the scan it
+    # would pay the whole O(N) pass over a subspace it is about to reject anyway.
     if states.shape[0] > _MAX_STATES:
         raise ValueError(
             f"subspace of {states.shape[0]} states exceeds the {_MAX_STATES} limit imposed by int32 "
