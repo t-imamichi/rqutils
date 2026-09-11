@@ -302,13 +302,42 @@ those regimes, and the XXZ one is closer to a real SQD workflow.
 It measures 1.07x and 1.25x on the two fixtures -- never best, never a loss, mid-surface on both. Every
 alternative that beats it on one is mediocre or losing on the other, which is exactly what a default
 across unknown Hamiltonians has to avoid, and the property §3.1's paired sweep selected for. `(32, 4)` is
-the best worst-case cell measured (1.34/1.30) and is the only candidate worth revisiting, but two synthetic
-fixtures with setup excluded is not grounds to overturn 27 paired XXZ configurations.
+the best worst-case cell measured here (1.34/1.30) and was the one candidate worth taking further -- **§3.4
+took it end-to-end and it loses by 45%**, which closes the question.
 
-**What still has not been measured is end-to-end `sqd` with setup included.** Every number in §3.2 and
-§3.3 drives `ground_locg` on `apply_h` directly, excluding the `get_xsource` setup that is 66-97% of a real
-solve -- so a solver-side 1.4x is an Amdahl slice on a 4.5-8.4% term, the shape that capped the Bloom
-pre-filter at 1.09x. That measurement is what could move the default; the sweeps above cannot.
+### 3.4 End-to-end through `sqd`: `(32, 4)` loses by 45%, and the default is settled (2026-09-12)
+
+§3.2 and §3.3 drive `ground_locg` on `apply_h` directly, excluding the `get_xsource` setup that is 66-97%
+of a real solve -- so a solver-side 1.4x is an Amdahl slice on a 4.5-8.4% term. `(32, 4)` looked like the
+better *worst case* across those two fixtures (1.34x / 1.30x against `(32, 2)`'s 1.07x / 1.25x), which
+made it the one candidate worth taking to an end-to-end measurement.
+
+`examples/scaling/poc25_prefilter_cycles_e2e.py`, one CUDA device, `n=20`, `N=3586`, XXZ Krylov subspaces
+from `|Neel>`, setup inside the timed region, arms interleaved, 9 rounds per configuration:
+
+| `delta` | `(32, 2)` median | `(32, 4)` median | ratio | paired |
+|--------:|-----------------:|-----------------:|------:|-------:|
+| 0.5 | 274.9-288.0 ms | 405.2-423.6 ms | 0.68x | 0/27 |
+| 1.0 | 291.6-292.0 ms | 422.9-423.2 ms | 0.69x | 0/27 |
+| 1.5 | 296.4-296.9 ms | 422.5-423.3 ms | 0.70x | 0/27 |
+
+**Overall 0.69x, 0 of 81 paired rounds won, spreads 0.3-1.6%.** `(32, 4)` is uniformly ~45% slower
+end-to-end, far outside noise and consistent across every anisotropy. **`sqd`'s `(32, 2)` default is
+therefore settled on a direct measurement, not on absence of evidence.**
+
+**The dilution is not symmetric, which is the part worth keeping.** The prediction going in was that both
+arms compress toward 1.0x -- the solver-side gap diluted by setup. Instead the extra 66 filter matvecs cost
+*more* end-to-end than the iterations they remove save, so an option that measures 1.30x on the solver
+lands at 0.69x through `sqd`. §3.1's mechanism accounts for it: past cycle 2 you pay full cost for little
+separation, and end-to-end there is no solver-side surplus left to absorb that cost. **A ratio measured on
+a 4.5-8.4% slice can invert, not merely shrink, when the excluded 66-97% is restored.**
+
+**Caveat on the sweep's width.** `xxz_krylov` at `rungs=4, cap=4000` does not reach the cap, so
+`rng.choice` never fires and the fixture is seed-independent -- identical `N=3586` and identical energies
+to 10 digits across all three seeds. The table above is therefore **3 configurations measured 27 times
+each, not 9 configurations**. The `delta` sweep is real; the seed sweep is not. It does not change the
+verdict (0/81 across a 45% gap needs no seed variation) but a future run wanting genuine seed variation
+must raise `rungs` or lower `cap` until the subspace exceeds it.
 
 **`sqd`'s default `(32, 2)` measures 1.07x on this fixture**, well under the 1.42x available on it -- but
 see §3.3: on a second Hamiltonian it measures 1.25x while the cells that beat it here drop to 0.98-1.28x.

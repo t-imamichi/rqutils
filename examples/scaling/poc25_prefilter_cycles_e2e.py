@@ -33,6 +33,19 @@ runtime. UNRESOLVED on most configurations is the *likely* outcome and is an ans
 the poc9 surface does not reach the default, and ``(32, 2)`` stays on §3.1's evidence. A clear
 ``(32, 4)`` win across seeds and anisotropies is what would move the default.
 
+**RESULT (2026-09-12): that expectation was wrong, and its being wrong is the finding.** ``(32, 4)``
+measured **0.68-0.71x at every anisotropy, 0 of 81 paired rounds won**, spreads 0.3-1.6% -- ~45%
+*slower*, not diluted-toward-1.0x. The extra filter matvecs cost more end-to-end than the iterations
+they remove save, so a **1.30x on the solver became 0.69x through ``sqd``**. A ratio measured on a
+4.5-8.4% slice can change *sign* when the excluded 66-97% is restored. Table in §3.4; ``(32, 2)``
+stays, now on a direct measurement.
+
+**Known fixture limitation.** At the defaults, ``xxz_krylov`` does not reach ``cap``, so ``rng.choice``
+never fires and the fixture is **seed-independent** -- ``--seeds 3`` measures one fixture three times
+(identical ``N`` and energies to 10 digits). The ``--deltas`` sweep is real. Raise ``--rungs`` or lower
+``--cap`` until the subspace exceeds the cap if genuine seed variation is wanted; the 2026-09-12 run
+did not need it, but a closer result would.
+
 **Arms are interleaved, not timed in sequence.** Per ``CLAUDE.md``: ``fmt_ratio``'s noise floor is the
 *max* of the two spreads, so one outlier in either arm suppresses the verdict however many trials are
 added -- a recorded 1.21x win once sat at "UNRESOLVED, noise floor 66.6%" across three re-runs. The

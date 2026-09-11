@@ -3164,14 +3164,33 @@ two fixtures: never best, never a loss, mid-surface on both. Every alternative b
 mediocre or losing on the other, which is what a default across unknown Hamiltonians must avoid and what
 §3.1's paired sweep selected for. Had the `K`/`J` run come back agreeing, I would have switched to
 `(24, 8)` — it measures **1.28x** on the second fixture against `(32,2)`'s 1.25x, inside the noise floor,
-so the switch would have bought nothing and been justified by a single fixture. **`(32, 4)` (1.34/1.30) is
-the best worst-case cell measured** and the only candidate worth revisiting.
+so the switch would have bought nothing and been justified by a single fixture. **`(32, 4)` (1.34/1.30) was
+the best worst-case cell measured** and the one candidate worth taking end-to-end — which settled it below.
 
-**What remains unmeasured is the measurement that actually decides it: end-to-end `sqd` with setup
-included.** Everything here drives `ground_locg` on `apply_h` directly and excludes `get_xsource` setup at
-66–97% of a solve, so a solver-side 1.4x is an Amdahl slice on a 4.5–8.4% term — the Bloom pre-filter shape
-that capped at 1.09x. **A default optimal on the solver and worth nothing through `sqd` is the failure mode
-here**, which is why even the damning 1.07x `cycles = 2` cell is not by itself grounds to move it.
+### End-to-end through `sqd`, `(32, 4)` loses by 45%: a solver-side ratio can invert, not just shrink (2026-09-12)
+
+`examples/scaling/poc25_prefilter_cycles_e2e.py`, one CUDA device, `n=20`, `N=3586`, XXZ Krylov subspaces
+from `|Neel>`, **setup inside the timed region**, arms interleaved, 9 rounds per configuration. Full table
+in `docs/locg-chebyshev-prefilter.md` §3.4. Result: **0.68–0.71x at every anisotropy, 0 of 81 paired rounds
+won, spreads 0.3–1.6%.** `(32, 4)` is ~45% slower end-to-end. **`sqd`'s `(32, 2)` is settled on a direct
+measurement now, not on absence of evidence.**
+
+**The transferable finding is that the dilution was not symmetric.** The stated prediction was that both
+arms compress toward 1.0x — a solver-side gap diluted by the setup term. Instead `(32, 4)`'s extra 66
+filter matvecs cost *more* end-to-end than the iterations they remove save, so **1.30x on the solver became
+0.69x through `sqd`**. §3.1's mechanism accounts for it: past cycle 2 you pay full cost for little
+separation, and end-to-end there is no solver-side surplus left to absorb it. `CLAUDE.md`'s Amdahl rule
+says to ask how many times per solve the target is paid before believing a ratio; this is the sharper
+version — **a ratio measured on a 4.5–8.4% slice can change sign when the excluded 66–97% is restored, not
+merely shrink toward 1.0x.** The Bloom entry's 1.09x cap was the benign case.
+
+**A fixture defect the run exposed, worth knowing before reusing poc25.** `xxz_krylov` at `rungs=4,
+cap=4000` never reaches the cap, so `rng.choice` never fires and the fixture is **seed-independent** —
+identical `N=3586` and energies identical to 10 digits across all three seeds. So the sweep is **3
+configurations measured 27 times each, not 9 configurations**; the `delta` sweep is real, the seed sweep is
+not. It does not change this verdict (0/81 across a 45% gap needs no seed variation) but it is the kind of
+thing that would silently narrow a *close* result. Raise `rungs` or lower `cap` until the subspace exceeds
+it. Related: `CLAUDE.md`'s "check the fixture exercises the thing under test".
 
 **Process note worth more than the numbers: a one-fixture optimization surface produced two confident
 wrong rules in a row** (`extra mv` ≈ 200–350; "§3.1 is contradicted"), and both were caught by a *single*
