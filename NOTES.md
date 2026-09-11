@@ -3117,6 +3117,81 @@ Two process lessons, both about reading a truncated result:
 - **The two configurations that looked like they exhausted the GPU are the two fastest.** Believing the
   failure was about their cost would have removed exactly the settings worth using.
 
+### The prefilter optimum is a ridge in `extra mv`, and `(32, 8)` was a boundary artifact (2026-09-12)
+
+Same harness, same fixture (`n=26`, `N=1048576`, `J=30`). The entry above concluded "the optimum is near
+`(32, 8)`" from a grid whose maximum sat on its own upper corner in *both* axes — a truncation, not a
+maximum, and the same misreading as the SKIPPED rows one axis over. Two runs closed it. Full tables in
+`docs/locg-chebyshev-prefilter.md` §3.2.
+
+**The optimum is fixture-dependent, and `extra mv` is not the controlling variable.** I proposed that rule
+from a 3x3 grid on one Hamiltonian — a ridge at `cycles·(degree+1)` ≈ 200–350 — and a second Hamiltonian
+falsified it. **Recorded as a correction rather than deleted, because the over-fit is the lesson.** Matched
+4x5 grids, `n=26`/`J=30` against `n=22`/`J=8` (full tables in §3.2/§3.3):
+
+- `n=26`/`J=30` peaks along an **anti-diagonal** — `(16,16)` 1.41x, `(24,8)` 1.42x, `(32,8)` 1.38x,
+  `(40,4)` 1.40x, all inside the 1.3% noise floor, so a tie. Bottom-right still holds 1.07–1.28x.
+- `n=22`/`J=8` peaks at `(16,8)` 1.43x and `(40,2)` 1.38x, then **collapses**: 5 of 20 configurations lose
+  outright, `(40,16)` at **0.70x**.
+- The same `extra mv` gives opposite verdicts: 283 → 1.41x there, 1.25x here; 411 → 1.28x there, **0.98x**
+  here. `degree = 40` is near-best at `cycles = 2` on the second fixture and a **loss** at `cycles = 8`.
+
+**The two surfaces are near-transposes, so no `(degree, cycles)` is best on both** — `(16,8)` 1.29/1.43,
+`(24,8)` 1.42/1.28, `(40,2)` 1.11/1.38 — and the gaps are far outside the 0.2–1.4% noise floors.
+
+**This also retracts my claim that the sweep contradicts §3.1.** §3.1 reasons `degree` is high-leverage and
+`cycles` saturates past 2. On `n=26`/`J=30` the reverse holds (2 → 8 cycles is 1.07x → 1.38x at degree 32,
+while `degree` at fixed `cycles = 2` moves only 1.01 → 1.11). On `n=22`/`J=8` **§3.1's recipe is correct**:
+`(40, 2)` tops that column at 1.38x. §3.1's 27 configurations are XXZ chains on connected subspaces;
+poc9's is a random 100-term operator. **The knob ordering inverts between the regimes** — the disagreement
+was the fixture, and the XXZ regime is the one closer to a real SQD workflow. Two intermediate readings in
+this entry's history were both wrong: first that §3.1 predicted the ridge (coincidence — both accounts
+penalize large `extra mv` for unrelated reasons), then that §3.1 was contradicted (fixture, not error).
+
+**Iteration count is anti-correlated with wall clock out here.** Iterations fall monotonically with
+`extra mv` across the whole grid, 212 → 106, and the *fewest* iterations measured (106, at `(64,16)`)
+belong to the *slowest* configuration measured. Third independent instance of the quote-end-to-end rule.
+
+**Claim 1 holds exactly.** The four corner configurations return **identical** iteration counts on CPU and
+GPU — 138 / 115 / 125 / 106, not merely within an iteration — `|dE| ≤ 1.8e-15`, and wall-clock ratios
+agreeing to 1–3% at every point. Keep the claim narrow: §3.1's CPU peak near `(16, 4)` against the GPU's
+1.08x there is a real divergence and still stands. **The backends disagree about where the ridge begins
+and agree about where it ends.**
+
+**`sqd`'s `(32, 2)` default stays — requested three times across the session, and the second fixture is what
+turned the answer from "insufficient evidence" into a positive reason.** It measures 1.07x and 1.25x on the
+two fixtures: never best, never a loss, mid-surface on both. Every alternative beating it on one fixture is
+mediocre or losing on the other, which is what a default across unknown Hamiltonians must avoid and what
+§3.1's paired sweep selected for. Had the `K`/`J` run come back agreeing, I would have switched to
+`(24, 8)` — it measures **1.28x** on the second fixture against `(32,2)`'s 1.25x, inside the noise floor,
+so the switch would have bought nothing and been justified by a single fixture. **`(32, 4)` (1.34/1.30) is
+the best worst-case cell measured** and the only candidate worth revisiting.
+
+**What remains unmeasured is the measurement that actually decides it: end-to-end `sqd` with setup
+included.** Everything here drives `ground_locg` on `apply_h` directly and excludes `get_xsource` setup at
+66–97% of a solve, so a solver-side 1.4x is an Amdahl slice on a 4.5–8.4% term — the Bloom pre-filter shape
+that capped at 1.09x. **A default optimal on the solver and worth nothing through `sqd` is the failure mode
+here**, which is why even the damning 1.07x `cycles = 2` cell is not by itself grounds to move it.
+
+**Process note worth more than the numbers: a one-fixture optimization surface produced two confident
+wrong rules in a row** (`extra mv` ≈ 200–350; "§3.1 is contradicted"), and both were caught by a *single*
+run at a different `K`/`J` rather than by any amount of refinement on the original grid. `CLAUDE.md`'s "a
+quantity measured at one size is not a law" applies to the *shape* of an optimization surface, not just to
+scalars — and per that file `K` sets which axis dominates, so it is the parameter to vary first, not last.
+
+Two harness defects the runs exposed, both fixed in `poc9_prefilter_gpu.py`:
+
+- **The CPU banner claimed every CPU number was already documented.** True of the default grid only —
+  the 2026-09-12 CPU corner run was new, and the banner told its reader to discard it. A "this is already
+  known" message must scope itself to the parameters it was written for.
+- **Claim 3's sharded arm hardcodes `(16, 4)`**, now known to be off-ridge. It asserts the output *spec*
+  survives sharding; its ratio is not a recommendation and its 298→254 iterations are not comparable to
+  the sweep table above it. Commented in place.
+
+Also: the 4-virtual-device Claim 3 arm reported 8340ms → 7617ms. **Discard those milliseconds** — one
+physical backend, so it measures contention, not scaling (`CLAUDE.md`). The `spec=P('x',)` on both arms
+and `|dE| ≤ 1.8e-15` are the results; sharding-transparency holds.
+
 ### Sweeping a static argument in one process exhausts the GPU on compiled modules, not tensors (2026-09-04)
 
 `prefilter` is a `static_argnames` entry on `ground_locg` and `run_sqd`, so each `(degree, cycles)`

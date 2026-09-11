@@ -106,9 +106,13 @@ def assemble(problem):
 def main():
     print(f"devices: {init_devices(options.devices)}")
     if jax.default_backend() == "cpu":
+        # The banner used to claim every CPU number was already documented. That is only true of the
+        # default grid: --degrees/--cycles outside it reach configurations no CPU sweep has run, and
+        # the 2026-09-12 CPU corner run is in the docs precisely because it was new.
         print(
-            "\n*** THIS IS A CPU RUN. Every number below is already in "
-            "docs/locg-chebyshev-prefilter.md; this script exists to be run on a GPU. ***"
+            "\n*** THIS IS A CPU RUN. The default grid is already in "
+            "docs/locg-chebyshev-prefilter.md; this script exists to be run on a GPU. A grid outside "
+            "that default may still be new -- check §3.1/§3.2 before discarding it. ***"
         )
 
     problem = make_problem(
@@ -199,6 +203,9 @@ def main():
 
         margs = (sharded_sources, sharded_diagonals)
         sharded_init = jax.device_put(xinit, jax.sharding.NamedSharding(mesh, PartitionSpec("x")))
+        # (16, 4) is deliberately off the measured ridge (extra mv ~200-350; docs §3.2) -- this arm
+        # asserts the output *spec* survives sharding, not that the setting is fast. Don't read its
+        # ratio as a recommendation, and don't compare it to the sweep table above.
         for label, prefilter in (("plain", None), ("prefiltered", (16, 4))):
             result = ground_locg(
                 sharded_matvec,

@@ -207,15 +207,112 @@ therefore a CPU statement: on GPU, `cycles = 8` is where the wins are. This is t
 (a GPU's gather-heavy matvec against bandwidth-bound `O(N)` bookkeeping shifts the trade) resolving
 toward "keep paying matvecs for longer", not toward "the trade stops working".
 
-Wall-clock returns flatten while iterations keep falling: `(32,4)` -> `(32,8)` drops iterations 181 ->
-138 (-24%) for +3% wall clock, so the optimum is near `(32, 8)`. Where it turns over is unmeasured --
-the sweep ends there.
+#### The turnover, and what actually controls it (2026-09-12)
 
-**`sqd`'s default `(32, 2)` measures 1.07x here**, under a fifth of the 1.38x available. Two reasons not
-to read that as a refutation of the documented 1.49x default: this harness drives `ground_locg` on
-`apply_h` directly and excludes the setup `sqd`'s end-to-end figure includes, and this is one
-Hamiltonian at one size. Changing the default needs the end-to-end `sqd` measurement across sizes, which
-has not been run on a GPU.
+The grid above ends at `(32, 8)`, so its maximum sat on the boundary -- a truncation, not an optimum.
+Two further runs bracket it. First the upper corner:
+
+| degree | cycles | extra mv | iters | GPU ratio | CPU ratio |
+|-------:|-------:|---------:|------:|----------:|----------:|
+| 32 | 8 | 275 | 138 | 1.41x | 1.41x |
+| 32 | 16 | 539 | 115 | 1.12x | 1.10x |
+| 64 | 8 | 531 | 125 | 1.08x | 1.06x |
+| 64 | 16 | 1051 | 106 | **0.74x** | **0.71x** |
+
+Then the interior, on GPU, as a full 4x5 grid. Baseline 298 iterations / 279.2 ms; `|dE|` <= 8.9e-16 in
+all twenty.
+
+| degree | cycles=2 | cycles=4 | cycles=8 | cycles=12 | cycles=16 |
+|-------:|---------:|---------:|---------:|----------:|----------:|
+| 16 | 1.01x | 1.08x | 1.29x | 1.40x | **1.41x** |
+| 24 | 1.01x | 1.22x | **1.42x** | 1.38x | 1.28x |
+| 32 | 1.07x | 1.34x | 1.38x | 1.27x | 1.11x |
+| 40 | 1.11x | 1.40x | 1.34x | 1.15x | 1.007x unresolved |
+
+Iterations, same layout: 285/254/191/153/133 at degree 16, 275/212/151/129/117 at 24, 256/181/138/119/115
+at 32, 241/163/126/117/106 at 40.
+
+**The optimum runs along an anti-diagonal: low `degree` wants many `cycles`, high `degree` wants few.**
+The peaks are `(16,16)` 1.41x, `(24,8)` 1.42x, `(32,8)` 1.38x, `(40,4)` 1.40x -- four cells at 1.38-1.42x,
+which is inside the 1.3-1.4% noise floor, so they are a **tie, not a ranking**. Reproduced across three
+runs of this fixture to within that floor.
+
+An earlier reading of a narrower 3x3 grid called the controlling variable `extra mv` = `cycles*(degree+1)`,
+with a ridge at ~200-350. **That is wrong** -- `(16,16)` reaches 1.41x at 283 and `(24,16)` holds 1.28x at
+411, while §3.3 measures a second Hamiltonian where those same costs give 1.25x and **0.98x**. The
+anti-diagonal is a real feature of *this* fixture; the `extra mv` band was over-fit to one Hamiltonian and
+does not transfer.
+
+The surface is bracketed on all four sides: `degree = 64` loses at both cycle counts tried, `(40,16)` is
+unresolved, and the whole `cycles = 2` column sits at or below 1.11x.
+
+**The `cycles = 2` column is the sharpest result in the grid, because it is the column `sqd`'s default
+lives in.** All four entries are <= 1.11x and `(16,2)`/`(24,2)` at 1.01x are inside their own noise floors
+-- indistinguishable from no prefilter at all on this fixture. `sqd`'s `(32, 2)` is the 1.07x cell.
+
+**On this fixture §3.1's mechanism reads as contradicted** -- §3.1 has `degree` high-leverage and `cycles`
+saturating after 2, and recommends raising `degree` at `cycles = 2`, while here 2 -> 8 cycles is worth
+1.07x -> 1.38x at degree 32 and raising `degree` at fixed `cycles = 2` recovers almost nothing
+(1.01x -> 1.01x -> 1.07x -> 1.11x across 16/24/32/40). **§3.3 resolves this: the contradiction is the fixture, not
+§3.1.** On an XXZ-like operator with small `J`, §3.1's recipe measures correct. Read this paragraph as
+"the random-100-term regime inverts the knob ordering", not as a correction to §3.1.
+
+**Iteration count is not the objective, and these grids are the clearest demonstration in this document.**
+Iterations fall monotonically with `extra mv` everywhere -- 285 down to 106 across §3.2, 142 down to 78
+across §3.3 -- yet on §3.3's fixture the *fewest* iterations in a column repeatedly belong to a **losing**
+configuration: `(40,16)` takes 84 iterations against the baseline's 167 and still measures 0.70x. Quote
+end-to-end wall clock.
+
+**Claim 1 holds exactly, and the ratios are backend-independent out here.** The four corner
+configurations return identical iteration counts on CPU and GPU -- 138 / 115 / 125 / 106, all four, not
+merely within an iteration -- with `|dE|` <= 1.8e-15 throughout, and the wall-clock ratios agree to 1-3%
+at every point, inside both noise floors. Note the *narrowness* of that claim: §3.1's CPU peak near
+`(16, 4)` against the GPU's 1.08x there is a real divergence and still stands. The backends disagree
+about where the ridge begins; they agree about where it ends.
+
+### 3.3 A second Hamiltonian moves the optimum, which is why the default stays (2026-09-12)
+
+Same harness and grid, `n=22`, `J=8`, `N=1048576` padded; baseline 167 iterations / 72.7 ms. `|dE|` <=
+3.6e-15 in all twenty. Left value is §3.2's `n=26`/`J=30`, right is this fixture:
+
+| degree | cycles=2 | cycles=4 | cycles=8 | cycles=12 | cycles=16 |
+|-------:|---------:|---------:|---------:|----------:|----------:|
+| 16 | 1.01 / 1.12 | 1.08 / 1.33 | 1.29 / **1.43** | 1.40 / 1.36 | **1.41** / 1.25 |
+| 24 | 1.01 / 1.19 | 1.22 / 1.34 | **1.42** / 1.28 | 1.38 / 1.12 | 1.28 / **0.98** |
+| 32 | 1.07 / 1.25 | 1.34 / 1.30 | 1.38 / 1.28 | 1.27 / 1.05 | 1.11 / **0.89** |
+| 40 | 1.11 / **1.38** | 1.40 / 1.23 | 1.34 / **0.98** | 1.15 / **0.81** | 1.007 / **0.70** |
+
+**The two surfaces are near-transposes.** `n=26`/`J=30` peaks along an anti-diagonal and is still at
+1.07-1.28x in the bottom-right; `n=22`/`J=8` peaks at `(16,8)` and `(40,2)` and then collapses there, with
+**5 of 20 configurations losing outright** and `(40,16)` at 0.70x. The corner `(40,16)` is 1.007x
+unresolved on one fixture and 0.70x on the other. `degree = 40` is near-best at `cycles = 2` here (1.38x)
+and a **loss** at `cycles = 8` (0.98x); on the other fixture that same column was worthless.
+
+**So no `(degree, cycles)` is best on both**, and the differences are far outside the 0.2-1.4% noise
+floors. `(16,8)` is 1.29/1.43, `(24,8)` is 1.42/1.28, `(40,2)` is 1.11/1.38. The `extra mv` band §3.2
+first proposed is falsified here: 283 and 411 extra matvecs give 1.41x/1.28x there and 1.25x/0.98x here.
+
+**This also resolves §3.2's apparent contradiction of §3.1 as a fixture difference, not an error in
+either.** §3.1's recipe -- raise `degree`, keep `cycles = 2` -- measures *correct* on this fixture, where
+`(40, 2)` tops the `cycles = 2` column at 1.38x. §3.1's 27 configurations are XXZ chains on connected
+subspaces; §3.2's fixture is a random 100-term operator with `J = 30`. The knob ordering inverts between
+those regimes, and the XXZ one is closer to a real SQD workflow.
+
+**`sqd`'s `(32, 2)` default therefore stays, now for a positive reason rather than for want of evidence.**
+It measures 1.07x and 1.25x on the two fixtures -- never best, never a loss, mid-surface on both. Every
+alternative that beats it on one is mediocre or losing on the other, which is exactly what a default
+across unknown Hamiltonians has to avoid, and the property §3.1's paired sweep selected for. `(32, 4)` is
+the best worst-case cell measured (1.34/1.30) and is the only candidate worth revisiting, but two synthetic
+fixtures with setup excluded is not grounds to overturn 27 paired XXZ configurations.
+
+**What still has not been measured is end-to-end `sqd` with setup included.** Every number in §3.2 and
+§3.3 drives `ground_locg` on `apply_h` directly, excluding the `get_xsource` setup that is 66-97% of a real
+solve -- so a solver-side 1.4x is an Amdahl slice on a 4.5-8.4% term, the shape that capped the Bloom
+pre-filter at 1.09x. That measurement is what could move the default; the sweeps above cannot.
+
+**`sqd`'s default `(32, 2)` measures 1.07x on this fixture**, well under the 1.42x available on it -- but
+see §3.3: on a second Hamiltonian it measures 1.25x while the cells that beat it here drop to 0.98-1.28x.
+Neither figure refutes the documented end-to-end 1.49x, which includes the setup this harness excludes.
 
 Claim 1 of that script -- that the *iteration* reduction is backend-independent -- holds: counts are
 stable to <=1 iteration across four runs and `|dE|` against the unfiltered reference is 0.0-1.8e-15
@@ -226,9 +323,9 @@ a static argument, so each `(degree, cycles)` retains its own executable; the 8t
 its module* on a 71 GB GPU (`RESOURCE_EXHAUSTED` / "Failed to load in-memory CUBIN") while the device
 held under 1 GB of tensors. It is not a per-config memory limit -- compiled HLO size and
 `temp_size_in_bytes` are identical (1836504 B) across all nine, `degree` and `cycles` being `lax.scan`
-trip counts. `(32,4)` and `(32,8)` are the two fastest configurations *and* were the two that appeared
-to exhaust the GPU. This affects sweeps only: `sqd` forwards one `prefilter` value and its cache stays
-at one entry across repeated calls (measured).
+trip counts. `(32,4)` and `(32,8)` were the two fastest configurations in that nine-point grid *and*
+were the two that appeared to exhaust the GPU. This affects sweeps only: `sqd` forwards one `prefilter`
+value and its cache stays at one entry across repeated calls (measured).
 
 Correctness, every case: energy agrees with `scipy.sparse.linalg.eigsh(tol=0)` to **1.8e-15–2.8e-14**,
 eigenvector overlap with the unfiltered `ground_locg` result is **1.0000000**, and `converged` is
