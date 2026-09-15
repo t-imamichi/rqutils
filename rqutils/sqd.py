@@ -1031,13 +1031,16 @@ def hproj(
                 "than an error deeper in. Pass np.unique(states, axis=0), or leave "
                 "unique_states=False to have hproj do it."
             )
+    # After uniquification, which settles the count `get_xsource` reshards over.
+    _check_mesh_divisible(states.shape[0], "hproj")
     states_p = PauliSumXZ.pack_states(states)
 
-    columns, elements = _hproj_cols_elems(hamiltonian, states_p)
+    # To the host before masking: a boolean-mask gather on a sharded array raises ShardingTypeError.
+    columns, elements = (np.asarray(a) for a in _hproj_cols_elems(hamiltonian, states_p))
     valid = columns != -1
     rows = np.tile(np.arange(states.shape[0])[None, :], (columns.shape[0], 1))[valid]
-    data = np.array(elements[valid])
-    cols = np.array(columns[valid])
+    data = elements[valid]
+    cols = columns[valid]
     # shape= is mandatory here, not cosmetic: without it scipy infers the extent from the largest
     # index present, so a trailing basis state that no term couples into is dropped and the matrix
     # comes back too small (measured 41x41 for a 53-state subspace with local two-site js
@@ -2066,6 +2069,24 @@ def apply_h(
     )
 
 
+def _check_mesh_divisible(num_states: int, caller: str) -> None:
+    """Raise unless the state count divides the mesh, naming the size to pass `uniquify_states`.
+
+    `get_xsource` reshards one entry per state, so every caller reaching it needs this -- `apply_h`
+    and `hproj` both do. jax's own message names neither `uniquify_states` nor `states_size`.
+
+    Raises:
+        ValueError: If ``num_states`` is not a multiple of the device count.
+    """
+    if (mesh := get_abstract_mesh()).empty or (resid := num_states % mesh.size) == 0:
+        return
+    size = num_states + mesh.size - resid
+    raise ValueError(
+        f"{caller}: {num_states} states is not a multiple of the {mesh.size} mesh devices; size "
+        f"every per-state array to {size}, e.g. uniquify_states(states, {size})"
+    )
+
+
 def _place_vec(vec: NDArray[np.inexact], divisible: StateList | None) -> NDArray[np.inexact]:
     """Put `vec` on the live mesh, replicated; return it unchanged when there is no mesh.
 
@@ -2087,12 +2108,7 @@ def _place_vec(vec: NDArray[np.inexact], divisible: StateList | None) -> NDArray
     if divisible is not None:
         if (n := divisible.shape[0]) != vec.shape[0]:
             raise ValueError(f"apply_h: vec length {vec.shape[0]} disagrees with {n} states")
-        if (resid := n % mesh.size) != 0:
-            size = n + mesh.size - resid
-            raise ValueError(
-                f"apply_h: {n} states is not a multiple of the {mesh.size} mesh devices; size every "
-                f"per-state array to {size}, e.g. uniquify_states(states, {size})"
-            )
+        _check_mesh_divisible(n, "apply_h")
     if jax.typeof(vec).sharding.mesh is mesh.abstract_mesh:
         return vec
     return jax.device_put(vec, jax.sharding.NamedSharding(mesh, PartitionSpec()))

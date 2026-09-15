@@ -2752,6 +2752,34 @@ class TestShardedApplyHVec:
         assert int(got["xsources_len"]) == 23, f"xsources length was changed: {got['xsources_len']}"
 
 
+class TestShardedHproj:
+    """``hproj`` must work under a mesh, and an indivisible subspace must name the fix.
+
+    Two separate defects, both pre-existing and both reproduced before the fix. The mask gather
+    ``columns[valid]`` on a sharded array raised ``ShardingTypeError`` ("output PartitionSpec ...
+    could not be resolved"), so *every* mesh-enabled call failed at any size; and an indivisible
+    subspace reached ``get_xsource``'s reshard, giving jax's own message rather than one naming
+    ``uniquify_states``. ``hproj`` returns a scipy matrix, so the arrays come to the host first.
+    """
+
+    def test_hproj_agrees_sharded_and_names_indivisible_subspace(self):
+        stdout = run_sharded_child("_sharded_hproj.py", "hproj")
+
+        got = dict(line.split(maxsplit=1) for line in stdout.strip().splitlines() if " " in line)
+        assert set(got) == {
+            "agrees_20",
+            "agrees_24",
+            "named",
+            "symmetric_20",
+            "symmetric_24",
+        }, f"child did not print every case, got {sorted(got)}:\n{stdout[-2000:]}"
+        # Exactly 0.0: a replicated run agrees with single-device bit-for-bit, not to a tolerance.
+        for n in (20, 24):
+            assert float(got[f"agrees_{n}"]) == 0.0, f"{n} states disagreed with single-device"
+            assert float(got[f"symmetric_{n}"]) == 0.0, f"{n}-state projection is not symmetric"
+        assert got["named"] == "True", "an indivisible subspace did not name uniquify_states"
+
+
 class TestHostScalar:
     """``_host_scalar`` must accept every scalar form ``sqd`` can hand it, sharded or not.
 
