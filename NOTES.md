@@ -332,6 +332,75 @@ the single-device answer to exactly 0.0, so "correct but silently unsharded" is 
 comparison — the regression a dropped `out_sharding` would actually cause. `TestShardedOutput` asserts
 both.
 
+### `apply_h` under a mesh: placement shipped, rounding declined (2026-09-15)
+
+`docs/rqutils-apply-h-mesh-request.md` reported that `apply_h` raised `Resource axis: x of P('x',) is
+not found in mesh: ()` for a host numpy `vec`, and asked for two things: place it internally, and round
+the working length up to `mesh.size` as `sqd` does. Placement shipped; rounding was built, measured, and
+withdrawn. Every factual claim in the request verified.
+
+**The mechanism is a mismatch between two arrays, not one bad spec.** A host `vec` resolves to
+`P(None,)` on an *empty* mesh — the `P('x',)` in the message is derived from the partitioned `xsource`
+index array and then validated against the operand's empty mesh, inside `apply_xgrp`'s
+`out_sharding=jax.typeof(vec).sharding` gather. Worth stating because the obvious reading ("numpy has a
+bad spec") sends you to the wrong array.
+
+**`isinstance(vec, jax.Array)` is the wrong discriminator, and it was shipped first.** A `jax.Array`
+committed to one device carries an empty mesh exactly as a host array does, so the isinstance guard
+passed it through to the identical error. Mutation-testing caught it. Mesh *identity* is the test:
+`jax.typeof(vec).sharding.mesh is mesh.abstract_mesh`. `jax.typeof` is doing real work there — a
+committed array's own `.sharding` is a `SingleDeviceSharding` with no `.mesh` attribute at all, and
+`jax.typeof` normalizes both cases to a `NamedSharding` over the same empty singleton `AbstractMesh`.
+
+**Why the rounding was withdrawn (commit `1a339e8`, reverted by `82c204b`).** The request argued "both or
+neither", and it is right that placement alone deletes only 5 of the caller's 7 lines — verified against
+the placement-only build, where its own target call site still raises. But rounding cannot be applied
+consistently, because the three diagonal strategies disagree about which axis is the state axis:
+`diagonals` is `(n_groups, n_states)` (trailing) and `diag_signs` is `(n_states, n_zbytes)` (leading). No
+single pad serves both. The implementation worked for `zsignatures=` — the one strategy the request
+exercised — and broke the other two with `TypeError: mul got incompatible shapes for broadcasting: (24,),
+(23,)` from inside the jitted scan, which is *worse* than the error it replaced. The shipped behaviour is
+a message naming the size and `uniquify_states`, identical across all three strategies.
+
+**Three defects the guard itself went through, all found by review after the fact:**
+
+- **It checked `vec`'s length when the constraint binds `states`.** `get_xsource` reshards one entry per
+  state, so a divisible `vec` against an indivisible `states` passed the guard and hit the raw jax error
+  the guard exists to replace. Every test arm sized both arrays together, so the substitution was
+  invisible to them — the arm that catches it builds them at *different* lengths deliberately.
+- **It read `vec.shape[0]` where the kernel broadcasts over a leading batch axis.** A valid `(2, 24)` call
+  against 24 states was rejected as "vec length 2 disagrees with 24 states". `shape[-1]` is the data axis.
+  Mutating it back produces "24 disagrees with 24", which is the tell.
+- **One shared error message cannot serve both callers.** While `hproj` still had a divisibility check,
+  the message named `uniquify_states` for both — but `hproj` takes *unpacked* binary rows and that
+  function pads with `255`, so following the advice literally raised ``states` must be binary`. Fixed by
+  per-caller wording, then made moot when `hproj` stopped supporting meshes at all.
+
+**`sqd`'s return does not round-trip**, which is worth knowing because it is the request's motivating
+case: the eigenvector is trimmed to the genuine uniques, so its length is precisely what fails
+divisibility. Build the subspace at a divisible `states_size` instead.
+
+### `hproj` does not support sharding, and rejecting is simpler than fixing (2026-09-15)
+
+`hproj` failed under a mesh at **every** subspace size, divisible or not: `columns[valid]` is a
+boolean-mask gather on the partitioned array `get_xsource` returns, and XLA cannot resolve an output spec
+for it (`ShardingTypeError`). Pre-existing — confirmed against `1a339e8^`.
+
+It was first fixed (bring the arrays to the host before masking, add the divisibility check) and then the
+fix was **withdrawn** in favour of an explicit `ValueError`, because nothing wants it: `hproj` returns a
+host scipy matrix, `spinchain` never calls it, and every in-tree caller —
+`examples/scaling/poc7_sharding.py` (7a and 7c), `poc24`, `poc25`, `tests/_sharded_eigvec_roundtrip.py` —
+already calls it *outside* its `with jax.set_mesh(...)` block, using it as the unsharded oracle.
+
+Rejecting removed 17 lines and retired two bug classes: the per-caller error wording above, and a
+limitation that could be documented but never tested (the host transfer is single-process only by
+construction, since the arrays are genuinely partitioned and a multi-process rank owns only its own
+shards — virtual devices are one process, so no test can reach it).
+
+The check goes **before** the `np.unique`/`_is_lex_sorted` pass, for the same reason `_MAX_STATES` does:
+reading `get_abstract_mesh().empty` is O(1), so a doomed call should not pay the O(N) host sort first.
+Measured 0.57 ms to reject 4096 states on the lex-sort path.
+
 ### Why `tests/_sharded_*.py` are files rather than inline strings
 
 The leading underscore keeps them uncollected; `test_sqd.py::TestShardedCacheLevels` subprocesses

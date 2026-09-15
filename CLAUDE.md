@@ -258,7 +258,10 @@ ingest). Terms are grouped by unique X signature, Z groups zero-padded to a rect
 ### `sqd.py` — sample-based quantum diagonalization
 
 Project a Pauli-sum Hamiltonian onto the subspace spanned by computational-basis bitstrings and solve
-matrix-free. `sqd(...)` is the entry point, `hproj(...)` the dense/debug path.
+matrix-free. `sqd(...)` is the entry point, `hproj(...)` the dense/debug path — and `hproj` **raises under
+a mesh**, deliberately: it returns a host scipy matrix, so sharding buys it nothing. Call it outside the
+mesh context (`examples/scaling/poc7_sharding.py` is the pattern, building its dense oracle outside its
+own `with jax.set_mesh(...)` block).
 
 **Return shapes.** `sqd` returns 3 values with `return_eigvec=True` (`eigval, eigvec, basis`) and a bare
 `float` otherwise — not a 5-tuple; the convergence flag and subspace dim are consumed inside `sqd`,
@@ -395,7 +398,8 @@ raises — its matvec is a `jax.lax.dot`, which rejects a rank-2 rhs. **`(1, 2)`
 lose**: both axes cached leaves no per-matvec setup to share, so only the stack cost remains — 0.93× at
 N=2k, recovering to 1.04–1.09× by N=8k–30k as it amortizes. Every other level measured 1.20–1.24×. Left
 on by default anyway: `(1, 2)` needs the whole diagonal cache resident, so it is the rarest level. The contract is "broadcasts over a
-leading axis of *any* size", not just 2. **Memory depends on the operator and the two regimes have
+leading axis of *any* size", not just 2 — so **any new length check on `vec` must read `shape[-1]`**; a
+`shape[0]` check rejected a valid `(2, N)` call as "vec length 2". **Memory depends on the operator and the two regimes have
 opposite signs** — measured, not reasoned: against `sqd`'s matvec, whole-`run_sqd` temp *falls* a flat
 −16.00 B/slot (0.942×, N=4000–60000), because the unbatched arm holds two gather results live where the
 batched arm holds one `(2, N)` buffer; against an elementwise operator with no gather to save, it rises
@@ -469,6 +473,20 @@ runtime assertion can pin this.
 *caller's* job. Examples establish the pattern: a single axis named `'x'` with `AxisType.Explicit`, plus
 `jax.config.update('jax_enable_x64', True)` (without x64 you silently get complex64/int32).
 
+**Two mesh accessors, and the choice is forced, not stylistic.** `get_abstract_mesh()` is the default and
+is the only one callable under tracing — `jax.sharding.get_mesh()` raises `get_mesh can only be used
+outside of jax.jit`. But `device_put` rejects an `AbstractMesh` (`is_fully_addressable is not
+implemented`), so a host-side placement must use `get_mesh()` and must be skipped under tracing. That is
+why `_place_vec` leads with `isinstance(vec, jax.core.Tracer)`; `jax.core` needs an explicit `import
+jax.core` or `ty` warns the submodule may be unimported.
+
+**To test whether an array is on the live mesh, compare mesh *identity*, not `isinstance(vec,
+jax.Array)`.** A `jax.Array` committed to one device carries an **empty** mesh exactly as a host numpy
+array does, so the isinstance form passes it straight through to whatever error placement exists to
+prevent. `jax.typeof(vec).sharding.mesh is mesh.abstract_mesh` is the check; `jax.typeof` is also what
+normalizes a committed array's `SingleDeviceSharding` (which has no `.mesh` at all) into a comparable
+`NamedSharding`.
+
 **Don't index a sharded array to read one element.** `seed.at[i].add(f(seed[i]))` is correct arithmetic
 but emits an `all-gather` per read, each materializing the whole vector on every device — which is what
 `ground_locg`'s single-vector budget exists to avoid. Use a `broadcasted_iota` mask and an elementwise
@@ -533,6 +551,18 @@ in it.
   break rather than a shim, so the six valid input sets become the only constructible ones. Bind the
   *arrays* for a matvec thunk (`functools.partial(apply_h, xsources=xs, diagonals=dg)`), not the
   `cache_level`.
+- **`apply_h` places a host `vec` on the live mesh for you, but will not round its length.** With an
+  `xsignatures=` strategy the state count must divide `mesh.size`, because `get_xsource` reshards one entry
+  per state; the error names the size and `uniquify_states`. It binds **`states`, not `vec`** — checking
+  `vec` let a divisible vector against an indivisible `states` reach the raw jax message. `xsources=`
+  reshards nothing and takes any length. Rounding is **declined, not unimplemented**: `diagonals` is
+  `(n_groups, n_states)` and `diag_signs` is `(n_states, n_zbytes)`, so no single pad axis serves both and
+  padding only `vec`/`states` breaks the other two strategies with a broadcast `TypeError` from inside the
+  scan. `docs/rqutils-apply-h-mesh-response.md` has the argument; the implementation is recoverable at
+  `1a339e8`.
+- **`hproj` raises under a mesh.** It was broken under one at *every* subspace size (a boolean-mask gather
+  on the partitioned `get_xsource` output raises `ShardingTypeError`), and nothing wants it sharded, so it
+  rejects rather than half-supports. Rejected before the O(N) sort, like the `_MAX_STATES` check.
 - **`sqd(..., packed=True)` returns *packed* states.** One flag governs both directions, so a round trip
   needs no re-pack — which also removes a hazard, `pack_states` not being idempotent. A caller comparing
   the result against an unpacked array breaks loudly on the shape mismatch. Both overloads annotate
