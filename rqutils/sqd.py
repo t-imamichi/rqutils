@@ -1969,13 +1969,11 @@ def apply_h(
     ``zsignatures``/``diag_signs``/``diagonals`` the second, and ``coeffs`` is required by the two
     diagonal strategies that compute rather than read a diagonal.
 
-    **Under a mesh** ``vec`` is placed on the live mesh automatically, so ``sqd``'s own return feeds
-    straight back in. Two constraints stay the caller's: with an ``xsignatures=`` strategy every
-    per-state array must have a length divisible by the device count, since ``get_xsource`` partitions
-    it -- ``uniquify_states(states, states_size)`` pads to any size, and ``sqd``'s return is trimmed to
-    the genuine uniques so it needs re-padding -- and a ``states`` passed already sharded must be
-    replicated. Its ``255`` filler is load-bearing: a zero-filled pad is a reachable state that real
-    rows map onto through ``xsource``, so it steals amplitude with nothing raised.
+    **Under a mesh** ``vec`` is placed on the live mesh automatically. Two constraints stay the
+    caller's: with an ``xsignatures=`` strategy the state count must divide the device count, since
+    ``get_xsource`` partitions per state -- size the arrays through ``uniquify_states(states,
+    states_size)``, including ``sqd``'s return, which is trimmed to the genuine uniques -- and a
+    ``states`` passed already sharded must be replicated, its ``255`` filler being load-bearing.
 
     Args:
         vec: Vector to multiply. Placed on the live mesh unless already there.
@@ -1992,8 +1990,7 @@ def apply_h(
         coeffs: Pauli coefficients per group. Required by ``zsignatures`` and ``diag_signs``.
 
     Returns:
-        :math:`Hv`. Under a mesh with an ``xsignatures=`` strategy this is rounded up to a multiple of
-        the device count, so it can be longer than ``vec``; the added entries are zero.
+        :math:`Hv`.
 
     Raises:
         ValueError: If the named arrays do not select exactly one X source and one diagonal strategy
@@ -2061,39 +2058,41 @@ def apply_h(
     _check_array_role(xname, xarray)
     _check_array_role(dname, darray)
 
-    # Only `xaxis == 0` reshards (via `get_xsource`), so only it needs a divisible length.
-    vec = _place_vec(vec, require_divisible=xaxis == 0)
+    # `states`, not `vec`: `get_xsource` reshards one entry per state, and only `xaxis == 0` gets there.
+    vec = _place_vec(vec, states if xaxis == 0 else None)
 
     return _apply_h_kernel(
         vec, _pack_scanned(cache_level, xarray, darray, coeffs), states, cache_level
     )
 
 
-def _place_vec(vec: NDArray[np.inexact], require_divisible: bool) -> NDArray[np.inexact]:
+def _place_vec(vec: NDArray[np.inexact], divisible: StateList | None) -> NDArray[np.inexact]:
     """Put `vec` on the live mesh, replicated; return it unchanged when there is no mesh.
-
-    Skipped under tracing: `apply_h` doubles as `ground_locg`'s `matvec`, and `get_mesh` raises
-    inside a jit (`tests/_sharded_sqd_prefilter.py` reaches it).
 
     Keyed on mesh *identity*, not `isinstance(vec, jax.Array)`: a committed `jax.Array` carries an
     empty mesh just as a host array does, so that guard passed it through to the "Resource axis" error
-    this prevents. `get_mesh`, not `get_abstract_mesh`: `device_put` rejects an `AbstractMesh`.
+    this prevents. `get_mesh`, not `get_abstract_mesh`: `device_put` rejects an `AbstractMesh`. Skipped
+    under tracing, where `get_mesh` raises.
 
-    The length is *named*, not rounded. Padding it here would have to pad every per-state array to
-    match, and `diagonals` (state axis trailing) and `diag_signs` (leading) cannot share one pad -- so
-    the caller sizes them all through `uniquify_states`, which jax's own message does not point at.
+    Args:
+        vec: Vector to place.
+        divisible: States whose row count must divide the device count, or None to skip that check.
 
     Raises:
-        ValueError: If ``require_divisible`` and the length is not a multiple of the device count.
+        ValueError: If ``divisible``'s row count is not a multiple of the device count, or disagrees
+            with ``len(vec)``.
     """
     if isinstance(vec, jax.core.Tracer) or (mesh := jax.sharding.get_mesh()).empty:
         return vec
-    if require_divisible and (resid := vec.shape[0] % mesh.size) != 0:
-        raise ValueError(
-            f"apply_h: vec length {vec.shape[0]} is not a multiple of the {mesh.size} mesh devices; "
-            f"size every per-state array to {vec.shape[0] + mesh.size - resid}, e.g. "
-            f"uniquify_states(states, {vec.shape[0] + mesh.size - resid})"
-        )
+    if divisible is not None:
+        if (n := divisible.shape[0]) != vec.shape[0]:
+            raise ValueError(f"apply_h: vec length {vec.shape[0]} disagrees with {n} states")
+        if (resid := n % mesh.size) != 0:
+            size = n + mesh.size - resid
+            raise ValueError(
+                f"apply_h: {n} states is not a multiple of the {mesh.size} mesh devices; size every "
+                f"per-state array to {size}, e.g. uniquify_states(states, {size})"
+            )
     if jax.typeof(vec).sharding.mesh is mesh.abstract_mesh:
         return vec
     return jax.device_put(vec, jax.sharding.NamedSharding(mesh, PartitionSpec()))

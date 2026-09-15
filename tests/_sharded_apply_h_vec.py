@@ -74,6 +74,14 @@ def main() -> None:
         except ValueError as exc:
             print(f"{name}_named {str(size) in str(exc)}")
 
+    # A DIVISIBLE vec against an indivisible states: the check must read `states`, since that is what
+    # `get_xsource` reshards. Reading `vec`'s length passed this straight through to the raw jax error.
+    try:
+        apply_h(vec, xsignatures=x, zsignatures=z, coeffs=c, states=st)
+        print("mismatch_named False")
+    except ValueError as exc:
+        print(f"mismatch_named {str(exc).startswith('apply_h:')}")
+
     # An `xsources=` strategy does no search, so no reshard and no divisibility requirement.
     xs = np.stack([np.asarray(get_xsource(xi, states)) for xi in x])[:, :NUM_STATES]
     kept = apply_h(short, xsources=xs, diagonals=np.ones((len(x), NUM_STATES)))

@@ -2715,22 +2715,12 @@ class TestShardedCacheLevels:
 class TestShardedApplyHVec:
     """A host ``vec`` must work under a mesh, and an indivisible length must name the fix.
 
-    ``apply_xgrp`` gathers with ``out_sharding=jax.typeof(vec).sharding``, so a host array carried an
-    *empty* mesh into a gather whose index array is partitioned: "Resource axis: x of P('x',) is not
-    found in mesh: ()". ``sqd`` never hit it -- it builds its vector inside its own jit -- but its
-    **return** is a host array, so feeding an eigenvector back into ``apply_h`` raised. Verified by
-    reverting ``_place_vec``'s call site: the child dies with exactly that message.
+    Two mutants this kills, both of which raised "Resource axis: x of P('x',) is not found in mesh:
+    ()": dropping ``_place_vec``'s call, and testing ``isinstance(vec, jax.Array)`` instead of mesh
+    identity -- a committed ``jax.Array`` carries an empty mesh exactly as a host array does.
 
-    **A ``jax.Array`` committed to one device is the same defect**, which is why the guard tests the
-    sharding's mesh rather than ``isinstance(vec, jax.Array)``. Measured: an isinstance guard passed
-    ``jax.device_put(v, jax.devices()[0])`` straight through to that identical raise, because a
-    committed array's sharding carries an empty mesh exactly as a host array's does.
-
-    An indivisible length is **named, not rounded** -- padding here would have to pad every per-state
-    array to match, and ``diagonals`` (state axis trailing) and ``diag_signs`` (leading) cannot share
-    one pad axis. All three diagonal strategies are checked, because the request doc that motivated
-    this exercised only ``zsignatures=`` and a rounding implementation broke the other two with an
-    opaque "mul got incompatible shapes for broadcasting" from inside the scan.
+    All three diagonal strategies are checked: the request doc exercised only ``zsignatures=``, and a
+    rounding implementation broke the other two.
     """
 
     def test_host_vec_is_placed_and_indivisible_length_names_the_size(self):
@@ -2742,6 +2732,7 @@ class TestShardedApplyHVec:
             "committed",
             "diag_signs_named",
             "diagonals_named",
+            "mismatch_named",
             "placed",
             "spec",
             "xsources_len",
@@ -2754,6 +2745,9 @@ class TestShardedApplyHVec:
         assert float(got["committed"]) == 0.0, "a device-committed vec disagreed with a host vec"
         for name in ("zsignatures", "diagonals", "diag_signs"):
             assert got[f"{name}_named"] == "True", f"{name}= did not name the required length"
+        # The check must read `states`, not `vec`: reading `vec`'s length let a divisible vec with an
+        # indivisible states through to the raw jax error this replaces.
+        assert got["mismatch_named"] == "True", "a vec/states length mismatch was not named"
         # `xsources=` does no search, so no reshard and no divisibility requirement.
         assert int(got["xsources_len"]) == 23, f"xsources length was changed: {got['xsources_len']}"
 
