@@ -1008,6 +1008,13 @@ def hproj(
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
     states = _check_states_shape(states, hamiltonian.num_qubits)
+    # Rejected rather than supported: the return is a host scipy matrix, so a mesh buys nothing. Here
+    # rather than below for the same reason as the ceiling check: O(1), so it precedes the O(N) sort.
+    if not get_abstract_mesh().empty:
+        raise ValueError(
+            "hproj does not support sharding: it builds a host-side scipy matrix, so a mesh buys "
+            "nothing. Call it outside the mesh context, or use sqd() for a sharded solve."
+        )
     # Same int32 ceiling sqd() enforces, since hproj reaches get_xsource too and its returned
     # positions are int32 with -1 as the absent marker. Checked here, before the O(N) sortedness scan
     # and the np.unique below: it is an O(1) look at a shape, so it costs nothing to do first and
@@ -1032,12 +1039,6 @@ def hproj(
                 "than an error deeper in. Pass np.unique(states, axis=0), or leave "
                 "unique_states=False to have hproj do it."
             )
-    # Rejected rather than supported: the return is a host scipy matrix, so a mesh buys nothing.
-    if not get_abstract_mesh().empty:
-        raise ValueError(
-            "hproj does not support sharding: it builds a host-side scipy matrix, so a mesh buys "
-            "nothing. Call it outside the mesh context, or use sqd() for a sharded solve."
-        )
     states_p = PauliSumXZ.pack_states(states)
 
     columns, elements = _hproj_cols_elems(hamiltonian, states_p)
@@ -2004,7 +2005,9 @@ def apply_h(
         ValueError: If the named arrays do not select exactly one X source and one diagonal strategy
             (including naming none at all); if ``coeffs`` is missing where required or supplied
             alongside ``diagonals``; or if ``states`` is None while the resolved ``cache_level`` has a
-            0 in either position.
+            0 in either position. Under a mesh with an ``xsignatures=`` strategy, also if ``states``
+            disagrees with ``vec``'s trailing axis, or if its row count does not divide the device
+            count.
     """
     # Each axis is one list of (keyword name, cache_level digit, array). Pairing the three together
     # means an axis is filtered, validated and unpacked from a single place -- no name-to-digit table
