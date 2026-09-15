@@ -2729,6 +2729,8 @@ class TestShardedApplyHVec:
         got = dict(line.split(maxsplit=1) for line in stdout.strip().splitlines() if " " in line)
         # Completeness before values: a child that died partway would otherwise pass on what it got.
         assert set(got) == {
+            "batched_agrees",
+            "batched_shape",
             "committed",
             "diag_signs_named",
             "diagonals_named",
@@ -2745,6 +2747,12 @@ class TestShardedApplyHVec:
         assert float(got["committed"]) == 0.0, "a device-committed vec disagreed with a host vec"
         for name in ("zsignatures", "diagonals", "diag_signs"):
             assert got[f"{name}_named"] == "True", f"{name}= did not name the required length"
+        # The length check reads shape[-1]: the kernel broadcasts over a leading batch axis of any
+        # size, and reading shape[0] rejected a valid (2, 24) vec as "vec length 2".
+        assert got["batched_shape"] == "2x24", f"batched vec reshaped: {got['batched_shape']}"
+        assert float(got["batched_agrees"]) == 0.0, (
+            "a batched row disagreed with the unbatched call"
+        )
         # The check must read `states`, not `vec`: reading `vec`'s length let a divisible vec with an
         # indivisible states through to the raw jax error this replaces.
         assert got["mismatch_named"] == "True", "a vec/states length mismatch was not named"

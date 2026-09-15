@@ -74,6 +74,14 @@ def main() -> None:
         except ValueError as exc:
             print(f"{name}_named {str(size) in str(exc)}")
 
+    # A batched `(k, N)` vec: the kernel broadcasts over a leading axis of any size, so the length
+    # check must read shape[-1]. Reading shape[0] rejected this as "vec length 2 disagrees with 24".
+    batched = np.asarray(
+        apply_h(np.stack([vec, vec * 2.0]), xsignatures=x, zsignatures=z, coeffs=c, states=states)
+    )
+    print(f"batched_shape {batched.shape[0]}x{batched.shape[1]}")
+    print(f"batched_agrees {float(np.abs(batched[0] - np.asarray(out)).max()):.15e}")
+
     # A DIVISIBLE vec against an indivisible states: the check must read `states`, since that is what
     # `get_xsource` reshards. Reading `vec`'s length passed this straight through to the raw jax error.
     try:

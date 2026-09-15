@@ -1032,10 +1032,13 @@ def hproj(
                 "unique_states=False to have hproj do it."
             )
     # After uniquification, which settles the count `get_xsource` reshards over.
-    _check_mesh_divisible(states.shape[0], "hproj")
+    _check_mesh_divisible(
+        states.shape[0], "hproj", "pass {size} basis rows (this count is after uniquification)"
+    )
     states_p = PauliSumXZ.pack_states(states)
 
     # To the host before masking: a boolean-mask gather on a sharded array raises ShardingTypeError.
+    # Single-process only -- these are partitioned, so a multi-process rank owns just its own shards.
     columns, elements = (np.asarray(a) for a in _hproj_cols_elems(hamiltonian, states_p))
     valid = columns != -1
     rows = np.tile(np.arange(states.shape[0])[None, :], (columns.shape[0], 1))[valid]
@@ -1972,11 +1975,12 @@ def apply_h(
     ``zsignatures``/``diag_signs``/``diagonals`` the second, and ``coeffs`` is required by the two
     diagonal strategies that compute rather than read a diagonal.
 
-    **Under a mesh** ``vec`` is placed on the live mesh automatically. Two constraints stay the
-    caller's: with an ``xsignatures=`` strategy the state count must divide the device count, since
-    ``get_xsource`` partitions per state -- size the arrays through ``uniquify_states(states,
-    states_size)``, including ``sqd``'s return, which is trimmed to the genuine uniques -- and a
-    ``states`` passed already sharded must be replicated, its ``255`` filler being load-bearing.
+    **Under a mesh** ``vec`` is placed on the live mesh automatically, batch axis and all. Two
+    constraints stay the caller's: with an ``xsignatures=`` strategy the state count must divide the
+    device count, since ``get_xsource`` partitions per state -- build the subspace with
+    ``uniquify_states(states, states_size)`` at a divisible ``states_size``, **not** from ``sqd``'s
+    return, which is trimmed to the genuine uniques and so is the one input guaranteed to fail -- and
+    a ``states`` passed already sharded must be replicated, its ``255`` filler being load-bearing.
 
     Args:
         vec: Vector to multiply. Placed on the live mesh unless already there.
@@ -2069,11 +2073,15 @@ def apply_h(
     )
 
 
-def _check_mesh_divisible(num_states: int, caller: str) -> None:
-    """Raise unless the state count divides the mesh, naming the size to pass `uniquify_states`.
+def _check_mesh_divisible(num_states: int, caller: str, remedy: str) -> None:
+    """Raise unless the state count divides the mesh, naming how to reach the next valid size.
 
     `get_xsource` reshards one entry per state, so every caller reaching it needs this -- `apply_h`
-    and `hproj` both do. jax's own message names neither `uniquify_states` nor `states_size`.
+    and `hproj` both do. jax's own message names neither the size nor the call that produces it.
+
+    The remedy differs per caller, so it is passed in: `apply_h` takes packed states and can route
+    through `uniquify_states`, while `hproj` takes unpacked binary rows that its 255 filler would
+    make non-binary.
 
     Raises:
         ValueError: If ``num_states`` is not a multiple of the device count.
@@ -2083,8 +2091,8 @@ def _check_mesh_divisible(num_states: int, caller: str) -> None:
         return
     size = -(-num_states // mesh.size) * mesh.size
     raise ValueError(
-        f"{caller}: {num_states} states is not a multiple of the {mesh.size} mesh devices; size "
-        f"every per-state array to {size}, e.g. uniquify_states(states, {size})"
+        f"{caller}: {num_states} states is not a multiple of the {mesh.size} mesh devices; "
+        f"{remedy.format(size=size)}"
     )
 
 
@@ -2107,9 +2115,14 @@ def _place_vec(vec: NDArray[np.inexact], divisible: StateList | None) -> NDArray
     if isinstance(vec, jax.core.Tracer) or (mesh := jax.sharding.get_mesh()).empty:
         return vec
     if divisible is not None:
-        if (n := divisible.shape[0]) != vec.shape[0]:
-            raise ValueError(f"apply_h: vec length {vec.shape[0]} disagrees with {n} states")
-        _check_mesh_divisible(n, "apply_h")
+        # shape[-1], not shape[0]: the kernel broadcasts over a leading batch axis of any size.
+        if (n := divisible.shape[0]) != vec.shape[-1]:
+            raise ValueError(f"apply_h: vec length {vec.shape[-1]} disagrees with {n} states")
+        _check_mesh_divisible(
+            n,
+            "apply_h",
+            "size every per-state array to {size}, e.g. uniquify_states(states, {size})",
+        )
     if jax.typeof(vec).sharding.mesh is mesh.abstract_mesh:
         return vec
     return jax.device_put(vec, jax.sharding.NamedSharding(mesh, PartitionSpec()))
