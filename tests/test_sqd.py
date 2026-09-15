@@ -2761,31 +2761,38 @@ class TestShardedApplyHVec:
 
 
 class TestShardedHproj:
-    """``hproj`` must work under a mesh, and an indivisible subspace must name the fix.
+    """``hproj`` must reject a live mesh, and still work once the mesh context exits.
 
-    Two separate defects, both pre-existing and both reproduced before the fix. The mask gather
-    ``columns[valid]`` on a sharded array raised ``ShardingTypeError`` ("output PartitionSpec ...
-    could not be resolved"), so *every* mesh-enabled call failed at any size; and an indivisible
-    subspace reached ``get_xsource``'s reshard, giving jax's own message rather than one naming
-    ``uniquify_states``. ``hproj`` returns a scipy matrix, so the arrays come to the host first.
+    It returns a host scipy matrix, so a mesh buys it nothing -- and every mesh-enabled call failed
+    anyway, at any subspace size: ``columns[valid]`` is a boolean-mask gather on the partitioned array
+    ``get_xsource`` returns, which raises ``ShardingTypeError``. Rejected explicitly rather than
+    half-supported. ``examples/scaling/poc7_sharding.py`` is the pattern that must keep working: it
+    builds its dense reference with ``hproj`` *outside* its ``with jax.set_mesh(...)`` block.
     """
 
-    def test_hproj_agrees_sharded_and_names_indivisible_subspace(self):
+    def test_hproj_rejects_a_mesh_and_works_outside_one(self):
         stdout = run_sharded_child("_sharded_hproj.py", "hproj")
 
         got = dict(line.split(maxsplit=1) for line in stdout.strip().splitlines() if " " in line)
         assert set(got) == {
-            "agrees_20",
-            "agrees_24",
-            "named",
-            "symmetric_20",
-            "symmetric_24",
+            "after_scope_agrees",
+            "global_raised_23",
+            "global_raised_24",
+            "no_mesh_shapes",
+            "scoped_raised",
         }, f"child did not print every case, got {sorted(got)}:\n{stdout[-2000:]}"
-        # Exactly 0.0: a replicated run agrees with single-device bit-for-bit, not to a tolerance.
-        for n in (20, 24):
-            assert float(got[f"agrees_{n}"]) == 0.0, f"{n} states disagreed with single-device"
-            assert float(got[f"symmetric_{n}"]) == 0.0, f"{n}-state projection is not symmetric"
-        assert got["named"] == "True", "an indivisible subspace did not name uniquify_states"
+        # Without a mesh both sizes work: hproj never cared about mesh divisibility.
+        assert got["no_mesh_shapes"] == "[23, 24]", (
+            f"unsharded hproj broke: {got['no_mesh_shapes']}"
+        )
+        assert got["scoped_raised"] == "True", "hproj did not reject a scoped mesh"
+        # A divisible count is not a loophole -- rejection is unconditional.
+        for n in (23, 24):
+            assert got[f"global_raised_{n}"] == "True", f"hproj accepted a mesh at {n} states"
+        # Exactly 0.0: leaving the mesh context must restore the single-device result bit-for-bit.
+        assert float(got["after_scope_agrees"]) == 0.0, (
+            "hproj differed after the mesh context exited"
+        )
 
 
 class TestHostScalar:

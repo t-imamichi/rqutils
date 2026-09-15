@@ -999,7 +999,8 @@ def hproj(
         The projected Hamiltonian as a sparse matrix.
 
     Raises:
-        ValueError: If ``unique_states=True`` and ``states`` is not strictly increasing in
+        ValueError: If a mesh is set -- ``hproj`` is single-device only; if ``unique_states=True`` and
+            ``states`` is not strictly increasing in
             lexicographic order (unsorted, or containing duplicate rows); or if the subspace exceeds
             :math:`2^{31} - 1` states, the ceiling imposed by the int32 indices
             :func:`get_xsource` returns.
@@ -1031,19 +1032,19 @@ def hproj(
                 "than an error deeper in. Pass np.unique(states, axis=0), or leave "
                 "unique_states=False to have hproj do it."
             )
-    # After uniquification, which settles the count `get_xsource` reshards over.
-    _check_mesh_divisible(
-        states.shape[0], "hproj", "pass {size} basis rows (this count is after uniquification)"
-    )
+    # Rejected rather than supported: the return is a host scipy matrix, so a mesh buys nothing.
+    if not get_abstract_mesh().empty:
+        raise ValueError(
+            "hproj does not support sharding: it builds a host-side scipy matrix, so a mesh buys "
+            "nothing. Call it outside the mesh context, or use sqd() for a sharded solve."
+        )
     states_p = PauliSumXZ.pack_states(states)
 
-    # To the host before masking: a boolean-mask gather on a sharded array raises ShardingTypeError.
-    # Single-process only -- these are partitioned, so a multi-process rank owns just its own shards.
-    columns, elements = (np.asarray(a) for a in _hproj_cols_elems(hamiltonian, states_p))
+    columns, elements = _hproj_cols_elems(hamiltonian, states_p)
     valid = columns != -1
     rows = np.tile(np.arange(states.shape[0])[None, :], (columns.shape[0], 1))[valid]
-    data = elements[valid]
-    cols = columns[valid]
+    data = np.array(elements[valid])
+    cols = np.array(columns[valid])
     # shape= is mandatory here, not cosmetic: without it scipy infers the extent from the largest
     # index present, so a trailing basis state that no term couples into is dropped and the matrix
     # comes back too small (measured 41x41 for a 53-state subspace with local two-site js
@@ -2073,15 +2074,11 @@ def apply_h(
     )
 
 
-def _check_mesh_divisible(num_states: int, caller: str, remedy: str) -> None:
-    """Raise unless the state count divides the mesh, naming how to reach the next valid size.
+def _check_mesh_divisible(num_states: int) -> None:
+    """Raise unless the state count divides the mesh, naming the size to pass `uniquify_states`.
 
-    `get_xsource` reshards one entry per state, so every caller reaching it needs this -- `apply_h`
-    and `hproj` both do. jax's own message names neither the size nor the call that produces it.
-
-    The remedy differs per caller, so it is passed in: `apply_h` takes packed states and can route
-    through `uniquify_states`, while `hproj` takes unpacked binary rows that its 255 filler would
-    make non-binary.
+    `get_xsource` reshards one entry per state. jax's own message names neither the size nor the call
+    that produces it.
 
     Raises:
         ValueError: If ``num_states`` is not a multiple of the device count.
@@ -2091,8 +2088,8 @@ def _check_mesh_divisible(num_states: int, caller: str, remedy: str) -> None:
         return
     size = -(-num_states // mesh.size) * mesh.size
     raise ValueError(
-        f"{caller}: {num_states} states is not a multiple of the {mesh.size} mesh devices; "
-        f"{remedy.format(size=size)}"
+        f"apply_h: {num_states} states is not a multiple of the {mesh.size} mesh devices; size "
+        f"every per-state array to {size}, e.g. uniquify_states(states, {size})"
     )
 
 
@@ -2118,11 +2115,7 @@ def _place_vec(vec: NDArray[np.inexact], divisible: StateList | None) -> NDArray
         # shape[-1], not shape[0]: the kernel broadcasts over a leading batch axis of any size.
         if (n := divisible.shape[0]) != vec.shape[-1]:
             raise ValueError(f"apply_h: vec length {vec.shape[-1]} disagrees with {n} states")
-        _check_mesh_divisible(
-            n,
-            "apply_h",
-            "size every per-state array to {size}, e.g. uniquify_states(states, {size})",
-        )
+        _check_mesh_divisible(n)
     if jax.typeof(vec).sharding.mesh is mesh.abstract_mesh:
         return vec
     return jax.device_put(vec, jax.sharding.NamedSharding(mesh, PartitionSpec()))

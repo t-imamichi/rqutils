@@ -1,4 +1,4 @@
-"""Run ``hproj`` on a 4-device mesh, printing the projection's agreement with a single-device one.
+"""Check that ``hproj`` rejects a live mesh, and still works once the mesh context exits.
 
 Driven by ``test_sqd.py::TestShardedHproj``. A file rather than an inline blob so ruff and ty check
 it; not collected by pytest (leading underscore) because the virtual device count must be set before
@@ -29,25 +29,32 @@ def basis(count: int) -> np.ndarray:
 
 def main() -> None:
     ham = SparsePauliOp(["XXIIII", "IIZZII", "IXIZII"], [0.7, -1.3, 0.4])
+    # 23 is indivisible by 4, 24 divisible: neither is supported under a mesh, and both must work
+    # without one -- the divisibility of the subspace is irrelevant to hproj either way.
+    reference = {n: hproj(ham, basis(n)).toarray() for n in (23, 24)}
+    print(f"no_mesh_shapes {[reference[n].shape[0] for n in (23, 24)]}")
 
-    # Single-device reference first, before any mesh exists.
-    single = {n: hproj(ham, basis(n)).toarray() for n in (MESH_SIZE * 5, MESH_SIZE * 6)}
+    mesh = jax.make_mesh((MESH_SIZE,), ("x",), (AxisType.Explicit,))
 
-    jax.set_mesh(jax.make_mesh((MESH_SIZE,), ("x",), (AxisType.Explicit,)))
+    # Scoped mesh: `hproj` inside must raise, outside must work. This is poc7_sharding.py's pattern,
+    # which builds its dense reference outside the `with` block.
+    with jax.set_mesh(mesh):
+        try:
+            hproj(ham, basis(24))
+            print("scoped_raised False")
+        except ValueError as exc:
+            print(f"scoped_raised {'does not support sharding' in str(exc)}")
+    after = hproj(ham, basis(24)).toarray()
+    print(f"after_scope_agrees {float(np.abs(after - reference[24]).max()):.15e}")
 
-    # Divisible counts must work and agree exactly: a boolean-mask gather on the sharded `columns`
-    # raised ShardingTypeError, so every mesh-enabled hproj call failed at any size.
-    for n, ref in single.items():
-        got = hproj(ham, basis(n)).toarray()
-        print(f"agrees_{n} {float(np.abs(got - ref).max()):.15e}")
-        print(f"symmetric_{n} {float(np.abs(got - got.T).max()):.15e}")
-
-    # An indivisible count must name uniquify_states rather than raising jax's own message.
-    try:
-        hproj(ham, basis(MESH_SIZE * 5 + 3))
-        print("named False")
-    except ValueError as exc:
-        print(f"named {str(exc).startswith('hproj:')}")
+    # Globally set mesh: both sizes rejected, so a divisible count is no loophole.
+    jax.set_mesh(mesh)
+    for n in (23, 24):
+        try:
+            hproj(ham, basis(n))
+            print(f"global_raised_{n} False")
+        except ValueError as exc:
+            print(f"global_raised_{n} {'does not support sharding' in str(exc)}")
 
 
 if __name__ == "__main__":
