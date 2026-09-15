@@ -2712,6 +2712,67 @@ class TestShardedCacheLevels:
             )
 
 
+class TestShardedApplyHVec:
+    """A host ``vec`` must work under a mesh, and an indivisible length must name the fix.
+
+    ``apply_xgrp`` gathers with ``out_sharding=jax.typeof(vec).sharding``, so a host array carried an
+    *empty* mesh into a gather whose index array is partitioned: "Resource axis: x of P('x',) is not
+    found in mesh: ()". ``sqd`` never hit it -- it builds its vector inside its own jit -- but its
+    **return** is a host array, so feeding an eigenvector back into ``apply_h`` raised. Verified by
+    reverting ``_place_vec``'s call site: the child dies with exactly that message.
+
+    **A ``jax.Array`` committed to one device is the same defect**, which is why the guard tests the
+    sharding's mesh rather than ``isinstance(vec, jax.Array)``. Measured: an isinstance guard passed
+    ``jax.device_put(v, jax.devices()[0])`` straight through to that identical raise, because a
+    committed array's sharding carries an empty mesh exactly as a host array's does.
+
+    An indivisible length is **rounded**, both arrays together: ``vec`` with zeros and ``states`` with
+    ``255`` filler, which is the policy ``sqd`` already applies to its own inputs (``sqd.py:878``).
+    Padding either alone would be a silent wrong answer, since the two fillers differ, so one function
+    owns both. Only ``xsignatures=`` needs it -- ``get_xsource``'s reshard is the sole partitioning
+    step, so an ``xsources=`` call keeps whatever length it was given.
+    """
+
+    def test_host_vec_is_placed_and_length_is_rounded(self):
+        stdout = run_sharded_child("_sharded_apply_h_vec.py", "apply_h")
+
+        got = dict(line.split(maxsplit=1) for line in stdout.strip().splitlines() if " " in line)
+        # Completeness before values: a child that died partway would otherwise pass on what it got.
+        assert set(got) == {
+            "committed",
+            "diag_signs_named",
+            "diagonals_named",
+            "mismatch_raised",
+            "placed",
+            "rounded_agrees",
+            "rounded_len",
+            "rounded_pad",
+            "spec",
+            "xsources_len",
+        }, f"child did not print every case, got {sorted(got)}:\n{stdout[-2000:]}"
+        assert float(got["placed"]) == pytest.approx(4.738728797964961e-02, rel=1e-9)
+        # Replicated, not partitioned -- a partitioned vec hits `get_diagonal`'s vmap.
+        assert got["spec"] == "P(None,)", f"expected a replicated result, got {got['spec']}"
+        # Exactly 0.0: the two arms must agree bit-for-bit, not merely to a tolerance.
+        assert float(got["committed"]) == 0.0, "a device-committed vec disagreed with a host vec"
+        # 23 rounds to 24 on 4 devices, the pad row stays zero, and the real rows are unchanged.
+        assert int(got["rounded_len"]) == 24, f"length not rounded, got {got['rounded_len']}"
+        assert float(got["rounded_pad"]) == 0.0, "the pad row carries amplitude"
+        assert float(got["rounded_agrees"]) < 1e-15, (
+            f"rounded result disagrees with the hand-padded one by {got['rounded_agrees']}"
+        )
+        # `xsources=` does no search, so its length must survive untouched.
+        assert int(got["xsources_len"]) == 23, f"xsources length was rounded: {got['xsources_len']}"
+        assert got["mismatch_raised"] == "True", (
+            "a vec/states width mismatch was padded into silence"
+        )
+        # Only `zsignatures=` can round -- the other two diagonals are caller-supplied per-state
+        # arrays, so an unrounded length must name the size rather than reaching the scan, which
+        # raised an opaque "mul got incompatible shapes for broadcasting".
+        assert got["diagonals_named"] == "True", "diagonals= did not name the required length"
+        assert got["diag_signs_named"] == "True", "diag_signs= did not name the required length"
+
+
 class TestHostScalar:
     """``_host_scalar`` must accept every scalar form ``sqd`` can hand it, sharded or not.
 

@@ -204,6 +204,7 @@ from numbers import Number
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 import jax
+import jax.core
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental.multihost_utils import process_allgather
@@ -1968,8 +1969,13 @@ def apply_h(
     ``zsignatures``/``diag_signs``/``diagonals`` the second, and ``coeffs`` is required by the two
     diagonal strategies that compute rather than read a diagonal.
 
+    **Under a mesh** the host-side bookkeeping is done here, so ``sqd``'s own return feeds straight
+    back in: ``vec`` is placed on the live mesh, and an ``xsignatures=`` strategy rounds it and
+    ``states`` up to a multiple of the device count -- so the result can be **longer than** ``vec``
+    (see :func:`_prep_vec`). A ``states`` passed already sharded must be replicated.
+
     Args:
-        vec: Vector to multiply.
+        vec: Vector to multiply. Placed on the live mesh unless already there -- see the note above.
         states: Uniquified state list. Required whenever either element of the resolved
             ``cache_level`` is 0, i.e. for every combination except ``(1, 1)`` and ``(1, 2)`` -- those
             two read neither the X signatures nor the Z signatures, so they need no states at all.
@@ -1983,7 +1989,9 @@ def apply_h(
         coeffs: Pauli coefficients per group. Required by ``zsignatures`` and ``diag_signs``.
 
     Returns:
-        :math:`Hv`.
+        :math:`Hv`. Under a mesh with an ``xsignatures=`` strategy this is rounded up to a multiple of
+        the device count, so it can be longer than ``vec``; the added entries are zero. Under a mesh with an ``xsignatures=`` strategy this is rounded up to a multiple of
+        the device count, so it can be longer than ``vec``; the added entries are zero.
 
     Raises:
         ValueError: If the named arrays do not select exactly one X source and one diagonal strategy
@@ -2051,9 +2059,60 @@ def apply_h(
     _check_array_role(xname, xarray)
     _check_array_role(dname, darray)
 
+    # Only `xaxis == 0` reshards (via `get_xsource`), so only it needs the rounding; a `(1, *)` call
+    # keeps the vector replicated and takes any length.
+    # Only `xaxis == 0` reshards (via `get_xsource`), so only it needs the rounding; and only
+    # `zsignatures=` can supply it, its diagonal coming from the padded `states`. The other two are
+    # caller-supplied per-state arrays with different state axes, so padding them would be guesswork.
+    vec, states = _prep_vec(vec, states, xaxis == 0, daxis == 0, dname)
+
     return _apply_h_kernel(
         vec, _pack_scanned(cache_level, xarray, darray, coeffs), states, cache_level
     )
+
+
+def _prep_vec(
+    vec: NDArray[np.inexact], states: StateList | None, needed: bool, can_pad: bool, dname: str
+) -> tuple[NDArray[np.inexact], StateList | None]:
+    """Put `vec` on the live mesh, rounding it and `states` up to the device count when `pad`.
+
+    Skipped under tracing: `apply_h` doubles as `ground_locg`'s `matvec`, and `get_mesh` raises
+    inside a jit (`tests/_sharded_sqd_prefilter.py` reaches it).
+
+    Both arrays or neither -- the fillers differ (255 for `states`, zero for `vec`), so a length
+    disagreement is a wrong answer rather than a shape error. Bounded by `mesh.size`, so a genuinely
+    short `states` keeps raising instead of being padded into silent agreement.
+
+    Keyed on mesh *identity*, not `isinstance(vec, jax.Array)`: a committed `jax.Array` carries an
+    empty mesh just as a host array does, so that guard passed it through to the "Resource axis" error
+    this prevents. `get_mesh`, not `get_abstract_mesh`: `device_put` rejects an `AbstractMesh`.
+
+    Raises:
+        ValueError: If the length needs rounding but `dname`'s per-state array cannot be padded here.
+    """
+    if isinstance(vec, jax.core.Tracer) or (mesh := jax.sharding.get_mesh()).empty:
+        return vec, states
+    if needed and (resid := (nvec := vec.shape[0]) % mesh.size) != 0:
+        size = nvec + mesh.size - resid
+        if not can_pad:
+            raise ValueError(
+                f"apply_h: vec length {nvec} is not a multiple of the {mesh.size} mesh devices, and "
+                f"{dname}= is per-state, so it cannot be padded here; pass length-{size} arrays "
+                "throughout (uniquify_states takes the size)"
+            )
+        vec = np.append(vec, np.zeros(size - nvec, dtype=vec.dtype))
+        if states is not None and (deficit := size - states.shape[0]) > 0:
+            if deficit >= mesh.size:
+                raise ValueError(
+                    f"apply_h: states has {states.shape[0]} rows against a vec of {nvec}; "
+                    "they must describe one subspace"
+                )
+            states = np.append(
+                states, np.full((deficit, states.shape[1]), 255, dtype=np.uint8), axis=0
+            )
+    if jax.typeof(vec).sharding.mesh is mesh.abstract_mesh:
+        return vec, states
+    return jax.device_put(vec, jax.sharding.NamedSharding(mesh, PartitionSpec())), states
 
 
 @jax.jit(static_argnames=["cache_level"])
