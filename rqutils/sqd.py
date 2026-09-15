@@ -1969,13 +1969,16 @@ def apply_h(
     ``zsignatures``/``diag_signs``/``diagonals`` the second, and ``coeffs`` is required by the two
     diagonal strategies that compute rather than read a diagonal.
 
-    **Under a mesh** the host-side bookkeeping is done here, so ``sqd``'s own return feeds straight
-    back in: ``vec`` is placed on the live mesh, and an ``xsignatures=`` strategy rounds it and
-    ``states`` up to a multiple of the device count -- so the result can be **longer than** ``vec``
-    (see :func:`_prep_vec`). A ``states`` passed already sharded must be replicated.
+    **Under a mesh** ``vec`` is placed on the live mesh automatically, so ``sqd``'s own return feeds
+    straight back in. Two constraints stay the caller's: with an ``xsignatures=`` strategy every
+    per-state array must have a length divisible by the device count, since ``get_xsource`` partitions
+    it -- ``uniquify_states(states, states_size)`` pads to any size, and ``sqd``'s return is trimmed to
+    the genuine uniques so it needs re-padding -- and a ``states`` passed already sharded must be
+    replicated. Its ``255`` filler is load-bearing: a zero-filled pad is a reachable state that real
+    rows map onto through ``xsource``, so it steals amplitude with nothing raised.
 
     Args:
-        vec: Vector to multiply. Placed on the live mesh unless already there -- see the note above.
+        vec: Vector to multiply. Placed on the live mesh unless already there.
         states: Uniquified state list. Required whenever either element of the resolved
             ``cache_level`` is 0, i.e. for every combination except ``(1, 1)`` and ``(1, 2)`` -- those
             two read neither the X signatures nor the Z signatures, so they need no states at all.
@@ -1990,7 +1993,6 @@ def apply_h(
 
     Returns:
         :math:`Hv`. Under a mesh with an ``xsignatures=`` strategy this is rounded up to a multiple of
-        the device count, so it can be longer than ``vec``; the added entries are zero. Under a mesh with an ``xsignatures=`` strategy this is rounded up to a multiple of
         the device count, so it can be longer than ``vec``; the added entries are zero.
 
     Raises:
@@ -2059,60 +2061,42 @@ def apply_h(
     _check_array_role(xname, xarray)
     _check_array_role(dname, darray)
 
-    # Only `xaxis == 0` reshards (via `get_xsource`), so only it needs the rounding; a `(1, *)` call
-    # keeps the vector replicated and takes any length.
-    # Only `xaxis == 0` reshards (via `get_xsource`), so only it needs the rounding; and only
-    # `zsignatures=` can supply it, its diagonal coming from the padded `states`. The other two are
-    # caller-supplied per-state arrays with different state axes, so padding them would be guesswork.
-    vec, states = _prep_vec(vec, states, xaxis == 0, daxis == 0, dname)
+    # Only `xaxis == 0` reshards (via `get_xsource`), so only it needs a divisible length.
+    vec = _place_vec(vec, require_divisible=xaxis == 0)
 
     return _apply_h_kernel(
         vec, _pack_scanned(cache_level, xarray, darray, coeffs), states, cache_level
     )
 
 
-def _prep_vec(
-    vec: NDArray[np.inexact], states: StateList | None, needed: bool, can_pad: bool, dname: str
-) -> tuple[NDArray[np.inexact], StateList | None]:
-    """Put `vec` on the live mesh, rounding it and `states` up to the device count when `pad`.
+def _place_vec(vec: NDArray[np.inexact], require_divisible: bool) -> NDArray[np.inexact]:
+    """Put `vec` on the live mesh, replicated; return it unchanged when there is no mesh.
 
     Skipped under tracing: `apply_h` doubles as `ground_locg`'s `matvec`, and `get_mesh` raises
     inside a jit (`tests/_sharded_sqd_prefilter.py` reaches it).
-
-    Both arrays or neither -- the fillers differ (255 for `states`, zero for `vec`), so a length
-    disagreement is a wrong answer rather than a shape error. Bounded by `mesh.size`, so a genuinely
-    short `states` keeps raising instead of being padded into silent agreement.
 
     Keyed on mesh *identity*, not `isinstance(vec, jax.Array)`: a committed `jax.Array` carries an
     empty mesh just as a host array does, so that guard passed it through to the "Resource axis" error
     this prevents. `get_mesh`, not `get_abstract_mesh`: `device_put` rejects an `AbstractMesh`.
 
+    The length is *named*, not rounded. Padding it here would have to pad every per-state array to
+    match, and `diagonals` (state axis trailing) and `diag_signs` (leading) cannot share one pad -- so
+    the caller sizes them all through `uniquify_states`, which jax's own message does not point at.
+
     Raises:
-        ValueError: If the length needs rounding but `dname`'s per-state array cannot be padded here.
+        ValueError: If ``require_divisible`` and the length is not a multiple of the device count.
     """
     if isinstance(vec, jax.core.Tracer) or (mesh := jax.sharding.get_mesh()).empty:
-        return vec, states
-    if needed and (resid := (nvec := vec.shape[0]) % mesh.size) != 0:
-        size = nvec + mesh.size - resid
-        if not can_pad:
-            raise ValueError(
-                f"apply_h: vec length {nvec} is not a multiple of the {mesh.size} mesh devices, and "
-                f"{dname}= is per-state, so it cannot be padded here; pass length-{size} arrays "
-                "throughout (uniquify_states takes the size)"
-            )
-        vec = np.append(vec, np.zeros(size - nvec, dtype=vec.dtype))
-        if states is not None and (deficit := size - states.shape[0]) > 0:
-            if deficit >= mesh.size:
-                raise ValueError(
-                    f"apply_h: states has {states.shape[0]} rows against a vec of {nvec}; "
-                    "they must describe one subspace"
-                )
-            states = np.append(
-                states, np.full((deficit, states.shape[1]), 255, dtype=np.uint8), axis=0
-            )
+        return vec
+    if require_divisible and (resid := vec.shape[0] % mesh.size) != 0:
+        raise ValueError(
+            f"apply_h: vec length {vec.shape[0]} is not a multiple of the {mesh.size} mesh devices; "
+            f"size every per-state array to {vec.shape[0] + mesh.size - resid}, e.g. "
+            f"uniquify_states(states, {vec.shape[0] + mesh.size - resid})"
+        )
     if jax.typeof(vec).sharding.mesh is mesh.abstract_mesh:
-        return vec, states
-    return jax.device_put(vec, jax.sharding.NamedSharding(mesh, PartitionSpec())), states
+        return vec
+    return jax.device_put(vec, jax.sharding.NamedSharding(mesh, PartitionSpec()))
 
 
 @jax.jit(static_argnames=["cache_level"])
