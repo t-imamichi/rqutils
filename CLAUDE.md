@@ -480,19 +480,13 @@ runtime assertion can pin this.
 *caller's* job. Examples establish the pattern: a single axis named `'x'` with `AxisType.Explicit`, plus
 `jax.config.update('jax_enable_x64', True)` (without x64 you silently get complex64/int32).
 
-**Two mesh accessors, and the choice is forced, not stylistic.** `get_abstract_mesh()` is the default and
-is the only one callable under tracing — `jax.sharding.get_mesh()` raises `get_mesh can only be used
-outside of jax.jit`. But `device_put` rejects an `AbstractMesh` (`is_fully_addressable is not
-implemented`), so a host-side placement must use `get_mesh()` and must be skipped under tracing. That is
-why `_place_vec` leads with `isinstance(vec, jax.core.Tracer)`; `jax.core` needs an explicit `import
-jax.core` or `ty` warns the submodule may be unimported.
+**The two mesh accessors are a forced choice.** Only `get_abstract_mesh()` works under tracing; only
+`get_mesh()` works with `device_put`. So a host-side placement uses `get_mesh()` and must early-out on
+`isinstance(x, jax.core.Tracer)` — which needs an explicit `import jax.core`, or `ty` flags the submodule.
 
-**To test whether an array is on the live mesh, compare mesh *identity*, not `isinstance(vec,
-jax.Array)`.** A `jax.Array` committed to one device carries an **empty** mesh exactly as a host numpy
-array does, so the isinstance form passes it straight through to whatever error placement exists to
-prevent. `jax.typeof(vec).sharding.mesh is mesh.abstract_mesh` is the check; `jax.typeof` is also what
-normalizes a committed array's `SingleDeviceSharding` (which has no `.mesh` at all) into a comparable
-`NamedSharding`.
+**"Is this array on the live mesh?" is `jax.typeof(x).sharding.mesh is mesh.abstract_mesh`, never
+`isinstance(x, jax.Array)`** — a single-device-committed `jax.Array` carries an empty mesh exactly as a
+host array does, so the isinstance form admits the very case placement exists to catch.
 
 **Don't index a sharded array to read one element.** `seed.at[i].add(f(seed[i]))` is correct arithmetic
 but emits an `all-gather` per read, each materializing the whole vector on every device — which is what
@@ -502,28 +496,19 @@ but emits an `all-gather` per read, each materializing the whole vector on every
 
 ### Comments
 
-**One line. Default to one line, and to none.** Comments were cut five separate times in one session
-against the rule below, so treat the ceiling as hard: **an inline comment is 1–2 lines**, a docstring
-paragraph is 3–5. Over that, the content belongs in `NOTES.md` (evidence) or the docstring (user-facing).
-State the constraint; never narrate the code.
+**One line, and prefer none. The ceiling is hard: 1–2 lines inline, 3–5 per docstring paragraph.** Over
+that, it belongs in `NOTES.md` (evidence) or the docstring (user-facing). State the constraint; never
+narrate the code. A measured defect earns **one line plus a `NOTES.md` pointer** — not any length, or the
+clause licenses everything, since here every comment documents a measured defect. This was corrected by
+hand five times in one session; it is the most-violated rule in the file.
 
-**A measured defect earns *one line*, not any length** — name it and point at `NOTES.md`; the evidence
-lives there. This clause used to read "earns any length", which licensed every over-long block written in
-that session, since in this repo *everything* is a measured defect. Ask what a reader loses if it is
-deleted, then write the shortest thing that keeps it.
+Three failure modes that produce length without content:
 
-**A private helper's docstring is not the place to re-explain its caller.** The public docstring owns the
-contract; the helper states only what is non-obvious *at its own site*. Three docstrings explaining one
-9-line function is the smell.
-
-Two failure modes that produce length without content:
-
-- **Editing by appending** — revisiting a comment and adding a paragraph instead of rewriting the
-  existing one, leaving two explanations of one statement and often a now-false opening sentence.
-- **Restating a document that already exists.** Check whether the content belongs in `NOTES.md` or
-  `docs/` before writing it inline.
-
-**A rule stated near-identically in two places: prefer one statement plus a pointer.**
+- **Editing by appending** — adding a paragraph instead of rewriting, leaving two explanations of one
+  statement and often a now-false opening sentence.
+- **Restating `NOTES.md` or `docs/`.** One statement plus a pointer, wherever a rule would appear twice.
+- **A private helper re-explaining its caller.** The public docstring owns the contract; the helper states
+  only what is non-obvious at its own site. Three docstrings for one 9-line function is the smell.
 
 ### Docstrings
 
@@ -565,18 +550,11 @@ in it.
   break rather than a shim, so the six valid input sets become the only constructible ones. Bind the
   *arrays* for a matvec thunk (`functools.partial(apply_h, xsources=xs, diagonals=dg)`), not the
   `cache_level`.
-- **`apply_h` places a host `vec` on the live mesh for you, but will not round its length.** With an
-  `xsignatures=` strategy the state count must divide `mesh.size`, because `get_xsource` reshards one entry
-  per state; the error names the size and `uniquify_states`. It binds **`states`, not `vec`** — checking
-  `vec` let a divisible vector against an indivisible `states` reach the raw jax message. `xsources=`
-  reshards nothing and takes any length. Rounding is **declined, not unimplemented**: `diagonals` is
-  `(n_groups, n_states)` and `diag_signs` is `(n_states, n_zbytes)`, so no single pad axis serves both and
-  padding only `vec`/`states` breaks the other two strategies with a broadcast `TypeError` from inside the
-  scan. `docs/rqutils-apply-h-mesh-response.md` has the argument; the implementation is recoverable at
-  `1a339e8`.
-- **`hproj` raises under a mesh.** It was broken under one at *every* subspace size (a boolean-mask gather
-  on the partitioned `get_xsource` output raises `ShardingTypeError`), and nothing wants it sharded, so it
-  rejects rather than half-supports. Rejected before the O(N) sort, like the `_MAX_STATES` check.
+- **`apply_h` places a host `vec` on the live mesh but will not round its length.** With `xsignatures=`
+  the *`states`* count must divide `mesh.size` (`get_xsource` reshards per state); `xsources=` takes any
+  length. Rounding is **declined, not unimplemented** — the two precomputed diagonals put the state axis
+  on opposite ends. `docs/rqutils-apply-h-mesh-response.md`; implementation recoverable at `1a339e8`.
+- **`hproj` raises under a mesh**, rather than half-supporting one it was never able to serve.
 - **`sqd(..., packed=True)` returns *packed* states.** One flag governs both directions, so a round trip
   needs no re-pack — which also removes a hazard, `pack_states` not being idempotent. A caller comparing
   the result against an unpacked array breaks loudly on the shape mismatch. Both overloads annotate
