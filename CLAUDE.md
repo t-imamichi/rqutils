@@ -46,6 +46,11 @@ When a rule needs evidence, it points there rather than restating it.
   `dev` in commit count, which makes them look like pending work; they are not.
 - **Integrate with `git merge --ff`**, not `--no-ff`. Older history shows merge commits; that is not the
   convention to follow.
+- **`origin/main` holds a commit local `main` lacks** (`ec93bf2`, a docs-URL change in `pyproject.toml`).
+  The reflog shows a real `pull`, so it is genuine remote work, not stale-fetch noise — a `dev → main` PR
+  reverts it unless picked up first.
+- **A background review agent may `git stash` your working tree.** One silently reverted an in-progress
+  edit mid-turn; the "file modified on disk" warning was the only signal. Commit before running one.
 - **Worktrees need `worktree.baseRef: "head"`** (already set in `.claude/settings.json`). The default
   `fresh` branches from `origin/main`, which predates the `dev` extra, so `uv run --extra dev` fails
   outright.
@@ -168,6 +173,8 @@ Four reasons a mutant survives that are *not* missing coverage:
 
 - **Multi-device paths are testable on CPU** via `--xla_force_host_platform_device_count=4`. Correctness
   only — timings under virtual devices are meaningless.
+- **`with jax.set_mesh(mesh)` scopes the mesh; the bare call is global.** A test needing both arms uses
+  the `with` form, and a mesh-rejecting entry point is testable only that way.
 - **Virtual devices cannot test multi-*process* at all** — they are one process, so every device is
   addressable and the entire class of "spans non-addressable devices" errors is unreachable. That is how
   `sqd` shipped unable to return its own eigenvalue on a 4-node mesh (`float()` on a rank-0 array whose
@@ -495,14 +502,21 @@ but emits an `all-gather` per read, each materializing the whole vector on every
 
 ### Comments
 
-**Concise: one line where one line will do.** A short block only for a non-obvious invariant or a defect
-the comment prevents recurring. Prefer stating the constraint over narrating the code. Long explanations
-belong in the docstring (user-facing) or `NOTES.md` (evidence), not inline.
+**One line. Default to one line, and to none.** Comments were cut five separate times in one session
+against the rule below, so treat the ceiling as hard: **an inline comment is 1–2 lines**, a docstring
+paragraph is 3–5. Over that, the content belongs in `NOTES.md` (evidence) or the docstring (user-facing).
+State the constraint; never narrate the code.
 
-**A comment must earn its length; length alone is not the test.** Ask what a reader loses if it is
-deleted. A block recording a measured defect earns any length — deleting it removes the only thing
-stopping recurrence. A block re-explaining what `NOTES.md` or `docs/` already says earns nothing at any
-length. **Do not trim by ratio.** Two failure modes to check for instead:
+**A measured defect earns *one line*, not any length** — name it and point at `NOTES.md`; the evidence
+lives there. This clause used to read "earns any length", which licensed every over-long block written in
+that session, since in this repo *everything* is a measured defect. Ask what a reader loses if it is
+deleted, then write the shortest thing that keeps it.
+
+**A private helper's docstring is not the place to re-explain its caller.** The public docstring owns the
+contract; the helper states only what is non-obvious *at its own site*. Three docstrings explaining one
+9-line function is the smell.
+
+Two failure modes that produce length without content:
 
 - **Editing by appending** — revisiting a comment and adding a paragraph instead of rewriting the
   existing one, leaving two explanations of one statement and often a now-false opening sentence.
