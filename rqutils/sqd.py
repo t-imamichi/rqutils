@@ -2078,9 +2078,10 @@ def _check_mesh_divisible(num_states: int, caller: str) -> None:
     Raises:
         ValueError: If ``num_states`` is not a multiple of the device count.
     """
-    if (mesh := get_abstract_mesh()).empty or (resid := num_states % mesh.size) == 0:
+    mesh = get_abstract_mesh()
+    if mesh.empty or num_states % mesh.size == 0:
         return
-    size = num_states + mesh.size - resid
+    size = -(-num_states // mesh.size) * mesh.size
     raise ValueError(
         f"{caller}: {num_states} states is not a multiple of the {mesh.size} mesh devices; size "
         f"every per-state array to {size}, e.g. uniquify_states(states, {size})"
