@@ -549,17 +549,96 @@ Two small changes are plausible but rank below the items above:
 Neither item changes the algorithmic memory floor or the dominant three-matvec steady-state loop, so
 neither should displace the norm-combination experiment.
 
+## Focused `sqd` follow-up (2026-09-16)
+
+The module-level review leaves three credible experiments beyond the existing priorities, plus one
+measurement fix. They rank below the measured partial diagonal cache and device-returning path until a
+real workload establishes that their setup costs amortize.
+
+### Cache expensive diagonal groups first
+
+Section 2's prototype caches a prefix of X groups. That makes the API and slicing simple, but it is not
+necessarily the best use of a fixed cache budget: every cached diagonal row costs the same
+`states_size * dtype.itemsize` bytes, while an uncached group's work depends on how many nonzero Z terms
+its zero-padded row contains. `_accumulate_diagonal` exits at the first zero coefficient, so a group with
+large `K_g` costs more to reconstruct on every matvec than a short group.
+
+Before implementing a public `dcache_groups` dial, compare the measured prefix policy with a
+cost-prioritized permutation that caches the largest `K_g` groups and preserves the original relative
+order inside each partition. This is a hypothesis, not a measured improvement. The experiment must:
+
+1. verify every matvec and complete solve against the unsplit operator before timing;
+2. include physical Hamiltonians whose `K_g` distributions differ, rather than a dense synthetic row;
+3. count compilation variants and temporary bytes as well as retained cache bytes;
+4. keep the all-zero X group available to `vinit_from_min_diag` independently of any permutation; and
+5. retain section 2's exclusions: no simultaneous `xcache_groups`, no full diagonal precompute followed
+   by truncation, and no setting whose reintroduced states plus 16 B/slot temporary exceed the saved
+   cache.
+
+If ordering by `K_g` does not beat the prefix on whole solves, keep the prefix API. The measured result
+that justifies the feature is partial diagonal caching itself; cost-prioritized selection is only a
+possible improvement to that policy.
+
+### Add a validated sorted-unique input path
+
+Every `sqd` call currently runs `uniquify_states`, even when an upstream workflow already owns a packed,
+lex-sorted, duplicate-free basis. A keyword analogous to `hproj(unique_states=True)` could skip the JAX
+sort after validating the declaration and constructing the same padded representation.
+
+This is not the rejected host-side `np.unique` rewrite: the proposed saving comes from omitting
+uniquification when its postcondition already holds, not replacing one sorting implementation with
+another. The validation must check uniqueness, lexicographic order and filler placement; an unchecked
+shortcut can feed a wrong basis to `get_xsource` and return a finite non-symmetric projection. Measure a
+real producer that naturally maintains sorted unique states. Reject the API if its O(N) validation and
+extra surface do not reduce end-to-end sequence time.
+
+### Separate preparation from repeated solves only when reuse is real
+
+A lower-level prepared-SQD object could retain `states_u`, `xsources`, diagonals and compiled kernels for
+repeated solves of the same projected problem with different tolerances, initial vectors or diagnostics.
+It would not help the normal one-shot call, and a growing subspace invalidates most of that state. The
+first experiment should therefore measure an actual repeated-solve workload and identify which arrays
+remain identical across calls; do not design an object around hypothetical reuse.
+
+If the workload exists, compose this boundary with section 4's device-returning path so preparation and
+results can remain on device. Continuation across changing subspaces remains section 7 instead: it needs
+state mapping and must not pretend that old caches apply to a new basis.
+
+### Make the public timing synchronize what it reports
+
+The `sqd` wrapper records elapsed time immediately after the jitted `run_sqd` call, before the later host
+reads necessarily synchronize asynchronous device execution. If that log is intended as solve timing,
+block on the returned eigenvalue before recording it. This does not accelerate the solve; it makes the
+measurement truthful. Keep synchronization out of `run_sqd` and do not add another device-to-host read --
+section 11 should still gather the eigenvalue and convergence flag together on multi-process runs.
+
+### Accuracy scope
+
+No arithmetic change currently has evidence for a lower attainable residual without losing speed or
+memory. Keep the fresh `Ax` used for convergence, full-precision carried vectors, fixed reorthogonalization
+and deterministic spread seed. The credible accuracy work is contractual instead: optional independent
+final-residual verification, safe continuation starts, and explicit treatment of degenerate eigenspaces.
+A block solver could expose a degenerate ground space, but multiplies the dominant O(N) storage and does
+not fit this module's current capacity objective.
+
 ### Priority by binding constraint
 
-1. **Multi-node latency:** make norm reductions combinable.
-2. **Repeated growing-subspace workflow:** add safe continuation starts.
-3. **Standalone dense matrices:** test explicit-matrix batching.
-4. **Large diagnostic runs:** add scalar-only diagnostics.
-5. **Narrow API cases:** test the `maxiter=0` and promotion-order changes.
+1. **Single-device production memory:** implement the measured partial diagonal cache; first test whether
+   selecting groups by `K_g` beats the measured prefix policy.
+2. **Distributed output capacity:** add a device-returning SQD path before investing in distributed
+   states, since the current return path re-replicates both O(N) outputs.
+3. **Multi-node latency:** make norm reductions combinable, then combine the two scalar host gathers.
+4. **Repeated growing-subspace workflow:** add safe continuation starts; test a sorted-unique input path
+   only when the producer already guarantees that invariant.
+5. **Repeated solves of one fixed projection:** measure a preparation/solve boundary before designing it.
+6. **Standalone dense matrices:** test explicit-matrix batching.
+7. **Large diagnostic runs:** add scalar-only diagnostics.
+8. **Narrow API cases:** test the `maxiter=0` and promotion-order changes, and make logged solve timing
+   synchronize the value it claims to measure.
 
-For single-device production memory, the credible levers remain outside `ground_locg`: the measured
-partial diagonal cache and a device-returning SQD path. The eigensolver itself is already at the measured
-algorithmic vector floor for its three-dimensional Rayleigh--Ritz basis.
+The eigensolver itself is already at the measured algorithmic vector floor for its three-dimensional
+Rayleigh--Ritz basis. The strongest remaining production levers are therefore diagonal-cache policy,
+avoiding result replication, and reducing collective count rather than storing its vectors differently.
 
 ## Ideas not to reopen without new evidence
 
@@ -580,32 +659,37 @@ The following have already been measured or ruled out structurally:
 
 ## Recommended order
 
-**Revised 2026-09-05 after verifying every item against the code.** Four items moved, two should be
-dropped, and one section's own instruction ("first count collectives in HLO") is what demoted it.
+**Revised 2026-09-16 after the focused `sqd` and `ground_locg` reviews.** The first four items remain the
+production priorities; the new module-level ideas are experiments until their workload gates pass.
 
 1. **Section 2 -- the partial diagonal cache.** The only unimplemented item already measured through real
    `sqd()` solves, bit-identical across a 10x `N` range, on the axis both `CLAUDE.md` and `sqd.py` name as
-   the larger lever, with the `xcache_groups` API precedent in place. Roughly a day, mostly validator and
-   docstring. Read the three obstacles added above first -- especially that it reintroduces the `13 * N`
-   state array at `(1, 2)` and goes net-negative below about `K = 7`.
-2. **Section 4 -- a device-returning path.** Promoted above section 3. It is an API shape rather than a
-   performance question, so unlike everything else distributed it needs no interconnect to justify *or* to
-   fix, and section 3's memory relief is pointless while the return path re-replicates. Measured: +7
-   all-gathers and `P(None)` on both outputs.
+   the larger lever. Before fixing the API to a prefix count, test whether equal-byte selection by group
+   cost `K_g` improves whole-solve time. Regardless of policy, read the three obstacles in section 2 --
+   especially that the split reintroduces the `13 * N` state array and goes net-negative below about
+   `K = 7`.
+2. **Section 4 -- a device-returning path.** It is an API shape rather than a performance hypothesis, and
+   section 3's memory relief is pointless while the return path re-replicates. Measured: +7 all-gathers
+   and `P(None)` on both outputs. Return padded arrays plus `subspace_dim`; dynamic trimming conflicts with
+   fixed JAX shapes.
 3. **Section 8, rescoped -- make the norms combinable.** *(First instead, if the target is multi-node:
-   `poc15` measured 4 devices at 4.06x slower than 1, with the first hop dearer than the second, which
-   makes the collective count the binding constraint there rather than memory.)* Not the `hypot` identity (1 of 13 ops, and it
-   puts the convergence test at risk) but the finding underneath it: 7 of 13 `all-reduce` ops are
-   single-scalar `jnp.linalg.norm` calls whose jit boundary blocks XLA's combiner, which has already
-   merged every neighbouring sum. Same residual semantics, ~7x the target.
-4. **Section 7 -- the continuation start.** The best of the "further experiments" and a smaller API change
-   than the note assumed, but gate it on the shape-recompilation question before building.
-5. **Section 11 -- one collective for the two scalars.** Mechanical, verified free (`process_allgather`
-   takes a mixed-dtype pytree), multi-process only. Do it opportunistically.
-6. **Section 9 -- GPU prefilter tuning.** Blocked on CUDA hardware; nothing to do here.
-7. **Section 3 -- distributed states.** Correctly deferred behind a real-interconnect measurement, and
-   roughly half of it restates `CLAUDE.md`.
-8. **Sections 5, 6, 10 -- drop.** Section 5's scatter is measured fatal to sharding (24 all-gathers
-   against 3, and `ShardingTypeError` without forced `out_sharding`). Section 6 measured zero-to-negative
-   with a filler-mask trap worth 91.1 in absolute error. Section 10's documentation ask already shipped and
-   its enum is the wrong shape by `NOTES.md`'s own argument. Keep their paragraphs as recorded negatives.
+   `poc15` measured 4 devices at 4.06x slower than 1, with the first hop dearer than the second.)* Do not
+   use the `hypot` identity; expose the seven existing norm reductions to XLA's collective combiner
+   without changing residual semantics.
+4. **Section 7 -- the continuation start.** The best growing-subspace experiment, but gate it on mapping
+   cost and shape recompilation before building. The spread component is mandatory.
+5. **Focused SQD follow-up -- validated sorted-unique input.** Measure only on a producer that already
+   maintains the invariant; this is omission of work, not another `np.unique` implementation.
+6. **Section 11 -- one collective for the two scalars.** Mechanical, verified free (`process_allgather`
+   takes a mixed-dtype pytree), multi-process only. Do it opportunistically and make the public timing
+   synchronize the same result without adding another host read.
+7. **Focused SQD follow-up -- preparation/solve boundary.** Proceed only if a real workload repeatedly
+   solves one unchanged projection. Do not apply it to growing bases whose caches are invalidated.
+8. **Section 9 -- GPU prefilter tuning.** Blocked on CUDA hardware; nothing to do here.
+9. **Section 3 -- distributed states.** Correctly deferred after the real-network result; measure an
+   in-box high-bandwidth interconnect before reconsidering it.
+10. **Sections 5, 6, 10 -- drop.** Section 5's scatter is measured fatal to sharding (24 all-gathers
+    against 3, and `ShardingTypeError` without forced `out_sharding`). Section 6 measured zero-to-negative
+    with a filler-mask trap worth 91.1 in absolute error. Section 10's documentation ask already shipped
+    and its enum is the wrong shape by `NOTES.md`'s own argument. Keep their paragraphs as recorded
+    negatives.
