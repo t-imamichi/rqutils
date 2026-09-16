@@ -435,6 +435,132 @@ is a non-issue: `process_allgather` accepts a **mixed-dtype pytree in one call**
 is mechanical -- one collective instead of two, no cast, no new protocol. Small but genuinely free;
 worth doing opportunistically the next time `_host_scalar` is touched.
 
+## Focused `ground_locg` follow-up (2026-09-16)
+
+Most obvious changes to `ground_locg` have already been measured and rejected. The remaining credible
+work is therefore narrow: one high-value distributed-scaling experiment, two workload-specific speed
+experiments, and one diagnostic-memory improvement. None of the unmeasured items below should be read as
+an implementation recommendation before its stated gate passes.
+
+### Make norm reductions combinable
+
+This is the strongest remaining solver-level opportunity, and the first item to try for multi-node
+scaling. The loop body currently computes several norms through `jnp.linalg.norm`; compiled on a
+four-device mesh, seven of thirteen `all-reduce` operations were isolated single-scalar norm reductions.
+By contrast, XLA had already combined the neighbouring scalar sums in `compute_sas` into multi-operand
+reductions. The likely obstacle is the norm boundary rather than the reduction arithmetic itself.
+
+Replace eligible norms with inline squared-norm reductions followed by a square root:
+
+```python
+norm_sq = jnp.sum(jnp.abs(vector) ** 2)
+norm = jnp.sqrt(norm_sq)
+```
+
+This must preserve the existing convergence scale and residual meaning. In particular, do not replace a
+direct `norm(axnext)` with `hypot(abs(theta), norm(rnext))`: that identity removes only one collective,
+and finite-precision loss of orthogonality gives its error an unsafe sign. The target is to make exact
+existing reductions visible to XLA's collective combiner, not to derive one quantity from another.
+
+The acceptance sequence is:
+
+1. Compare compiled HLO before and after, counting both `all-reduce` instructions and their operand
+   arities. A source-level rewrite that leaves the thirteen collectives unchanged has achieved nothing.
+2. Assert unchanged convergence decisions and independently recomputed true residuals over float32,
+   float64, complex, shifted and near-degenerate fixtures.
+3. Run the sharded correctness cases and assert output sharding specifications, not only values.
+4. Measure warm whole solves on a real multi-node mesh. Virtual devices can establish correctness and HLO
+   shape but cannot establish speed.
+
+This is the focused form of section 8. The measured motivation is direct: a four-device multi-node solve
+was 4.06x slower than one device at identical iteration count, and the first network crossing cost more
+than the next doubling. Collective count, not payload, is the term this experiment targets.
+
+### Batch explicit-matrix applications
+
+`batch_matvec=True` currently applies only to callable operators. The explicit-array path rejects it
+because its `jax.lax.dot(mat, x)` contraction accepts the vector-shaped right-hand side but not the
+stacked `(k, N)` shape. A rank-polymorphic contraction such as
+`einsum("ij,...j->...i", mat, x)` could let the dense path combine the independent `Ay` and `Ap`
+applications into one matrix-matrix operation, as the callable path already does.
+
+This is credible for standalone dense use, not for SQD's largest matrix-free workloads. It is also not
+licensed by the callable-path result: a dense contraction may choose a different kernel, materialize a
+larger temporary, or change rounding enough to alter the trajectory. Benchmark warm whole calls at
+several dimensions and both real and complex dtypes; report temporary bytes from XLA alongside wall
+clock. Require the batched and unbatched iteration counts to agree on an elementwise reference operator,
+and compare both returned pairs against an independent dense residual.
+
+Reject the change if it merely moves two GEMVs into a slower contraction or adds an O(N)-sized temporary
+without an end-to-end win. Keep the array path's current error for `batch_matvec=True` until that
+measurement exists; silently ignoring the flag remains wrong.
+
+### Add scalar-only diagnostics
+
+`debug=True` deliberately uses `lax.scan` for all `maxiter` iterations and records full `x`, `y` and `r`
+vectors in every output row. That makes its diagnostic storage O(`maxiter * N`), even when an
+investigation needs only `theta`, `rho`, `kappa`, `sas`, residual norm, `rtol_scale`, convergence and
+orthogonality defects.
+
+A separate scalar-only mode could retain those trajectories in O(`maxiter`) storage while leaving the
+existing full-vector mode unchanged. This is a diagnostic-memory improvement, not a production-solve
+optimization. It must not add reductions to the non-debug path, and the scalar mode should reuse values
+already computed by the iteration wherever possible. If an orthogonality metric needs a new reduction,
+measure its collective effect explicitly rather than treating debug overhead as free.
+
+Prefer a mode with an explicit return contract over changing `debug=True` in place. The full vectors are
+load-bearing for the mutation and residual-honesty investigations recorded in `tests/test_ground_locg.py`
+and `NOTES.md`.
+
+### Add safe continuation starts above the solver
+
+For a sequence of related growing SQD subspaces, map the previous eigenvector into the new sorted basis
+and blend it with the deterministic spread seed before passing it as `xinit`:
+
+```python
+xinit = normalize(embedded_previous + alpha * spread_seed)
+```
+
+The spread component is mandatory. A pure embedded vector is exactly zero on newly introduced states and
+can therefore have zero overlap with a new lower-energy connected component, reproducing the measured
+one-hot-start failure. This work belongs primarily in `sqd`/`run_sqd`; `ground_locg` already accepts the
+resulting `xinit`.
+
+Benchmark an entire growing-subspace sequence, including state mapping, padding and compilation, rather
+than timing one solve. Assert the reference eigenvalue at every round before comparing iteration counts.
+Gate implementation on the shape question first: if each growth step changes the compiled vector shape,
+the recompilation cost can erase the solver saving. This is the focused form of section 7.
+
+### Two minor experiments
+
+Two small changes are plausible but rank below the items above:
+
+- **Short-circuit `maxiter == 0` before `body_iter1`.** The current non-debug path computes the seed
+  Rayleigh quotient, then performs the second seed step before returning the original seed pair. Moving
+  the static zero-iteration return earlier would avoid a projected eigensolve and two matvecs for callers
+  using `maxiter=0` as a Rayleigh-quotient operation. Preserve the debug contract separately: it currently
+  returns both seed diagnostic rows.
+- **Promote `xinit` before its first normalization.** A float32 initial vector for a float64 or complex128
+  operator is currently normalized at float32 before being promoted to the operator work dtype. Promoting
+  first may produce a cleaner initial direction on difficult cases. Judge this by iteration count over a
+  sweep, not final energy, because subsequent iterations can repair a small initial-direction error. Drop
+  it if it does not move whole-call time or iteration count consistently.
+
+Neither item changes the algorithmic memory floor or the dominant three-matvec steady-state loop, so
+neither should displace the norm-combination experiment.
+
+### Priority by binding constraint
+
+1. **Multi-node latency:** make norm reductions combinable.
+2. **Repeated growing-subspace workflow:** add safe continuation starts.
+3. **Standalone dense matrices:** test explicit-matrix batching.
+4. **Large diagnostic runs:** add scalar-only diagnostics.
+5. **Narrow API cases:** test the `maxiter=0` and promotion-order changes.
+
+For single-device production memory, the credible levers remain outside `ground_locg`: the measured
+partial diagonal cache and a device-returning SQD path. The eigensolver itself is already at the measured
+algorithmic vector floor for its three-dimensional Rayleigh--Ritz basis.
+
 ## Ideas not to reopen without new evidence
 
 The following have already been measured or ruled out structurally:
