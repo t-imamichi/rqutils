@@ -343,6 +343,16 @@ Recorded so these are not mistaken for unexplored options. All measured on this 
   reintroduces the disconnected-component failure `CLAUDE.md` records `_spread_seed` as existing to
   prevent.
 
+  **Re-tested 2026-09-17: this rejection stands, but the stated mechanism did not reproduce.**
+  `examples/scaling/poc26_warmstart.py` tried the shape the mechanism implies — carry the eigenvector on
+  surviving states, `_spread_seed` on the newly added ones — across three fixtures. It beats the cold
+  start 1.3–1.9×, and **zero-padding beat both arms in all 19 rounds**, so nothing there can judge a
+  replacement for it. The reason is that the XXZ ground state is concentrated (top-256 = 98.8% of the
+  weight), leaving the previous eigenvector already ~99% of the next round's answer whatever the growth
+  rule. A genuine retest needs relgap ≤ 1e-04, which that operator family does not reach at any
+  `delta`, `n` or dimension measured. `NOTES.md`, "Warm-starting the growing subspace", has the four
+  eliminated hypotheses and the gate that withheld the verdict.
+
 - **Jacobi preconditioner on the raw indefinite projected `H`.** `ground_locg(precond=...)` shipped
   and measures 1.79× median on a *shifted* operator, and the diagonal is already computed for free at
   `cache_level[1]=2`. Applied to the unshifted operator it hits `maxiter=1000` at every size and lands
