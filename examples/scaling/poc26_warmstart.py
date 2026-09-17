@@ -49,8 +49,8 @@ def xxz_strings(nq, delta, bx):
 
     **`bx` does nothing on a hop-generated subspace** -- it is one Hamming sector and single-site X
     changes weight by +-1, so every field term projects to exactly zero (bit-identical nnz and E0 at
-    0.3 and 3.0). Kept only for signature parity with poc24_davidson_xxz.py, whose docstring claims the
-    opposite; use `delta` to change the projected operator. `NOTES.md` has the measurement.
+    0.3 and 3.0). Kept only for signature parity with poc24_davidson_xxz.py, which has the same dead
+    knob; use `delta` to change the projected operator. `NOTES.md` has the measurement.
     """
     strings, coeffs = [], []
     for q in range(nq):

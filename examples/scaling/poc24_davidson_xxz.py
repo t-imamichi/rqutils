@@ -42,8 +42,10 @@ PREFILTER = tuple(int(x) for x in options.prefilter.split(","))
 def xxz_strings(nq, delta, bx):
     """Periodic XXZ (XX+YY+delta*ZZ per bond) plus a transverse field Bx on every site.
 
-    Bx breaks magnetization conservation; without it the hop-generated subspace is closed under H
-    and the projection is trivially block-diagonal.
+    **Bx is inert here and `--bx` is a dead knob**, though it does break magnetization conservation in
+    `H`: `xxz_krylov` gives one Hamming sector, so the projection annihilates every field term --
+    bit-identical `nnz` and `E0` at bx=0.0, 0.5 and 3.0. Use `delta`, which survives projection.
+    Results here are unaffected (bx is never swept). `NOTES.md`, "Warm-starting the growing subspace".
     """
     strings, coeffs = [], []
     for q in range(nq):
@@ -201,7 +203,7 @@ def davidson(matvec, x0, diag, max_dav, rtol, scale, maxiter=4000):
 def main():
     print(f"backend={jax.default_backend()}  prefilter={PREFILTER}  rtol={options.rtol:g}")
     print(
-        f"XXZ n={options.num_qubits} delta={options.delta} Bx={options.bx} "
+        f"XXZ n={options.num_qubits} delta={options.delta} Bx={options.bx} (inert, see xxz_strings) "
         f"rungs={options.rungs} cap={options.cap}"
     )
     rows = []

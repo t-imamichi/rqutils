@@ -3341,10 +3341,15 @@ monotonically along that axis — 2–3 iterations at Δ=1.0, exactly 1 at Δ=0.
 **A fixture trap worth keeping: the transverse field is inert on a hop-generated subspace.** `xxz_rungs`
 produces a single Hamming-weight sector (verified: all weight 6 at n=12), and single-site `X` changes weight
 by ±1, so **every `bx` term projects to exactly zero** — `nnz=4208` and `E0=-21.0756622399` bit-identical at
-`bx=0.3` and `bx=3.0`. So `bx` cannot be used to delocalize here, and
-`poc24_davidson_xxz.py:44`'s docstring — "Bx breaks magnetization conservation; without it the
-hop-generated subspace is closed under H and the projection is trivially block-diagonal" — is true of the
-*Hamiltonian* but **not of its projection onto that subspace**. Use `delta`.
+`bx=0.3` and `bx=3.0`. So `bx` cannot be used to delocalize here. `poc24_davidson_xxz.py` carried the
+same dead knob and claimed the opposite in its docstring — "Bx breaks magnetization conservation; without
+it the hop-generated subspace is closed under H and the projection is trivially block-diagonal" — which is
+true of the *Hamiltonian* but **not of its projection onto that subspace**; corrected 2026-09-17, and its
+results are unaffected since `bx` is never swept there. Verified through poc24's own functions at its own
+defaults, including a `bx=0.0` arm: `nnz` and `E0` bit-identical across bx=0.0/0.5/3.0 (n=12, dim=380,
+E0=-20.883220316338; n=16, dim=1325, E0=-27.524421980960). **Inferring a property of the projection from a
+property of the operator is the error** — the projector onto a fixed-weight subspace annihilates exactly
+the terms that break the conservation. Use `delta`.
 
 **What a genuine retest of §8 would need: relgap ≲ 1e-04.** This operator family does not reach it at any
 Δ, `n`, or dimension measured. The gap narrows with dimension then **saturates** — 2.06e-01 at dim=489,
