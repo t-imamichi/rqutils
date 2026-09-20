@@ -290,6 +290,57 @@ arms.
 Before recording a negative result, check whether a *more direct* assertion exists; reach for the
 docstring note only once it does not.
 
+### A surviving mutant can mean the line is redundant in the *library* (2026-09-20)
+
+The fifth reason a mutant survives, alongside the four in `CLAUDE.md`: the mutated line is an
+early-out whose condition a later line already covers, so removing it changes speed and not one
+answer. Nothing to pin, and a test written to pin it would be asserting the behaviour the *next*
+branch produces.
+
+`_is_lex_sorted`'s duplicate-row test is the worked example. It reads
+
+```python
+if not bool(np.all(np.any(differs, axis=1))):   # <- the early-out
+    return False
+first = np.argmax(differs, axis=1)
+return bool(np.all(lhs[rows, first] < rhs[rows, first]))
+```
+
+and for a duplicate pair the final comparison is `32 < 32`, already False. Measured — replacing the
+early-out's condition with `False` leaves all of `test_sqd.py` green (224 passed).
+
+What made this worth recording is that a test *claimed* to cover it and could not. Old
+`test_two_filler_rows_are_still_rejected` built two all-`255` rows and asserted `not
+_is_lex_sorted(...)`; fillers are caught by the **high-bit check two lines earlier**, which returns
+before the strictness pass runs, so the test was a second copy of
+`test_one_filler_row_is_rejected` under a name promising otherwise. Both assertions pass either way,
+which is why it survived review. It is now `test_duplicate_rows_are_rejected`, on a filler-free
+fixture (byte 0 < 128) that genuinely reaches the sortedness pass and asserts the rejection there.
+
+So: when a mutant survives, check whether a **later line in the same function** subsumes the mutated
+one before recording missing coverage — and check what the fixture actually reaches, since an
+*earlier* guard returning first is the mirror-image trap. Neither shows up in a green suite.
+
+### Collapsing duplicate validation tests: parametrize, and prove it with the same mutant (2026-09-20)
+
+Nine test functions across two modules each exercised one shared guard with a different input, which
+is boilerplate rather than coverage — `_check_states_shape`'s single `states.shape[1] != num_qubits`
+comparison had four (packed via `sqd`, packed via `hproj`, transposed, mismatched Hamiltonian),
+`_check_cache_level` had three parametrized tests all asserting `match="cache_level"`, and
+`pack_states`' binary check had two, one hiding a second input inside a bare `for` loop where a
+failure would not name which value broke.
+
+Collapsed to three parametrized tests, −53/+69 lines. The check that makes this safe rather than
+lossy: disable the guard in `rqutils/` and confirm the **same set of failures** before and after —
+7 kills for the width guard, 10 for `cache_level`, 4 for the binary check, identical both ways. The
+distinct inputs survive as parametrize ids, so a failure still names the shape that broke.
+
+Worth distinguishing from the reasoned overlaps elsewhere in this suite, which are **not** the same
+thing and should not be collapsed: `test_fully_cached_level_matches_dense` says "overlaps by design"
+because it is the positive control for `test_omitting_states_raises`, and
+`test_filler_slots_are_excluded_against_a_dense_reference` is the only arm surviving the `>> 7` →
+`>> 8` mutation. Those pin separate mutants; the nine above pinned one apiece.
+
 ### Sweep `cache_level`, don't sample it
 
 Three bugs hid behind a single-cell check, each masked by the one before it — every existing sharding

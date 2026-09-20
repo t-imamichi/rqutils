@@ -157,7 +157,7 @@ does not work — the venv holds an editable install pointing at the original. M
 unrelated uncommitted work; a checkout discards all of it, and the suite passes either way so nothing
 flags it. The restore step is the half that matters.
 
-Four reasons a mutant survives that are *not* missing coverage:
+Five reasons a mutant survives that are *not* missing coverage:
 
 - **Wrong layer or branch.** Check which branch your fixture reaches before concluding anything.
 - **Fixture too small.** If the defect is in how something *scales*, the fixture must span that axis —
@@ -168,6 +168,10 @@ Four reasons a mutant survives that are *not* missing coverage:
 - **The option is a genuine no-op on that fixture.** To prove an option does nothing, compare traced
   graphs (`jax.make_jaxpr` string equality), not energies: a *working* option can return a bit-identical
   energy, so "same as baseline" is satisfied by both arms and pins nothing.
+- **The line is redundant in the library.** An early-out whose condition a later line already covers
+  changes speed, not answers — there is nothing to pin. Check for a subsuming branch *and* for an
+  earlier guard returning first, which is the mirror trap: `_is_lex_sorted`'s duplicate-row test was a
+  second copy of the filler test, because fillers are caught two lines above the pass it named.
 
 ### Sharding tests
 
