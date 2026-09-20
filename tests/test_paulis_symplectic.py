@@ -577,17 +577,19 @@ class TestBinaryStateValidation:
     ``O(N*n)`` on an array ``packbits`` is about to walk anyway.
     """
 
-    def test_spin_encoding_raises_instead_of_collapsing(self):
-        """``{-1, +1}`` input is the documented gotcha: every row packed to the same bitstring."""
-        spins = np.array([[-1, 1, -1, 1], [1, 1, 1, 1]], dtype=np.int8)
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            # The documented gotcha: {-1, +1} spins, every row packing to the same bitstring.
+            np.array([[-1, 1, -1, 1], [1, 1, 1, 1]], dtype=np.int8),
+            np.array([[0, 1, 256]]),  # wraps to 0 under astype(uint8)
+            np.array([[0, 1, 2]]),  # nonzero, so packbits reads it as 1
+        ],
+        ids=["spins", "wraps_to_zero", "nonzero_above_one"],
+    )
+    def test_non_binary_input_raises(self, bad):
         with pytest.raises(ValueError, match="binary"):
-            PauliSumXZ.pack_states(spins)
-
-    def test_values_above_one_raise_instead_of_wrapping(self):
-        """``256`` wraps to 0 under ``astype(uint8)``; 2 is nonzero and packs as 1."""
-        for bad in (np.array([[0, 1, 256]]), np.array([[0, 1, 2]])):
-            with pytest.raises(ValueError, match="binary"):
-                PauliSumXZ.pack_states(bad)
+            PauliSumXZ.pack_states(bad)
 
     def test_the_error_names_an_offending_value(self):
         """A caller holding spins needs to see *what* was wrong, not just that something was."""

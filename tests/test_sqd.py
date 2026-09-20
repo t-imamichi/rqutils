@@ -660,22 +660,27 @@ class TestCacheLevelValidation:
     never see it) -- the validation belongs at the public boundary, not in the jit plumbing.
     """
 
-    @pytest.mark.parametrize("bad", [(2, 0), (-1, 0), (3, 1)])
-    def test_out_of_range_first_digit_raises(self, bad):
-        """Was silently equivalent to ``(0, 0)``: same answer, 7.2x the cost."""
-        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
-        with pytest.raises(ValueError, match="cache_level"):
-            sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=bad)
-
-    @pytest.mark.parametrize("bad", [(1, 5), (1, 3), (0, -1)])
-    def test_out_of_range_second_digit_raises_a_value_error(self, bad):
-        """Was ``UnboundLocalError``, an internal error leaking from a public entry point."""
-        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
-        with pytest.raises(ValueError, match="cache_level"):
-            sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=bad)
-
-    @pytest.mark.parametrize("bad", [(1,), (1, 0, 0), 1, "10"])
-    def test_malformed_cache_level_raises(self, bad):
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            # First digit out of range: was silently equivalent to (0, 0) -- same answer, 7.2x cost.
+            (2, 0),
+            (-1, 0),
+            (3, 1),
+            # Second digit out of range: was `UnboundLocalError`, an internal error leaking from a
+            # public entry point.
+            (1, 5),
+            (1, 3),
+            (0, -1),
+            # Malformed altogether -- wrong arity, wrong type.
+            (1,),
+            (1, 0, 0),
+            1,
+            "10",
+        ],
+    )
+    def test_invalid_cache_level_raises(self, bad):
+        """Every rejected shape must name ``cache_level`` rather than fall through the implicit else."""
         states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
         with pytest.raises((ValueError, TypeError), match="cache_level"):
             sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=bad)
@@ -724,30 +729,28 @@ class TestStatesWidthCheck:
     what catches that case, since packed bytes exceed 1.
     """
 
-    def test_sqd_rejects_packed_states(self):
-        """The measured loop: pack the states, feed them back, get a different subspace."""
-        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
-        packed = pack_padded(states)
-        assert packed.shape[1] != states.shape[1], "fixture must actually change width"
-        with pytest.raises(ValueError, match="num_qubits|width|shape"):
-            sqd((["ZZII"], [1.0]), packed, return_eigvec=False)
+    STATES = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
 
-    def test_hproj_rejects_packed_states(self):
-        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            # The measured loop: pack the states, feed them back, get a different subspace.
+            lambda s: sqd((["ZZII"], [1.0]), pack_padded(s), return_eigvec=False),
+            lambda s: hproj((["ZZII"], [1.0]), pack_padded(s)),
+            # Second payoff: (n, N) instead of (N, n).
+            lambda s: sqd((["ZZII"], [1.0]), s.T.copy(), return_eigvec=False),
+            # Third payoff: right shape family, wrong qubit count.
+            lambda s: sqd((["ZZ"], [1.0]), s, return_eigvec=False),
+        ],
+        ids=["sqd_packed", "hproj_packed", "transposed", "mismatched_hamiltonian"],
+    )
+    def test_wrong_width_is_rejected(self, entry):
+        """All four mistakes reach the one shared comparison; mutating it kills every case."""
+        assert pack_padded(self.STATES).shape[1] != self.STATES.shape[1], (
+            "fixture must actually change width"
+        )
         with pytest.raises(ValueError, match="num_qubits|width|shape"):
-            hproj((["ZZII"], [1.0]), pack_padded(states))
-
-    def test_a_transposed_array_is_rejected(self):
-        """Same check, second payoff: (n, N) instead of (N, n)."""
-        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
-        with pytest.raises(ValueError, match="num_qubits|width|shape"):
-            sqd((["ZZII"], [1.0]), states.T.copy(), return_eigvec=False)
-
-    def test_a_mismatched_hamiltonian_is_rejected(self):
-        """Third payoff: right shape family, wrong qubit count."""
-        states = np.array([[0, 1, 0, 1], [1, 0, 1, 0]], dtype=np.uint8)
-        with pytest.raises(ValueError, match="num_qubits|width|shape"):
-            sqd((["ZZ"], [1.0]), states, return_eigvec=False)
+            entry(self.STATES)
 
     def test_the_error_names_both_widths(self):
         states = np.array([[0, 1, 0, 1]], dtype=np.uint8)
@@ -2159,13 +2162,24 @@ class TestSingleFillerRow:
         assert padded[-1, 0] == 255, "fixture must actually contain one filler row"
         assert not _is_lex_sorted(padded)
 
-    def test_two_filler_rows_are_still_rejected(self):
-        """The case that already worked, via the duplicate test -- must not regress."""
+    def test_duplicate_rows_are_rejected(self):
+        """Duplicate rows must be rejected, on filler-free input so the filler branch is not what does it.
+
+        Was ``test_two_filler_rows_are_still_rejected``, using two all-255 rows -- which the high-bit
+        filler check rejects first, making it a second copy of
+        :meth:`test_one_filler_row_is_rejected`. This fixture keeps byte 0 < 128 so the rejection has
+        to come from the sortedness pass instead.
+
+        Note the ``np.all(np.any(differs, axis=1))`` line it reaches is an **early-out, not an
+        independent guard**: for a duplicate pair the final ``lhs < rhs`` comparison is False too, so
+        disabling the early-out leaves the suite green (measured). Nothing to pin there -- the
+        behaviour is what this asserts.
+        """
         from rqutils.paulis.symplectic import PauliSumXZ
 
-        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
-        padded = np.asarray(uniquify_states(PauliSumXZ.pack_states(states), 4))
-        assert not _is_lex_sorted(padded)
+        duplicated = np.asarray(PauliSumXZ.pack_states(np.array([[0, 1], [0, 1]], dtype=np.uint8)))
+        assert duplicated[-1, 0] < 128, "fixture must clear the filler branch to reach sortedness"
+        assert not _is_lex_sorted(duplicated)
 
     def test_unpack_states_silently_launders_a_filler_into_a_real_state(self):
         """A *separate* hazard, recorded rather than fixed here -- and not reachable by this guard.
