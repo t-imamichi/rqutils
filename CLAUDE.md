@@ -71,15 +71,23 @@ warnings" summary line too.
 ```bash
 uv run --extra dev ruff check rqutils/ tests/ examples/     # lint
 uv run --extra dev ruff format rqutils/ tests/ examples/    # format (line width 100)
-uv run --extra dev ty check rqutils/ tests/ examples/       # type check
+uv run --exact --extra dev --extra mpl --extra qutip --extra docs \
+  ty check rqutils/ tests/ examples/                        # type check
 ```
 
-All three are clean; keep them that way — **from a venv without the `mpi` extra**, which is what those
-commands give. The two `# ty: ignore[unresolved-import]` on `mpi4py` are required there and are reported
-as *unused* if `mpi4py` happens to be installed, so `ty check` cannot be clean in both states and the
-no-`mpi` one is the contract. Don't "fix" that warning by deleting the suppressions: it breaks `ty` for
-every normal install. (A global `unused-ignore-comment = "ignore"` is the wrong trade too — that rule is
-what flags the other six suppressions going stale.)
+All three are clean; keep them that way — and `ty` only **from a venv without the `mpi` extra**, which is
+why its command spells out every *other* extra under `--exact`. Plain `uv run --extra dev` does **not**
+give that state: it guarantees `dev` is present without pruning, so a `mpi4py` left behind by any earlier
+`--extra mpi` sync stays resolvable and the check reports two *false* `unused-ignore-comment` warnings.
+`--exact` alone overshoots the other way, dropping `mpl`/`qutip`/`docs` for 6 real `unresolved-import`
+diagnostics — hence the full list. The two `# ty: ignore[unresolved-import]` on `mpi4py` are required in
+the contract state and are reported as *unused* if `mpi4py` happens to be installed, so `ty check` cannot
+be clean in both states and the no-`mpi` one is the contract. Don't "fix" that warning by deleting the
+suppressions: it breaks `ty` for every normal install. (A global `unused-ignore-comment = "ignore"` is the
+wrong trade too — that rule is what flags the other six suppressions going stale.)
+
+**`--exact` uninstalls `mpi4py`, so a `ty check` leaves the venv unable to run the `mpi` paths.** Re-sync
+before an `mpirun` invocation: `uv sync --extra dev --extra mpl --extra qutip --extra docs --extra mpi`.
 
 Config is in `[tool.ruff]` / `[tool.ty.rules]` in `pyproject.toml`, and every suppression carries the
 reason it exists — read those comments before adding another. Pre-commit runs only whitespace/EOF/YAML/large-file hooks, not ruff or ty. Notebooks are
