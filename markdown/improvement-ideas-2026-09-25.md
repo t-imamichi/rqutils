@@ -42,13 +42,11 @@ ranks. Stacking into one `(2,)` array would merge them, but saves one dispatch p
 hundreds of iterations, and the multi-process path is unverifiable in the sandbox (localhost bind is
 denied). `NOTES.md` has the entry.
 
-### 7. A cheaper residual check -- **new, decision first**
+### 7. A cheaper residual check -- **DONE** (2026-09-25)
 
-Item 6's check costs **+3.2%** at `(1, 0)` and **+7.9%** at `(1, 2)` (`J=120`, `N=30k`, measured) because
-it always runs an uncached `(0, 0)` matvec, paying the `J`-fold `get_xsource` search again. When the solve
-cached source indices, checking at `(1, 0)` would reuse them and still recompute every diagonal from its
-signatures -- dropping the search, but no longer independent of an `xsources` defect. That trade is a
-correctness-policy decision before it is a performance one; decide it, then A/B warm and interleaved.
+The `(0, 0)` check matvec took 80.5 ms against 7.7 ms reusing the cached `xsources`: ~90% of its cost was
+redoing the search. It now reuses a full `xsources` cache and still rebuilds every diagonal, taking the
+whole-solve overhead from +3.2%/+7.9% to **+0.9%/+0.6%** at `(1, 0)`/`(1, 2)`. `NOTES.md` has the entry.
 
 ## Memory
 
@@ -107,7 +105,7 @@ a named `states_size` policy. The levers left are the operator's storage (3, 8) 
 
 ## Order
 
-1. **7** -- the only item that is small and measurable on one machine; blocked only on the policy call.
+1. ~~**7**~~ -- done.
 2. **3** -- one measurement (largest-`K_g` first against a prefix, at equal bytes) settles the API.
 3. **8** -- prototype and measure; drop it if scatter loses to gather.
 4. **4**, **9** -- need a real multi-process run; **5** needs real sampler output.
