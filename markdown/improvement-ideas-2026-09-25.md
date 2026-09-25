@@ -42,6 +42,14 @@ ranks. Stacking into one `(2,)` array would merge them, but saves one dispatch p
 hundreds of iterations, and the multi-process path is unverifiable in the sandbox (localhost bind is
 denied). `NOTES.md` has the entry.
 
+### 7. A cheaper residual check -- **new, decision first**
+
+Item 6's check costs **+3.2%** at `(1, 0)` and **+7.9%** at `(1, 2)` (`J=120`, `N=30k`, measured) because
+it always runs an uncached `(0, 0)` matvec, paying the `J`-fold `get_xsource` search again. When the solve
+cached source indices, checking at `(1, 0)` would reuse them and still recompute every diagonal from its
+signatures -- dropping the search, but no longer independent of an `xsources` defect. That trade is a
+correctness-policy decision before it is a performance one; decide it, then A/B warm and interleaved.
+
 ## Memory
 
 ### 3. Partial diagonal cache
@@ -54,7 +62,8 @@ fixing the API. Limits: net-negative below about `K = 7`, and must not be combin
 ### 4. Return device arrays from `sqd`
 
 `sqd` re-replicates both O(N) outputs (+7 all-gathers, measured), which makes sharding `states` pointless
-until fixed. Return padded arrays plus `subspace_dim`.
+until fixed. Return padded arrays plus `subspace_dim`. `run_sqd` now returns a `SqdResult` carrying exactly
+those fields, so this is an `sqd`-level API choice; verifying it still needs a real multi-process run.
 
 ### 5. Split the solve by symmetry sector -- **new, unmeasured**
 
@@ -65,6 +74,21 @@ If `H` conserves a quantity readable from a bitstring (Hamming weight for XXZ, Z
 "symmetry". **Gate:** it only pays when real sampler output spans several sectors -- the warm-start
 fixture was a single sector (`NOTES.md`, 2026-09-17), so check an actual sampler first.
 
+### 8. Sparse transition pairs instead of dense source indices -- **unmeasured**
+
+The source cache stores one `int32` per `(X group, state)`, `-1` for an absent transition, while measured
+hit rates run 2--100%. XOR is an involution, so present transitions pair up; storing each pair once costs
+about `4·h·N` bytes per group against `4·N` -- **~10× less at a 10% hit rate**. Risks recorded in
+`markdown/sqd-locg-improvement-ideas.md` §5: scatter slower than gather, ragged group lengths, and
+distributed ownership of the two directed updates. Needs a prototype before any API.
+
+### 9. Distributed `states` -- **built, blocked on hardware**
+
+Hash ownership plus a local search is verified bit-identical at **16× less** per-device `states` memory,
+and range-partitioned `uniquify_states` is built too (`CLAUDE.md`, "`states` must be replicated today").
+What is unmeasured is whether the routing pays, which needs a real interconnect; virtual devices cannot
+time it (`markdown/sqd-locg-improvement-ideas.md` §3).
+
 ## Accuracy
 
 ### 6. Independent final-residual check -- **DONE** (2026-09-25)
@@ -72,3 +96,18 @@ fixture was a single sector (`NOTES.md`, 2026-09-17), so check an actual sampler
 Shipped as `EigenpairCheckError`, always on in `sqd`: one `(0, 0)` matvec after the solve, raising
 above 10× the convergence bound. Converged solves measure at most 0.96 of the bound; the cost is
 +1.5–7.9% by cache level. Lets spinchain drop its own `_eigen_residual` guard. `NOTES.md` has the entry.
+
+## Not reopened
+
+The solver's arithmetic is closed: its basis and carried-vector count, reusing `Ax`, reduced precision,
+compensated sums, adaptive re-orthogonalization, preconditioning and Davidson at matched memory are all
+measured and recorded (`CLAUDE.md`, "Closed investigations"; `markdown/sqd-locg-improvement-ideas.md`,
+"Ideas not to reopen"). So are the Bloom pre-filter, `cache_level[1] = 1`, the identity-X special case and
+a named `states_size` policy. The levers left are the operator's storage (3, 8) and data movement (4, 9).
+
+## Order
+
+1. **7** -- the only item that is small and measurable on one machine; blocked only on the policy call.
+2. **3** -- one measurement (largest-`K_g` first against a prefix, at equal bytes) settles the API.
+3. **8** -- prototype and measure; drop it if scatter loses to gather.
+4. **4**, **9** -- need a real multi-process run; **5** needs real sampler output.
