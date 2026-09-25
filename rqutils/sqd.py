@@ -1719,7 +1719,7 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
     `np.unique(..., axis=0)`'s. Note `hproj`'s `unique_states=True` shortcut skips that `np.unique`,
     so a caller passing unsorted-but-unique states gets a wrong (and non-symmetric) matrix; that
     predates this implementation and is pinned by
-    `test/test_sqd.py::TestHproj::test_unsorted_input_with_unique_states_is_wrong` -- named for the
+    `test/test_sqd_hproj.py::TestHproj::test_unsorted_input_with_unique_states_is_wrong` -- named for the
     behaviour, since nothing is rejected: the result is silently wrong.
 
     Since `S` is sorted, finding `A` is a **binary search** of `S ^ X` into `S` -- not a reason to

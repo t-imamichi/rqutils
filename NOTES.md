@@ -432,7 +432,7 @@ states.
 
 ### Why `test/sharded/*.py` are files rather than inline strings
 
-Not named `test_*`, so pytest does not collect them; `test_sqd.py::TestShardedSqd` subprocesses
+Not named `test_*`, so pytest does not collect them; `test_sqd_sharded.py::TestShardedSqd` subprocesses
 `test/sharded/sqd_grid.py` under `XLA_FLAGS=--xla_force_host_platform_device_count=4`, because the
 virtual device count must be set before jax initializes and `conftest.py` has already imported it by
 collection time. They live in files so ruff and ty check them — as a `textwrap.dedent` blob an

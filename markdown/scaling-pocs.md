@@ -115,7 +115,7 @@ the script's own instruction.
 Note this is now a claim about `lax.sort` itself: the sort left the library in 23fb226, so it is
 answerable only against the pinned legacy arm, and a flat result there is a finding about JAX rather
 than about `sqd`. The removal still stands on the other three grounds (speed, the `2N` allocation
-behind the `N ≤ 2**31` ceiling, and shardability). Tests are in `test/test_sqd.py::TestGetXsource`, verified to fail against
+behind the `N ≤ 2**31` ceiling, and shardability). Tests are in `test/test_sqd_kernels.py::TestGetXsource`, verified to fail against
 three injected defects: reversed byte significance (7 failures), the `uint64` path used beyond 8 bytes
 (3 failures, exactly the `B > 8` cases), and a non-negative absent-source sentinel (13 failures).
 

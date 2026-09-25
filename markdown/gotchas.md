@@ -214,7 +214,7 @@ the change with the payoff.
 It went unnoticed because the chain is uniform, so the mislabelled operator is the *bit-reversed* XXZ
 -- a legitimate instance with qubits renumbered, giving self-consistent ratios. A site-dependent field
 would have exposed it. The helper is now fixed, and
-`test/test_sqd.py::TestHproj::test_states_columns_are_character_indexed_not_qubit_indexed` pins it,
+`test/test_sqd_hproj.py::TestHproj::test_states_columns_are_character_indexed_not_qubit_indexed` pins it,
 including an arm asserting the naive pairing really is insensitive to qubit 0 (so the reversal is
 load-bearing rather than cosmetic). Verified by mutation: deleting the `[::-1]` fails the test with
 `[1.0, 1.0]` against the expected `[-1.0, 1.0]`.

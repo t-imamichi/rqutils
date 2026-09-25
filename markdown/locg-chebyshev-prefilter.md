@@ -45,7 +45,7 @@ Sharding coverage is 1/2/4 devices x partitioned/replicated (12 cases), assertin
 Ragged mesh splits are **not** swept because they are unreachable: explicit sharding rejects
 `dim % mesh.size != 0` at `device_put`, before `ground_locg` runs. That is `sqd`'s concern, where
 `uniquify_states` pads to a power of two — **now covered** by
-`test/sharded/sqd_grid.py` / `test_sqd.py::TestShardedSqd` (2026-08-28): the padded
+`test/sharded/sqd_grid.py` / `test_sqd_sharded.py::TestShardedSqd` (2026-08-28): the padded
 subspace and `apply_h`'s gather-heavy matvec on a mesh, swept over 1/2/4 devices x all six
 `cache_level`s, asserting the prefilter's output *spec* as well as the energy.
 

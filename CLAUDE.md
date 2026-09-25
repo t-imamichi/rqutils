@@ -27,7 +27,8 @@ When a rule needs evidence, it points there rather than restating it.
 - **No `timeout` on macOS** (it is GNU coreutils) — use the Bash tool's own timeout.
 - **The Bash tool runs zsh, not the login shell fish: quote globs** (`--include="*.py"`). An unmatched
   glob aborts the *whole* command line with `(eval):1: no matches found`, which reads as "no results";
-  fish syntax (`for …; end`) fails to parse, and a bare `=word` is expanded (`echo ====` errors).
+  fish syntax (`for …; end`) fails to parse, a bare `=word` is expanded (`echo ====` errors), and
+  `read path` clobbers `PATH` (zsh ties the two), so name loop variables anything else.
 - **macOS `sed -i` needs an explicit backup arg** (`sed -i '' 's/x/y/' f`). Without it BSD sed reads the
   filename as the suffix and fails — **while exiting 0**, so it looks like a successful no-op. Prefer a
   short `uv run python -` heredoc for in-place edits (system `python3` is older than the venv's), and assert the match count before writing.
@@ -124,7 +125,9 @@ check` still applies, since codespell and rumdl read markdown. **Docstrings are 
 `test/conftest.py` enables `jax_enable_x64` before any `rqutils` import — every tolerance depends on it
 — and holds the shared reference helpers, each validated against qiskit before being trusted. It also
 configures caches taking the suite from ~53 s cold to ~12–20 s warm under `-n auto`. One `test/test_<module>.py`
-per module. `test/sharded/*.py` are subprocessed under
+per module, except `sqd`, split by concern into `test_sqd.py` (end-to-end, validation, tolerances),
+`test_sqd_kernels.py`, `test_sqd_hproj.py` and `test_sqd_sharded.py`; helpers two of them share live
+in `conftest`. `test/sharded/*.py` are subprocessed under
 `XLA_FLAGS=--xla_force_host_platform_device_count=4` (the device count must be set before jax
 initializes) by `conftest.run_sharded_child`; not named `test_*`, so pytest does not collect them. Each
 imports `common` first and prints one JSON object through `common.emit` after every case has run, so a
