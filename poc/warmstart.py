@@ -20,7 +20,7 @@ Three rules for reusing this, each measured:
 
 Run:
     uv run python poc/warmstart.py       # demo() self-check, then xxz_rungs arm
-    uv run python -c "import examples.scaling.warmstart as m; m.run_recovery(delta=0.5)"
+    uv run python -c "import poc.warmstart as m; m.run_recovery(delta=0.5)"
 """
 
 import functools

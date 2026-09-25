@@ -688,31 +688,9 @@ of a stacked `2N` array.
 
 ### Replacing that sort out-of-core: prototyped and rejected (2026-08-29)
 
-The sort is still the ceiling, and the obvious move is `poc/ooc_uniquify.py`'s chunk-sort-and-merge,
-which bounds the working set by a chosen chunk size rather than by `N`. That POC bails out at `B > 8`
-("no uint64 equivalence available"), so it never covered `n = 100`. `_pack_state_words` removes that
-obstacle — wide rows pack into `ceil(B/8)` uint64 columns, and a structured-dtype view makes
-`np.unique` / `np.union1d` lexicographic over them with no row comparator — so the wide case was built
-and measured. **It loses on both axes it exists to win.** At n=100, B=13, N=8M host-side:
-
-| approach | time | peak RSS |
-| --- | --- | --- |
-| `np.unique(rows, axis=0)` (incumbent shape) | 7.3 s | **365 MB** |
-| word-packed `np.unique` | **4.9 s** | 1655 MB |
-| chunked sort + merge tree on words | 31.3 s | 1048 MB |
-
-4.3× slower and 2.9× more peak memory than plain `np.unique`. Output verified identical in all arms.
-
-The reason is worth keeping, because it is the same fact that makes the *in-JAX* fix a good trade and
-this one a bad trade: **packing widens the data.** `8*ceil(B/8) - B` bytes per row — +7 at n=64
-(B=9→16), +3 at n=100, free at n=127. Speed bought with memory is right for the JAX sort, whose own
-working set dominates, and exactly wrong for a design whose entire purpose is bounding memory. Do not
-read the shipped `uniquify_states` change as a step toward an out-of-core one; they pull opposite ways.
-
-Two things the POC's own docstring already says, confirmed here and worth not rediscovering: chunking
-removes the single-device *sort* but **distributes nothing** (sequential merge, full result on one
-host), and a real multi-node uniquify needs a range-partitioned shuffle, for which chunk-local sorting
-is the per-node kernel and not the algorithm.
+Rejected: the word-packed chunked sort + merge at n=100, B=13, N=8M is 4.3× slower (31.3 s vs 7.3 s) with
+2.9× the peak RSS (1048 vs 365 MB) of plain `np.unique`: packing widens rows, and chunking distributes
+nothing. `poc/ooc-uniquify.md` §2–§3.
 
 ## Memory at scale: the source cache, the diagonals, and their pre-filters
 
@@ -1309,86 +1287,10 @@ across `J = n` groups. The crossover arithmetic is structure-independent; the ti
 
 ### A partial *diagonal* cache works, composes into a solve, and selects a diagonal-only dial (2026-08-30)
 
-The open question the entry above surfaced: `cache_level[1]` is all-or-nothing across X groups, so
-level 2's 808 B/slot at `J=101` cannot be traded down. Prototyped outside the library as two summed
-`_apply_h_kernel` calls -- `(1, 2)` over the first `J'` groups, `(1, 0)` over the rest -- and measured.
-**It works, and unlike the Bloom pre-filter it survives composition into a solve.**
-
-**Real `sqd()` solves**, n=100, J=100, K=99, N=50,072, `states_size` 65536. Every arm returned
-`-52.23606798`, identical to 8 decimals:
-
-| `J'` | diagonal store | memory saved | solve | vs all-cached |
-| --- | --- | --- | --- | --- |
-| 0 | 0 MB | 100% | 3243.8 ms | 5.13× |
-| 25 | 13.1 MB | 75% | 2004.9 ms | **3.17×** |
-| 50 | 26.2 MB | 50% | 1552.2 ms | **2.45×** |
-| 75 | 39.3 MB | 25% | 1091.0 ms | 1.73× |
-| 100 | 52.4 MB | 0% | 632.3 ms | 1.00× |
-
-So **half the diagonal memory for 2.45×**, or 75% of it for 3.17×. At `J=101, K=100` that is
-808 → 404 B/slot; against the 24M-slot budget above, `(1, 2)`'s 43.5 GB → ~24 GB.
-
-**Why it composes where the filter did not, which is the transferable part.** The implied matvec count
-is **129**, stable across n=40/60/100 (from `(s10 - s12) / (mv10 - mv12)`). The diagonal cache is
-*consumed* ~129 times per solve, so a per-matvec saving multiplies; the filter targeted a one-off
-precompute at 4.5–8.4% of a solve, so Amdahl divided it. Matvec ratios of 5.0–8.2× became solve ratios
-of **3.59–5.13×** — compression, not collapse. **The question to ask of any `sqd` optimization is how
-many times per solve its target is paid**, and it is the same "weighted by call count" distinction that
-made the filter look worth building.
-
-**Three ways this axis behaves better than `xcache_groups` does on its own:**
-
-- **Linear and monotonic**, no cliff. The X axis "never reaches full-cache time" with a
-  disproportionate last step; this one lands on it.
-- **Peak temp memory does not regress.** 1.1 MB at an intermediate split against 0.0–0.5 MB at the
-  endpoints (XLA `memory_analysis`), i.e. 3.5% of the 31.5 MB store at J=60 — where the X-axis split
-  measured 9.0 MB against 10.4 MB, a large fraction of its cache. End-to-end the two-arm overhead is
-  **nil**: `J' = J` measured 632.3 ms against the single-kernel 649.1 (1.027×, noise).
-  **Superseded in the entry below**: that 1.1 MB is not flat in `N` — it is 16 B/slot, so it scales
-  linearly. The invariant is the *ratio*, 4.0% of the memory the split gives back at every
-  `states_size`, and `4/J` in the group count.
-- **Bit-identical at every split** — `max |Δ|` exactly `0.00e+00` against the all-cached reference at
-  every `J'`, at both n=60 and n=100.
-
-**The projection model was validated against points it was not calibrated on**, since `NOTES.md`
-records the analogous X-axis model drifting 17.5% mid-range. Calibrating
-`solve(J') = fixed + niter * matvec(J')` on the two endpoints only (`niter = 129`, `fixed = 245.9 ms`)
-and testing the middle:
-
-| `J'` | projected | measured | residual |
-| --- | --- | --- | --- |
-| 25 | 2050.7 | 2004.9 | +2.3% |
-| 50 | 1665.6 | 1552.2 | **+7.3%** |
-| 75 | 1207.3 | 1091.0 | **+10.7%** |
-
-Worst non-calibration residual **10.7%**, and it errs *pessimistic* — real solves beat the projection.
-Better than the X axis's 17.5%, and the same rule follows: **a budget API can size the cache by exact
-arithmetic and must not advertise a runtime.**
-
-**Two constraints any design must respect, both measured.**
-
-**Do not split both axes.** Not because of the arm count, but because `cache_level[0] = 0` is
-catastrophic per matvec: over all J groups at n=60, `(0, 2)` costs **73.97 ms against `(1, 2)`'s
-1.80** — a **41×** gap, consistent with the documented 59.8×. Any X-axis split reintroduces it, so a
-shared split point across both axes would pay 41× to save diagonal bytes. A four-arm prototype measured
-39.37 ms against the two-arm 4.97 at the same diagonal split, and the cause is that arm's presence, not
-the arm count. **The two axes are not symmetric: the diagonal axis is cheap to split (5.1× spread), the
-X axis is expensive (41×).** So the dial belongs on the diagonal axis alone, orthogonal to
-`xcache_groups`, with `cache_level[0]` left at 1.
-
-**One compiled variant per distinct `J'`, and power-of-two rounding does not help — it makes it worse.**
-13 distinct splits produced 13 variants; rounding `J'` up to a power of two produced **16**, because
-both arms' lengths vary together (`xs[:jr]` and `xs[jr:]` are two shapes, and the complement is not a
-power of two). This is unlike the pre-filter's `cap`, where rounding bounded the count. Acceptable
-because `J'` is static per solve, but a caller sweeping it pays one compile per value, and that must be
-documented rather than discovered.
-
-**Caveats.** One laptop CPU. `N` ≈ 50k with `states_size` 65536 in every run, so the peak-memory claim
-was unconfirmed at large `N` — **now measured, in the entry below**: it holds as a ratio (4.0% of
-savings, invariant in `N`) rather than as the absolute figure quoted here. Fixtures are 1D Heisenberg with a subspace half-closed under a weight-preserving hop, not
-sampled from a circuit. The intermediate solves came from throwaway `run_sqd` instrumentation behind an
-env var, since `sqd` has no such parameter; it was removed and the file restored from a `cp` backup
-(626 passed after).
+Split at `J'`: `(1, 2)` over `J'` groups, `(1, 0)` over the rest. Real `sqd()` solves (n=100, J=100) give
+**half the diagonal memory for 2.45×** (75% for 3.17×), bit-identical; it composes because the cache is
+read ~129 times per solve. **Do not split both axes** (41×), and expect **one compile per distinct
+`J'`**. `poc/diag-cache.md` §1, §2, §5.
 
 ### Sparse transition pairs beat every cache level on memory *and* speed (2026-09-25, prototype)
 
@@ -1404,121 +1306,21 @@ and no duplicate transients. Open: GPU timing, sharding, sampler subspaces.
 
 ### Partial diagonal cache: *which* groups to cache barely matters, only how many (2026-09-25)
 
-Every cached group costs the same bytes (one diagonal per state), but recomputing group `g` costs `K_g`
-iterations -- `_accumulate_diagonal` stops at the first zero-padded term -- so at equal bytes, caching the
-largest `K_g` first removes the most work. Measured with `poc/diag_cache_order.py` (the two-kernel
-construction of the entry above) on a molecular-like Jordan--Wigner Hamiltonian from random integrals,
-chosen because a spin chain cannot test it: all its diagonal terms land in the identity-X group, which
-sorts first, so a prefix already picks it (`K_g = [23, 2, 2, ...]` on an XXZ chain with a field).
-
-n=18, density 0.25: `J = 2641`, `K_g` quartiles 8/8/8 (min 6, max 62), `states_size` 16384, 330 MiB full
-store; matvecs warm, 15 interleaved rounds, each arm checked against the full-cache product:
-
-| cached | `K` left, prefix | `K` left, largest | matvec, prefix | matvec, largest | paired | ratio |
-| --- | --- | --- | --- | --- | --- | --- |
-| `J/8` | 19250 | 18486 | 167.4 ms | 162.5 ms | 14/15 | **1.030×** |
-| `J/4` | 16412 | 15846 | 145.9 ms | 141.8 ms | 15/15 | **1.028×** |
-| `J/2` | 10882 | 10566 | 102.1 ms | 99.8 ms | 15/15 | **1.023×** |
-
-Whole `ground_locg` solves at `J/8` (prefilter `(32, 2)`, batched, as `run_sqd` drives it): 49.9 s
-against 48.8 s, **1.023×**, same eigenvalue to 12 digits and the same 107 iterations. n=14: 1.013--1.027×,
-5/5 paired at every fraction.
-
-- **The gain is the `K`-left difference, near one for one**: matvec time fits `a + b·(K left)`
-  (n=14: `a` ≈ 3.1 ms, `b` ≈ 1.65 µs per term), so the order can only win what its `K` coverage differs by.
-- **That difference is small because `K_g` is concentrated**: most groups here share `K = 8`, so ranking
-  moves a few large groups. A denser n=12 variant (density 1.0, `K_g` 8/22/79) differs more -- 56% more
-  `K` removed at `J/8`, 7% at `J/2` -- a work count, not timed.
-- **So the API should expose the count, not an order.** Largest-first is never worse and costs a host
-  argsort over `.c`, but it is worth ≤3% on these fixtures and 0% on spin chains; the dial that matters
-  is `J'`, whose half-memory point costs 2.45× (the entry above).
+At equal bytes, largest-`K_g`-first beats a prefix by only **1.02–1.03×** (whole solve 1.023×, n=18 JW)
+and gains nothing on spin chains, so an API exposes the count `J'`, not an order.
+`poc/diag_cache_order.py`; `poc/diag-cache.md` §6.
 
 ### Partial diagonal cache on XXZ: the identity group is the best byte, not most of the win (2026-09-25)
 
-The 1D periodic XXZ chain (`Jz = 1`, `poc/sqd_multinode.py`'s `xxz_hamiltonian` and
-`xxz_krylov_states`, the Néel-Krylov subspace) puts every diagonal term in the identity-X group, which
-sorts first: `K_g = [n, 2, 2, ...]` over `J = n + 1` groups. Three arms, each checked against the
-full-cache product -- `J' = 0` (`(1, 0)`), `J' = 1` (the identity group cached, the rest `(1, 0)`, the
-two-kernel form above) and `J' = J` (`(1, 2)`) -- timed as whole `ground_locg` solves driven as `run_sqd`
-drives them (prefilter `(32, 2)`, batched), memory from XLA `memory_analysis` of the whole solve
-(inputs + temp). `N = 60000`, `states_size = 65536`, warm, one laptop CPU:
-
-| n | `(1, 0)` | `J' = 1` | `(1, 2)` |
-| --- | --- | --- | --- |
-| 24 | 555 ms, 11.5 MiB | **441 ms (1.26×), 13.1 MiB** | 196 ms (2.83×), 23.8 MiB |
-| 32 | 1123 ms, 13.6 MiB | **814 ms (1.38×), 15.1 MiB** | 325 ms (3.46×), 29.8 MiB |
-
-Eigenvalue and iteration count identical across arms (44 and 59 iterations).
-
-- **The identity group is a third of the recompute, not most of it.** It holds `n` of the `3n` terms
-  (the `n` hops have `K = 2` each), and the solve fits the linear-in-`K`-left model of the entry above:
-  removing a third of the terms predicts 436 ms at n=24, measured 441. A prediction that it would
-  recover "nearly all" of the full-cache speed was wrong for exactly this reason.
-- **But it is the best byte by far**: ~73 ms saved per MiB at n=24, against ~29 ms for the whole cache,
-  because it is `1/(n+1)` of the store and a third of the work. Further hop groups buy linearly.
-- **Ordering is moot on XXZ**: a prefix *is* largest-first.
-- **The dial only matters when `(1, 2)` does not fit.** `(1, 2)`'s store is `8·(n+1)` B/slot; `J' = 1`
-  costs ~24 B/slot (its 8 B store plus the 16 B/slot two-kernel temp).
+Caching only the identity group (`J' = 1`, ~24 B/slot) gives **1.26× / 1.38×** at n=24/32 against `(1,
+2)`'s 2.83× / 3.46×: a third of the recompute, at ~73 ms per MiB against the whole cache's ~29. On XXZ a
+prefix already is largest-first. `poc/diag-cache.md` §7.
 
 ### The diagonal split at large `N`: the overhead is a *ratio*, and "flat 1.1 MB" was an artifact (2026-08-30)
 
-The entry above left one load-bearing claim unmeasured — peak temp memory "flat at 1.1 MB across every
-intermediate split", from a single `states_size` of 65536. Swept to 2^21 it is **not flat**, and the
-corrected statement is stronger.
-
-**Peak temp is exactly 16 B/slot, and it scales linearly with `N`:**
-
-| `states_size` | full diagonal store | peak temp at `J/2` | peak B/slot |
-| --- | --- | --- | --- |
-| 2^16 | 52.4 MB | 1.05 MB | **16.0** |
-| 2^18 | 209.7 MB | 4.20 MB | **16.0** |
-| 2^20 | 838.9 MB | 16.78 MB | **16.0** |
-| 2^21 | 1677.7 MB | 33.56 MB | **16.0** |
-
-Two float64 output buffers, one per kernel arm — `O(N)`, not `O(J·N)`. **That is why the
-`xcache_groups` hazard does not occur here**: its two-kernel overhead was a fraction of a `4·J·N`
-int32 cache and could exceed the saving (9.0 MB against 10.4), while this overhead is `O(N)` against a
-`8·J·N` store.
-
-**So the invariant is a ratio, not an absolute.** Overhead against the memory the split gives back is
-**4.0% at every `states_size`** — invariant because it is a quotient of two terms both linear in `N`,
-which is a far stronger guarantee than a small number at one size.
-
-**It depends on `J` as `4/J`, measured at `states_size = 2^18`, `J' = J/2`:**
-
-| `J` | store B/slot | peak B/slot | overhead vs saved |
-| --- | --- | --- | --- |
-| 10 | 80 | 16.0 | **40.0%** |
-| 25 | 200 | 16.0 | 16.0% |
-| 50 | 400 | 16.0 | 8.0% |
-| 100 | 800 | 16.0 | **4.0%** |
-| 200 | 1600 | 16.0 | **2.0%** |
-
-`16 / (4·J)` exactly. (A `2/J` prediction stated while working this out was wrong by 2× — it divided
-the 16 B/slot by the *full* store rather than the half a `J' = J/2` split gives back. Measured beats
-that prediction; the `1/J` shape was right, the constant was not.) **The dial is only cheap at large
-`J`** — 40% overhead at `J = 10` — but `J = 10` is also where the whole feature is pointless.
-
-**The time ratios hold at scale, on a real Hamiltonian.** 1D Heisenberg n=100, J=100, matvec:
-
-| `N` | `states_size` | store | all-cached | `J/2` | none | `J/2` vs all | exact |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 50,072 | 65536 | 52.4 MB | 4.49 ms | 12.49 | 28.04 | **2.78×** | `0.0e+00` |
-| 187,846 | 262144 | 209.7 MB | 14.70 ms | 38.21 | 79.80 | **2.60×** | `0.0e+00` |
-| 501,157 | 524288 | 419.4 MB | 19.99 ms | 56.51 | 123.97 | **2.83×** | `0.0e+00` |
-
-Stable across a 10× range in `N`, and slightly better than the 2.45× recorded above. Bit-identical at
-every size.
-
-**A trap worth recording, because it produced a 25–39× phantom.** Timing this on
-*synthetic shape-only* arrays — the right approach for peak memory, since that depends on shapes alone —
-measured the `J/2` split at 25–39× rather than 2.6–2.8×. The cause is `_accumulate_diagonal`'s early
-exit: it stops at the first zero coefficient in a zero-padded Z group, and `rng.normal` coefficients are
-never zero, so all `K = 99` terms ran per group where a real Hamiltonian's structured groups stop far
-sooner. **Synthetic arrays are valid for memory and invalid for time** whenever a kernel's trip count is
-data-dependent. `NOTES.md` already records the converse trap (a *broken* arm flatters its own benchmark
-by doing less work); this is the same lesson from the other side — an unrealistically *dense* fixture
-punishes the arm that depends on sparsity.
+Peak temp is **16 B/slot**, linear in `N`: **4.0% of the memory saved** at every `states_size` up to
+`2^21`, `4/J` in the group count (40% at J=10), net-negative below about `J = 7`. Matvec time holds at
+2.6–2.8× up to N=501k; synthetic arrays gave a 25–39× phantom. `poc/diag-cache.md` §3, §4.
 
 ### `states_size`'s power-of-two padding: the default is right at small `N` and wastes GBs at large `N` (2026-08-30)
 
@@ -1595,54 +1397,10 @@ bisecting sweeps, so ~10^5 is an order of magnitude rather than a boundary.
 
 ### f32 *storage* for the solver's carried vectors: `ax` cannot be demoted, and it is the one that matters (2026-08-30)
 
-Proposed as the one lever on the `(0, 0)` floor. That floor is **120 B/slot** measured, of which only 13
-is the Hamiltonian: 32 B/slot is `_State`'s four carried vectors (`x, y, r, ax`) and ~75 is transients.
-At `2^31` slots the floor alone is **258 GB**, and no `cache_level` setting touches it.
-
-**This is a different proposal from POC 6, which is already rejected.**
-`poc/mixed_precision.py` runs the matvec *arithmetic* in f32 and casts back, keeping
-f64 *storage* — a bandwidth optimization. Demoting a carried vector is a memory optimization. The POC's
-verdict (`markdown/scaling-pocs.md` §6, **reject**) does not cover it, and re-running the POC confirms that
-verdict still reproduces: 1.17–1.30× at fixed iterations, three of four converged solves hitting
-`maxiter=300`, **0.42× end-to-end**, and 6d's naive form converging in 9 iterations with
-`converged=True` and a **4.42% relative error**.
-
-**But the shared discriminator settles the storage variant too, and cheaply.** Take a converged
-eigenpair (1D Heisenberg n=40, N≈20k, `theta = -28.236067977500`, 66 iterations, `‖A‖ ≤ Σ|c| = 117`)
-and round individual operands of `r = Ax - θx` to f32:
-
-| residual path | `‖r‖` | `‖r‖/‖A‖` |
-| --- | --- | --- |
-| f64 (today) | 2.813e-09 | 2.405e-11 |
-| **`r` stored f32** | **2.813e-09** | **2.405e-11** |
-| **`ax` stored f32** | **6.780e-07** | 5.795e-09 |
-
-`ground_locg`'s default `tol` is `eps(f64) = 2.22e-16`, so an f32 `ax` puts the residual floor
-**3.1e6× above the tolerance** — the convergence test becomes unsatisfiable and the solver runs to
-`maxiter`, which is precisely POC 6's measured failure arriving by a different route.
-
-**The asymmetry is the finding, and it is structural.** Storing `r` at f32 changes nothing, because `r`
-is already `O(1e-9)` and f32 carries ~7 significant digits of *relative* precision. Storing `ax` is
-fatal because `ax` is `O(‖A‖) ≈ 117` while `r` is `O(1e-9)`: the subtraction is a catastrophic
-cancellation of nearly equal `O(100)` quantities, and rounding the operands destroys the digits the
-cancellation depends on. **That is a property of the arithmetic, not a tunable tolerance** — no
-`work_dtype` handling or looser `tol` recovers it without accepting POC 6d's silent error.
-
-**What that leaves is not worth the risk.** `x` is the answer and also an operand of the same
-subtraction; `ax` is ruled out above. So at best `r` and `y` could be demoted: **8 of 120 B/slot, 6.7%**,
-or 17 GB of 258 at `2^31`. Achieving it needs a mixed-dtype `_State` — `while_loop` requires the carry
-types to agree, and `ground_locg:951` derives `work_dtype` from `result_type(xinit, matvec output)` and
-casts `xinit` to it, so a per-field dtype is a change to every operation in the iteration. Against
-`markdown/locg.md`'s seven defects that each failed *silently*, 6.7% of the floor is not a good trade.
-
-**For scale, the levers already available at that same problem size:** `cache_level` from `(1, 1)` to
-`(0, 0)` is 1805 → 120 B/slot, **15.0×**, no code change; hand-sizing `states_size` at N=24M saves
-**7.7 GB** for one keyword. Both dwarf the 6.7% and neither risks a silent wrong answer.
-
-So the `(0, 0)` floor stands at 120 B/slot, and **258 GB at `2^31` is the honest ceiling** for this
-solver on one device. Lowering it needs a different eigensolver structure — fewer carried `O(N)`
-vectors, or a restart scheme that trades vectors for matvecs — not a dtype change. That is a separate
-investigation and nothing here bears on it.
+Rejected: an f32 `ax` raises the residual floor 3.1e6× above tolerance (cancellation in `r = Ax - θx`);
+at best `r`, `y` save 8 of 120 B/slot (6.7%). The `(0, 0)` floor of 120 B/slot (258 GB at `2^31`) stands,
+and POC 6's f32-arithmetic variant still reproduces its reject at 0.42× end-to-end.
+`poc/mixed-precision.md` §1–§4.
 
 ### The eigensolver's `O(N)` vector count is at its algorithmic minimum; a smaller basis is a bad trade (2026-08-30)
 
@@ -1718,584 +1476,75 @@ prefilter or the `body_iter0` seeding. Vector counts at `2^31` are arithmetic on
 
 ### Distributing `states` is feasible: hash-by-prefix ownership plus a local search (2026-08-30)
 
-The `13 * N` replicated state list is the one term the `(0, 0)` floor cannot shed — 27.9 GB **per
-device** at `N = 2^31` — and `sqd.py:1042` records it as a hard requirement: a partitioned `[N, B]`
-"fails outright". Investigated with a breaking change permitted. **It is not a wall, and the literature
-has the established solution.**
-
-**What actually fails is narrower than "states must be replicated."** Per ingredient, on a `P('x', None)`
-state array under a 4-device mesh:
-
-| operation | partitioned |
-| --- | --- |
-| `bitwise_xor` (build `S ^ X`) | **OK**, `P('x', None)` |
-| `_pack_state_keys` | **OK**, `P('x',)` |
-| `jnp.searchsorted(keys, targets)` | **fails** — "Unmapped values passed to vmap cannot be sharded" |
-| `keys[pos]` gather | fixable with `out_sharding=` |
-
-The *targets* shard fine. What fails is that a binary search needs the whole sorted haystack visible to
-every query. That is a data dependency, not a JAX gap — and it is only unavoidable **given a
-range-agnostic partition**.
-
-**The established scheme is Wietek & Läuchli**, *Phys. Rev. E* **98**, 033309 (2018), described in
-`awietek.github.io/assets/pdf/thesis_awietek.pdf` §3.3. Split each basis state into **prefix** and
-**postfix** bits; states sharing a prefix live on one rank; **a hash of the prefix bits gives the owning
-rank**, so — quoting — *"we also don't have to store any information about their distribution. This
-information is all encoded in the hash function."* Within a rank states stay lexicographically ordered,
-so the local lookup is still a binary search, over `N/d` rows. The matvec buffers `(target, coefficient)`
-pairs locally, does one **`MPI_Alltoallv`**, then each rank searches its own list.
-
-**Hashing rather than range-partitioning, deliberately.** `poc/range_partition.py` builds ordered
-buckets from data-derived splitters, which is the natural fit here and keeps each shard sorted for free.
-But the paper warns against exactly that: a random distribution *"reduces load balance problems
-significantly since the communication structure is randomized. This is in stark contrast to distributing
-the basis states in a linear fashion,"* where single processes take a multiple of the workload. Range
-splitters are the linear case.
-
-**Not applicable: DanceQ's approach.** `arxiv.org/abs/2407.14591` reaches 46 spins over ~256 nodes and
-120 TiB with *"thread-local lookup tables for fast and synchronization-free state-to-index mapping"* —
-no routing at all. That works because its basis is a **complete** U(1) particle-number sector, so
-state → index is a closed-form combinatorial map (enumerative encoding, Cover 1973). **rqutils' subspace
-is an arbitrary sampled set**, for which no such formula exists — which is why `get_xsource` searches in
-the first place. The distinction is structural; do not cite DanceQ as evidence that this is easy.
-
-**All three ingredients work in JAX**, verified on a 4-device mesh: prefix-hash ownership is elementwise
-(`P('x',)`, balance 1011/1041/1016/1028 over 4096), `jax.lax.all_to_all` composes inside
-`jax.shard_map`, and — the load-bearing one — **`jnp.searchsorted` against the local slice inside
-`shard_map` works**, which is what removes the replicated haystack.
-
-**A minimal end-to-end version is exact.** Range-partitioned variant at n=30, N=2564, d=4, hit rate
-40.4%: **bit-identical to `get_xsource`** (1036 hits both, `np.array_equal` True), load imbalance
-**1.02×**, and a **4.0× per-device** reduction in the state array. The JAX form compiled to **zero
-`all-gather` / `all-reduce` / `collective-permute`** and 18 `all-to-all`.
-
-**The cost is traffic, and it composes the right way — but only at `cache_level[0] = 1`.** Routing a
-target and its answer is ~12 B/target (8 out as a uint64 key, 4 back as an int32 index), asymptotically
-in `d`. At `N = 2^31`, n=100:
-
-| `d` | states/device | routed per group/device |
-| --- | --- | --- |
-| 4 | **6.98 GB** (from 27.9) | 6.44 GB |
-| 16 | 1.74 GB | 1.61 GB |
-| 64 | 0.44 GB | 0.40 GB |
-| 256 | 0.11 GB | 0.10 GB |
-
-**The multiplier is `J`, not `J × niter`** — `get_xsource` runs once per solve in the precompute at
-`cache_level[0] = 1` (`sqd.py:1008`), not inside the matvec. So at `d = 4` it is ~650 GB routed **once**
-against 20.9 GB/device of permanent residency reclaimed, and it lands on the precompute this session
-measured at only 4.5–8.4% of a solve. At `cache_level[0] = 0` the recompute *is* per matvec and the
-traffic becomes ~84 TB per solve at `d=4` — unusable. **So this is only viable together with the source
-cache**, which is the opposite of the Bloom filter's constraint and worth stating plainly.
-
-**Why it composes where the filter did not:** the target is paid **once per solve**, not once per
-matvec. That is the same "how many times is it paid" question, and here the answer is favourable.
-
-**What is not done.** No hash-partitioned variant was built (the exact prototype range-partitions, which
-the paper says will imbalance on real data — the measured 1.02× is on an evenly-split *sorted* array and
-says nothing about a real subspace). Nothing measured on real interconnect; virtual devices make timings
-meaningless per `CLAUDE.md`, so **no speed claim is made**. `uniquify_states`' sort is a separate
-blocker with its own partial answer in `poc/range_partition.py` (2.19–1.74×, zero collectives, but
-splitter selection is host-side numpy and reassembly into the `[states_size, B]` contract is
-unimplemented). And the diagonal builders need `popcount(S[i] & z)`, i.e. the state *bits* — those shard
-elementwise, but that was not verified end-to-end here.
-
-**Verdict: the only lever left that moves the ceiling, and the first one this session that survives
-scrutiny.** It converts a hard 27.9 GB/device wall into `27.9/d`. It is also much larger than anything
-else attempted here — a new partitioning contract, a routed `get_xsource`, and `uniquify_states`
-rebuilt on POC 11 — so it is a project, not a patch.
+Only `searchsorted` fails on a partitioned `[N, B]`. Routing targets to the owning shard (Wietek &
+Läuchli) turns 27.9 GB/device into `27.9/d`; a minimal version is bit-identical to `get_xsource` with
+zero all-gathers. Viable only at `cache_level[0] = 1` (~650 GB routed once at d=4, against ~84 TB per
+solve at `(0, *)`). DanceQ is not a precedent. `poc/partition-states.md` §1–§2.
 
 ### Hash-partitioning `states`: hash the whole key, not the prefix — the prefix collapses on real subspaces (2026-08-30)
 
-The entry above proposed Wietek & Läuchli's scheme and flagged the untested claim: the 1.02×
-imbalance was measured on an evenly-split *sorted* array and said nothing about a real subspace. Built
-the hash-partitioned variant and tested it on fixtures chosen to break it. **One change to the
-published scheme is required, and the reason is specific to SQD.**
-
-**Prefix hashing collapses completely on a structured subspace.** Imbalance at n=60, N=200k, d=16,
-12 prefix bits:
-
-| fixture | prefix-hash | whole-key hash | range-split | distinct prefixes |
-| --- | --- | --- | --- | --- |
-| uniform | 1.12× | 1.01× | 1.00× | 2048 |
-| fixed-weight n/2 | 1.16× | 1.02× | 1.00× | 2048 |
-| low-weight n/8 | **3.81×** | 1.01× | 1.00× | 779 |
-| banded (last n/4) | **16.00×** — total collapse | **1.09×** | 1.01× | **1** |
-
-The last column is the mechanism: when excitations are confined to low qubits, **every state shares the
-same high bits**, so the prefix hash is constant and one shard takes everything. This is the same root
-cause `poc/range_partition.py` already recorded for equal-range splitting on the most-significant
-word — *"at n=100 that word is 7 bytes of leading pad"* — namely that **the high bits of an SQD state
-carry almost no entropy.** A banded subspace is not contrived: it is what a circuit acting on a subset
-of qubits produces.
-
-**Hashing the whole key fixes it and costs nothing.** The key is already computed by
-`_pack_state_keys`, so it is one extra `mix64`. Wietek & Läuchli hash the *prefix* because their scheme
-needs prefix-grouping for local enumeration; **rqutils has no such requirement**, so the constraint does
-not carry over.
-
-**The one thing whole-key hashing gives up is the free local sort.** A range split hands each shard a
-contiguous sorted block; a hash hands it a scattered subset that must be sorted per shard. That is
-affordable and already prototyped: `d` independent sorts of `N/d` rows is exactly
-`poc/range_partition.py`'s phase 3 (`vmap` over `lax.sort`, zero collectives), and it runs **once at
-setup**, not per `get_xsource` call. So the design is *hash to assign owners → per-shard sort → local
-binary search*, with ownership still metadata-free.
-
-**Verified exact on every fixture** against `get_xsource`, at n=60, d=16, with the hop chosen to act on
-qubits each fixture populates (a hop on qubits 0–1 gives the banded fixture a 0% hit rate and tests
-nothing):
-
-| fixture | N | hit rate | imbalance | bit-identical | per-device |
-| --- | --- | --- | --- | --- | --- |
-| uniform | 74,944 | 39.9% | 1.03× | **yes** | 16× less |
-| fixed-weight | 75,156 | 40.3% | 1.02× | **yes** | 16× less |
-| banded | 6,435 | 53.3% | 1.14× | **yes** | 16× less |
-
-**Balance holds as `d` grows, and the residual is Poisson, not structural.** Including a Zipf-sampled
-fixture (2M shots → 148,976 unique, a **92.6% duplicate rate**, matching the 91–97.6% `NOTES.md`
-measured for real shot distributions):
-
-| fixture | N | d=4 | d=16 | d=64 | d=256 | d=1024 |
-| --- | --- | --- | --- | --- | --- | --- |
-| fixed-weight | 200,000 | 1.01× | 1.03× | 1.04× | 1.08× | 1.21× |
-| banded | 6,435 | 1.01× | 1.09× | 1.22× | 1.63× | 2.86× |
-| zipf-sampled | 148,976 | 1.01× | 1.01× | 1.04× | 1.09× | 1.22× |
-
-**Checked against the balls-in-bins bound** `1 + sqrt(2 ln d / (N/d))` rather than asserted: predicted
-and measured agree in magnitude at every point and **both depend only on `N/d`**, not on the fixture.
-Banded degrades because its `N` is 6,435, so `d=1024` leaves ~6 states per shard — not because its
-structure survives. **That is the hash working: it has erased the structure that destroyed prefix
-hashing, leaving ordinary sampling noise**, which a capacity slack absorbs exactly as `poc/range_partition`'s `slack`
-parameter does.
-
-**Practical rule:** size shard capacity from `N/d` via the balls-in-bins bound, and keep `N/d` above
-~1000 for a slack under 1.15×. At `N = 2^31` that permits `d` up to ~2×10^6 — far beyond any real mesh.
-
-**Still unbuilt.** The verified prototype is numpy, so it validates the *algorithm*, not a JAX
-implementation; the three JAX ingredients were verified separately in the entry above but not composed
-with hashing. No real-interconnect measurement and **no speed claim**. `uniquify_states` still needs
-rebuilding on `poc/range_partition`, and the diagonal builders' `popcount(S[i] & z)` path was not verified end-to-end.
+Prefix hashing collapses to 16.00× at d=16 on a banded subspace (1 distinct prefix). A whole-key `mix64`
+gives 1.01–1.14×, exact on every fixture, its imbalance balls-in-bins in `N/d` alone: keep `N/d` above
+~1000 for a slack under 1.15×. `poc/partition-states.md` §3.
 
 ### The variable-length routing has a primitive, and the capacity bound is the one the Bloom work lacked (2026-08-30)
 
-The gap left by the hash-partitioning entry above: the prototype is numpy, and a JAX implementation
-needs a routing step where **each shard receives a different, data-dependent count**. MPI does this with
-`Alltoallv`; JAX requires static shapes. Explored, and both routes are now characterized.
-
-**`jax.lax.ragged_all_to_all` exists** (JAX 0.11.1) and is the direct analogue — it takes
-`(operand, output, input_offsets, send_sizes, output_offsets, recv_sizes)` and ships exactly the
-per-destination counts.
-
-**Its known defect does not apply here, which is the useful part.** FESOM2-JAX
-(`arxiv.org/abs/2608.01546`) reports it "has a defective reverse-mode rule in JAX 10.1 and is usable
-**forward-only**", and they fell back to a padded variant to keep exact adjoints. `get_xsource` returns
-**integer indices** and is never differentiated — `sqd` does not backprop through it — so rqutils can use
-the ragged path they had to abandon.
-
-**It cannot be verified in this environment**: `JaxRuntimeError: UNIMPLEMENTED: HLO opcode
-`ragged-all-to-all` is not supported by XLA:CPU ThunkEmitter`. So it is a GPU/TPU-only path here, and
-nothing about it is measured — only that the API exists and the published objection is irrelevant to
-this use.
-
-**The padded fallback is affordable, and its capacity is computable — unlike the Bloom filter's.** Size
-each send buffer by the balls-in-bins bound `cap = m/d + sqrt(2·(m/d)·ln d)` with `m = N/d`:
-
-| `N` | d=4 | d=16 | d=64 | d=256 |
-| --- | --- | --- | --- | --- |
-| 10^6 | 0.7% | 3.8% | 18.8% | **90.1%** |
-| 24×10^6 | 0.1% | 0.8% | 3.8% | 17.4% |
-| 2^31 | 0.0% | 0.1% | 0.4% | **1.8%** |
-
-Padding overhead, as a fraction of the data sent. **It shrinks as `N` grows and grows with `d`** — the
-same `N/d` dependence as the imbalance, and negligible exactly where the feature matters (0.4% at
-`N = 2^31, d = 64`). FESOM2-JAX measured padded against ragged at **0.742 vs 0.589 s/step** on 64 GPUs,
-a 26% penalty rather than a cliff, so the fallback is a real option and not a last resort.
-
-**The contrast with the pre-filter's `cap` is the point, and it is structural.** `NOTES.md` records that
-the capacity problem "blocks the whole pre-filter family": there `cap = hits + FP` and **`hits` is the
-unknown being computed**, so any data-independent bound collapses to `cap = N`, "correct and worthless."
-Here the capacity depends only on `N/d`, **known at setup**, so the bound is tight and derivable in
-advance. The overflow check is equally free — sum the per-destination counts and compare — and the same
-rule carries over: **raise, do not clamp**, since an undersized capacity drops states silently.
-
-So the routing is not a blocker on either path. What remains unbuilt is the JAX composition itself, and
-it cannot be validated on this hardware.
+`ragged_all_to_all` fits (forward-only, which nothing needs to differentiate) but is UNIMPLEMENTED on
+XLA:CPU, so unmeasured. Padded buffers sized by balls-in-bins cost 0.4% at `N = 2^31, d = 64` (26%
+penalty in FESOM2-JAX), and that capacity is known at setup, unlike the pre-filter's: raise, don't clamp.
+`poc/partition-states.md` §5.
 
 ### 1D XXZ is the case that decides it: prefix hashing fails at exactly `d`, and range splitting fails on the *targets* (2026-08-30)
 
-The hash-partitioning entry above used synthetic fixtures. Re-run on a real 1D XXZ subspace — built the
-way SQD gets one, a Krylov expansion from |Néel⟩ under the nearest-neighbour hop graph, so it lives in
-one magnetization sector and stays *local* rather than spread over the weight shell. **Both alternatives
-to whole-key hashing fail, and one fails completely.**
-
-**Prefix hashing measures exactly `d`.** At n=30, N=200k, 12 prefix bits:
-
-| scheme | d=4 | d=16 | d=64 | d=256 |
-| --- | --- | --- | --- | --- |
-| prefix-hash | **4.00×** | **16.00×** | **64.00×** | **256.00×** |
-| whole-key hash | 1.00× | 1.02× | 1.04× | 1.11× |
-
-Imbalance equal to `d` at every device count means **one shard holds the entire subspace and the other
-`d-1` hold nothing** — not degradation, complete failure. The cause is **1 distinct prefix**, and it is
-an artifact of the packing width rather than the physics: `B = ceil(31/8) = 4` bytes leaves **33 leading
-zero bits** in the uint64 key, so the top 12 bits are constant *by construction*. At n=60 and n=100 there
-are 312 and 280 distinct prefixes and imbalance is still **2.05–118.98×**, because a
-magnetization-conserving Krylov subspace concentrates near Néel and even the non-pad high bits barely
-vary.
-
-**Range splitting looked competitive and is not — measuring it on the states hides the failure.**
-Splitters derived from the state list balance *that list* by construction (1.00–1.85× measured), but
-**what gets routed is the targets `S ^ X`**. At n=60, d=64, per XXZ hop:
-
-| hop | hit rate | range-split | whole-key hash |
-| --- | --- | --- | --- |
-| (45, 46) | 18.4% | 1.01× | 1.05× |
-| (29, 30) | 18.5% | 2.48× | 1.03× |
-| (15, 16) | 18.3% | 7.90× | 1.04× |
-| (0, 1) | 18.4% | **13.68×** | 1.05× |
-| (59, 0) | 18.5% | **14.95×** | 1.04× |
-
-The failure is **hop-dependent**: swapping *high-order* bits moves a key far in lex order, piling targets
-into few range buckets, while a swap deep in the string barely moves it. **XXZ has a hop on every bond,
-so the worst case is always present** in the J-fold sweep.
-
-**And splitters go stale where a hash cannot.** A real SQD run grows the subspace during configuration
-recovery, so the set the splitters were derived from is not the set later queried. Splitters from half the
-subspace applied to the full set: **32.51×**, against whole-key hashing's **1.04×**. A hash of the key
-does not depend on the population at all, which is the property that matters here.
-
-**Verified exact on XXZ across every X group.** n=60, J=61 groups, K=60, N=80,000, d=64: **61 groups, 0
-mismatches**, hit rates spanning **2.2%–100.0%** (the 100% group is the one where the subspace is closed
-under that hop), imbalance **1.04×–1.10×** throughout, 64× fewer state rows per device. The
-100%-hit-rate group matters — it is the degenerate case where every target is present, and the routing
-handles it at the same imbalance.
-
-**So the design choice is settled by physics, not preference.** On the Hamiltonian this library is most
-often pointed at, prefix hashing is unusable and range splitting is unusable; whole-key hashing is
-1.03–1.11× everywhere and invariant to hop, to `d`, and to the subspace growing. `poc/hash_partition` now carries the
-XXZ fixture and asserts exactness over all 60 hops.
+On an XXZ Krylov subspace prefix hashing measures exactly `d` (4.00–256.00×), and range splitting
+13.68–14.95× on high-order hops, 32.51× with stale splitters. Whole-key hashing stays at 1.03–1.11×,
+exact over all 61 X groups at n=60, d=64. `poc/partition-states.md` §4.
 
 ### The JAX composition works and is exact: `poc/hash_partition_jax.py` (2026-08-30)
 
-`poc/hash_partition` validated the hash-partitioning *algorithm* in numpy and left the JAX implementation as the
-open item, with the caveat that `ragged_all_to_all` is `UNIMPLEMENTED` on XLA:CPU. **The composition
-turned out to be fully verifiable here anyway**, because the dense `all_to_all` over fixed-capacity
-buckets carries the identical dataflow — ragged is a *bandwidth* optimization of the same routing step,
-not a different algorithm — and the dense form runs on CPU.
-
-**Bit-identical to `get_xsource`** on a 1D XXZ Krylov subspace, n=30, N=21,716, hit rate 24.9%:
-
-| D | hop | cap | exact | overflow | all-gather / all-reduce / collective-permute / all-to-all |
-| --- | --- | --- | --- | --- | --- |
-| 2 | (0,1) | 8826 | **yes** | 0 | 0 / 0 / 0 / 8 |
-| 2 | (15,16) | 8826 | **yes** | 0 | 0 / 0 / 0 / 8 |
-| 2 | (29,0) | 8826 | **yes** | 0 | 0 / 0 / 0 / 8 |
-| 4 | (0,1) | 2270 | **yes** | 0 | 0 / 0 / 0 / 12 |
-| 4 | (15,16) | 2270 | **yes** | 0 | 0 / 0 / 0 / 12 |
-| 4 | (29,0) | 2270 | **yes** | 0 | 0 / 0 / 0 / 12 |
-
-The hops are chosen deliberately: `(0,1)` and `(29,0)` touch the **high-order** bits, which is exactly
-where range splitting measured 13.68–14.95× (`poc/hash_partition`). Under hashing they are indistinguishable from the
-mid-string hop. **Zero all-gather, all-reduce and collective-permute** in every case — only the intended
-`all_to_all`.
-
-**Bucketing must be `D` passes of an `[n]` cumsum, not one `[n, D]` one-hot.** `poc/range_partition` rejected the
-one-hot shape for costing `4*N*NSH` bytes; measured here at D=4, **24 B/slot for the one-hot against 13
-for the loop**, and the gap widens in `D` since one is `O(N·D)` and the other `O(N)`. Both give identical
-buckets — verified against a numpy reference before either was used.
-
-**The capacity guard works, and the check is sufficient.** `cap` must be static (`all_to_all` needs a
-fixed shape), derived from the balls-in-bins bound `mu + sqrt(2·mu·ln D)` with `mu = (N/D)/D`. The kernel
-returns a free overflow count (a sum of a mask already computed):
-
-| slack | cap | overflow | exact |
-| --- | --- | --- | --- |
-| 1.6 | 2270 | 0 | **yes** |
-| 0.9 | 1277 | **1284** | **no** |
-
-**Exactness and a zero overflow count coincide**, which is what makes the free check a sufficient guard
-rather than a partial one — and it is why a caller must **raise, not clamp**. Note the contrast that
-mattered: the Bloom pre-filter's `cap = hits + FP` needed `hits`, the unknown being computed, so it
-collapsed to `cap = N`; this capacity depends only on `N/D`, known at setup.
-
-**Two JAX mechanics worth recording.** A rank-0 output cannot be concatenated across the mesh —
-`shard_map` rejects `out_specs=P('x')` on a scalar with "which has rank 0 (and 0 < 1)", so the overflow
-count must be `.reshape(1)`. And the sentinel is `0xFFFF...`, which is unreachable by construction: the
-packed keys carry a zero pad bit at position 0, so no real key is all-ones.
-
-**Still not established.** Nothing on a real interconnect — virtual devices make timings meaningless per
-`CLAUDE.md`, so **no speed claim is made**. The setup phase (owner assignment plus per-shard sort) is
-host-side numpy; in the library it is `poc/range_partition`'s phase 3. `uniquify_states` remains a separate blocker,
-and the diagonal builders' `popcount(S[i] & z)` path is still unverified end-to-end.
+Dense `all_to_all` over fixed-capacity buckets is bit-identical to `get_xsource` at D=2/4 with only
+`all-to-all` collectives; bucket with `D` cumsum passes (13 B/slot, against 24 for a one-hot). The free
+overflow count coincides with inexactness (slack 0.9 gives 1284 dropped), so it is a sufficient guard.
+`poc/partition-states.md` §6.
 
 ### Sharding `uniquify_states`: three gaps, all closable, and the hard one is a global prefix sum (2026-08-30)
 
-`poc/range_partition.py` made the *sort* shardable and named two gaps in its own docstring — host-side
-splitter selection, and no reassembly into the `[states_size, B]` contract. Probing those found a third,
-which is the real one. **All three are closable; each mechanism is verified separately, and the full
-composition is not built.**
-
-**`uniquify_states` cannot use the hash partitioning of `poc/hash_partition`/`poc/hash_partition_jax`.** Its output feeds
-`get_xsource`, which binary-searches, so the result must be **globally lex-sorted**. A hash destroys
-global order by design. Range partitioning is therefore mandatory here — splitters guarantee bucket
-`i` < bucket `i+1`, so concatenating in order is globally sorted. **That is a real asymmetry between the
-two functions**: `get_xsource` needs balance and gets it from hashing; `uniquify_states` needs order and
-must accept range splitting's imbalance.
-
-**Gap 1 — in-graph splitters: works, but they must compare the full row.** A strided sample gathered with
-`.at[idx].get(out_sharding=P(None, None))` lands replicated (the explicit spec is required; JAX cannot
-infer it off a partitioned axis), and sorting `d*64` rows is negligible. **But ordering the sample by its
-lead word alone collapses.** On a fixture with a constant lead word and the order carried entirely by the
-tail: lead-word-only puts **4000 of 4000 rows in one bucket**, full-row lex gives 990/990/990/1030.
-Neither produces an *ordering violation* — lead-word splitting is sound, never wrong — it simply cannot
-see the tail, which is the same balance collapse `poc/range_partition` documented for equal-range on the
-most-significant word.
-
-**An n=100 XXZ fixture does not catch this**: 94.1% of its rows share a lead word with another row, yet
-enough distinct lead values remain that both schemes measured 0 violations and the balance looked fine at
-1.30×. The adversarial fixture was necessary to separate them.
-
-**Gap 2 — reassembly into `[states_size, B]`: works.** Bucket `k`'s rows land at
-`sum(unique counts of buckets < k)`, and those counts are *traced*. A scatter at traced offsets is
-expressible: park dead slots at index `states_size` in a `states_size + 1` buffer and drop them
-(`mode='drop'`), then slice. Verified — output globally sorted, unique count exact, filler correct.
-`states_size` must be `static_argnums`, which it already is in the real function. One subtlety: after
-dedupe the live rows inside a block are **not contiguous** (interior duplicates are blanked), so the
-within-block destination needs a *re-rank* (`cumsum(live) - 1`), not the original slot index.
-
-**Gap 3 — the global prefix sum, which is the blocker `poc/range_partition` did not reach.** Ranking a row within its
-bucket is `cumsum(bucket == k)` over the **sharded** axis, and that raises:
-`ShardingTypeError: The input should be fully replicated when axis is not specified to cumsum`. `NOTES.md`
-already records the rule — *"everything that reorders or compacts along the sharded axis fails; only
-elementwise ops and reductions survive."* This is why `poc/hash_partition_jax` worked and a naive port here does not: there
-the cumsum ran **inside `shard_map`** over each shard's own slice, whereas these ranks must be *global* to
-place rows in a globally sorted output.
-
-**Resolved by a two-level prefix sum**, the standard distributed counting-sort structure: each shard
-cumsums its own slice for a local rank, one `all_gather` of a `[d, d]` per-shard-per-bucket count matrix,
-then add the exclusive prefix over lower-numbered shards. **Verified against a sequential reference** —
-global within-bucket ranks bit-identical, per-shard counts summing to the bucket totals, and **1
-`all_gather`, no all-reduce, no collective-permute, no all-to-all**. The communicated volume is `O(d^2)`,
-**independent of `N`**.
-
-**What is not built.** These are three verified mechanisms, not a working `uniquify_states` — the
-composition was not assembled, so there is no end-to-end exactness check against the real function and
-**no speed claim** (virtual devices, per `CLAUDE.md`). Also unaddressed: the input `[N, B]` must divide
-`d` (`sqd` already rounds `states_size` to a multiple of `mesh.size`, so the machinery exists), and
-`poc/range_partition`'s capacity `slack` remains a correctness parameter needing the raise-not-clamp treatment. Note
-`uniquify_states`' word packing is documented as *"the wrong trade for an out-of-core design"* at the
-`2^31` ceiling (6–15 GB of extra buffer); that judgement is unchanged by anything here.
+Global order forces range partitioning. In-graph splitters must compare the full row (lead-word-only put
+4000/4000 rows in one bucket), reassembly works via a drop-scatter, and the sharded `cumsum` needs a
+two-level prefix sum: one `all_gather`, `O(d^2)`, independent of `N`. `poc/partition-states.md` §7.
 
 ### Composing sharded `uniquify_states`: the algorithm is exact, and it needs *two* routing rounds (2026-08-30)
 
-The three mechanisms from the probe above compose into an algorithm that is **bit-identical to
-`uniquify_states`** — verified in numpy at n=100, N=209,400 with duplicates, `states_size` 262,144, d=4:
-**157,051 unique rows, `np.array_equal` True**, including the `[states_size, B]` uint8 layout and its 255
-filler. Bucket imbalance 1.15%.
-
-**But the composition needs a second routing round that the probe did not anticipate, and this is the
-finding.** The output is a *sharded* `[states_size, B]` array, so shard `s` owns a contiguous block of
-rows. Bucket `k`'s unique rows land at a **data-dependent** global offset — the prefix sum of earlier
-buckets' unique counts — which does **not** align with output-shard boundaries. Measured on this fixture:
-offsets `[0, 22279, 50782, 96614]` against a shard size of 65,536, so **2 of 4 buckets straddle a
-boundary**. A bucket owner must therefore send rows to more than one output shard. Zero crossings would be
-luck, not a property.
-
-So the real structure is **route → sort/dedupe → route again**:
-
-1. splitters from a strided sample, compared on the **full row** (the probe's gap 1)
-2. `all_to_all` #1: rows to their bucket's owner
-3. local sort + dedupe — each owner ends up holding one sorted unique run
-4. `all_gather` of the `d` unique counts, giving each bucket's global offset
-5. `all_to_all` #2: rows from bucket owner to output-shard owner
-
-**Two dead ends worth recording, because both looked right.**
-
-*Private per-shard blocks cannot be declared replicated.* Having every shard scatter into its own
-`[d, cap]` block and giving `out_specs=P(None, None, None)` is rejected: *"implies that the corresponding
-output value is replicated across mesh axis 'x', but could not infer replication over any axes."*
-**`check_vma` was correct and the spec was the lie** — those blocks are per-shard *partial* results, so
-declaring them replicated would need a cross-shard reduction to become true. Suppressing the check with
-`check_vma=False` would have produced a silently wrong answer. Routing to a single owner per bucket
-removes the reduction entirely, which is why step 2 exists.
-
-*A value derived from an explicitly-sharded array cannot be closed over.*
-`NotImplementedError: Closing over inputs to shard_map where the input is sharded on 'Explicit' axes is
-not implemented.` The splitters are computed outside `shard_map` from the sharded `words`, so they must be
-**passed as an argument** with `P(None, None)`, not captured. The error names the workaround.
-
-**Status: algorithm verified, JAX composition not built.** The numpy version above is exact and is the
-specification; the JAX form reached the two errors named here and was not completed. What it needs beyond
-the probe's three mechanisms is the second `all_to_all` plus its destination arithmetic, and a capacity
-for *that* buffer as well — the second round's per-destination counts are as data-dependent as the first's,
-so `poc/hash_partition_jax`'s raise-not-clamp treatment applies twice. **No speed claim**: numpy, single process, and two
-routing rounds is materially more communication than the one round this line assumed. `poc/range_partition`'s note that
-the word packing is *"the wrong trade for an out-of-core design"* at the `2^31` ceiling still stands and is
-unaffected.
+Buckets' global offsets straddle output-shard boundaries (2 of 4 measured), so it is route → sort/dedupe
+→ route again, and that second round is what makes `P('x', None)` honest. Declaring private blocks
+replicated is rejected by `check_vma`, correctly; splitters are passed to `shard_map`, not closed over.
+`poc/partition-states.md` §8.
 
 ### The two-round JAX composition works, and the capacity model for a range partition is *not* balls-in-bins (2026-08-30)
 
-The composition above was specified in numpy and left unbuilt in JAX. Built now: **bit-identical to
-`uniquify_states`** at n=100, N=209,400 with duplicates, `states_size` 262,144, at **D=2 and D=4** —
-157,051 unique rows, `np.array_equal` True, including the `[states_size, B]` uint8 output with 255 filler.
-
-**The structure that makes the output spec honest.** Round 2 exists so that after it, shard `s` holds
-exactly output rows `[s·SS/d, (s+1)·SS/d)` — which makes `out_specs=P('x', None)` **true**. That is what
-the earlier dead end was about: private per-shard `[d, cap]` blocks declared `P(None,None,None)` are a
-lie, and `check_vma` rejects them. Routing to a single owner makes the declaration honest instead of
-suppressing the check.
-
-**Collectives, D=4:** 1 `all-gather`, 24 `all-to-all`, 4 `all-reduce`, 0 `collective-permute`.
-
-The `all-reduce` needed explaining rather than accepting. Two of the four are the caller's own `.sum()`
-over `P('x')` results — summing a sharded array across shards *is* a reduction. The rest is
-`u64[256,2]`: the **splitter sample**. `words.at[idx].get(out_sharding=P(None, None))` gathers a
-replicated sample from a partitioned array, and XLA implements that replication as an all-reduce. It is
-4 KB and `O(nsample)`, **independent of `N`** — so the earlier claim that splitter selection is *free* was
-wrong; it is *cheap*, which is a different statement.
-
-**Two capacity defects found, and the second corrects a claim in the entries above.**
-
-*The guard fired on correct input.* The first working version reported **overflow 763,677 beside a
-bit-exact result**, because round 2 funnels every dead row to one bucket, which overflows by design and is
-then dropped harmlessly. The count conflated discarded padding with lost data. Fixed by masking the count
-to **live** elements. **A guard that fires on correct input is worse than none** — it trains a caller to
-ignore the one signal that matters, which is how `poc/range_partition`'s `cap` bug shipped.
-
-*Balls-in-bins is the wrong model here.* `poc/hash_partition_jax` sizes its capacity as `mu + sqrt(2·mu·ln d)`, which is
-correct **for a hash**: each element picks its destination independently at random. **A range partition
-violates that assumption** — the destination is the element's *value* bucket, and bucket sizes are set by
-the data distribution. Measured: buckets `[44557, 57006, 47400, 60437]`, so a shard sends `60437/d ≈
-15,109` rows to the largest bucket's owner, not the `N/d/d = 13,088` the bound predicts. A 1.2× slack over
-that mean still overflowed by 42,712. **`poc/range_partition` already had the right rule** — *"slack must exceed the
-splitter imbalance; 1.35 was sufficient in every fixture here"* — and 1.35 is exact here at both D.
-
-Round 2 needs a different baseline again: a bucket's unique rows land **contiguously**, so they reach only
-**1–2 output shards**, not all `d`. Its worst per-destination is therefore ~the whole bucket, so size off
-`ss/d`, not `ss/d/d` — understating it by a factor of `d`.
-
-**The guard is verified in both directions.** Undersizing either round makes overflow nonzero *and*
-`exact` False; at 1.35 both are clean. Exactness and a zero count coincide, which is what makes the free
-check sufficient — and a caller must **raise**, not clamp.
-
-**Still not established.** Virtual devices, so **no speed claim**, and two routing rounds with 24
-`all-to-all` at D=4 is materially more communication than the single round this line originally assumed —
-whether it pays for the 27.9 GB/device it saves needs real interconnect measurement. The prototype lives
-outside `rqutils/`; `states_size` and both capacities are `static_argnums`, and `N` must divide `d`.
+Bit-identical to `uniquify_states` at D=2/4: 157,051 unique rows, 1 all-gather and 24 all-to-all at D=4.
+Capacity follows the splitter imbalance (slack 1.35), not balls-in-bins, and round 2 sizes off `ss/d`;
+the overflow guard must count live elements only (763,677 false positives before that fix).
+`poc/partition-states.md` §8.
 
 ### Widening the POC device sweep found a latent `all_to_all` bug a 4-device box hid (2026-08-30)
 
-Reorganizing `poc/hash_partition_jax`/`poc/uniquify_sharded` to run on real GPUs replaced their hardcoded `XLA_FLAGS=...count=4` with
-`poc/gpu_unverified`'s `--devices` convention (argparse **before** `import jax`, since `CUDA_VISIBLE_DEVICES` and
-`XLA_FLAGS` are both read at backend initialization) and derived the shard sweep from
-`jax.device_count()` rather than pinning `(2, 4)`. **That immediately failed at 8 devices**, and the
-cause was a real defect rather than a limitation:
-
-`ValueError: The size of all_to_all split_axis (4) has to be divisible by the size of the named axis
-x (8)`. `run_case` took `mesh` and `num_shards` as **independent parameters that had to agree**. The
-send buffer got `num_shards` rows while the mesh axis had `jax.device_count()` devices, so routing is
-only well-defined when the two are equal — and **a 4-device box makes them coincide**, which is why
-every earlier run passed. Fixed by deriving `num_shards = mesh.shape["x"]` inside `run_case`, so the
-pair cannot disagree.
-
-**The transferable point: a hardcoded device count is not a fixture, it is a coincidence.** Sweeping
-the parameter is what separated two quantities that had been silently identical — the same reason
-`CLAUDE.md` says to sweep `cache_level` rather than sample it, and the same shape as the three bugs
-that hid behind its default `(1, 0)`.
-
-Also: `d = 1` needed handling in both scripts, for *different* reasons. `poc/hash_partition_jax` runs it as a
-meaningful degenerate case (zero collectives, still exact) but must **skip its overflow section** —
-with one bucket the derived capacity is ~`N`, so a 0.9x slack is still ample, nothing overflows, and
-the section's premise is false rather than its assertion weak. `poc/uniquify_sharded` **raises** at `d = 1`: with one
-bucket there is no second routing round, which is the mechanism it exists to verify.
+`run_case` took `mesh` and `num_shards` separately, and 4 devices made them coincide; at 8 it raised, and
+`num_shards` now derives from `mesh.shape["x"]`. A hardcoded device count is a coincidence, not a
+fixture. `poc/partition-states.md` §9.
 
 ### The popcount diagonal path already shards — verified, no work needed (2026-08-30)
 
-Carried as the last open item of the distributed-`states` line ("the diagonal builders need
-`popcount(S[i] & z)`, i.e. the state *bits* — those shard elementwise, but that was not verified
-end-to-end"). **Verified now, and there is nothing to build:** every function on the path shards with
-**zero collectives** and returns bit-identical values.
-
-**Why it was never at risk, which is the point worth keeping.** `_z_parity` is
-`sum(bitwise_count(states & z), axis=1) & 1`: two elementwise ops and a reduction along the **byte**
-axis. For a `P('x', None)` state array the sharded axis is axis 0, so the reduction runs entirely within
-each device's own rows. `NOTES.md`'s rule — *"everything that reorders or compacts along the sharded axis
-fails; only elementwise ops and reductions survive"* — is satisfied in its easiest form: **the reduction
-is over the unsharded axis.** Contrast `uniquify_states`, whose `cumsum` reduces *along* the sharded axis
-and needed a two-level prefix sum.
-
-Measured on 1D XXZ, `P('x', None)` states, 4 devices — asserting the **spec and the values together**,
-since `NOTES.md` records that a replicated run agrees to exactly 0.0 and "correct but silently unsharded"
-is invisible to value comparison alone:
-
-| function | out spec | values | max diff |
-| --- | --- | --- | --- |
-| `_z_parity` | `P('x',)` | match | 0.00e+00 |
-| `get_diag_signs` | `P('x', None)` | match | 0.00e+00 |
-| `get_diagonal` | `P('x',)` | match | 0.00e+00 |
-| `compute_diagonal` | `P('x',)` | match | 0.00e+00 |
-
-**Swept over every X group and both coefficient dtypes**, at n=40 (J=41, K=40, N=9,220 for real; J=42 for
-the complex case, where a single odd-Y string makes `.c` complex128): **0 failures out of 41 and 42
-groups** for all three builders, counting a missing `'x'` in the output spec as a failure alongside a
-value mismatch. And **`apply_h` end-to-end at both cache levels that use this path** — `(1, 0)` which
-recomputes from `zsignatures`, and `(1, 1)` which unpacks cached `diag_signs` — output spec `P('x',)`
-and `max|diff| = 0.00e+00` on both dtypes.
-
-**One pre-existing behaviour found and correctly attributed.** `apply_h` with a **real** `vec` against
-**complex128** coefficients raises `TypeError: scan body function carry input and carry output must have
-equal types ... float64[N] but ... complex128[N]`. That looked like a sharding failure in the first run
-and is not: it **reproduces on a single device with no mesh at all**. It is an undocumented dtype
-contract — `vec` must be promotable to the coefficient dtype — and `PauliSumXZ` makes `.c` complex
-whenever any Pauli string has an odd Y count. Worth knowing, unrelated to this work, and *not* fixed
-here.
-
-**Pinned by `test/sharded/diagonals.py` and mutation-verified.** Dropping the single
-`out_sharding=jax.typeof(states).sharding` on `get_diag_signs`' `init` accumulator makes the whole
-builder run **correctly but unsharded**: `bad_value = 0` — every value still bit-identical — while
-`bad_spec` goes to 42/44. **A value-only test passes that mutant silently**, which is the concrete
-demonstration of `CLAUDE.md`'s rule rather than a restatement of it. Placing the mutation *inside* the
-scan instead raises on a carry-type mismatch, so the `init` line is the one that had to be mutated to
-produce the silent form.
-
-**So the distributed-`states` line has no remaining unverified mechanism.** `get_xsource` (`poc/hash_partition_jax`),
-`uniquify_states` (`poc/uniquify_sharded`) and the diagonal path all have working, exact, sharded forms. What remains is
-entirely the open question stated in those entries: whether the routing communication pays for the
-27.9 GB/device it removes, which needs a real interconnect and cannot be answered on virtual devices.
+The reduction runs over the unsharded byte axis, so all four builders and `apply_h` at `(1, 0)`/`(1, 1)`
+keep `P('x', …)` with max diff 0.0 and zero collectives; `test/sharded/diagonals.py` pins it with a spec
+assertion, since a value-only test passes the unsharded mutant. `poc/partition-states.md` §10.
 
 ### The range-partitioned shuffle works — `poc/range_partition.py` (2026-08-29)
 
-That shuffle was then built. **It is the one design that removes the single-device sort**, and it is
-correct: output bit-identical to `np.unique(rows, axis=0)`, and **zero `all-gather` / `all-reduce` /
-`collective-permute`** in the compiled HLO. Sample sort with data-derived splitters, fixed-capacity
-buckets, then `NSH` independent `lax.sort`s under `vmap`. Concatenating buckets in splitter order is
-globally sorted, so no cross-bucket comparison ever happens.
-
-Four findings, each of which cost a wrong turn:
-
-- **Equal-range splitting collapses.** Splitting the packed most-significant word's nominal `2^64`
-  range gives **4.00x/8.00x imbalance at NSH=4/8** — i.e. every row in one bucket. At n=100 that word
-  is 7 bytes of leading pad (a consequence of `_pack_state_words`' leading-pad choice), so its range
-  carries almost no information. Data-derived quantiles give **1.07–1.19x** on both uniform and
-  fixed-Hamming-weight fixtures.
-- **A global `argsort` for within-bucket rank defeats the whole design.** The obvious way to compute
-  "position among earlier rows in my bucket" is `argsort(bucket)` — which is a global sort, the exact
-  thing being removed. Measured **256 ms against 8 ms** at N=2M, and it showed up as 208 `sort` ops in
-  the HLO against the incumbent's 29.
-- **The `[N, NSH]` one-hot cumsum is the wrong fix.** Same speed as the alternative but `4*N*NSH`
-  bytes — **34 GB at `N = 2^31, NSH = 4`, 275 GB at NSH=32**. It grows *with* the device count, so
-  adding devices to reach larger `N` makes it worse. Use `NSH` sequential `[N]` cumsums instead: `O(N)`
-  memory, same time, identical result.
-- **Capacity overflow is detectable, which is what makes this shippable.** Static shapes force a
-  per-shard capacity and an undersized one drops rows (16,090 lost at slack 1.05). But the kernel
-  *returns the overflow count*, so a caller can raise. Contrast the rank-select prototype
-  (`markdown/spinchain/rqutils-multiobs-response.md` §5.3), whose analogous `cap` had no detectable failure mode —
-  that is why one is a candidate and the other is not.
-
-Timings are 1.70–2.32x against the incumbent on 4 virtual CPU devices, reported only to show the
-structure is not pathologically slow; **virtual-device timings are meaningless** and the claim here is
-shardability, not speed. Two pieces of real work remain before it could replace `uniquify_states`:
-splitter selection is host-side numpy (one device sees the sample), and reassembly into the
-`[states_size, B]` contract is not implemented — the POC returns `[NSH, cap, NW]` blocks.
+Sample sort with data-derived splitters is bit-identical to `np.unique` with zero all-gather/all-reduce.
+Equal-range splitting collapses (4.00×/8.00×), a global `argsort` defeats the design, a one-hot cumsum
+costs 34 GB at `2^31`, and overflow is detectable; its two gaps are closed by `poc/uniquify_sharded.py`.
+`poc/partition-states.md` §7.
 
 ## Convergence: the residual floor and `atol`/`rtol`
 
@@ -2528,151 +1777,17 @@ taken under, which is the same trap the requester's own table fell into.
 
 ### Davidson vs `ground_locg`: the two regimes split, and memory is the axis that decides it (2026-09-02)
 
-Asked because `diaglib` ships both algorithms, so the paper's headline claim ("Davidson remains the best
-choice for most applications; LOBPCG is competitive, especially when memory is an issue") could be checked
-against this module rather than taken on trust. Comparison is by **matvec count**, not wall-clock — a
-50-line NumPy Davidson against a jitted JAX solver says nothing about time, and matvecs are the currency
-for a matrix-free method anyway.
-
-**Memory, from `diaglib`'s own allocations rather than a benchmark.** `davidson_driver` allocates
-`space(n,lda)` *and* `aspace(n,lda)` with `lda = dim_dav·n_max`, so its footprint is **linear in history
-depth**; `lobpcg_driver` allocates `3·n_max` blocks plus temporaries. Per eigenpair:
-
-| | vectors/eigenpair | at N = 18 360 640, 50 states |
-| --- | --- | --- |
-| Davidson, depth 25 | **51** | 384 GB (paper reports ~356) |
-| `diaglib` LOBPCG | 9 | 68 GB (paper reports ~55) |
-| **`ground_locg`, m=1** | **8 total** | **1.1 GB** |
-
-The model reproduces the paper's published numbers within 8–23% (the gap is their locking shrinking
-`n_act`), so it is sound. `ground_locg` is a further step past `diaglib`'s LOBPCG purely by being
-block-size-1.
-
-**Matvecs at matched memory — the comparison that is not obvious.** Davidson at depth 25 looks dominant,
-but that is 54 O(N) vectors against 8. Sweeping depth, median over 5 seeds, `n=512`, `rtol=1e-10`, all
-arms 5/5 converged:
-
-| | depth 3 (10 vec) | depth 5 (14) | depth 10 (24) | depth 25 (54) | **`ground_locg` (8 vec)** |
-| --- | --- | --- | --- | --- | --- |
-| diagonally dominant | **390** | 311 | 241 | 213 | **731** |
-| dense non-dominant | **580** | 276 | 126 | 103 | **404** |
-
-**The two regimes split, reproducing the paper's conclusion:** at comparable memory Davidson is **1.9×
-better on the diagonally dominant** fixture (390 vs 731 — its Jacobi preconditioner exploits the
-dominance) and **1.4× worse on the non-dominant** one (580 vs 404). Davidson's headline advantage is
-bought with memory, very nearly linearly: on the dense fixture 580 → 103 matvecs (5.6×) costs 10 → 54
-vectors (5.4×).
-
-**Which row applies to `sqd` is the non-dominant one.** The projected `H` is not diagonally dominant —
-that is the structural reason `precond` is closed (see below) — and `N` is the binding constraint. So the
-regime where `ground_locg` wins at matched memory is the regime `sqd` is in. Reassuring rather than
-surprising, but it had never been measured.
-
-**Accuracy: comparable, and `ground_locg` is better at the floor.** Eigenvalue errors agree within ~1.5×
-at usable tolerances. Driving `rtol` to `4·eps`, Davidson reports `conv=False` on both fixtures while
-`ground_locg` converges, reaching a **10× lower true residual** on the dense case (2.42e-14 against
-2.96e-13). That is the fixed 2-pass orthogonalization of the next entry earning its keep.
-
-**A thick restart is the one place `(AV)u` reuse is legitimate, and the distinction is worth stating.**
-The first Davidson written here restarted on a single Ritz vector; `diaglib` re-seeds with `n_max`
-(`dcopy(n_max*n,evec,1,space,1)`). Fixing it to keep the `k` lowest Ritz vectors — `V ← V·S[:,:k]`,
-`AV ← AV·S[:,:k]` — is exact: measured `‖VkᵀVk − I‖ = 1.8e-15` and `‖AVk − A·Vk‖ = 2.4e-14`. This is the
-same `(AV)u` form the reuse investigation above shows corrupting the residual, and it is safe **because
-`S` is orthogonal *and* `V`/`AV` are current, not stale**. Accumulated staleness is the defect, not the
-matmul. `‖u‖ = 1` alone was never the sufficient condition.
-
-**Two negatives worth keeping.** First, the thick restart barely matters at shallow depth (384 vs 394 at
-depth 3, identical at 290 on the dense fixture), so the suspicion that a thin restart handicapped Davidson
-was **wrong** — it only helps at depth 10–25 (263 vs 266, 210 vs 226). Second, `n_keep = max_dav - 1`
-**stalls outright**: the retained Ritz vectors plus one new direction refill the space every iteration, so
-the subspace never grows — measured 6001 matvecs and error **2.3** (wrong answer, non-convergent) at
-`max_dav=3, n_keep=2`, where `n_keep=1` converges in 374. Any thick restart needs `n_keep ≤ max_dav - 2`.
-
-**Caveats on the whole comparison.** Synthetic dense fixtures at `n=512`, not a physical Hamiltonian —
-CLAUDE.md warns a physically-motivated fixture can invert a synthetic conclusion, so the matvec ratios
-should be re-measured on `xxz_krylov` and through `apply_h` before being quoted as load-bearing.
-**That re-measurement is now done** — see the `xxz_krylov` entry below, which confirms the matched-memory
-conclusion on a physical fixture and adds that the prefilter *regresses* every Davidson arm. The
-Davidson is a faithful-but-minimal reimplementation (no locking, no Cholesky `ortho_cd` with level
-shifting, single eigenpair), which is adequate for counting matvecs and comparing eigenvalue error and
-nothing else. The memory table, being read off `diaglib`'s allocations and cross-checked against the
-paper, does not depend on it.
+Davidson's matvec advantage is bought with memory: 51 vectors per eigenpair at depth 25 against
+`ground_locg`'s 8, 5.6× fewer matvecs for 5.4× the vectors. At matched memory (synthetic, n=512) it is
+1.9× better diagonally dominant and 1.4× worse non-dominant, `sqd`'s regime; `ground_locg` also converges
+at `4·eps` where Davidson does not, and `n_keep = max_dav - 1` stalls. `poc/davidson.md` §1–§2.
 
 ### Davidson vs `ground_locg` on `xxz_krylov` through `apply_h`, prefilter on both arms (2026-09-02)
 
-Closes the caveat the entry above left open: its ratios are synthetic dense fixtures at n=512 with no
-filter. Here the operator is a periodic XXZ chain (`XX + YY + delta*ZZ` per bond, transverse `Bx` per
-site — `Bx` is load-bearing, since without it magnetization is conserved, the hop-generated subspace is
-closed under `H`, and the projection is trivially block-diagonal) projected onto `poc/hash_partition`'s `xxz_krylov`
-subspace and applied through `apply_h` at `cache_level=(1, 2)`. n=24, rungs=6, cap=8000 so the cap bites
-and each seed is a *distinct* subspace, N=8000 (padded 8192), 5 seeds, `rtol=1e-10`, all arms 5/5
-converged, every energy within 6e-13 of `eigsh(tol=0)`.
-
-**The filter goes to both arms, and that is the whole design of the comparison.** `_chebyshev_prefilter`
-is an operator-agnostic start-vector transform — nothing about it is LOBPCG-specific, so handing it to
-one arm measures the filter, not the algorithm. Both arms get the identical filtered vector and are
-charged the identical `cycles*(degree+1) = 66` matvecs.
-
-**Matvec counts, median over 5 seeds, excluding the shared 66:**
-
-| | vectors | plain (delta=1.0) | filtered | plain (delta=0.2) | filtered |
-| --- | --- | --- | --- | --- | --- |
-| **`ground_locg`** | **8** | 156 | **57** | 129 | **48** |
-| Davidson depth 2 | 8 | **112** | 67 | **125** | 68 |
-| Davidson depth 3 | 10 | 68 | 40 | 74 | 40 |
-| Davidson depth 10 | 24 | 47 | 24 | 49 | 25 |
-| Davidson depth 25 | 54 | 41 | 23 | 42 | 23 |
-
-**At matched memory the filter is what separates them, and it separates them in `ground_locg`'s favour.**
-Depth 2 is the only Davidson arm holding 8 vectors, and unfiltered it is a near-tie (112 vs 156;
-125 vs 129 on the non-dominant fixture). Filtered, `ground_locg` wins both (57 vs 67, 48 vs 68). Reading
-any deeper Davidson column as a win is the mistake the entry above warns about — depth 3 already buys
-its 68 with 10 vectors, and depth 25 with 54.
-
-**The filter helps LOBPCG and *hurts* Davidson, which is the finding worth keeping.** Speedup in matvecs
-including the filter's own 66, median over seeds:
-
-| | delta=1.0 | delta=0.2 |
-| --- | --- | --- |
-| `ground_locg` | **1.27x** (1.09-2.03) | **1.11x** (1.00-1.74) |
-| Davidson depth 2 | 0.90x | 0.96x |
-| Davidson depth 3 | 0.65x | 0.69x |
-| Davidson depth 25 | 0.46x | 0.47x |
-
-Every Davidson arm is a *regression*. The mechanism is not mysterious and is the same Amdahl argument
-that caps the Bloom filter: Davidson converges in 41-125 matvecs, so a fixed 66-matvec precompute cannot
-pay for itself no matter how much it improves the start. `ground_locg` needs 129-156, so the same 66 does.
-**This makes the filter a poor discriminator between the algorithms and a good one between operating
-points** — it is worth having exactly when the solver is iteration-hungry, which is the regime the
-single-vector method is in by construction.
-
-**A regime caveat that inverts the fixture choice, and it is measured, not assumed.** CLAUDE.md warns a
-physical fixture can invert a synthetic conclusion; here it partly does, but not via the axis expected.
-Diagonal dominance of the projected `H`, measured on the assembled sparse matrix: `delta=1.0` gives 45%
-dominant rows at a median `|d|/offsum` of **1.00** — borderline, not the non-dominant regime `sqd` is
-claimed to be in — while `delta=0.2, Bx=2.0` gives 0.1% and **0.20**. So the anisotropy, not the
-subspace, is what selects the regime, and a default `delta=1.0` XXZ is *not* a non-dominant fixture.
-The matched-memory conclusion holds on both, which is the reassuring part.
-
-**Two measurement traps hit here, both silent.**
-
-- **A Python-level counting wrapper cannot count matvecs through this module.** `body` runs under
-  `jax.lax.while_loop` and the prefilter under `jax.lax.scan`, so a counting closure is invoked once per
-  *trace*: measured **7 against a true 429**, and 3 against the prefilter's 66. It does not error and the
-  numbers look plausible. Counts must be analytic — `body_iter0` is 1 matvec, `body_iter1` 2, `body()` 3,
-  and `niter` counts `body()` calls only, so **matvecs = 3 + 3*niter** (verified by a `maxiter=0,1,2,5`
-  sweep, where `niter` returns exactly `maxiter`).
-- **`cap` must actually bite or the seed does nothing.** At rungs=3 the reachable set is smaller than the
-  cap, so every seed returned a bit-identical subspace and the same energy — a "median over 5 seeds" over
-  one fixture repeated 5 times. The tell was identical `N=489 E=-26.7560572683` on every row.
-
-Caveats. Single-device CPU, one Hamiltonian family, one subspace size; matvec counts only, no wall clock
-(a numpy Davidson against a jitted JAX solver says nothing about time, as the entry above notes). The
-Davidson is the same faithful-but-minimal reimplementation — Jacobi preconditioner, thick restart at
-`n_keep = max_dav - 2`, no locking, no `ortho_cd`, single eigenpair — so it is adequate for counting
-matvecs and eigenvalue error and nothing else. Its Jacobi preconditioner reads the diagonal off the
-assembled sparse operator, which a matrix-free caller would have to get from `get_diagonal`'s
-identity-X group; that is free in `sqd` but is not counted as a matvec here.
+The matched-memory result holds on a physical fixture (N=8000): at 8 vectors unfiltered is a near-tie
+(112 vs 156, 125 vs 129) and filtered goes to `ground_locg` (57 vs 67, 48 vs 68); the shared 66-matvec
+prefilter gives `ground_locg` 1.11–1.27× and every Davidson arm 0.46–0.96×. Count matvecs analytically,
+`3 + 3*niter`. `poc/davidson.md` §3–§4.
 
 ### The fixed 2-pass re-orthogonalization beats `diaglib`'s adaptive loop on its own metric (2026-09-02)
 
@@ -2982,179 +2097,29 @@ conditioned B matrices". Not applicable at `B = I`.
 
 ### Multi-node, one GPU per node: five harness failures before the library's own surfaced (2026-09-04)
 
-A 4-node cluster with a single GPU per node. `mpirun` is not optional there -- it is the only way to
-reach 4 GPUs -- and every POC in `poc/` assumed a single process owning several local
-GPUs. Five distinct failures, in the order they appeared, each hidden behind the previous one. The
-library's own defect took one more run to surface -- a scalar host read, recorded below -- so read
-these five as the *harness* failures they were, not as evidence the library was clean.
-
-**1. `jax.distributed.initialize` is the whole difference, and its absence is not an error.** Under
-`mpirun -n 4` without it, each rank comes up as an *independent* JAX client that sees all 4 GPUs, so
-`jax.devices()` prints `[CudaDevice(0..3)]` four times and everything looks right. `examples/sqd.py`
-already had the fix (`--gpus mpi` → `initialize(cluster_detection_method="mpi4py")`); the scaling POCs
-never got it. Now `_scaling_common.init_devices` covers all three modes and **raises** when a launcher
-put several ranks in the job without `--devices mpi`, because the symptom otherwise arrives minutes
-later as failure 2.
-
-**2. `jax.make_mesh` rejects multi-slice topologies outright** -- and it does so *after* `initialize`
-has correctly formed the cluster, which makes it read as an initialization problem. Reading its source
-settles it: it routes through `mesh_utils.create_device_mesh`, then raises whenever the chosen devices
-carry more than one distinct `slice_index`. **One GPU per node means one slice per node**, so an
-N-node job hits this unconditionally. Its message names `create_hybrid_device_mesh`, which wants a
-`dcn_mesh_shape` split.
-
-For a **1-D** mesh none of that is needed: `create_device_mesh`'s topology optimization exists to order
-devices for *multi-dimensional* meshes on a torus, and a 1-D mesh has no ordering choice -- every
-device is one axis element. `_scaling_common.make_1d_mesh` constructs `Mesh` directly over
-`jax.devices()`, verified bit-identical to `make_mesh` on a single slice (same devices, shape,
-axis_types, and `Mesh` equality) so it is a drop-in.
-
-**3. A module-scope `jnp` call initializes the backend at import**, after which `initialize` refuses
-with "must be called before any JAX calls that might initialise the XLA backend". `poc/uniquify_sharded` had
-`SENTINEL = jnp.uint64(0xFFFFFFFFFFFFFFFF)` at module level. The fix is `np.uint64`, not a bare Python
-int -- `0xFFFFFFFFFFFFFFFF` exceeds int64 and `jnp.where` raises `OverflowError` on the untyped
-literal, which is how the first attempt failed. Pinned by asserting `xla_bridge._backends` is empty
-after importing the module.
-
-**4. Closing over a sharded array is legal single-process and illegal across processes.** A rank
-addresses only its own shard, so a `functools.partial` over globally-sharded arrays raises "Closing
-over jax.Array that spans non-addressable (non process local) devices". `poc/prefilter_gpu` built its own partial
-over `apply_h`; the fix is `ground_locg`'s `args`, which it splats as `matvec(vec, *args)`. Note this
-is the *same* split `run_sqd` already uses for a different reason (`cache_level` must stay static or
-the kernel retraces every matvec) -- the library's performance requirement and multi-process
-correctness happen to want the identical shape.
-
-**5. Getting a sharded array to the host took three tries, and each fix exposed the next constraint.**
-This is the one worth reading before touching any gather:
-
-- `np.asarray` on a globally-sharded array raises "Fetching value for jax.Array that spans
-  non-addressable devices".
-- `process_allgather`'s **default `tiled=False` stacks a *fully addressable* array into a new leading
-  axis** -- `(4, 2)` becomes `(1, 4, 2)`. Single-process, that silently made `np.array_equal` against
-  the reference return False, and `poc/uniquify_sharded`'s exactness flipped True → False at `d=2`. The docstring
-  distinguishes the addressable and non-addressable cases; only the latter ignores `tiled`.
-- `process_allgather` **still fails on a sub-mesh**. `poc/uniquify_sharded` sweeps `jax.devices()[:num_shards]`, so at
-  `d=2` on a 4-process job ranks 2 and 3 hold no shard at all and its internal `addressable_data(0)`
-  raises `FullyReplicatedShard: Array has no addressable shards`. Measured: ranks 0-1 printed `True`,
-  ranks 2-3 crashed, then the shutdown barrier timed out at **2/4 tasks**.
-
-The working form is a **non-collective** gather: concatenate `addressable_shards` sorted by global
-index (`sh.index[0].start`), and return None off-mesh so a rank with nothing to say skips the
-comparison instead of asserting on an absent value. Sorting matters -- shard arrival order is not
-global order.
-
-**Two diagnostic notes.** Output from 4 ranks interleaves, so a single failure appears four times and a
-partial failure (2 of 4) is easy to misread as a flake -- count the tracebacks. And the gRPC "failed to
-connect to ... Connection refused" noise at the end of a failed run is the coordination service being
-torn down, *downstream* of the real error; it is never the cause.
+Five harness failures, each hiding the next, came before the library's own scalar-read defect surfaced:
+no `jax.distributed.initialize`, `make_mesh` rejecting multi-slice, a module-scope `jnp`, closing over a
+sharded array, and three wrong gathers. The working gather is a non-collective, index-sorted concat of
+`addressable_shards`; `process_allgather` stalled at 2/4 tasks. `poc/sqd-multinode.md` §1.
 
 ### The multi-node correctness result, and the wall clock that came with it (2026-09-04)
 
-`poc/sharding.py` passed in full on **4 real GPUs across 4 nodes**: all six `cache_level` cells, every
-`N mod mesh.size` in 0-3, and the `return_eigvec` reshard round trip, worst `|sharded - single|` =
-**4.441e-16** and `‖Hv-ev‖/‖v‖` = 2.670e-15. `poc/prefilter_gpu`'s Claim 3 also passed, asserting the output *spec*
-`P('x',)` rather than only the value -- which is the point, since a silently replicated run agrees with
-single-device to exactly 0.0. Multi-node sharding **correctness** for `sqd` is settled; the six-cell
-sweep matters because two sharding bugs once hid in the `cache_level[0] == 0` cells and the first
-masked the second.
-
-**The speed is another matter: 9010 ms sharded against 279 ms single-device, 32x SLOWER**, at
-*identical* iteration counts (298 plain, 253 prefiltered). Identical counts mean this is pure
-communication, not a different computation. At `N = 2^20` each device holds ~262k elements while every
-LOBPCG iteration's `O(N)` reductions cross a **network** rather than NVLink.
-
-Two things this does and does not say. It is a real measurement of the pessimistic topology, and it
-locates the crossover far above this size -- but it is **one size on one interconnect**, and per
-`CLAUDE.md` a quantity measured at one size is not a law. It says nothing about several GPUs in one
-box, where the same collectives run over NVLink. Record which interconnect produced any such figure.
-`poc/sqd_multinode.py` exists to sweep device count at fixed `N` and report per-device
-`bytes_in_use` beside the wall clock, so the memory question can be answered even where the speed
-answer is bad -- the replicated-`states` term (`13 * N` per device) should stay flat while the solver
-vectors halve, and per `CLAUDE.md` that must be asked of XLA rather than derived from a formula.
-
-Also measured while writing that script, first-hand: **omitting
-`jax.config.update("jax_enable_x64", True)` moved the 1-device energy from -23.782182463507 to
--23.782182693481** and fired its cross-device assertion at 3.8e-06, reading exactly like a sharding
-bug. With x64 the spread is 3.6e-15 across 1/2/4 devices. The rule is in `CLAUDE.md`; this is what
-breaking it looks like from the inside.
+Correctness is settled on 4 GPUs across 4 nodes: all six `cache_level` cells, worst `|sharded - single|`
+= 4.441e-16, spec `P('x',)` asserted. Speed is not: 9010 ms against 279 ms single-device at N = 2^20 (32x
+slower) at identical iteration counts, so it is pure communication — one size, one interconnect.
+`poc/sqd-multinode.md` §2–3.
 
 ### `poc/sqd_multinode` anchored: memory shards 3.2x, wall clock is 4.06x underwater, first hop is the dear one (2026-09-07)
 
-Same fixture as the 2026-09-05 entry below (1D XXZ `n=26`, `Jz=0.8`, N=400000, J=27, maxK=26, float64,
-`cache_level=(1, 0)`, one GPU per node, `--devices mpi`), now the full `for n in 1 2 4` sweep in one job
-with `--reference-energy` threaded from the 1-device row. Both instrument fixes held: the 1-device rank
-exits 0 so the loop completes, and `temp MB` reports real numbers.
-
-| devices | temp MB | vs 1-dev | ideal | excess | ms | vs 1-dev | vs prev |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 87.02 | -- | 87.02 | -- | 367.7 | -- | -- |
-| 2 | 48.28 | 1.80x | 43.51 | +4.77 | 871.5 | 2.37x slower | 2.37x |
-| 4 | 27.16 | **3.20x** | 21.75 | +5.41 | 1491.2 | **4.06x slower** | 1.71x |
-
-`|dE| = 7.1e-15` at both multi-rank points against the 1-device reference, so the energy is right and
-every millisecond of the regression is communication.
-
-**Claim 1 is answered, affirmatively: the working set shards.** `temp MB` falls 3.20x over 4 devices --
-"falling but not halving", as the script predicts. The excess over ideal is **flat at ~+5 MB** rather
-than growing, which is the signature of the known replicated `states` term (`13 * N` per device, the one
-the `(0,0)` floor cannot shed) and not of a leak. Read `temp MB` for this; `delta MB` sat at exactly 6.00
-on every row because it sees only what `run_sqd` returns and `eigvec`/`basis` come back replicated.
-
-**Claim 2's slope was wrong, and the correction changes which lever to pull.** The entry below reads
-1.80x per doubling from its 2- and 4-device points. With the 1-device anchor the cost is **not** a
-per-device slope: 1->2 is 2.37x and 2->4 only 1.71x. The expensive event is *crossing the network at
-all*, not each subsequent device -- so the term that dominates is collective **count**, not payload per
-device or hop count.
-
-That sharpens both pending decisions rather than reversing them. `markdown/sqd-locg-improvement-ideas.md`
-§3 (routing hash-partitioned state lookup) stays **do not integrate** -- it adds `all_to_all` to a solve
-already 4.06x underwater. §8 (cutting 7 of the 13 per-iteration `all-reduce` ops) is now the *only*
-lever aimed at the measured cause, since more than half the collectives per iteration would go.
-
-Unchanged caveat: multi-**node** over a network, the pessimistic topology. Says nothing about several
-GPUs in one box over NVLink, and per `CLAUDE.md` one fixture at one size is not a law -- `N` is fixed
-across all three rows here, so this is a device-count curve, not a scaling law.
+n=26, N=400000, 1/2/4 nodes: `temp MB` 87.02 → 48.28 → 27.16 (3.20x), a flat ~+5 MB excess from the
+replicated `states`. Wall clock is 4.06x slower; 1→2 costs 2.37x and 2→4 only 1.71x, so collective count
+dominates. `|dE|` = 7.1e-15. `poc/sqd-multinode.md` §4, §6.
 
 ### `poc/sqd_multinode` on real nodes: the scaling is negative, and the memory column was never measured (2026-09-05)
 
-First real multi-node run of `poc/sqd_multinode.py`, 1D XXZ `n=26`, `Jz=0.8`, N=400000 (J=27,
-maxK=26, float64), `cache_level=(1, 0)`, one GPU per node via `--devices mpi`:
-
-| devices | ms | vs 2-device |
-| --- | --- | --- |
-| 2 | 961.8 | -- |
-| 4 | 1728.6 | **1.80x SLOWER** |
-
-`|dE| = 0.0e+00` at both points, so this is pure communication -- the same conclusion as the 32x figure
-above, now with a *slope*: doubling devices at fixed `N` costs 1.80x. Two caveats. The 1-device arm never
-ran (its rank exited non-zero and `mpirun` aborted the job), so the ratio is computed across separate
-runs rather than reported by the script, and every printed `speedup` column said "baseline" because each
-rank count is its own job. And this is again a network, not NVLink.
-
-**Superseded by the anchored sweep below**, which adds the 1-device point and answers Claim 1. Both
-numbers above stand as measured; the *slope* reading does not, since 2->4 turns out to be the cheaper
-of the two doublings.
-
-**This is the measurement `markdown/sqd-locg-improvement-ideas.md` §3 was gated on, and it says do not
-integrate.** Routing hash-partitioned state lookup adds `all_to_all` on top of a solve already losing
-1.80x per doubling on this interconnect. It also promotes §8-rescoped: where 4 devices are 1.80x slower
-than 2, cutting 7 of the 13 per-iteration `all-reduce` ops is no longer a micro-optimization.
-
-**The memory columns all read `0.0`, and that was an instrument failure, not a finding.** The probe
-bracketed a `solve()` that returned `float(sqd(...))`, so every device array was freed before the second
-reading and both samples took the resting allocator value -- structurally zero on any backend. The
-script's own VERDICT could not catch it: its advice was "a FLAT delta means nothing sharded", and flat
-and absent both print `0.0`. Fixed by sampling while the arrays are still referenced, which `poc/gpu_unverified`'s
-docstring already recorded as the fix for the identical defect.
-
-One trap inside that fix, hit before it was right: routing `return_eigvec=True` through **`sqd`** does
-not work, because `sqd` converts on the way out (`np.array(eigvec[...])`, `np.asarray(basis_states)`), so
-holding those keeps no device memory alive and the delta stays `0.0` with more machinery in the way.
-`run_sqd` is the innermost layer whose outputs are still `jax.Array`. An exact zero now prints `0?`, since
-a real solve allocates `O(N)` vectors and 0 B can only mean the reading missed them. Claim 1 was still
-unanswered on real hardware at this point -- the fix was verified only under virtual devices, where the
-CPU backend has no allocator accounting and correctly reports `n/a`. **The 2026-09-07 entry above
-answers it on GPUs: 3.20x over 4 devices.**
+First run, 2 and 4 devices: 961.8 → 1728.6 ms. Its 1.80x-per-doubling reading is superseded by the
+anchored sweep, and its `|dE|` = 0 was vacuous (no `--reference-energy`). The memory column's `0.0` was
+an instrument failure, since fixed. `poc/sqd-multinode.md` §4–5.
 
 ### `sqd` could not return its own eigenvalue multi-process, and I audited past it once (2026-09-04)
 
@@ -3249,226 +2214,45 @@ partial.
 
 ### The GPU prefilter sweep: the peak transfers, its location does not (2026-09-04)
 
-`poc/prefilter_gpu.py` on one CUDA device, `n=26`, `N=1048576`, `J=30`. Full table in
-`markdown/locg-chebyshev-prefilter.md` §3.2. Headline: **1.38x at `(32, 8)`** against the CPU median of
-1.36x, so the prefilter pays about as well on GPU as on CPU — but CPU peaks near `(16, 4)` and that same
-setting gives only **1.08x** here. The CPU recipe's "do not exceed `cycles ≈ 4`" is a CPU statement.
-`sqd`'s `(32, 2)` default measures 1.07x, under a fifth of what is available; changing it needs the
-end-to-end `sqd` measurement, which this harness does not perform (it drives `ground_locg` on `apply_h`
-and excludes setup).
-
-Two process lessons, both about reading a truncated result:
-
-- **A sweep that dies partway invites the wrong conclusion, and I drew it.** With `(32,4)` and `(32,8)`
-  missing I concluded "the CPU 1.36x does not transfer" and "only `(16,8)` clears 1.28x". Both were
-  wrong, and wrong in the *optimistic-for-my-hypothesis* direction: the two absent configurations were
-  the two best in the grid. The measurement had no error in it — the inference from a grid with a hole
-  did. **A per-item `try` that prints a SKIPPED row is worth more than the rows it saves**, because it
-  makes the hole visible as a hole.
-- **The two configurations that looked like they exhausted the GPU are the two fastest.** Believing the
-  failure was about their cost would have removed exactly the settings worth using.
+On a GPU the prefilter peaks at about the CPU's gain (1.38x against the CPU median 1.36x) but not at the
+CPU's setting: `(16, 4)` gives only 1.08x, and `sqd`'s `(32, 2)` 1.07x. The sweep first died partway, and
+the two missing cells were the best two — print a SKIPPED row rather than dropping a cell.
+`poc/prefilter-gpu.md` §1.
 
 ### The prefilter optimum is a ridge in `extra mv`, and `(32, 8)` was a boundary artifact (2026-09-12)
 
-Same harness, same fixture (`n=26`, `N=1048576`, `J=30`). The entry above concluded "the optimum is near
-`(32, 8)`" from a grid whose maximum sat on its own upper corner in *both* axes — a truncation, not a
-maximum, and the same misreading as the SKIPPED rows one axis over. Two runs closed it. Full tables in
-`markdown/locg-chebyshev-prefilter.md` §3.2.
-
-**The optimum is fixture-dependent, and `extra mv` is not the controlling variable.** I proposed that rule
-from a 3x3 grid on one Hamiltonian — a ridge at `cycles·(degree+1)` ≈ 200–350 — and a second Hamiltonian
-falsified it. **Recorded as a correction rather than deleted, because the over-fit is the lesson.** Matched
-4x5 grids, `n=26`/`J=30` against `n=22`/`J=8` (full tables in §3.2/§3.3):
-
-- `n=26`/`J=30` peaks along an **anti-diagonal** — `(16,16)` 1.41x, `(24,8)` 1.42x, `(32,8)` 1.38x,
-  `(40,4)` 1.40x, all inside the 1.3% noise floor, so a tie. Bottom-right still holds 1.07–1.28x.
-- `n=22`/`J=8` peaks at `(16,8)` 1.43x and `(40,2)` 1.38x, then **collapses**: 5 of 20 configurations lose
-  outright, `(40,16)` at **0.70x**.
-- The same `extra mv` gives opposite verdicts: 283 → 1.41x there, 1.25x here; 411 → 1.28x there, **0.98x**
-  here. `degree = 40` is near-best at `cycles = 2` on the second fixture and a **loss** at `cycles = 8`.
-
-**The two surfaces are near-transposes, so no `(degree, cycles)` is best on both** — `(16,8)` 1.29/1.43,
-`(24,8)` 1.42/1.28, `(40,2)` 1.11/1.38 — and the gaps are far outside the 0.2–1.4% noise floors.
-
-**This also retracts my claim that the sweep contradicts §3.1.** §3.1 reasons `degree` is high-leverage and
-`cycles` saturates past 2. On `n=26`/`J=30` the reverse holds (2 → 8 cycles is 1.07x → 1.38x at degree 32,
-while `degree` at fixed `cycles = 2` moves only 1.01 → 1.11). On `n=22`/`J=8` **§3.1's recipe is correct**:
-`(40, 2)` tops that column at 1.38x. §3.1's 27 configurations are XXZ chains on connected subspaces;
-poc/prefilter_gpu's is a random 100-term operator. **The knob ordering inverts between the regimes** — the disagreement
-was the fixture, and the XXZ regime is the one closer to a real SQD workflow. Two intermediate readings in
-this entry's history were both wrong: first that §3.1 predicted the ridge (coincidence — both accounts
-penalize large `extra mv` for unrelated reasons), then that §3.1 was contradicted (fixture, not error).
-
-**Iteration count is anti-correlated with wall clock out here.** Iterations fall monotonically with
-`extra mv` across the whole grid, 212 → 106, and the *fewest* iterations measured (106, at `(64,16)`)
-belong to the *slowest* configuration measured. Third independent instance of the quote-end-to-end rule.
-
-**Claim 1 holds exactly.** The four corner configurations return **identical** iteration counts on CPU and
-GPU — 138 / 115 / 125 / 106, not merely within an iteration — `|dE| ≤ 1.8e-15`, and wall-clock ratios
-agreeing to 1–3% at every point. Keep the claim narrow: §3.1's CPU peak near `(16, 4)` against the GPU's
-1.08x there is a real divergence and still stands. **The backends disagree about where the ridge begins
-and agree about where it ends.**
-
-**`sqd`'s `(32, 2)` default stays — requested three times across the session, and the second fixture is what
-turned the answer from "insufficient evidence" into a positive reason.** It measures 1.07x and 1.25x on the
-two fixtures: never best, never a loss, mid-surface on both. Every alternative beating it on one fixture is
-mediocre or losing on the other, which is what a default across unknown Hamiltonians must avoid and what
-§3.1's paired sweep selected for. Had the `K`/`J` run come back agreeing, I would have switched to
-`(24, 8)` — it measures **1.28x** on the second fixture against `(32,2)`'s 1.25x, inside the noise floor,
-so the switch would have bought nothing and been justified by a single fixture. **`(32, 4)` (1.34/1.30) was
-the best worst-case cell measured** and the one candidate worth taking end-to-end — which settled it below.
+Both retracted: the `(32, 8)` optimum sat on the grid's corner, and a second Hamiltonian (`n=22`/`J=8`)
+gives a near-transposed surface, so no `(degree, cycles)` is best on both. CPU and GPU iteration counts
+are identical (138/115/125/106). `(32, 2)` stays at 1.07x/1.25x: never best, never a loss.
+`poc/prefilter-gpu.md` §2–§3, §8.
 
 ### End-to-end through `sqd`, `(32, 4)` loses by 45%: a solver-side ratio can invert, not just shrink (2026-09-12)
 
-`poc/prefilter_cycles_e2e.py`, one CUDA device, `n=20`, `N=3586`, XXZ Krylov subspaces
-from `|Neel>`, **setup inside the timed region**, arms interleaved, 9 rounds per configuration. Full table
-in `markdown/locg-chebyshev-prefilter.md` §3.4. Result: **0.68–0.71x at every anisotropy, 0 of 81 paired rounds
-won, spreads 0.3–1.6%.** `(32, 4)` is ~45% slower end-to-end. **`sqd`'s `(32, 2)` is settled on a direct
-measurement now, not on absence of evidence.**
-
-**The transferable finding is that the dilution was not symmetric.** The stated prediction was that both
-arms compress toward 1.0x — a solver-side gap diluted by the setup term. Instead `(32, 4)`'s extra 66
-filter matvecs cost *more* end-to-end than the iterations they remove save, so **1.30x on the solver became
-0.69x through `sqd`**. §3.1's mechanism accounts for it: past cycle 2 you pay full cost for little
-separation, and end-to-end there is no solver-side surplus left to absorb it. `CLAUDE.md`'s Amdahl rule
-says to ask how many times per solve the target is paid before believing a ratio; this is the sharper
-version — **a ratio measured on a 4.5–8.4% slice can change sign when the excluded 66–97% is restored, not
-merely shrink toward 1.0x.** The Bloom entry's 1.09x cap was the benign case.
-
-**A fixture defect the run exposed, worth knowing before reusing poc/prefilter_cycles_e2e.** `xxz_krylov` at `rungs=4,
-cap=4000` never reaches the cap, so `rng.choice` never fires and the fixture is **seed-independent** —
-identical `N=3586` and energies identical to 10 digits across all three seeds. So the sweep is **3
-configurations measured 27 times each, not 9 configurations**; the `delta` sweep is real, the seed sweep is
-not. It does not change this verdict (0/81 across a 45% gap needs no seed variation) but it is the kind of
-thing that would silently narrow a *close* result. Raise `rungs` or lower `cap` until the subspace exceeds
-it. Related: `CLAUDE.md`'s "check the fixture exercises the thing under test".
-
-**Process note worth more than the numbers: a one-fixture optimization surface produced two confident
-wrong rules in a row** (`extra mv` ≈ 200–350; "§3.1 is contradicted"), and both were caught by a *single*
-run at a different `K`/`J` rather than by any amount of refinement on the original grid. `CLAUDE.md`'s "a
-quantity measured at one size is not a law" applies to the *shape* of an optimization surface, not just to
-scalars — and per that file `K` sets which axis dominates, so it is the parameter to vary first, not last.
-
-Two harness defects the runs exposed, both fixed in `poc/prefilter_gpu.py`:
-
-- **The CPU banner claimed every CPU number was already documented.** True of the default grid only —
-  the 2026-09-12 CPU corner run was new, and the banner told its reader to discard it. A "this is already
-  known" message must scope itself to the parameters it was written for.
-- **Claim 3's sharded arm hardcodes `(16, 4)`**, now known to be off-ridge. It asserts the output *spec*
-  survives sharding; its ratio is not a recommendation and its 298→254 iterations are not comparable to
-  the sweep table above it. Commented in place.
-
-Also: the 4-virtual-device Claim 3 arm reported 8340ms → 7617ms. **Discard those milliseconds** — one
-physical backend, so it measures contention, not scaling (`CLAUDE.md`). The `spec=P('x',)` on both arms
-and `|dE| ≤ 1.8e-15` are the results; sharding-transparency holds.
+Through `sqd` with setup included, `(32, 4)` measures 0.68–0.71x, winning 0 of 81 paired rounds: a 1.30x
+on the solver becomes 0.69x end-to-end. Seed-independent at `rungs=4, cap=4000`. `poc/prefilter-gpu.md`
+§4, harness defects §6.
 
 ### Sweeping a static argument in one process exhausts the GPU on compiled modules, not tensors (2026-09-04)
 
-`prefilter` is a `static_argnames` entry on `ground_locg` and `run_sqd`, so each `(degree, cycles)`
-retraces and the process retains one more executable. The 8th configuration in poc/prefilter_gpu's 3x3 grid failed on
-a **71 GB** GPU with `RESOURCE_EXHAUSTED: Failed to load in-memory CUBIN`, while the device held under
-1 GB of tensors. `jax.clear_caches()` between configurations fixes it; `timeit`'s single warmup absorbs
-the forced recompile (ratios within noise of the pre-fix run, iteration counts identical).
-
-**What made the diagnosis, and two wrong turns before it:**
-
-- **Wrong turn 1: retention.** Every `ground_locg` return holds an `O(N)` eigenvector and eight were
-  reachable at the failure, which is a real defect and was fixed — but freeing them **left the failure at
-  exactly the same configuration**. A *reproducible* boundary is not a leak; a leak creeps. Fixing a real
-  problem that is not *the* problem is the trap: the fix looked justified and the symptom was unmoved.
-- **Wrong turn 2: graph growth.** Plausible because `degree` bounds a Chebyshev recurrence. Refuted by
-  measurement: **compiled HLO size and `temp_size_in_bytes` are identical across all nine configurations
-  (1836504 B, HLO within 2 characters)**, because both parameters are `lax.scan` trip counts and change
-  neither graph size nor working set. Per `CLAUDE.md`, ask XLA rather than a formula — that applies to
-  *excluding* a hypothesis, not only to sizing.
-- **The error message named the layer and I read past it.** "Failed to load in-memory **CUBIN**" is a
-  module load, not an allocation. The solve never began.
-
-**Scope: sweeps only, not the library.** Measured with `run_sqd._cache_size()`: five `sqd` calls at the
-default `prefilter` hold the cache at **1**; six distinct values grow it 1→6. The `(32,2)` step does not
-increment, since an earlier default call already created that entry — growth tracks *distinct static
-values*, not call count. Generic to every static argname (`cache_level`, `maxiter`, `states_size`,
-`xcache_groups`), not to `prefilter`. `poc/caching.py` is not exposed: it builds cache variants as
-arrays and hand-assembles matvecs rather than passing `cache_level` through a jit boundary.
+Each static `prefilter` value keeps one more executable: the 8th failed with "Failed to load in-memory
+CUBIN" on a 71 GB GPU holding under 1 GB of tensors, HLO and temp size identical in all nine (1836504 B).
+`jax.clear_caches()` between cells; sweeps only, since `sqd`'s cache stays at 1 entry.
+`poc/prefilter-gpu.md` §5.
 
 ### `poc/gpu_unverified`'s re-run: the `lax.sort` leak still does not reproduce, and two claims stay open (2026-09-04)
 
-The non-reproduction is already stated in `get_xsource`'s docstring from the GH200 run; this second CUDA
-device reproduces that non-reproduction (flat at +0.000 GB retained and +0.000 GB drift across 5 reps in
-both arms, 0.950 GB live and identical between them) and needs no separate record.
-
-**Still open from that script.** Its Claim 2 (searchsorted vs the legacy sort) reports 16.0x/14.6x/10.8x
-at `N=200k/1M/5M`, but the two larger sizes carry the script's own not-kernel-dominated warning — the
-sort arm grew 1.03x and 1.23x for a 5x `N` increase, against a fixed ~1.46 s floor. A floor that
-dominates *suppresses* the ratio, so those are lower bounds on an unmeasured value and **should not be
-quoted** until the floor is identified. Claim 3 (multi-GPU speed) is unrun: one physical device.
+The leak is flat on a second CUDA device (+0.000 GB retained and drift, 0.950 GB live). Claim 2's
+16.0x/14.6x/10.8x are lower bounds under a ~1.46 s floor, so don't quote them; Claim 3 is unrun (one
+device). `poc/prefilter-gpu.md` §7, §9.
 
 ## Warm starts, collectives and the eigenpair check (2026-09)
 
 ### Warm-starting the growing subspace: four hypotheses eliminated, and the fixture gate is the result (2026-09-17)
 
-`poc/warmstart.py`, CPU, float64, `n=14..20`, XXZ Krylov and recovery-style subspaces.
-`markdown/skqd-sqd-solve-tolerance.md` §8 rejected *zero-padded* eigenvector continuation (iterations 79→129
-and 112→136, a different eigenvalue at dim=12000 with `|dE| = 7.4e-01`). This tested the shape §8's stated
-mechanism suggests instead — **carry the converged eigenvector on surviving states, put `_spread_seed`
-values on the newly added ones**, so the new directions are populated rather than zero.
-
-**The verdict is withheld, and that is the finding.** The new shape beats a cold `_spread_seed` by a stable
-**1.3–1.9× on iteration count** in all 19 rounds measured, across every configuration. But **zero-padding —
-the shape §8 rejected — beat *both* arms in every one of those rounds**, so no fixture built here can
-reproduce §8 and none can judge a replacement for it. A fixture that cannot reproduce the rejection it is
-meant to overturn measures nothing, however clean its own numbers look.
-
-**The gate is the reusable part.** `run_recovery` reports a `valid` column that requires zero-padding to
-*lose* before the warm arm is read at all, and it refused a verdict 19/19. Without it the 1.3–1.9× would
-have read as a win — the arm is genuinely faster than the baseline it was compared against, just not than
-the one that matters. **Any continuation-scheme measurement needs the rejected shape as a third arm, not
-the shipped baseline alone.**
-
-Four hypotheses for the non-reproduction, all eliminated:
-
-| # | hypothesis | measurement | outcome |
-| --- | --- | --- | --- |
-| 1 | growth pattern (hop rungs too geometric) | recovery-style occupancy resampling, `new wt` 0.4–3.7% vs 18%→0.8% | **worse** — resampling is self-reinforcing |
-| 2 | ground-state weight concentration | top-64 = 89.9%, top-256 = 98.8% of weight (n=16, 6000 states) | root cause, but a property of the physics |
-| 3 | delocalization via `delta` | participation 48.2 → 440.9 states as Δ 1.0 → 0.0 | right dial, never crosses over |
-| 4 | near-degeneracy | relgap 6.9–8.0e-02, flat in Δ; plateaus at ~4e-02 to dim=104k | **not present** |
-
-**Hypothesis 2 is the mechanism.** The XXZ ground state is intrinsically concentrated, so a converged
-eigenvector from round `k` is already ~99% of the answer at round `k+1` no matter how the subspace grows —
-which is why zero-padding's "no escape direction" defect never bites and every continuation scheme wins.
-
-**`delta` is the knob that moves it, and `bx` is not.** Anisotropy controls concentration cleanly
-(participation 5.0 at Δ=2.0, 48.2 at Δ=1.0, 173.7 at Δ=0.5, 440.9 at Δ=0.0, dim=2038), and it survives
-projection because `ZZ` conserves magnetization. Zero-padding's margin over the warm arm shrinks
-monotonically along that axis — 2–3 iterations at Δ=1.0, exactly 1 at Δ=0.5, **a tie at 17 at Δ=0** where
-`new wt` peaks at 11.9% — but never inverts.
-
-**A fixture trap worth keeping: the transverse field is inert on a hop-generated subspace.** `xxz_rungs`
-produces a single Hamming-weight sector (verified: all weight 6 at n=12), and single-site `X` changes weight
-by ±1, so **every `bx` term projects to exactly zero** — `nnz=4208` and `E0=-21.0756622399` bit-identical at
-`bx=0.3` and `bx=3.0`. So `bx` cannot be used to delocalize here. `poc/davidson_xxz.py` carried the
-same dead knob and claimed the opposite in its docstring — "Bx breaks magnetization conservation; without
-it the hop-generated subspace is closed under H and the projection is trivially block-diagonal" — which is
-true of the *Hamiltonian* but **not of its projection onto that subspace**; corrected 2026-09-17, and its
-results are unaffected since `bx` is never swept there. Verified through poc/davidson_xxz's own functions at its own
-defaults, including a `bx=0.0` arm: `nnz` and `E0` bit-identical across bx=0.0/0.5/3.0 (n=12, dim=380,
-E0=-20.883220316338; n=16, dim=1325, E0=-27.524421980960). **Inferring a property of the projection from a
-property of the operator is the error** — the projector onto a fixed-weight subspace annihilates exactly
-the terms that break the conservation. Use `delta`.
-
-**What a genuine retest of §8 would need: relgap ≲ 1e-04.** This operator family does not reach it at any
-Δ, `n`, or dimension measured. The gap narrows with dimension then **saturates** — 2.06e-01 at dim=489,
-5.35e-02 at dim=6885, then flat at 3.95e-02 through dim=103876 — so the early narrowing is a finite-size
-effect, not a path to the tight-gap regime. For scale, `markdown/locg-next-candidates.md` records prefilter
-tuning breaking at relgap 4.0e-05, a thousand times tighter. A different Hamiltonian, not a fixture tweak.
-
-**§8's rejection therefore stands, better characterized rather than overturned.** The honest inverted
-finding is that on physically-motivated SQD subspaces the previous eigenvector is *so* good that the open
-question is not "does a warm start help" but "why does anything beat zero-padding" — and nothing here did.
-`sqd` exposes no `vinit` seam anyway (it is built inside jitted `run_sqd` via `jax.lax.cond` on
-`jnp.all(hamiltonian.x[0] == 0)`), so shipping any of this would mean adding a parameter to buy a
-measured non-result.
+No verdict: warm beats cold 1.3–1.9× on iterations, but zero-padding, the shape
+`markdown/skqd-sqd-solve-tolerance.md` §8 rejected, beat both in 19/19 rounds, so the `valid` gate
+withheld it. Cause: the ground state is concentrated (top-256 = 98.8%); a real retest needs relgap ≲
+1e-04, and this family saturates at 3.95e-02. `poc/warmstart.md` §1–§5.
 
 ### `body()`'s all-reduces are one chain; 13 -> 12 is the floor (2026-09-25)
 
@@ -3685,396 +2469,272 @@ projection is variational and rewards connectivity.
 
 ## Moved from code comments (2026-09-25)
 
-Evidence that used to sit in `#` comment blocks in `rqutils/`, moved here when those comments were cut
-to the two-line ceiling. Each code site now carries one statement and a pointer to its subsection.
+Evidence cut from `rqutils/` comments to meet the two-line ceiling; each code site points to its subsection.
 
 ### svsim._GATE_XZ: one table for the gate set, and no `cz`
 
-A separate parameterized-gate tuple kept alongside a per-gate dispatch spelled the same fact twice, and
-a drift between them would leave `angle` silently stale from the previous loop iteration rather than
-raising. `cz` is absent deliberately: it is decomposed on the `QuantumCircuit` path only, and rejected
-as a raw gate spec (`test/test_svsim.py::TestCz::test_cz_as_a_gate_spec_is_rejected`).
+A second parameterized-gate tuple beside the dispatch could drift and leave `angle` silently stale from the
+previous iteration. `cz` is absent deliberately: decomposed on the `QuantumCircuit` path only, rejected as
+a raw gate spec (`test/test_svsim.py::TestCz::test_cz_as_a_gate_spec_is_rejected`).
 
 ### svsim.do_svsim: build the index iota inside the scan body
 
-Closing over the iota makes XLA hoist it into the scan's carry, where a `2^n` int64 array stays resident
-for the whole simulation on top of the two complex128 statevector buffers the loop already needs.
-Measured peak temp **2.5x** the statevector, invariant in n, against **2.0x** when built in the body (an
-iota is loop-invariant, so XLA rematerializes it for free rather than keeping it live). That is 8 GiB
-at n=30 and 32 GiB at n=32, on a module whose docstring advertises 32+ qubits. Output is bit-identical
-either way.
+Closed over, XLA hoists the `2^n` int64 iota into the scan carry: peak temp **2.5x** the statevector (above the two complex128 buffers),
+invariant in n, against **2.0x** built in the body (loop-invariant, so rematerialized free) — 8 GiB at
+n=30, 32 GiB at n=32. Output bit-identical.
 
 ### svsim.to_circuitxz: the y/ry phase, and what omitting it cost
 
-x, z, rx, rz, rzz and cz all have `x·z == 0`, so the `(-i)^{x·z}` phase belongs to y and ry only.
-Omitting it left `ry` off by exactly a factor of `i`, and since transpiling to `['rx','ry','rz','rzz']`
-emits `ry` constantly, that corrupted essentially every nontrivial circuit: a 5-qubit GHZ came back with
-|overlap| **0.5** against qiskit, and a 6-qubit 4-rep Trotter step with **1e-16**. See also "`svsim`:
-`sin` is complex128 and must stay so".
+x, z, rx, rz, rzz and cz have `x·z == 0`, so the `(-i)^{x·z}` phase is y/ry's alone. Without it `ry` was
+off by `i`, corrupting nearly every transpiled circuit: |overlap| **0.5** against qiskit on a 5-qubit GHZ,
+**1e-16** on a 6-qubit 4-rep Trotter step. See also "`svsim`: `sin` is complex128 and must stay so".
 
 ### qprint._process: compress before phase work
 
-Only terms above the cutoff are ever printed, so normalizing every element's phase and then discarding
-all but a handful is pure waste, paid again on every repr since `output='text'` returns the object for a
-lazy `__repr__`. Measured on a 5-term printout of a dim-2^20 input: **25 ms -> 5.3 ms**. Selecting first
-also bounds the wrap-around loop by the term count rather than the input size. The later compression
-does the same for the wrap-around loop and the two `normalize_phase` passes. The `global_phase='mean'`
-offset is the exception: a mean over every element by definition, so it is taken before compressing.
+Only terms above the cutoff print, so select before normalizing phases (paid on every lazy `__repr__`):
+**25 ms -> 5.3 ms** for a 5-term printout of a dim-2^20 input, and the wrap-around loop and both
+`normalize_phase` passes become bounded by the term count. `global_phase='mean'` averages every element,
+so it is taken before compressing.
 
 ### qprint._qobj_data: two qutip defects
 
-- `dims[0]` is the row (ket) space and `dims[1]` the column (bra) space. For a bra `dims[0]` is the
-  trivial `[1]`, so taking it unconditionally raised "Product of subsystem dimensions 1 and qobj
-  dimension 3 do not match" for every bra. Operators have both sides populated and are unaffected.
-- `Qobj.full()`, not `Qobj.data`: in qutip 4 `.data` was a scipy sparse matrix, so `qobj.data.data`
-  reached its value buffer, but qutip 5 wraps the payload in its own Dense/CSR class with no `.data`.
-  The chained access raised "'qutip.core.data.dense.Dense' object has no attribute 'data'" and made
-  every Qobj input fail. `.full()` returns a dense ndarray in both versions.
+- `dims[0]` is the ket space, the trivial `[1]` for a bra: taken unconditionally it raised "Product of
+  subsystem dimensions 1 and qobj dimension 3 do not match" for every bra.
+- `Qobj.full()`, not `.data.data`: qutip 5 wraps the payload in its own Dense/CSR class, so every Qobj
+  raised "'qutip.core.data.dense.Dense' object has no attribute 'data'"; `.full()` is dense in 4 and 5.
 
 ### qprint.QPrintBraKet._add_labels: unravel per term
 
-Precomputing a `len(dim) x objdim` table to read one element per term out of costs **168 MB and
-16.7 ms** at dim 2^20 over 20 subsystems, against **0.009 ms** for unravelling the handful of indices
-actually printed.
+A precomputed `len(dim) x objdim` table cost **168 MB and 16.7 ms** at dim 2^20 over 20 subsystems,
+against **0.009 ms** to unravel only the printed indices.
 
 ### qprint.QPrintMatrix._make_lines: always emit the amplitude
 
-Suppressing an exact `1` is correct where a basis label follows (`\frac{IZ}{2}` reads better than
-`1\frac{IZ}{2}`), but a matrix element has no label, so dropping it left the cell empty and produced
-`\begin{pmatrix} & 0 & 0 & 0 \\ ...`, a malformed matrix missing its first entry.
+Suppressing an exact `1` suits a labelled term (`\frac{IZ}{2}`, not `1\frac{IZ}{2}`), but a matrix cell has
+no label, so it came out empty: `\begin{pmatrix} & 0 & 0 & 0 \\ ...`.
 
 ### paulis.symplectic.pack_states: the 0/1 check
 
-Checked before `astype`, which would erase the evidence: 256 wraps to 0 and -1 to 255. min/max rather
-than `(states == 0) | (states == 1)`: one pass instead of two comparisons and an OR, measured **1.05 ms
-against 4.14 ms** at N=1M, n=32. Equivalent for the integer and bool dtypes it receives, since the only
-values in [0, 1] are 0 and 1.
+Before `astype`, which erases the evidence (256 wraps to 0, -1 to 255). min/max rather than
+`(states == 0) | (states == 1)`: **1.05 ms against 4.14 ms** at N=1M, n=32, equivalent for the integer
+and bool dtypes it receives since only 0 and 1 lie in [0, 1].
 
 ### paulis.symplectic.from_paulisum: no quadratic group-bys
 
-- Summing duplicate strings' coefficients with a one-hot matmul materialized a dense
-  `(n_unique, n_terms)` mask to express a group-by: **64 MB and 27.5 ms** at 4000 terms / 2000 groups,
-  growing quadratically (400 MB at 10000/5000, OOM past that), against **0.03 ms** for the scatter-add.
-  `np.add.at` rather than `np.bincount` because `coeffs` is still complex there (the Hermiticity check
-  narrows it later) and bincount takes real weights only.
-- Bucketing the terms by X signature by rescanning `indices` once per signature was the same quadratic
-  shape — **15.9 ms** at 5000 groups against **0.3 ms** for one stable sort — and it also re-ran the
-  uint8 conversion per group. `indices` is already each term's group id, so sorting it groups the
-  terms and the cumulative counts give each group's slice.
+- A one-hot matmul summing duplicate strings materialized a dense `(n_unique, n_terms)` mask: **64 MB,
+  27.5 ms** at 4000 terms / 2000 groups, 400 MB at 10000/5000, OOM beyond, against **0.03 ms** for
+  `np.add.at` (not `np.bincount`: `coeffs` is still complex there).
+- Rescanning `indices` per X signature: **15.9 ms** at 5000 groups against **0.3 ms** for one stable
+  sort of `indices`, already each term's group id, which also stopped a per-group uint8 conversion; cumulative counts give each group's slice.
 
 ### paulis.symplectic.from_paulisum: the Hermiticity tolerance
 
-Checked once rather than per branch so both ingest paths agree: the Qiskit branch always raised, while
-the tuple branch used to warn and silently take `.real` under `force_real=True`, discarding the imaginary
-part of a non-Hermitian operator rather than rejecting it.
-
-The comparison is against `atol`, not exact zero. A mathematically Hermitian operator whose Pauli
-coefficients were obtained numerically carries rounding at the 1e-16 level: conjugating a Hermitian
-matrix by a non-Clifford circuit and decomposing the result — the standard way to build a rotated
-Hamiltonian — was rejected by the exact test **18 times out of 18** (n = 3, 4, 5 x 6 seeds) at a largest
-|imag| of **3.3e-16**, while those operators' own hermiticity error reached **2.7e-15**. The residue being
-rejected was an order of magnitude smaller than the property it tested for.
-
-Not a return to `force_real`, which took `.real` on genuinely nonzero imaginary parts. The default sits
-~4 orders above the observed rounding and many below any physical coefficient; pass a smaller `atol` to
-tighten it, or 0.0 to restore the exact test.
+Checked once so both ingest paths agree (the tuple path used to warn and take `.real` under
+`force_real=True`). Against `atol`, not zero: rounding sits at the 1e-16 level, and conjugating a Hermitian
+matrix by a non-Clifford circuit was rejected by the exact test **18 times out of 18** (n = 3, 4, 5 x 6
+seeds) at |imag| ≤ **3.3e-16**, while those operators' own hermiticity error reached **2.7e-15**. The
+default sits ~4 orders above that; `atol=0.0` restores the exact test.
 
 ### paulis.symplectic.from_paulisum: why `atol` is keyword-only
 
-As a second positional, `from_paulisum(op, 1e-3)` read naturally as a `simplify` tolerance or a
-coefficient cutoff (both plausible, since `simplify()` is called on ingest) and instead raised the
-Hermiticity threshold by nine orders. The loosened check does not merely permit the operator: the
-following `.real` throws the imaginary part away. Measured:
-`from_paulisum((["ZI", "IZ"], [1 + 1e-4j, 0.5]), 1e-3)` was accepted and returned `c = [0.5, 1.0]`, the
-1e-4 silently gone.
+Positionally, `from_paulisum(op, 1e-3)` reads as a `simplify` tolerance but raised the Hermiticity
+threshold nine orders, and the `.real` that follows dropped the imaginary part:
+`from_paulisum((["ZI", "IZ"], [1 + 1e-4j, 0.5]), 1e-3)` returned `c = [0.5, 1.0]`.
 
 ### paulis.symplectic: the pad bit is unconditional
 
-As an opt-in flag the pad bit was an invariant nothing could enforce: the signature side and the state
-side lived in separate call sites with no check that they agreed. When they disagreed every matrix
-element landed in the wrong column and the result stayed symmetric, so eigvalsh returned a plausible
-wrong ground energy — that is how `hproj` shipped broken. The X side goes through `pack_states`, the
-method consumers pad their states with, so both halves of the alignment contract are one code path. The
-Z signatures are `(n_xgroups, n_zterms, n_qubits)` and pad axis 2 rather than axis 1, so they cannot
-reuse it; the operation is otherwise identical. `svsim` builds `CircuitXZ` itself and never calls this.
+As an opt-in flag nothing enforced agreement between the signature and state sides; disagreement put every
+element in the wrong column, still symmetric, so eigvalsh gave a plausible wrong energy — how `hproj`
+shipped broken. The X side goes through `pack_states`, the consumers' padder; the Z signatures
+`(n_xgroups, n_zterms, n_qubits)` pad axis 2, not 1, so cannot reuse it. `svsim` builds `CircuitXZ` itself.
 
 ### paulis.general.paulis: cache the returned array itself
 
-Storing a `.copy()` and returning the original left a second, writeable allocation alive per key for the
-process lifetime: retained memory measured **2.00x** the result at `dim=(2,)*6` (537 MB for a 268 MB
-basis) against **1.00x** now. It also made the warm return writeable while the cold one was read-only, so
-no caller could have depended on writeability without already hitting that inconsistency.
+Caching a `.copy()` and returning the original kept a second writeable allocation per key: retained
+**2.00x** the result at `dim=(2,)*6` (537 MB for a 268 MB basis) against **1.00x**, and warm returns were
+writeable where cold ones were read-only.
 
 ### paulis.general.pauli_matrices: sparse is derived and frozen
 
-- **Derived from the dense basis.** The CSR branch this replaced re-derived the shell ordering and the
-  `sqrt(2/(k(k+1)))` diagonal normalization by hand as data/indices/indptr triplets — a second spelling
-  of the most bug-prone convention in the module, where a divergence would be silent because each branch
-  stayed internally consistent. Verified identical (max abs diff 0.0, equal nnz) for dim 2 through 6
-  before the swap.
-- **Frozen buffers.** The function memoizes and returns the cached object, so every caller shares one set
-  of CSR instances: measured, `pauli_matrices(3, sparse=True)[1] /= 2` shifted the cached values by 0.5
-  max abs, still Hermitian, so every later `components()` call returned plausible and consistently wrong
-  coefficients.
-- **Read-only rather than a copy on return.** Copying on every cache hit measured **276 us against
-  0.10 us** (2698x slower) at dim=6. `setflags` on the three buffers blocks `/=`, `*=`, `data[i] = ...`
-  and `mat[i, j] = ...` at their source, costs 1.15 ms cold at dim=6, and leaves `toarray`, `@` and
-  every other read untouched. A caller who wants to rescale calls `.copy()` first, as the dense path
-  already requires.
+- **Derived**: the old CSR branch re-spelled the shell ordering and `sqrt(2/(k(k+1)))` normalization by
+  hand; verified identical (max abs diff 0.0, equal nnz) for dim 2 through 6 before the swap.
+- **Frozen**: callers share the memoized instances; `pauli_matrices(3, sparse=True)[1] /= 2` shifted the
+  cache by 0.5 max abs, still Hermitian, so every later `components()` was consistently wrong.
+- **Read-only, not copied**: a copy per hit is **276 us against 0.10 us** (2698x) at dim=6; `setflags` on
+  the three buffers costs 1.15 ms cold and blocks `/=`, `*=`, `data[i] = ...`, `mat[i, j] = ...`.
 
 ### paulis.general.components: ungated normalize_dim, required dim
 
-`normalize_dim` runs for every npmod: gating it left `components(m, dim=3, npmod=jnp)` raising "object of
-type 'int' has no len()" from the return statement, naming nothing (the general case is "`paulis/general`:
-the `npmod` gating bug"). `dim` is required because inferring it from the matrix shape was silently
-ambiguous: a 4x4 matrix inferred `(4,)`, one 4-level qudit, where the caller may have meant `(2, 2)`. Both
-pass the `prod(dim)` check and yield 16 valid coefficients, but in different bases: the
-`2**(len(dim) - 2)` normalization is 0.5 for one subsystem against 1.0 for two, so the coefficient vectors
-differ in norm by sqrt(2) (measured 1.4142135623730951) with nothing to say which the caller received.
+Gated, `components(m, dim=3, npmod=jnp)` raised "object of type 'int' has no len()" (general case:
+"`paulis/general`: the `npmod` gating bug"). `dim` is required: a 4x4 matrix inferred `(4,)` where
+`(2, 2)` may be meant, both giving 16 valid coefficients, but `2**(len(dim) - 2)` is 0.5 against 1.0, so
+the norms differ by sqrt(2) (measured 1.4142135623730951) with nothing to say which the caller got.
 
 ### paulis.general.labels: fold the affixes in
 
-The prefix goes into the seed and the suffix into the last subsystem's per-label list. Two extra
-whole-array `np.char.add` passes over `np.full(out.shape, ...)` at the end cost **47-58%** of the call at
-10 qubits, where the latex prefix alone was a 25 MB array holding one repeated 7-char string. Replacing
-`np.full` with a scalar does not help: `np.char.add` densifies it anyway.
+Two whole-array `np.char.add` passes over `np.full(out.shape, ...)` cost **47-58%** of the call at 10
+qubits (the latex prefix alone a 25 MB array of one 7-char string); a scalar for `np.full` does not help,
+since `np.char.add` densifies it.
 
 ### ground_locg._check_tols: the accept-anything cutoffs
 
-Every normalized vector satisfies `‖Hv − Ev‖ ≤ ‖H‖` (since `|E| ≤ ‖H‖`), so a bound reaching `‖H‖` makes
-the first iterate report convergence on an arbitrary eigenpair with `converged=True`. Measured on both
-arms: `atol=100` against `‖H‖=17` converged in one iteration, and on the superseded `* n * 10` scale
-`rtol=1e-8` at `n=2^20` gave a bound of 4.2 against `‖H‖=20` (history in "`atol`/`rtol`: the pair is
-right, and `rtol`'s scale took two tries to get right (2026-09-01)"). For `rtol` the scale is
-`‖Hv‖ + |E| ≤ 2‖H‖`, hence the cutoff `rtol >= 0.5`. For `atol` the bound is compared against
-`opnorm_bound = Σ|c_k|`, an over-estimate of `‖H‖₂` (measured **1.56-1.90x** on 1D XXZ), so it errs toward
-accepting. Both are deliberately loose: they catch accept-anything without second-guessing a caller who
-wants a sloppy solve.
+`‖Hv − Ev‖ ≤ ‖H‖` for every normalized v, so a bound reaching `‖H‖` accepts the first iterate: `atol=100`
+against `‖H‖=17` converged in one iteration, and the superseded `* n * 10` scale made `rtol=1e-8` at
+`n=2^20` a bound of 4.2 against `‖H‖=20` ("`atol`/`rtol`: the pair is right, and `rtol`'s scale took two
+tries to get right (2026-09-01)"). Hence `rtol >= 0.5` (scale ≤ `2‖H‖`), and `atol` against `Σ|c_k|`,
+which over-estimates `‖H‖₂` by **1.56-1.90x** on 1D XXZ. Both deliberately loose.
 
 ### ground_locg debug diagnostics: `reltol` became `rtol_scale`
 
-Renamed 2026-09-01: the value is the scale `‖Ax‖ + |θ|` that `rtol` multiplies, never a tolerance. A
-`debug=True` caller reading `diag["reltol"]` now gets a KeyError rather than a number ~2|λ_min| where the
-old name promised a floor near eps·‖A‖ — off by ~1e16 against what it claimed. `rtol_scale` rather than
-the local's bare `scale`: the local sits three lines from `rtol * scale`, while a key is read on its own
-out of a dict of nine.
+Renamed 2026-09-01: the value is the scale `‖Ax‖ + |θ|` (~2|λ_min|) that `rtol` multiplies, where the old
+name promised a floor near eps·‖A‖ — off by ~1e16; `diag["reltol"]` now raises KeyError. Not bare `scale`:
+a key is read out of context, from a dict of nine.
 
 ### ground_locg.body: the batched matvec pair
 
-- **Speed and collectives.** Measured 1.61-1.81x on the pair, bit-identical `theta`; on a 4-device mesh it
-  halves the all-gathers, 6 -> 3, because the operator's gather is paid once for the pair. `jnp.stack` of
-  a `P('x')` vector is `P(None, 'x')`, so nothing reshards. Off by default in `ground_locg` because an
-  arbitrary `mat` callable need not accept a batch.
-- **Memory has opposite signs by operator.** The stack is a real materialization. Against an elementwise
-  operator (no gather to save) temp rises one vector; against `sqd`'s it falls a flat **−16.00 B/slot**
-  (one f64 complex slot, 0.942x, N=4000..60000), because the unbatched arm holds two gather results live
-  where the batched arm holds one `(2, N)` buffer. Don't restore the two-call form to save memory.
-- **Vectors need not round identically.** XLA may pick a different contraction order for a `(k, N)`
-  operand than an `(N,)`. With atol=rtol=0 and `debug=True` at dim=32, an elementwise-diagonal operator
-  gives exactly 0.0 on every diagnostic while a dense einsum/matmul moves `y` by **1.1e-9**. On a
-  near-degenerate `sqd` subspace `y` moved **0.56** while `theta` still agreed to **2.2e-15**, the
-  eigenvector rotating inside an invariant subspace. Judge this by `theta`, never a vector norm, and
-  don't reach for compensated summation (closed; CLAUDE.md, "Closed investigations").
+- **Speed**: 1.61-1.81x on the pair, bit-identical `theta`; all-gathers 6 -> 3 on a 4-device mesh, and
+  `jnp.stack` of `P('x')` is `P(None, 'x')`. Off in `ground_locg`: a `mat` callable need not batch.
+- **Memory, opposite signs**: +1 vector temp against an elementwise operator; **−16.00 B/slot** (one f64
+  complex slot, 0.942x, N=4000..60000) against `sqd`'s, whose unbatched arm holds two gather results live against one `(2, N)` buffer.
+- **Rounding may differ**: at atol=rtol=0, `debug=True`, dim=32 a dense einsum moves `y` by **1.1e-9**
+  (elementwise: exactly 0.0); a near-degenerate `sqd` subspace moved `y` **0.56** with `theta` agreeing to
+  **2.2e-15**. Judge by `theta`; compensated summation is closed (CLAUDE.md, "Closed investigations").
 
-The three `debug=True` diagnostic matvecs batch the same way and cannot change the trajectory, since
-`diagnostics` is `scan`'s output, never its carry.
+The three `debug=True` matvecs batch too, and cannot change the trajectory: `diagnostics` is `scan`'s
+output, never its carry.
 
 ### ground_locg.body: the convergence test's scale
 
-`‖r‖ < max(atol, rtol·(‖Ax‖ + |θ|))` — `max`, not `min`, since either tolerance suffices. `atol` lets a
-caller with a fixed requirement (a downstream guard at 1e-6) have it hold at every dimension; `rtol` is a
-fraction of the operator magnitude, as in `np.allclose` and scipy, so it needs the `(‖Ax‖ + |θ|)` factor
-(‖r‖ has units of ‖A‖) and nothing else. The pre-2026-08-31 `* n * 10` factor made `rtol=1e-8` at
-`n=2^20` a bound of 4.2 against `‖A‖ = 20`. `abs(theta)` rather than `+theta`: the sum must not cancel
-for either sign, and a ground-state search is typically negative-definite; the natural-looking
-`norm(Ax) - theta` was measured going **negative** for a positive-definite operator, making the test
-unsatisfiable.
+`max`, not `min`: either arm suffices, so a fixed `atol` (a downstream 1e-6 guard) holds at every
+dimension, and `rtol` scales by `(‖Ax‖ + |θ|)` alone — the pre-2026-08-31 `* n * 10` factor made
+`rtol=1e-8` at `n=2^20` a 4.2 bound against `‖A‖ = 20`. `abs(theta)` so the sum cannot cancel:
+`norm(Ax) - theta` went **negative** on a positive-definite operator, making the test unsatisfiable.
 
 ### ground_locg: promote xinit up front
 
-The projected matrix inherits `xinit`'s dtype at the seed step but the operator's inside the loop, so a
-lower-precision `xinit` made `while_loop`'s carry types disagree on `theta`. Independently, a complex
-operator with a real `xinit` (complex128 `mat`, float64 `xinit`, a natural and previously-working call)
-kept `xinit` real through `compute_sas`'s scatter, which raised FutureWarning/ComplexWarning and silently
-discarded the imaginary part of the projected matrix — a correctness bug, not a noisy warning. One
-promotion fixes both, so it is not a carry-type workaround to remove later. `eval_shape` reads the
-operator dtype without a matvec, and `astype` on a matching dtype is a no-op.
+One promotion fixes two defects: a lower-precision `xinit` made `while_loop`'s carry disagree on `theta`
+(seed step against loop), and a float64 `xinit` with a complex128 `mat` stayed real through
+`compute_sas`'s scatter, silently dropping the projected matrix's imaginary part behind a ComplexWarning.
+`eval_shape` reads the dtype without a matvec.
 
 ### ground_locg: the `rtol=None` default
 
-Only `rtol` takes None; `atol` defaults to 0.0 because a derived absolute bound is exactly the
-unintuitive thing the pair replaced. 4·eps, not eps: the scale `‖Ax‖ + |θ|` is ~2‖A‖, so `rtol = eps`
-would target 2·eps·‖A‖, only 2x the measured floor of eps·‖A‖, whose constant spans 0.49-1.26 over 27
-samples. 4·eps gives 8x the floor, the same 3.2x margin over the worst observed constant that
-`residual_floor` uses. Derived from the operator dtype (`work_dtype`), not the initial guess: a float32
-`xinit` on a complex128 problem would otherwise loosen it by nine orders of magnitude.
+`atol` defaults to 0.0, since a derived absolute bound is what the pair replaced. 4·eps, not eps: the scale
+is ~2‖A‖, so eps targets 2·eps·‖A‖, only 2x the floor eps·‖A‖ whose constant spans 0.49-1.26 over 27
+samples; 4·eps is 8x, `residual_floor`'s 3.2x margin over the worst constant. From `work_dtype`, not
+`xinit`: a float32 `xinit` on a complex128 problem would loosen it nine orders.
 
 ### ground_locg._project_out: sources for the two-pass form
 
-Interspersing the normalization with the subtraction, rather than subtracting twice then normalizing, is
-Algorithm 5 ("Modified orthogonalization procedure") of Duersch, Shao, Yang & Gu, *A Robust and
-Efficient Implementation of LOBPCG*, arXiv:1704.07458, whose loop likewise alternates `U -= V (V^T M U)`
-with an orthonormalization pass. The block form there needs SVQB to resolve rank deficiency across
-columns; at block size 1 `normalize` is the whole content.
-
-Two passes rather than a convergence test is the "twice is enough" criterion, due to Kahan and analyzed
-in Parlett, *The Symmetric Eigenvalue Problem* (1980), Sec. 6.9. SLEPc technical report STR-1,
-"Orthogonalization Routines in SLEPc" (Hernandez, Roman, Tomas & Vidal, 2007), is the practical treatment
-and makes the same attribution. Its URL now redirects: reach it from the "SLEPc Technical Reports"
-section of <https://slepc.upv.es/documentation/> rather than the older `/documentation/reports/str1.pdf`
-path. `_reorthogonalize`'s pass count is fixed at 2 for the same reason; see "The fixed 2-pass
+Interleaved normalization is Algorithm 5 ("Modified orthogonalization procedure") of Duersch, Shao, Yang &
+Gu, *A Robust and Efficient Implementation of LOBPCG*, arXiv:1704.07458; at block size 1 their SVQB is
+just `normalize`. Two passes is Kahan's "twice is enough" (Parlett, *The Symmetric Eigenvalue Problem*
+(1980), Sec. 6.9; SLEPc STR-1, "Orthogonalization Routines in SLEPc", Hernandez, Roman, Tomas & Vidal,
+2007, reached from "SLEPc Technical Reports" at <https://slepc.upv.es/documentation/> since
+`/documentation/reports/str1.pdf` redirects). `_reorthogonalize` likewise: "The fixed 2-pass
 re-orthogonalization beats `diaglib`'s adaptive loop on its own metric (2026-09-02)".
 
 ### ground_locg.eigenpair_3x3: the discriminant form
 
-`disc` is Cardano's `p^3 - q^2` for `q = -13.5 * c0` (182.25 == 13.5**2), written out in `c1` and `c0`
-rather than as the recognizable `p*p*p - q*q` because it is measurably more accurate: **1.16e-16** mean
-relative error against **1.92e-16** for the factored form over 200k random inputs versus exact rational
-arithmetic, holding that ~1.7x margin all the way down the near-degenerate sweep where `disc -> 0` and
-cancellation is worst. Reason: `p = -3*c1` rounds once and cubing triples that error, whereas 27.0 is
-exact in binary, so `c1` enters the cube unrounded. Don't simplify it into the textbook form.
+`disc` is Cardano's `p^3 - q^2` (`q = -13.5 * c0`, 182.25 == 13.5**2) expanded in `c1`, `c0`: **1.16e-16**
+mean relative error against **1.92e-16** factored, over 200k random inputs against exact rationals, ~1.7x
+down the whole near-degenerate sweep. `p = -3*c1` rounds once and cubing triples it; 27.0 is exact. Don't
+simplify it into the textbook form.
 
 ### sqd._host_scalar: one path on every rank
 
-- **The branch must not depend on this rank's view of the array.** An earlier version returned early when
-  `addressable_shards` was non-empty, a per-rank property: measured on 4 nodes, two ranks printed a
-  result while two raised "spans non-addressable devices" from the same call. Had those two returned
-  early while the others entered the collective, the job would have hung at the barrier instead —
-  strictly worse. The version before that read an empty `addressable_shards` as "already host-side" and
-  handed the unreadable array to the caller's `float()`, raising the very error the function exists to
-  prevent. `jax.process_count()` is the same on every rank, so every rank takes the same path.
-- **The collective is safe only because every rank calling `sqd` reaches it.** Don't copy this shape into
-  a branch some ranks skip; `poc/uniquify_sharded.py`'s sub-mesh gather is the non-collective form.
-- **`process_allgather` rather than a hand-rolled `jit(out_shardings=...)`**, whose attempts each failed on
-  a topology detail: a bare `PartitionSpec` resolves against the context mesh and raises "jit requires a
-  non-empty mesh in context" outside `set_mesh`; a `NamedSharding` built from `value.sharding.mesh`
-  replicates only across that array's mesh — one device on a 1-device solve — so 3 of 4 ranks still had
-  no addressable shard and the `[0]` raised `IndexError`. `tiled=True` is required: `process_allgather`
-  rejects `tiled=False` for the non-addressable case.
-- **The result's shape depends on addressability.** A non-addressable rank-0 input comes back as a
-  scalar, while a fully addressable one is expanded to `(1,)` and gathered to `(process_count,)` even
-  under `tiled=True`. Measured on 4 nodes: the 1-device row returned shape (4,) and `float()` raised "only
-  0-dimensional arrays can be converted to Python scalars". Every entry is the same scalar, so
-  `.reshape(-1)[0]` is exact for both shapes without branching on addressability.
+- **Branch on `jax.process_count()`, never `addressable_shards`**: an early return on non-empty shards had
+  two of 4 ranks print and two raise "spans non-addressable devices" (a hang, had they entered the
+  collective); before that, empty shards read as host-side handed `float()` the unreadable array.
+- **Safe only because every rank calling `sqd` reaches it**; `poc/uniquify_sharded.py`'s sub-mesh gather
+  is the non-collective form.
+- **`process_allgather(tiled=True)`**: a bare `PartitionSpec` raised "jit requires a non-empty mesh in
+  context" outside `set_mesh`, and a `NamedSharding` on `value.sharding.mesh` replicated over one device,
+  leaving 3 of 4 ranks an `IndexError`. `tiled=False` is rejected for non-addressable input.
+- **Shape depends on addressability**: fully addressable input is expanded to `(1,)` and gathered to
+  `(process_count,)` — (4,) on 4 nodes, where `float()` raised "only 0-dimensional arrays can be
+  converted to Python scalars" — hence `.reshape(-1)[0]`.
 
 Background: "`sqd` could not return its own eigenvalue multi-process, and I audited past it once
 (2026-09-04)".
 
 ### sqd.sqd: `packed=True` skips the pack
 
-`pack_states` is not idempotent: a second pass reads each byte as one bit. Unpacked `[N, num_qubits]` is
-~7.7x the packed width at n=100, and both arrays are live at once during the pack, so a caller already
-holding the packed form was paying an 8x expansion plus a transient peak — **2.40 GB against 0.31 GB** at
-n=100, N=24M — for nothing. `run_sqd` has always taken the packed form.
+`pack_states` is not idempotent (a second pass reads each byte as one bit), and a caller holding packed
+states paid the unpacked `[N, num_qubits]` (~7.7x the width at n=100) with both live at once — an 8x
+expansion, **2.40 GB against 0.31 GB** at n=100, N=24M. `run_sqd` always took packed.
 
 ### sqd.sqd: pad the input states too
 
-`states_p` is a traced argument of `run_sqd`, so its leading dimension is part of the jit cache key.
-Leaving it at the raw input length retraced the whole solver on every distinct `len(states)`, what
-`states_size` exists to prevent: measured **0.44 s per call against 0.064 s** once the shape repeats.
-`uniquify_states` already pins every array it derives, so this was the one shape still leaking the input
-length through.
+`states_p`'s leading dimension is in `run_sqd`'s jit cache key, so the raw length retraced on every
+distinct `len(states)`: **0.44 s per call against 0.064 s** once the shape repeats.
 
 ### sqd.hproj: `shape=` is mandatory
 
-Without it scipy infers the extent from the largest index present, so a trailing basis state that no
-term couples into is dropped and the matrix comes back too small — measured **41x41 for a 53-state
-subspace** with local two-site js operators. Silent: the result is still symmetric, so eigvalsh returns a
-plausible wrong ground energy. When nothing survives, the index arrays are empty and scipy raises
-("cannot infer dimensions from zero sized index arrays"), though the projection is legitimately the
-zero matrix then.
+Inferred, a trailing uncoupled state is dropped: **41x41 for a 53-state subspace** (local two-site js
+operators), still symmetric, so eigvalsh gives a plausible wrong energy. With nothing surviving scipy
+raises "cannot infer dimensions from zero sized index arrays" on what is legitimately the zero matrix.
 
 ### sqd._spread_seed: reshard the filler mask
 
-`vec` is built sharded unconditionally (the iota takes `out_sharding`), but `run_sqd` reshards `states_u`
-only inside `if cache_level[0] == 1`, because the uncached branch needs it replicated for the
-`get_xsource` searches. So at `cache_level[0] == 0` the predicate arrived replicated while `vec` was
-partitioned, and `jnp.where` rejected the pair ("select `which` must be scalar or have the same sharding
-as cases") on every mesh for (0, 0), (0, 1) and (0, 2), the three levels no sharding test covered. It was
-masked by `_accumulate_diagonal`'s rank bug, which failed all six earlier in the call. Fixed here rather
-than in the caller because this function decides `vec`'s sharding, so it owns the requirement.
+`vec` is always sharded, but `run_sqd` reshards `states_u` only at `cache_level[0] == 1` (the uncached
+search needs it replicated), so at (0, 0), (0, 1), (0, 2) `jnp.where` raised "select `which` must be
+scalar or have the same sharding as cases" on every mesh — masked by `_accumulate_diagonal`'s rank bug,
+which failed all six earlier. Fixed here because this function decides `vec`'s sharding.
 
 ### sqd.vinit_from_min_diag: `.real` on both branches
 
-A Hermitian operator's projected diagonal is real by construction, but `diagonals` carries
-`hamiltonian.c`'s dtype, complex128 whenever any Pauli string has an odd Y count (the folded `(-i)^{x·z}`
-phase). `jnp.max`/`argmin` reject complex input, so `cache_level[1] == 2` raised `TypeError: lt does not
-accept dtype complex128` for every such Hamiltonian — single-device, no mesh involved. The uncached
-branch took `.real` and worked, which made the asymmetry easy to miss.
+`diagonals` has `hamiltonian.c`'s dtype, complex128 whenever a string has an odd Y count, though the
+projected diagonal is real; at `cache_level[1] == 2` `jnp.max`/`argmin` raised `TypeError: lt does not
+accept dtype complex128`, single-device, while the uncached branch already took `.real`.
 
 ### sqd.run_sqd: the initial-vector guards
 
-`vinit_from_min_diag` weights the minimum-diagonal state heavily — the best single guess, and it keeps
-the heuristic's fast convergence — but adds the spread seed underneath rather than returning a one-hot.
+The minimum-diagonal state is weighted heavily, with the spread seed underneath rather than a one-hot.
 
-- **Sign:** "`vinit_from_min_diag`'s weight must carry the seed's sign, or it cancels it" has the
-  measurements and why the unreachable `sign == 0` branch stays.
-- **One-hot:** "`sqd`: why the initial vector is a spread, not a one-hot". The measured case was a
-  14-state subspace splitting 4+10, where `sqd` returned **−1.293**, the exact minimum of the block holding
-  the seed, against a true **−2.191** in the other block — a genuine eigenvalue, so nothing downstream
-  could detect it. `vinit_nodiag` has the sharper form: `e_0` violates `ground_locg`'s non-vanishing
-  overlap precondition whenever state 0 is decoupled from the rest of the subspace (every xsource from it
-  lands outside, so row 0 of the projected H is identically zero). `e_0` is then a true eigenvector with
-  eigenvalue 0, the zero-residual guard correctly reports convergence, and `sqd` returns 0.0 with
-  `converged=True`. Reproduced on a 9-state IIIX subspace whose true answer is −1.
-- **Mask, not index:** "Indexing a *sharded* array to read one element emits an `all-gather` of the whole
+- **Sign**: "`vinit_from_min_diag`'s weight must carry the seed's sign, or it cancels it", including why
+  the unreachable `sign == 0` branch stays.
+- **One-hot**: "`sqd`: why the initial vector is a spread, not a one-hot". A 14-state subspace splitting
+  4+10 returned **−1.293**, its seed block's exact minimum, against a true **−2.191**; `vinit_nodiag`'s
+  `e_0` with state 0 decoupled is an eigenvector with eigenvalue 0, so `sqd` returned 0.0 with
+  `converged=True` on a 9-state IIIX subspace whose answer is −1.
+- **Mask, not index**: "Indexing a *sharded* array to read one element emits an `all-gather` of the whole
   vector" (3 all-gathers against 0, bit-identical at several `imin`).
-- **`out_sharding` is mandatory:** the original form was a scatter into a sharded operand, which cannot
-  resolve its output sharding unambiguously (the update might land on any device), so JAX raised
-  `ShardingTypeError` rather than guessing. Without it `sqd()` failed on any multi-device mesh before the
-  solver was reached, unnoticed because nothing in the suite then ran a mesh;
-  `XLA_FLAGS=--xla_force_host_platform_device_count` reproduces it on CPU, as `poc/sharding.py` does.
-  **Still mandatory in today's mask form**, re-measured 2026-09-25: dropping `out_sharding` from the
-  `broadcasted_iota` leaves it replicated against the partitioned seed, and the `where` raises
-  `ShardingTypeError: select 'which' must be scalar or have the same sharding as cases` on a 4-device
-  mesh (a diagonal first X group, so `vinit_from_min_diag` runs).
+- **`out_sharding` is mandatory**: the original scatter raised `ShardingTypeError` on any multi-device
+  mesh (on CPU via `XLA_FLAGS=--xla_force_host_platform_device_count`, as `poc/sharding.py` does), and
+  re-measured 2026-09-25 in the mask form, a replicated `broadcasted_iota` makes the `where` raise
+  `ShardingTypeError: select 'which' must be scalar or have the same sharding as cases` on 4 devices.
 
 ### sqd.uniquify_states: lexsort on uint64 words
 
-`lax.sort` compares key operands one at a time, so `num_keys=B` costs O(B) per comparison — 13 columns at
-n=100. Packing to `ceil(B/8)` words makes it 2, and the permutation is identical because
-`_pack_state_words` is order-preserving. Measured **1.79x at n=30 through 5.06x at n=127** (N=200k); this
-sort dominates the function, which in turn measured 14-27x `get_xsource` at every width.
-
-It trades memory for speed: the words are an extra `[N, ceil(B/8)]` uint64 buffer, and rounding B up to a
-multiple of 8 widens each row by `8*ceil(B/8) - B` bytes — worst at n=64 (B=9 -> 16 bytes, +7/row), free
-at n=127 (B=16). Measured 1.09-1.69x compiled temp bytes at N=1M: negligible here (0.07-0.17 GB at
-N=24M) but 6-15 GB at the 2^31 ceiling, so the wrong trade for an out-of-core design whose whole point is
-bounding memory (see "Replacing that sort out-of-core: prototyped and rejected (2026-08-29)").
+`lax.sort` compares one key operand at a time, so `num_keys=B` (13 at n=100) packed into `ceil(B/8)`
+order-preserving words (2) gives the same permutation at **1.79x (n=30) through 5.06x (n=127)**, N=200k;
+this sort dominates the function, itself 14-27x `get_xsource`. Cost: an extra `[N, ceil(B/8)]` uint64
+buffer, rows widened `8*ceil(B/8) - B` bytes (worst n=64, B=9 -> 16, +7/row; free at n=127, B=16), 1.09-1.69x
+temp at N=1M — 0.07-0.17 GB at N=24M but 6-15 GB at the 2^31 ceiling, the wrong trade out-of-core
+("Replacing that sort out-of-core: prototyped and rejected (2026-08-29)").
 
 ### sqd._is_lex_sorted: the filler test
 
-Two or more fillers are duplicates and so fail the strictness test, which is what the "rejects a padded
-result by design" claim rested on — but a single filler is still strictly increasing and used to pass.
-`hproj` has no filler-masking step, so that row became a spurious basis state: one row and column too
-large, still symmetric, and measured **−1.118034 against a true −1.0**. The test is on the packed byte
-because `pack_states` makes byte 0 < 128 for every genuine state, so 255 is unambiguous; unpacking a
-filler at n=2 gives [1, 1], a legitimate state, so an unpacked-side check could not work.
-
-O(1): fillers are all-255 rows and sort to the end, so if any is present the last row carries one. A full
-`np.any(states[:, 0] >> 7)` measured **5.25 ms at N=10M against 0.00012 ms**, ~4.4x the cost of the
-adjacent-row pass it was prepended to, for the same answer.
+A single filler is strictly increasing and used to pass (two or more fail as duplicates), and `hproj` does
+not mask fillers, so it became a spurious basis state: **−1.118034 against a true −1.0**. Tested on the
+packed byte, where genuine states have byte 0 < 128 (unpacked at n=2 a filler is [1, 1], a legitimate
+state). O(1) on the last row, since all-255 fillers sort last: a full `np.any(states[:, 0] >> 7)` is
+**5.25 ms at N=10M against 0.00012 ms**, ~4.4x the adjacent-row pass.
 
 ### sqd.get_xsource: search on uint64 words
 
-A level costs `ceil(B/8)` comparisons instead of B — 2 rather than 13 at n=100 — and the packing is one
-pass. The word form is what makes this path affordable past n=60: the byte form measured an ~8x
-per-state cliff across the B > 8 boundary (**15 ns/state at n=60, 189 at n=100**). Invariant: `lo` is the
-count of rows strictly less than the target, so after `ceil(log2(N)) + 1` halvings it is the insertion
-point.
+`ceil(B/8)` comparisons per level instead of B, 2 against 13 at n=100; the byte form had an ~8x per-state
+cliff across B > 8 (**15 ns/state at n=60, 189 at n=100**). Invariant: `lo` counts rows strictly below the
+target, so after `ceil(log2(N)) + 1` halvings it is the insertion point.
 
 ### sqd._accumulate_diagonal: the output sharding
 
-The output is 1-D of length `template.shape[0]` while the template may be 2-D — `get_diagonal` passes
-the `(N, nbytes)` state list — and `jnp.zeros` rejects a rank-2 spec on a rank-1 aval ("Length of
-sharding.spec (2) must be equal to aval's ndim (1)"). That raise fired on every sharded `sqd` call at
-every `cache_level`, because `run_sqd`'s `vinit_from_min_diag` reaches `get_diagonal` unconditionally. A
-bare `PartitionSpec` is rejected when no mesh context is active, the ordinary single-device path, hence
-the `NamedSharding`.
+The output is 1-D, `template.shape[0]` long, while the template may be the 2-D `(N, nbytes)` state list, and `jnp.zeros` rejected a
+rank-2 spec ("Length of sharding.spec (2) must be equal to aval's ndim (1)") on every sharded `sqd` call at
+every `cache_level`. `NamedSharding`, since a bare `PartitionSpec` is rejected with no mesh context.
 
 ### sqd.compute_diagonal: the bit offset wraps at 8
 
-`iterm & 7` is the bit offset within the selected byte. With `& 255` the shift `7 - ibit` goes negative
-from `iterm=8` onward, i.e. as soon as an X group holds more than 8 Z terms, and the composed diagonal is
-silently wrong: measured **0.71 absolute error on 9 terms, and a 25% error in the end-to-end
-eigenvalue**.
+With `& 255` rather than `& 7` the shift `7 - ibit` goes negative from `iterm=8`, i.e. past 8 Z terms in an
+X group: **0.71 absolute error on 9 terms, and a 25% error in the end-to-end eigenvalue**.

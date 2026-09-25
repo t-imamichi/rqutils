@@ -3,7 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 **This file holds only the rules.** Every measurement, post-mortem, rejected alternative and dated
-record lives in **`NOTES.md`** — read it before changing anything here that looks redundant or
+record lives in **`NOTES.md`**, or in the `poc/*.md` write-up a NOTES entry points to — read it before changing anything here that looks redundant or
 over-engineered, because most of it is load-bearing for a reason someone had to find the hard way.
 When a rule needs evidence, it points there rather than restating it.
 
@@ -196,8 +196,8 @@ Five reasons a mutant survives that are *not* missing coverage:
   addressable and the entire class of "spans non-addressable devices" errors is unreachable. That is how
   `sqd` shipped unable to return its own eigenvalue on a 4-node mesh (`float()` on a rank-0 array whose
   sharding names the whole mesh). **Anything reading a device value on the host needs a real
-  multi-process run**, or `_host_scalar`-style handling by construction. `NOTES.md` has the four wrong
-  gathers this produced.
+  multi-process run**, or `_host_scalar`-style handling by construction. `poc/sqd-multinode.md` §1 has the
+  wrong gathers this produced.
 - **`addressable_shards` is topology-dependent, so assert its length.** It holds *every* shard when one
   process owns the mesh and only *this rank's* when it does not, so concatenating it is exact
   single-process and **silently partial** across processes — measured, 50782 rows against a true 157051,
@@ -351,7 +351,7 @@ hash-ownership-plus-local-search design is verified bit-identical at 16× less p
 popcount diagonal path already shards with zero collectives. **Hash the whole key, not a prefix, and not
 a range split.** `uniquify_states` is the exception — its output feeds a binary search so it must stay
 globally lex-sorted, which needs *range* partitioning; that is built and bit-identical too. What remains
-unverified is whether the routing pays, which needs a real interconnect. `NOTES.md` has the cost tables,
+unverified is whether the routing pays, which needs a real interconnect. `poc/partition-states.md` has the cost tables,
 the balance measurements, the dead ends, and what is unbuilt. **A sort is the anti-pattern for sharding**
 — only elementwise ops and reductions survive a partitioned axis.
 
