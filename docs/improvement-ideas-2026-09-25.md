@@ -67,8 +67,8 @@ fixture was a single sector (`NOTES.md`, 2026-09-17), so check an actual sampler
 
 ## Accuracy
 
-### 6. Optional independent final-residual check
+### 6. Independent final-residual check -- **DONE** (2026-09-25)
 
-No arithmetic change has evidence for a lower attainable residual. What is left is contractual: one extra
-matvec after the solve recomputes `‖Hx − θx‖` outside the loop, catching the `converged=True` wrong-answer
-class this repo keeps hitting, at zero cost to the iteration path.
+Shipped as `EigenpairCheckError`, always on in `sqd`: one `(0, 0)` matvec after the solve, raising
+above 10× the convergence bound. Converged solves measure at most 0.96 of the bound; the cost is
++1.5–7.9% by cache level. Lets spinchain drop its own `_eigen_residual` guard. `NOTES.md` has the entry.

@@ -189,6 +189,7 @@ SQD API
 =======
 
 .. autofunction:: sqd
+.. autoexception:: EigenpairCheckError
 .. autofunction:: hproj
 
 States are packed with :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states`, which inserts the
@@ -493,6 +494,19 @@ def _check_states_shape(states: Any, num_qubits: int, packed: bool = False) -> S
             "subspace. Also check for a transposed array or a mismatched Hamiltonian."
         )
     return states
+
+
+#: Headroom of :class:`EigenpairCheckError` over the convergence bound: converged solves measure at
+#: most 0.96 of it, so this only fires on a pair that is wrong rather than marginal (``NOTES.md``).
+_RESIDUAL_SLACK = 10.0
+
+
+class EigenpairCheckError(RuntimeError):
+    """:func:`sqd` returned ``converged=True`` for a pair that is not an eigenpair.
+
+    Distinct from non-convergence, which raises a plain ``RuntimeError``: that one is fixed by raising
+    ``maxiter``, this one never is, so a caller retrying on non-convergence must not catch it.
+    """
 
 
 def _host_scalar(value: jax.Array | float | bool) -> jax.Array | float | bool:
@@ -829,6 +843,8 @@ def sqd(
             that this absence "is the reason I4 could hide", a sign error that made the convergence
             test unsatisfiable so the solver silently never converged. Raise ``maxiter``, or loosen
             ``atol`` / ``rtol``, to proceed.
+        EigenpairCheckError: If the solve converged but ``||Hv - Ev||``, recomputed after it at
+            ``cache_level=(0, 0)``, exceeds 10x the convergence bound (or the residual floor).
         ValueError: If ``states_size`` is smaller than ``states.shape[0]``, or if it exceeds
             :math:`2^{31} - 1`, the ceiling imposed by the int32 indices used for subspace positions
             (beyond it an index wraps negative and the subspace is silently permuted); or if either
@@ -915,6 +931,7 @@ def sqd(
         atol=atol,
         rtol=rtol,
         prefilter=prefilter,
+        check_residual=True,
     )
     LOG.info("Found ground eigenpair in %f seconds.", time.time() - start)
     eigval = float(_host_scalar(result[0]))
@@ -942,8 +959,21 @@ def sqd(
             "principle; `rtol` is a fraction of (||Hv|| + |E|) instead. A genuinely "
             "ill-conditioned subspace is the rarer cause."
         )
+    residual, ax_norm = (float(_host_scalar(v)) for v in result[-3:-1])
+    eps = float(np.finfo(hamiltonian.c.dtype).eps)
+    bound = max(atol, (4.0 * eps if rtol is None else rtol) * (ax_norm + abs(eigval)))
+    threshold = _RESIDUAL_SLACK * max(bound, _residual_floor_of(hamiltonian))
+    LOG.info("Independent eigen-residual %.3e (threshold %.3e).", residual, threshold)
+    if not residual <= threshold:  # `not <=` so a NaN residual raises too
+        raise EigenpairCheckError(
+            f"LOBPCG reported convergence, but the returned pair fails an independent check: "
+            f"||Hv - Ev|| recomputed at cache_level=(0, 0) is {residual:.3e}, above {threshold:.3e} "
+            f"({_RESIDUAL_SLACK:g}x the convergence bound {bound:.3e}). The eigenvector is "
+            "inconsistent with its eigenvalue, which raising `maxiter` or loosening a tolerance "
+            "cannot fix; please report it with the Hamiltonian and states."
+        )
     if return_eigvec:
-        eigvec, states_u, subspace_dim = result[1:-1]
+        eigvec, states_u, subspace_dim = result[1:-3]
         # `packed` now governs BOTH directions: a caller who hands over packed states gets packed
         # states back, so a round trip through `sqd` needs no re-pack. The returned rows are the same
         # array `run_sqd` searched, sliced to the genuine uniques.
@@ -1157,6 +1187,7 @@ def _spread_seed(
         "prefilter",
         "log_level",
         "batch_matvec",
+        "check_residual",
     ]
 )
 def run_sqd(
@@ -1172,7 +1203,8 @@ def run_sqd(
     prefilter: tuple[int, int] | None = (32, 2),
     log_level: int = logging.INFO,
     batch_matvec: bool = True,
-) -> tuple[float, bool] | tuple[float, jax.Array, jax.Array, int, bool]:
+    check_residual: bool = False,
+) -> tuple:
     """JIT-compiled part of the SQD function.
 
     Returns the eigenvalue, optionally the eigenvector/basis/dimension, and **the convergence flag as
@@ -1199,6 +1231,9 @@ def run_sqd(
             path and exists to keep the A/B runnable. Default ``True``, unlike
             :func:`rqutils.ground_locg.ground_locg`'s ``False``, which cannot assume an arbitrary
             callable accepts a batch. Static, being forwarded by keyword.
+        check_residual: Recompute ``||Hv - Ev||`` and ``||Hv||`` at ``cache_level=(0, 0)`` after the
+            solve and insert both just before the convergence flag. Off by default so direct callers'
+            positional unpackings keep their meaning; :func:`sqd` turns it on and raises on the result.
     """
     # `cache_level` is static, so this is a concrete tuple at trace time and the check runs once per
     # trace rather than once per call. `sqd` validates too; this covers the direct callers, which are
@@ -1420,15 +1455,23 @@ def run_sqd(
         log_level=log_level,
         batch_matvec=batch_matvec,
     )
+    # (0, 0) reads signatures directly, which needs `states_u` replicated, as does the return.
+    if sharding and (return_eigvec or check_residual):
+        states_u = jax.reshard(states_u, PartitionSpec(None))
+    checks = ()
+    if check_residual:
+        # (0, 0) whatever level solved, so a defect in one cache level cannot vouch for itself.
+        scanned_ref = _pack_scanned((0, 0), hamiltonian.x, hamiltonian.z, hamiltonian.c)
+        ax = _apply_h_kernel(eigvec, scanned_ref, states_u, cache_level=(0, 0))
+        checks = (jnp.linalg.norm(ax - eigval * eigvec), jnp.linalg.norm(ax))
     result = (eigval,)
     if return_eigvec:
         if sharding:
             eigvec = jax.reshard(eigvec, PartitionSpec(None))
-            states_u = jax.reshard(states_u, PartitionSpec(None))
         subspace_dim = jnp.searchsorted(_is_filler(states_u), 1)
         result += (eigvec, states_u, subspace_dim)
     # Convergence last, so the existing positional unpackings above keep their meaning.
-    return result + (converged,)
+    return result + checks + (converged,)
 
 
 @jax.jit(static_argnames=["states_size"])

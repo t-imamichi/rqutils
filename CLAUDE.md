@@ -284,7 +284,10 @@ own `with jax.set_mesh(...)` block).
 
 **Return shapes.** `sqd` returns 3 values with `return_eigvec=True` (`eigval, eigvec, basis`) and a bare
 `float` otherwise — not a 5-tuple; the convergence flag and subspace dim are consumed inside `sqd`,
-which raises on non-convergence. `hproj` returns a scipy `csr_array`, so `np.asarray()` on it yields a
+which raises on non-convergence. It also recomputes the residual at `(0, 0)` after every solve and
+raises `EigenpairCheckError` — a distinct subclass, and its message must never say "did not converge",
+since callers retry on that substring. `run_sqd` does this only under `check_residual=True`, which
+inserts two scalars before the convergence flag. `hproj` returns a scipy `csr_array`, so `np.asarray()` on it yields a
 **0-d object array** and the failure surfaces frames later as `IndexError`. Use `.toarray()`.
 
 **Two invariants that produced silent wrong answers:**

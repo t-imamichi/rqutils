@@ -26,6 +26,7 @@ import textwrap
 import warnings
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from conftest import (
@@ -41,6 +42,7 @@ from conftest import (
 
 from rqutils.sqd import (
     _MAX_STATES,
+    EigenpairCheckError,
     _host_scalar,
     _is_lex_sorted,
     _pack_scanned,
@@ -1788,6 +1790,41 @@ class TestConvergenceIsReported:
         loose = eigval_of(strings, coeffs, states, atol=1e-6)
         expected = lowest_projected(strings, coeffs, states)
         assert abs(loose - expected) < 1e-4
+
+
+class TestEigenpairCheck:
+    """A pair that converged but is not an eigenpair must raise, not return.
+
+    Defect injected: ``ground_locg`` returns its eigenvector with the dominant component's sign
+    flipped and ``converged=True`` -- a shape a downstream caller (spinchain) measured at ~1e+00 and
+    checked for itself. Components 0 and 1 would not do: they carry ~1e-17 of this ground state, so
+    swapping them is a no-op. Measured here: 5.7e+00 against a threshold of 7.8e-14.
+    """
+
+    def test_a_sign_flipped_eigenvector_raises_the_subclass(self, monkeypatch):
+        import rqutils.sqd as sqd_module
+
+        real = sqd_module.ground_locg
+
+        def flipped(*args, **kwargs):
+            eigval, eigvec, iters, converged = real(*args, **kwargs)
+            dominant = jnp.arange(eigvec.shape[-1]) == jnp.argmax(jnp.abs(eigvec))
+            return eigval, jnp.where(dominant, -eigvec, eigvec), iters, converged
+
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        monkeypatch.setattr(sqd_module, "ground_locg", flipped)
+        run_sqd.clear_cache()  # `ground_locg` is read at trace time
+        try:
+            with pytest.raises(EigenpairCheckError) as excinfo:
+                sqd((strings, coeffs.tolist()), states, return_eigvec=False)
+        finally:
+            monkeypatch.undo()
+            run_sqd.clear_cache()  # or later tests reuse the defective trace
+        # Callers retry on this substring (non-convergence); a wrong pair must not match it.
+        assert "did not converge" not in str(excinfo.value)
 
 
 class TestAtolAndRtol:

@@ -3447,6 +3447,30 @@ broken four times, which a laptop cannot exercise -- a two-rank localhost cluste
 coordinator's `bind`. Such a cluster would be the first local multi-process test for `_host_scalar`
 if run outside the sandbox.
 
+### `EigenpairCheckError`: an independent residual after every `sqd` solve (2026-09-25)
+
+`sqd` recomputes `‖Hv − Ev‖` and `‖Hv‖` at `cache_level=(0, 0)` after the solve, whatever level solved,
+and raises `EigenpairCheckError` (a `RuntimeError` subclass) above `10 × max(bound, residual_floor)`,
+where `bound` is the solver's own `max(atol, rtol·(‖Hv‖+|E|))` with the exact `‖Hv‖`. Motivated by
+spinchain's `sqd_backend._eigen_residual`, which repacked, re-uniquified and re-built the operator to
+check the same thing; all of that was rqutils code except the `(0, 0)` kernel, so doing it here keeps
+the independence and drops the rebuild.
+
+- **Slack measured, not chosen**: over the full suite's 185 converged `sqd` solves the recomputed
+  residual sits at **max 0.96, median 0.27** of `bound`. The tail is at the floor (`r = 2.9e-15`,
+  `bound = 3.0e-15`, floor `4.2e-15`), where the recomputation's own rounding is the discrepancy --
+  hence the `max(…, floor)` inside the slack rather than a bare multiple of `bound`.
+- **Catches what it is for**: a dominant-component sign flip with `converged=True` reads **5.7e+00**
+  against a threshold of 7.8e-14. A swap of components 0/1 was a no-op on that fixture (both ~1e-17).
+- **Cost**, `J=120`, `N=30k`, warm, interleaved 9 rounds: `(1,0)` +3.2%, `(1,2)` +7.9%, `(0,0)` +1.5%
+  (6/9, noise); XLA temp +0.25–0.60 MiB, i.e. about one vector. `(1,2)` pays most because its solve
+  matvec is cheap and the check's `(0,0)` one is not.
+- **Must not say "did not converge"**: spinchain's `sqd_with_retry` retries on that substring, and a
+  wrong pair retried at `maxiter=100_000` is the outcome it forbids. Pinned by the test.
+- Under a mesh the check needs `states_u` replicated, so `return_eigvec=False` with `cache_level[0]=1`
+  now reshards it back once (it was replicated before the precompute, so the peak does not rise).
+  Multi-process: both reads go through `_host_scalar`, replicated, so every rank raises together.
+
 ## `precond` was removed; `sqd` defaults to `prefilter=(32, 2)`
 
 2026-08-28, acting on the comparison below.
