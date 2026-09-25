@@ -54,8 +54,13 @@ whole-solve overhead from +3.2%/+7.9% to **+0.9%/+0.6%** at `(1, 0)`/`(1, 2)`. `
 
 The only unbuilt item measured through real `sqd()` solves: half the diagonal memory for 2.45× the
 full-cache solve time, bit-identical (`NOTES.md`, 2026-08-30). `xcache_groups` is the pattern on the
-other axis. Test whether caching the **largest-`K_g` groups first** beats a prefix at equal bytes before
-fixing the API. Limits: net-negative below about `K = 7`, and must not be combined with `xcache_groups`.
+other axis. Limits: net-negative below about `K = 7`, and must not be combined with `xcache_groups`.
+
+**The ordering question is answered (2026-09-25): order barely matters.** At equal bytes, caching the
+largest `K_g` first beats a prefix by only **1.02--1.03×** (whole solve 1.023×) on a molecular-like JW
+fixture, and not at all on spin chains, whose one large group already sorts first. So the API is a
+count, `J'`, not an order (`NOTES.md`, "Partial diagonal cache: *which* groups to cache barely
+matters"; `poc/diag_cache_order.py`). What remains is building that dial.
 
 ### 4. Return device arrays from `sqd`
 
@@ -106,6 +111,6 @@ a named `states_size` policy. The levers left are the operator's storage (3, 8) 
 ## Order
 
 1. ~~**7**~~ -- done.
-2. **3** -- one measurement (largest-`K_g` first against a prefix, at equal bytes) settles the API.
+2. **3** -- measured (order ≤3%); build the `J'` count dial.
 3. **8** -- prototype and measure; drop it if scatter loses to gather.
 4. **4**, **9** -- need a real multi-process run; **5** needs real sampler output.

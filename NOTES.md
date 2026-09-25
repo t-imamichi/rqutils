@@ -1401,6 +1401,37 @@ sampled from a circuit. The intermediate solves came from throwaway `run_sqd` in
 env var, since `sqd` has no such parameter; it was removed and the file restored from a `cp` backup
 (626 passed after).
 
+### Partial diagonal cache: *which* groups to cache barely matters, only how many (2026-09-25)
+
+Every cached group costs the same bytes (one diagonal per state), but recomputing group `g` costs `K_g`
+iterations -- `_accumulate_diagonal` stops at the first zero-padded term -- so at equal bytes, caching the
+largest `K_g` first removes the most work. Measured with `poc/diag_cache_order.py` (the two-kernel
+construction of the entry above) on a molecular-like Jordan--Wigner Hamiltonian from random integrals,
+chosen because a spin chain cannot test it: all its diagonal terms land in the identity-X group, which
+sorts first, so a prefix already picks it (`K_g = [23, 2, 2, ...]` on an XXZ chain with a field).
+
+n=18, density 0.25: `J = 2641`, `K_g` quartiles 8/8/8 (min 6, max 62), `states_size` 16384, 330 MiB full
+store; matvecs warm, 15 interleaved rounds, each arm checked against the full-cache product:
+
+| cached | `K` left, prefix | `K` left, largest | matvec, prefix | matvec, largest | paired | ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| `J/8` | 19250 | 18486 | 167.4 ms | 162.5 ms | 14/15 | **1.030×** |
+| `J/4` | 16412 | 15846 | 145.9 ms | 141.8 ms | 15/15 | **1.028×** |
+| `J/2` | 10882 | 10566 | 102.1 ms | 99.8 ms | 15/15 | **1.023×** |
+
+Whole `ground_locg` solves at `J/8` (prefilter `(32, 2)`, batched, as `run_sqd` drives it): 49.9 s
+against 48.8 s, **1.023×**, same eigenvalue to 12 digits and the same 107 iterations. n=14: 1.013--1.027×,
+5/5 paired at every fraction.
+
+- **The gain is the `K`-left difference, near one for one**: matvec time fits `a + b·(K left)`
+  (n=14: `a` ≈ 3.1 ms, `b` ≈ 1.65 µs per term), so the order can only win what its `K` coverage differs by.
+- **That difference is small because `K_g` is concentrated**: most groups here share `K = 8`, so ranking
+  moves a few large groups. A denser n=12 variant (density 1.0, `K_g` 8/22/79) differs more -- 56% more
+  `K` removed at `J/8`, 7% at `J/2` -- a work count, not timed.
+- **So the API should expose the count, not an order.** Largest-first is never worse and costs a host
+  argsort over `.c`, but it is worth ≤3% on these fixtures and 0% on spin chains; the dial that matters
+  is `J'`, whose half-memory point costs 2.45× (the entry above).
+
 ### The diagonal split at large `N`: the overhead is a *ratio*, and "flat 1.1 MB" was an artifact (2026-08-30)
 
 The entry above left one load-bearing claim unmeasured — peak temp memory "flat at 1.1 MB across every

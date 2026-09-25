@@ -99,10 +99,10 @@ excluded from both: they get names from IPython magics that static analysis cann
   Count first with `ty check -c 'rules.X="error"'`, then read the diagnostics rather than the count.
   The two patterns that work are a per-line suppression where the stub is genuinely wrong, and
   `@overload` where a runtime flag picks the return shape.
-- **New scripts under `poc/` trip rules the library does not**: **B023** (a `lambda` in a `for` loop
-  capturing the loop variable — endemic to benchmark harnesses; fix by binding as a default arg,
-  `lambda vec=vec: ...`) and **E402** (imports after the mandatory
-  `jax.config.update('jax_enable_x64', True)`, needing `# noqa: E402`). `ruff --fix` resolves neither.
+- **New scripts under `poc/` trip a rule the library does not: B023**, a function in a `for` loop
+  capturing the loop variable — endemic to benchmark harnesses; bind it as a default arg
+  (`lambda vec=vec: ...`). `ruff --fix` does not resolve it. E402 is not enabled under the current ruff,
+  so imports after the mandatory `jax.config.update('jax_enable_x64', True)` need no `noqa`.
 
 ## Testing
 
