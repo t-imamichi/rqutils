@@ -1,6 +1,6 @@
 """POC 9: does ``ground_locg``'s Chebyshev prefilter still pay on a GPU? NOT VERIFIED on CPU-only hardware.
 
-``markdowns/locg-chebyshev-prefilter.md`` measures the prefilter at a median **1.36x** over 18 XXZ
+``markdown/locg-chebyshev-prefilter.md`` measures the prefilter at a median **1.36x** over 18 XXZ
 configurations, on an Apple M1 with ``jax.default_backend() == "cpu"``, one device. That number must
 not be quoted as a GPU number. POC 8 states the rule this script inherits: *a result measured on one
 backend says nothing about another, in either direction* -- a flat CPU result does not mean a change is
@@ -27,7 +27,7 @@ loosens by ~9 orders and the counts are meaningless).
 ``fmt_ratio``, which refuses to call a difference inside the measured spread a win. A result under the
 noise floor is the honest answer, not a failure of the script.
 
-**Claim 3: it stays sharding-transparent on real devices.** ``tests/_sharded_prefilter.py`` verifies
+**Claim 3: it stays sharding-transparent on real devices.** ``test/_sharded_prefilter.py`` verifies
 the output *spec* is preserved across 1/2/4 virtual devices and both partitioned and replicated
 inputs, but virtual devices share one physical backend -- per ``CLAUDE.md``, timings under them are
 meaningless and only correctness transfers. This script asserts the spec on real devices and reports
@@ -111,7 +111,7 @@ def main():
         # the 2026-09-12 CPU corner run is in the docs precisely because it was new.
         print(
             "\n*** THIS IS A CPU RUN. The default grid is already in "
-            "markdowns/locg-chebyshev-prefilter.md; this script exists to be run on a GPU. A grid outside "
+            "markdown/locg-chebyshev-prefilter.md; this script exists to be run on a GPU. A grid outside "
             "that default may still be new -- check §3.1/§3.2 before discarding it. ***"
         )
 

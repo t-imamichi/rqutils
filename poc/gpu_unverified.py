@@ -237,7 +237,7 @@ def claim2_speedup_on_gpu():
                     "-- measurement may not be kernel-dominated; corroborate before quoting."
                 )
                 # This fires reproducibly at J=50 on every GPU tried, and the answer is already
-                # recorded rather than open: markdowns/scaling-pocs.md "Measured on GPU (NVIDIA GH200
+                # recorded rather than open: markdown/scaling-pocs.md "Measured on GPU (NVIDIA GH200
                 # 120GB)" diagnosed the identical pattern
                 # on a GH200 (sort arm flat at 1141/1239/1201 ms) as launch-latency bound, making
                 # the ratio a quotient of two overheads that lands misleadingly near the CPU
@@ -245,7 +245,7 @@ def claim2_speedup_on_gpu():
                 # fits alpha and refuses ratios below 0.6: 5.15x at N=64M, rising with N.
                 print(
                     "    -> Already diagnosed: launch-bound at J=50, NOT a new finding. See "
-                    'markdowns/scaling-pocs.md "Measured on GPU"; quotable GPU number is 5.15x at '
+                    'markdown/scaling-pocs.md "Measured on GPU"; quotable GPU number is 5.15x at '
                     "N=64M from "
                     "searchsorted.py check_scaling --sweep-to."
                 )

@@ -33,7 +33,7 @@ dependencies = [
 mpl = ["matplotlib"]
 qutip = ["qutip"]
 # `qiskit` moved to the required dependencies above, but `uv run --extra qiskit ...` appears throughout
-# CLAUDE.md, NOTES.md, markdowns/ and every poc/ docstring; deleting the name would make all of
+# CLAUDE.md, NOTES.md, markdown/ and every poc/ docstring; deleting the name would make all of
 # those fail with "unknown extra" for no benefit, so it stays as an empty alias that installs nothing.
 qiskit = []
 # mpi4py stays an extra deliberately: it needs a working host MPI to build, so requiring it would make
@@ -42,7 +42,7 @@ qiskit = []
 # --devices mpi`).
 mpi = ["mpi4py"]
 docs = ["sphinx", "sphinx-rtd-theme"]
-dev = ["pytest", "pytest-xdist", "pytest-sugar", "ruff", "ty"]
+dev = ["pytest", "pytest-xdist", "pytest-sugar", "ruff", "ty", "rumdl", "codespell"]
 
 [project.urls]
 Homepage = "https://github.com/UTokyo-ICEPP/rqutils"
@@ -50,9 +50,8 @@ Issues = "https://github.com/UTokyo-ICEPP/rqutils/issues"
 Documentation = "https://rqutils.readthedocs.io/en/latest/index.html"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["test"]
 python_files = ["test_*.py"]
-addopts = "-n auto"
 
 [tool.ruff]
 line-length = 100
@@ -67,7 +66,7 @@ exclude = ["**/*.ipynb"]
 # JAX ships almost no type information, and `jax.jit` converts arguments before the body runs, so a
 # parameter annotated `int` really does have a `.dtype` when read. numpy's stubs are also stricter than
 # the dtype-generic `npmod` convention allows. Tool limitation, not defect -- revisit when JAX ships
-# stubs. Six sibling rules were retired by fixing their sites; `markdowns/typing-notes.md` has the survey,
+# stubs. Six sibling rules were retired by fixing their sites; `markdown/typing-notes.md` has the survey,
 # the per-rule counts, and which remaining findings are worth acting on.
 unresolved-attribute = "ignore"
 no-matching-overload = "ignore"

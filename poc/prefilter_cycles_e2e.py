@@ -2,7 +2,7 @@
 
 **The question, and why the existing measurements cannot answer it.** ``prefilter_gpu.py``
 sweeps ``(degree, cycles)`` on two synthetic Hamiltonians and finds ``(32, 4)`` the better *worst
-case* -- 1.34x / 1.30x against ``(32, 2)``'s 1.07x / 1.25x (``markdowns/locg-chebyshev-prefilter.md``
+case* -- 1.34x / 1.30x against ``(32, 2)``'s 1.07x / 1.25x (``markdown/locg-chebyshev-prefilter.md``
 §3.2/§3.3). That is a real result and it is the wrong quantity twice over:
 
 1. **It excludes setup.** prefilter_gpu drives ``ground_locg`` on a pre-assembled ``apply_h`` matvec. Per
@@ -19,7 +19,7 @@ So this script measures ``(32, 2)`` against ``(32, 4)`` **through ``sqd``, setup
 subspaces**, sweeping seeds and anisotropies the way §3.1 did.
 
 **§3.1's harness is not in the tree.** ``da7299e`` (the commit that changed the recommendation to
-``(32, 2)``) touched only ``markdowns/locg-chebyshev-prefilter.md`` and ``rqutils/ground_locg.py``; no
+``(32, 2)``) touched only ``markdown/locg-chebyshev-prefilter.md`` and ``rqutils/ground_locg.py``; no
 sweep script was ever committed, and ``git log -S`` finds none in any branch. Its 27-configuration
 table is therefore **not reproducible from this repository** -- only its conclusions survive, in
 §3.1. This script does not reconstruct it (different fixture generator, different sizes, and it

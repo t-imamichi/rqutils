@@ -1,7 +1,7 @@
 """POC 6: float32 matvec with a float64 solver -- accuracy against speed.
 
 The matvec dominates the per-iteration cost, so running it in float32 halves its bandwidth. The
-Rayleigh-Ritz step must stay float64: ``markdowns/locg.md``'s I1-I7 are all cases where reduced precision
+Rayleigh-Ritz step must stay float64: ``markdown/locg.md``'s I1-I7 are all cases where reduced precision
 in *that* step returns a plausible wrong number rather than failing, and the ``eigenpair_3x3``
 balancing exists specifically because the intermediates lose significance.
 

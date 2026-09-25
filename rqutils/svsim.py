@@ -55,7 +55,7 @@ class CircuitXZ:
     # Q = (-i)^{x.z} Z^z X^x already folded in. Every supported gate has popcount(x & z) in {0, 1},
     # so the folded factor is exactly +i or +1 and no rounding is introduced. Keeping it real would
     # make the phase unrepresentable, which is how it came to be omitted entirely -- see
-    # ``to_circuitxz`` and ``markdowns/skqd.md``.
+    # ``to_circuitxz`` and ``markdown/skqd.md``.
     sin: np.ndarray[tuple[int], np.dtype[np.complexfloating]]
     num_qubits: int = field(metadata={"static": True})
 
@@ -72,7 +72,7 @@ type CircuitInput = CircuitXZ | list[GateSpec] | QuantumCircuit
 # separate tuple alongside a per-gate dispatch meant the same fact was spelled twice, and a drift
 # between them would leave `angle` silently stale from the previous loop iteration rather than
 # raising. Note `cz` is absent deliberately -- it is decomposed on the QuantumCircuit path only, and
-# rejected as a raw gate spec (tests/test_svsim.py::TestCz::test_cz_as_a_gate_spec_is_rejected).
+# rejected as a raw gate spec (test/test_svsim.py::TestCz::test_cz_as_a_gate_spec_is_rejected).
 _GATE_XZ = {
     "x": (1, 0, False),
     "y": (1, 1, False),
@@ -161,7 +161,7 @@ def do_svsim(
         )
         # No leading 1.0j here: gate.sin already carries i * (-i)^popcount(x & z) from
         # to_circuitxz. Multiplying by 1.0j again would double-count the rotation's i and drop the
-        # symplectic phase, which is exactly the bug documented in markdowns/skqd.md.
+        # symplectic phase, which is exactly the bug documented in markdown/skqd.md.
         out = gate.sin * signs * xstate
         out = jax.lax.cond(gate.cos == 0.0, lambda: out, lambda: out + gate.cos * state)
         return out, None

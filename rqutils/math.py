@@ -122,7 +122,7 @@ def matrix_ufunc(
             that is not verified: ``hermitian=1`` routes to ``eigh``, which reads only one triangle,
             so a non-Hermitian input yields a well-formed spectrum of a *different* operator.
             Checking it would cost an ``O(n^2)`` comparison per call, so the contract stands -- see
-            ``tests/test_math.py::TestHermitianHint``.
+            ``test/test_math.py::TestHermitianHint``.
         with_diagonals: If True, also return the array ``operator(eigenvalues)``.
 
     Returns:

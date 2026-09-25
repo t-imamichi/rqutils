@@ -138,7 +138,7 @@ caching setting should be adjusted according to the values of :math:`n` and :mat
 **How expensive, concretely: the source-index setup dominates the solve, so this is not a symmetric
 memory-for-speed dial.** Weighted by call count, the :math:`J`-fold :func:`get_xsource` precompute
 measured **66-97%** of an entire solve -- 97.5% at 10 iterations, 66.4% at 200 (3064 ms of setup
-against 8.35 ms per matvec iteration, N=200k, J=50; see ``markdowns/scaling-pocs.md``). Turning source-index
+against 8.35 ms per matvec iteration, N=200k, J=50; see ``markdown/scaling-pocs.md``). Turning source-index
 caching *off* therefore pays that cost once per matvec rather than once per solve, which is a far
 larger effect than the :math:`4 J N` bytes it reclaims -- measured end-to-end at N=3k, n=12, J=23,
 ``(0, 2)`` is 10.9x slower than ``(1, 2)`` and ``(0, 0)`` is 7.2x slower than ``(1, 0)``, all four
@@ -805,7 +805,7 @@ def sqd(
             filter's required upper bound itself as :math:`\sum_k |c_k|`, so the option costs the
             caller nothing to use and there is no bound to get wrong.
 
-            That 1.49x is **below** the 1.88x median ``markdowns/locg-chebyshev-prefilter.md`` measured on
+            That 1.49x is **below** the 1.88x median ``markdown/locg-chebyshev-prefilter.md`` measured on
             dense ``ground_locg``, and the gap is the point: the filter spends
             ``cycles * (degree + 1)`` matvecs up front, and :func:`apply_h`'s sparse gather-heavy
             kernel is cheap enough that those cost proportionally more here. Counting *iterations*
@@ -839,7 +839,7 @@ def sqd(
         RuntimeError: If LOBPCG does not converge within ``maxiter``. Previously the convergence flag
             was discarded and the non-converged value was returned as the answer: it is
             ``state.theta``, a valid variational **upper bound**, so finite, real and above the true
-            minimum -- indistinguishable from a correct result by inspection. ``markdowns/locg.md`` records
+            minimum -- indistinguishable from a correct result by inspection. ``markdown/locg.md`` records
             that this absence "is the reason I4 could hide", a sign error that made the convergence
             test unsatisfiable so the solver silently never converged. Raise ``maxiter``, or loosen
             ``atol`` / ``rtol``, to proceed.
@@ -937,7 +937,7 @@ def sqd(
     eigval = float(_host_scalar(result[0]))
     # The convergence flag used to be discarded here, and a non-converged run still returns
     # `state.theta` -- a valid variational *upper bound*, so finite, real, and above the true minimum,
-    # i.e. indistinguishable from a correct answer by inspection. markdowns/locg.md records that this
+    # i.e. indistinguishable from a correct answer by inspection. markdown/locg.md records that this
     # absence "is the reason I4 could hide": a sign error made the convergence test unsatisfiable, so
     # the solver silently never converged and every answer was the iteration cap's best guess.
     #
@@ -1314,7 +1314,7 @@ def run_sqd(
     # A partial cache needs a *second* scanned tuple: the cached and uncached groups carry different
     # X arrays (int32 indices against uint8 signatures), so they cannot share one leading axis. The
     # matvec becomes the sum of two kernels, one per arm -- verified exact against the single-arm form
-    # for all six cache_levels at every J' (tests/test_sqd.py::TestPartialXCache).
+    # for all six cache_levels at every J' (test/test_sqd.py::TestPartialXCache).
     #
     # The diagonal axis is sliced identically in both arms and is orthogonal to the split: it is
     # indexed by X group, so group k's diagonal data travels with whichever arm holds group k.
@@ -1438,7 +1438,7 @@ def run_sqd(
 
     # sum|c_k| bounds lambda_max rigorously -- every Pauli string is unitary, and projecting onto the
     # subspace only shrinks the spectral radius -- and costs no matvec. `ground_locg` cannot derive it
-    # from a callable, and raises rather than guessing (markdowns/rqutils-prefilter-bug.md). Gated on the
+    # from a callable, and raises rather than guessing (markdown/rqutils-prefilter-bug.md). Gated on the
     # filter actually running, since degree<=1 or cycles==0 is a documented no-op and computing the
     # bound anyway would add ops to the traced graph for those values.
     filter_runs = prefilter is not None and prefilter[0] > 1 and prefilter[1] > 0
@@ -1705,7 +1705,7 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
     `np.unique(..., axis=0)`'s. Note `hproj`'s `unique_states=True` shortcut skips that `np.unique`,
     so a caller passing unsorted-but-unique states gets a wrong (and non-symmetric) matrix; that
     predates this implementation and is pinned by
-    `tests/test_sqd.py::TestHproj::test_unsorted_input_with_unique_states_is_wrong` -- named for the
+    `test/test_sqd.py::TestHproj::test_unsorted_input_with_unique_states_is_wrong` -- named for the
     behaviour, since nothing is rejected: the result is silently wrong.
 
     Since `S` is sorted, finding `A` is a **binary search** of `S ^ X` into `S` -- not a reason to
@@ -1716,7 +1716,7 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
     pure gather, so it also shards, where a sort does not. Measured on CPU at 12-25x per signature and
     12-17x on the J-fold precompute, and **5.15x at N=64M on an NVIDIA GH200** (a GPU sort is
     well optimized relative to its gather, so the ratio compresses while the direction holds); see
-    `markdowns/scaling-pocs.md`.
+    `markdown/scaling-pocs.md`.
 
     The memory leak, re-measured on that GH200 against a pinned copy of the old sort, **did not
     reproduce**: ~0.95 GB of transients at `(5M, 4)` were fully reclaimed after every repetition. That

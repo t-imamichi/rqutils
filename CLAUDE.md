@@ -10,26 +10,27 @@ When a rule needs evidence, it points there rather than restating it.
 ## Environment
 
 - **Always `uv run python`**, never bare `python` — the venv at `.venv` is managed by uv.
-- **`qiskit` is a required dependency**; `mpl`, `qutip`, `mpi`, `docs` and `dev` (pytest + ruff + ty)
-  are extras and are **not** installed by default. Pull those in per invocation:
-  `uv run --extra mpl python examples/bench.py`. `qiskit` is required because it is a public *input*
+- **`qiskit` is a required dependency**; `mpl`, `qutip`, `mpi`, `docs` and `dev` (pytest, ruff, ty, rumdl,
+  codespell) are extras and are **not** installed by default. Pull those in per invocation:
+  `uv run --extra mpl python <script>`. `qiskit` is required because it is a public *input*
   type (`PauliSumXZ.from_paulisum` takes a `SparsePauliOp`, `svsim` takes a `QuantumCircuit`) — the
   `HAS_QISKIT` guards stay regardless, since they turn a broken install into a `RuntimeError` at the
   call site rather than an `ImportError` at `import rqutils`. The `qiskit` extra survives as an **empty
-  alias** so the `--extra qiskit` invocations throughout this file, `NOTES.md`, `markdowns/` and the
+  alias** so the `--extra qiskit` invocations throughout this file, `NOTES.md`, `markdown/` and the
   `poc/` docstrings keep resolving; it installs nothing.
 - **Every multi-process run needs `--extra mpi`.** `mpi4py` is an extra rather than a dependency because
   it builds against the host MPI, so requiring it would make every install depend on a system MPI, and
-  nothing under `rqutils/` imports it — only `examples/sqd.py --gpus mpi` and
-  `poc/*.py --devices mpi` do, via
+  nothing under `rqutils/` imports it — only `examples/{sqd,svsim}.py --gpus mpi`
+  and `poc/*.py --devices mpi` do, via
   `jax.distributed.initialize(cluster_detection_method="mpi4py")`. `mpirun … --devices mpi` without the
   extra raises at that call.
 - **No `timeout` on macOS** (it is GNU coreutils) — use the Bash tool's own timeout.
-- **The shell is fish: quote grep globs** (`--include="*.py"`). Unquoted, fish fails with
-  `(eval):1: no matches found` *before* grep runs, which reads as "no results" rather than an error.
+- **The Bash tool runs zsh, not the login shell fish: quote globs** (`--include="*.py"`). An unmatched
+  glob aborts the *whole* command line with `(eval):1: no matches found`, which reads as "no results";
+  fish syntax (`for …; end`) fails to parse, and a bare `=word` is expanded (`echo ====` errors).
 - **macOS `sed -i` needs an explicit backup arg** (`sed -i '' 's/x/y/' f`). Without it BSD sed reads the
   filename as the suffix and fails — **while exiting 0**, so it looks like a successful no-op. Prefer a
-  short `python3 -` heredoc for in-place edits, and assert the match count before writing.
+  short `uv run python -` heredoc for in-place edits (system `python3` is older than the venv's), and assert the match count before writing.
 - **Don't put `cd` in a backgrounded command.** "Session cwd remains" applies to *subsequent* commands,
   not the backgrounded one, so `cd /tmp && uv run ...` leaves the project and fails with `No module
   named jax`. Use `uv run --directory <project>`.
@@ -58,7 +59,10 @@ When a rule needs evidence, it points there rather than restating it.
 ### Docs
 
 `docs/` holds only the published Sphinx source; working notes and request/response memos live in
-`markdowns/`, and proof-of-concept scripts in `poc/` (`examples/` is for user-facing examples).
+`markdown/`, and proof-of-concept scripts in `poc/`.
+
+**`examples/` and `tests/` (the scratchpad notebooks) are the original files from `main`; don't touch
+them unless asked.** New tests go in `test/`, new scripts in `poc/`.
 
 ```bash
 cd docs && uv run --extra docs make html    # output in docs/build/html
@@ -72,25 +76,17 @@ warnings" summary line too.
 ## Linting and type checking
 
 ```bash
-uv run --extra dev ruff check rqutils/ tests/ examples/ poc/     # lint
-uv run --extra dev ruff format rqutils/ tests/ examples/ poc/    # format (line width 100)
-uv run --exact --extra dev --extra mpl --extra qutip --extra docs \
-  ty check rqutils/ tests/ examples/ poc/                   # type check
+uv sync --extra dev --extra mpl --extra qutip --extra docs   # once; `mpi` may be added, it no longer matters
+uv run make check     # codespell, ruff check + format --check, ty, rumdl -- all must stay clean
+uv run make format    # the fixing counterparts; review the diff, `ty check --fix` edits code
 ```
 
-All three are clean; keep them that way — and `ty` only **from a venv without the `mpi` extra**, which is
-why its command spells out every *other* extra under `--exact`. Plain `uv run --extra dev` does **not**
-give that state: it guarantees `dev` is present without pruning, so a `mpi4py` left behind by any earlier
-`--extra mpi` sync stays resolvable and the check reports two *false* `unused-ignore-comment` warnings.
-`--exact` alone overshoots the other way, dropping `mpl`/`qutip`/`docs` for 6 real `unresolved-import`
-diagnostics — hence the full list. The two `# ty: ignore[unresolved-import]` on `mpi4py` are required in
-the contract state and are reported as *unused* if `mpi4py` happens to be installed, so `ty check` cannot
-be clean in both states and the no-`mpi` one is the contract. Don't "fix" that warning by deleting the
-suppressions: it breaks `ty` for every normal install. (A global `unused-ignore-comment = "ignore"` is the
-wrong trade too — that rule is what flags the other six suppressions going stale.)
-
-**`--exact` uninstalls `mpi4py`, so a `ty check` leaves the venv unable to run the `mpi` paths.** Re-sync
-before an `mpirun` invocation: `uv sync --extra dev --extra mpl --extra qutip --extra docs --extra mpi`.
+`ty` needs `mpl`/`qutip`/`docs` installed, or it reports their imports as 6 real `unresolved-import`s.
+`poc/` loads `mpi4py` through `importlib.import_module` so `ty` is clean with or without the `mpi` extra; a
+static import needs a suppression that is *unused* whenever `mpi4py` is installed, and `make format`'s
+`ty check --fix` then deletes it. Keep the dynamic form. `examples/` keeps its static import and is
+outside `make check`'s targets. (A global `unused-ignore-comment = "ignore"` is
+the wrong trade -- that rule is what flags the other six suppressions going stale.)
 
 Config is in `[tool.ruff]` / `[tool.ty.rules]` in `pyproject.toml`, and every suppression carries the
 reason it exists — read those comments before adding another. Pre-commit runs only whitespace/EOF/YAML/large-file hooks, not ruff or ty. Notebooks are
@@ -102,7 +98,7 @@ excluded from both: they get names from IPython magics that static analysis cann
   Count first with `ty check -c 'rules.X="error"'`, then read the diagnostics rather than the count.
   The two patterns that work are a per-line suppression where the stub is genuinely wrong, and
   `@overload` where a runtime flag picks the return shape.
-- **New scripts under `examples/` and `poc/` trip rules the library does not**: **B023** (a `lambda` in a `for` loop
+- **New scripts under `poc/` trip rules the library does not**: **B023** (a `lambda` in a `for` loop
   capturing the loop variable — endemic to benchmark harnesses; fix by binding as a default arg,
   `lambda vec=vec: ...`) and **E402** (imports after the mandatory
   `jax.config.update('jax_enable_x64', True)`, needing `# noqa: E402`). `ruff --fix` resolves neither.
@@ -110,8 +106,8 @@ excluded from both: they get names from IPython magics that static analysis cann
 ## Testing
 
 ```bash
-uv run --extra dev pytest              # whole suite
-uv run --extra dev pytest -v -x        # verbose, stop at first failure
+uv run make test                       # whole suite (`-n auto` comes from `addopts`)
+uv run pytest -v -x                    # verbose, stop at first failure
 ```
 
 **Run the full extras** — `--extra dev --extra mpl --extra qutip` — or tests **silently skip**. The
@@ -119,18 +115,19 @@ qiskit reference comparisons this file treats as the trustworthy oracle need no 
 `qiskit` is a required dependency; `mpl` and `qutip` still do. A fresh worktree gets a bare venv, so
 this bites there first.
 
-**Don't run the suite for a markdown-only change.** `testpaths = ["tests"]` and
+**Don't run the suite for a markdown-only change.** `testpaths = ["test"]` and
 `python_files = ["test_*.py"]`, so pytest never looks at `*.md` — the result is known before it runs, and
-a green run that could not have been red dilutes the signal. `git status --short` is the check. Ruff and
-`ty` likewise only target `rqutils/ tests/ examples/ poc/`. **Docstrings are the exception**: they live in
+a green run that could not have been red dilutes the signal. `git status --short` is the check; `make
+check` still applies, since codespell and rumdl read markdown. **Docstrings are the exception**: they live in
 `.py`, so editing one *is* a code change for `ty` and the docs build.
 
-`tests/conftest.py` enables `jax_enable_x64` before any `rqutils` import — every tolerance depends on it
+`test/conftest.py` enables `jax_enable_x64` before any `rqutils` import — every tolerance depends on it
 — and holds the shared reference helpers, each validated against qiskit before being trusted. It also
-configures caches taking the suite from ~53 s to ~6 s; expect ~53 s cold. One `tests/test_<module>.py`
-per module. `tests/_sharded_*.py` are subprocessed under
+configures caches taking the suite from ~53 s cold to ~12–20 s warm under `-n auto`. One `test/test_<module>.py`
+per module. `test/_sharded_*.py` are subprocessed under
 `XLA_FLAGS=--xla_force_host_platform_device_count=4` (the device count must be set before jax
-initializes); the leading underscore keeps them uncollected, as do the scratchpad notebooks.
+initializes); the leading underscore keeps them uncollected. The scratchpad notebooks are in `tests/`,
+outside `testpaths`.
 
 ### Writing tests
 
@@ -207,7 +204,7 @@ Five reasons a mutant survives that are *not* missing coverage:
 - **Assert the sharding *spec*, not just the values.** A replicated run agrees with single-device to
   exactly 0.0, so "correct but silently unsharded" is invisible to value comparison.
 - **A guard on a sharding decision may be invisible single-device.** If a change touches resharding, add
-  a `tests/_sharded_*.py` case and mutation-test it *there*; `conftest.run_sharded_child` is the driver.
+  a `test/_sharded_*.py` case and mutation-test it *there*; `conftest.run_sharded_child` is the driver.
 - **`poc/sharding.py` is the fuller harness.** Run it after any change to
   `ground_locg`'s reductions or helper signatures, not just after touching `sqd`.
 - **`svsim` requires `mesh.size` to divide `2^num_qubits`** — documented rather than fixed, since a state
@@ -368,7 +365,7 @@ that closes `precond` — and `N` is the binding constraint, so this is the regi
 Accuracy is comparable, with `ground_locg` better at the residual floor. Don't switch algorithms without
 redoing that measurement on a physical Hamiltonian.
 
-**Every guard in it is load-bearing and was measured**; `markdowns/locg.md` catalogues seven defects that each
+**Every guard in it is load-bearing and was measured**; `markdown/locg.md` catalogues seven defects that each
 failed *silently* (it is stale on scope and line numbers). Don't "simplify" the balancing, the
 re-orthogonalizations or the zero-direction masks, don't unify `body_iter1`'s exclusion bound with
 `body()`'s, and don't reintroduce the one-matmul `_compute_sas` form.
@@ -524,7 +521,7 @@ Three failure modes that produce length without content:
 
 - **Editing by appending** — adding a paragraph instead of rewriting, leaving two explanations of one
   statement and often a now-false opening sentence.
-- **Restating `NOTES.md` or `markdowns/`.** One statement plus a pointer, wherever a rule would appear twice.
+- **Restating `NOTES.md` or `markdown/`.** One statement plus a pointer, wherever a rule would appear twice.
 - **A private helper re-explaining its caller.** The public docstring owns the contract; the helper states
   only what is non-obvious at its own site. Three docstrings for one 9-line function is the smell.
 
@@ -571,7 +568,7 @@ in it.
 - **`apply_h` places a host `vec` on the live mesh but will not round its length.** With `xsignatures=`
   the *`states`* count must divide `mesh.size` (`get_xsource` reshards per state); `xsources=` takes any
   length. Rounding is **declined, not unimplemented** — the two precomputed diagonals put the state axis
-  on opposite ends. `markdowns/rqutils-apply-h-mesh-response.md`; implementation recoverable at `1a339e8`.
+  on opposite ends. `markdown/rqutils-apply-h-mesh-response.md`; implementation recoverable at `1a339e8`.
 - **`hproj` raises under a mesh**, rather than half-supporting one it was never able to serve.
 - **`sqd(..., packed=True)` returns *packed* states.** One flag governs both directions, so a round trip
   needs no re-pack — which also removes a hazard, `pack_states` not being idempotent. A caller comparing

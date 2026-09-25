@@ -21,6 +21,7 @@ benchmark arm; treat it as the order of magnitude to expect, not a constant for 
 on the per-run spread that ``timeit`` actually reports.)
 """
 
+import importlib
 import os
 import statistics
 import time
@@ -269,8 +270,8 @@ def init_devices(devices: str | None, host_devices: int = 4) -> str:
 
     if devices == "mpi":
         try:
-            # `mpi` extra, not a default dependency -- so `ty` cannot resolve it on a plain install.
-            import mpi4py  # noqa: F401  # ty: ignore[unresolved-import]
+            # A dynamic import keeps `ty` clean whether or not the `mpi` extra is installed.
+            importlib.import_module("mpi4py")
         except ImportError as exc:
             # mpi4py lives in the `mpi` extra rather than the default dependencies: it builds against
             # the host MPI, and nothing under rqutils/ imports it.

@@ -1,7 +1,7 @@
 """NEGATIVE RESULT. Warm-starting sqd's growing subspace: no verdict, and the gate is why.
 
 Tests carrying the converged eigenvector onto surviving states with `_spread_seed` on the newly added
-ones -- the shape `markdowns/skqd-sqd-solve-tolerance.md` §8's stated mechanism suggests after it rejected
+ones -- the shape `markdown/skqd-sqd-solve-tolerance.md` §8's stated mechanism suggests after it rejected
 *zero-padded* continuation. It beats the cold baseline 1.3-1.9x on iteration count and **that number is
 not quotable**: zero-padding, the rejected shape, beat both arms in all 19 rounds measured, so no
 fixture here reproduces §8 or can judge a replacement for it. `NOTES.md` has the four eliminated
@@ -106,7 +106,7 @@ def site_occupancy(states, vec):
     """Per-site occupation probabilities from the current eigenvector (arXiv:2605.29521 §II.A).
 
     This is what `skqd/recovery.py::_site_occupancy` computes: square the eigenvector's components and
-    sum the weight of every state that has site q occupied. `markdowns/rqutils-requests-2.md` notes the
+    sum the weight of every state that has site q occupied. `markdown/rqutils-requests-2.md` notes the
     occupancy is arbitrary under degeneracy -- irrelevant here, since the fixture only needs a
     distribution that MOVES between rounds, not a canonical one.
     """
