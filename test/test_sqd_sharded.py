@@ -22,21 +22,21 @@ from rqutils.sqd import (
 class TestShardedSqd:
     """``sqd`` must agree sharded and single-device at every ``cache_level`` and mesh size.
 
-    **Swept over the whole grid, not sampled**, because two sharding defects lived in the three
+    **Swept over every level, not sampled**, because two sharding defects lived in the
     ``cache_level[0] == 0`` cells that nothing covered, and the first masked the second:
 
     * ``_accumulate_diagonal`` carried its template's rank-2 spec onto a rank-1 accumulator ("Length
-      of sharding.spec (2) must be equal to aval's ndim (1)"), failing **all six** levels.
+      of sharding.spec (2) must be equal to aval's ndim (1)"), failing **every** level.
     * ``_spread_seed``'s ``jnp.where`` mixed a replicated predicate with a partitioned ``vec``, because
       ``run_sqd`` reshards ``states_u`` only when ``cache_level[0] == 1``: ``ShardingTypeError`` on the
-      three uncached levels. Fixing the first bug turned six failures into three, not none.
+      uncached levels. Fixing the first bug halved the failures, not cleared them.
 
     Runs with ``prefilter=(16, 2)`` on a **padded** subspace (37 states to 64), the one prefilter
     configuration only ``sqd`` reaches: filler masked to zero, partitioned, through ``apply_h``'s
     gather-heavy kernel -- which the filter calls ``cycles * (degree + 1)`` times before the first
     iteration. ``TestChebyshevPrefilter`` covers the dense, unpadded case.
 
-    **Asserts the spec, not only the energy**: all 18 energies agree to 4e-16 whether or not the
+    **Asserts the spec, not only the energy**: the energies agree to 4e-16 whether or not the
     partitioning survives, since a replicated run matches single-device exactly.
     """
 
@@ -60,30 +60,34 @@ class TestShardedSqd:
 
 
 class TestShardedBatchMatvec:
-    """``batch_matvec`` must give the same answer sharded, and must keep the data axis partitioned.
+    """``batch_matvec`` on ``sqd``'s own matvec: same answer sharded, data axis kept partitioned.
 
     Batching stacks ``ground_locg``'s two per-iteration vectors into ``(2, N)``, moving the partitioned
     axis to position 1. ``jnp.stack`` on a ``P('x')`` vector yields ``P(None, 'x')``, so nothing
-    reshards and no collective appears -- measured, all-gathers drop 6 to 3 because the operator's
-    gather is paid once per pair.
+    reshards, and the operator's gather is paid once per pair: one ``ground_locg`` iteration measures
+    3 all-gathers unbatched against 2 batched on 4 devices.
 
     **The spec assertion is the half values cannot make**: a stack partitioning the batch axis
-    (``P('x', None)``) or replicating everything both agree with single-device to exactly 0.0. Goes
-    through ``run_sqd`` because ``sqd`` does not forward ``batch_matvec``.
+    (``P('x', None)``) or replicating everything both agree with single-device to exactly 0.0. Drives
+    ``ground_locg`` directly with ``run_sqd``'s ``(1, 0)`` operator, since ``run_sqd`` always batches.
     """
 
     def test_batched_and_unbatched_agree_sharded(self):
         got = run_sharded_child("batch_matvec")
-        energies = got["energies"]
+        runs = got["runs"]
         for batch in ("False", "True"):
-            single, sharded = energies[batch]
+            (single, _, _), (sharded, _, _) = runs[batch]
             assert single == pytest.approx(sharded, abs=1e-12), (
                 f"batch_matvec={batch}: single-device {single} against sharded {sharded}"
             )
         for arm, name in ((0, "single-device"), (1, "sharded")):
-            assert energies["False"][arm] == pytest.approx(energies["True"][arm], abs=1e-12), (
-                f"{name}: batched {energies['True'][arm]} against unbatched {energies['False'][arm]}"
+            unbatched, batched = runs["False"][arm], runs["True"][arm]
+            # Batching changes only how the operator is called: same theta bit for bit, same path.
+            assert batched[:2] == unbatched[:2], (
+                f"{name}: batched (theta, iterations) {batched[:2]} against unbatched {unbatched[:2]}"
             )
+        gathers = [runs[batch][1][2] for batch in ("False", "True")]
+        assert gathers == [3, 2], f"all-gathers per iteration, unbatched then batched: {gathers}"
         assert got["specs"] == ["P('x',)", "P(None, 'x')"], (
             f"stacking must keep the data axis partitioned and replicate the batch axis, got "
             f"{got['specs']}"
@@ -97,8 +101,8 @@ class TestShardedApplyHVec:
     ()": dropping ``_place_vec``'s call, and testing ``isinstance(vec, jax.Array)`` instead of mesh
     identity -- a committed ``jax.Array`` carries an empty mesh exactly as a host array does.
 
-    All three diagonal strategies are checked: the request doc exercised only ``zsignatures=``, and a
-    rounding implementation broke the other two.
+    Only ``zsignatures=`` pairs with ``xsignatures=`` now, the one input set that searches ``states``;
+    ``xsources=`` is checked separately, since it has no divisibility requirement.
     """
 
     def test_host_vec_is_placed_and_indivisible_length_names_the_size(self):
@@ -108,11 +112,10 @@ class TestShardedApplyHVec:
         assert got["spec"] == "P(None,)", f"expected a replicated result, got {got['spec']}"
         # Exactly 0.0: the two arms must agree bit-for-bit, not merely to a tolerance.
         assert got["committed_diff"] == 0.0, "a device-committed vec disagreed with a host vec"
-        for name in ("zsignatures", "diagonals", "diag_signs"):
-            message = got["raised"][name]
-            assert message is not None and str(got["size"]) in message, (
-                f"{name}= did not name the required length: {message!r}"
-            )
+        message = got["raised"]["zsignatures"]
+        assert message is not None and str(got["size"]) in message, (
+            f"zsignatures= did not name the required length: {message!r}"
+        )
         # The check must read `states`, not `vec`: reading `vec` let a divisible vec with an
         # indivisible states through to the raw jax error this replaces.
         mismatch = got["raised"]["mismatch"]
@@ -281,28 +284,6 @@ class TestShardedEigvecRoundtrip:
         assert got["eigvec_len"] == got["basis_rows"] <= 30, got
         assert got["relative_residual"] < 1e-10, got
         assert got["eigval"] == pytest.approx(got["reference"], abs=1e-9), got
-
-
-class TestShardedPartialXCache:
-    """A partial source-index cache must agree with single-device on a 4-device mesh.
-
-    **This is the only test that can see the guard it exists for.** ``run_sqd`` reshards ``states_u``
-    after the precompute because no further searches happen -- true for a full cache, false for a
-    partial one, whose uncached groups search ``states`` inside every matvec, and ``get_xsource``
-    requires that array replicated. Deleting the ``not partial_xcache`` condition on that reshard
-    leaves all six ``TestPartialXCache`` cases **green** and raises on any mesh. Verified by mutation,
-    which is why this exists rather than being folded into the in-process class.
-    """
-
-    def test_partial_cache_agrees_with_single_device_on_a_mesh(self):
-        got = run_sharded_child("partial_xcache")
-        for j in (0, 1, 2):
-            for ncached in range(7):
-                value = got["sharded"][f"(1, {j}) {ncached}"]
-                assert value == pytest.approx(got["single"], abs=1e-12), (
-                    f"cache_level=(1, {j}), xcache_groups={ncached}: sharded {value} disagrees "
-                    f"with single-device {got['single']}"
-                )
 
 
 class TestShardedDiagonals:

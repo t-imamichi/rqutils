@@ -1,23 +1,18 @@
-"""POC 2 and 3: the caching axis -- a partial-J dial, and (1,1) versus (1,2).
+"""POC 2: the caching axis -- a partial-J source-index dial.
 
-Two related questions about ``cache_level``, measured together because they share a setup.
-
-**POC 3 (measurement only, no new code).** ``rqutils/sqd.py``'s module docstring predicts sign-bit
-caching (``cache_level[1] == 1``) costs ``kappa_bar * J * N`` bytes against ``8 J N`` or ``16 J N``
-for full diagonals (``== 2``) -- an 8-16x memory saving for a popcount-and-shift that should be
-nearly free. If that holds, ``(1, 1)`` is an underused option rather than a new idea. This measures
-the actual arrays and the actual matvec time.
-
-**POC 2 (new code).** ``cache_level`` is all-or-nothing across the J X-groups: either every group's
-source indices are cached or none are. A partial dial -- cache the first ``J'`` groups, recompute the
-rest -- turns a 6-point discrete choice into a continuous memory/time curve. Whether that is *useful*
-depends entirely on the shape of the curve, which is the thing to measure: if time is flat in ``J'``
-until it collapses at the end, the dial is worthless because only the endpoints matter.
+``cache_level`` is all-or-nothing across the J X-groups: either every group's source indices are
+cached or none are. A partial dial -- cache the first ``J'`` groups, recompute the rest -- turns the
+discrete choice into a continuous memory/time curve. Whether that is *useful* depends entirely on the
+shape of the curve, which is the thing to measure: if time is flat in ``J'`` until it collapses at the
+end, the dial is worthless because only the endpoints matter.
 
 POC 2 builds on POC 1's searchsorted, since after that result recomputation is 12-25x cheaper on CPU
 (5.15x on a GH200) than the old sort, and the tradeoff shifts substantially. Both are reported. The
 smaller GPU ratio does not change POC 2's "marginal" verdict, which rests on the *shape* of the curve
 -- flat in ``J'`` until it collapses at the end, so only the endpoints matter -- not on the magnitude.
+
+POC 3, ``cache_level`` (1,1) sign bits against (1,2) full diagonals, is gone with the level: (1,1) was
+removed from ``sqd`` as dominated by (1,2) on both memory and time.
 
 Run: uv run --extra qiskit python poc/caching.py
 """
@@ -31,7 +26,6 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 
-import functools
 
 import jax.numpy as jnp
 import numpy as np
@@ -41,7 +35,6 @@ from searchsorted import xsource_searchsorted_u64
 from rqutils.sqd import (
     apply_h,
     apply_xgrp,
-    get_diag_signs,
     get_diagonal,
     get_xsource,
     uniquify_states,
@@ -54,9 +47,6 @@ def build_caches(problem, states_u):
     xsources = jax.block_until_ready(
         jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, ham.x)[1]
     )
-    diag_signs = jax.block_until_ready(
-        jax.lax.scan(lambda _, z: (None, get_diag_signs(z, states_u)), None, ham.z)[1]
-    )
     diagonals = jax.block_until_ready(
         jax.lax.scan(lambda _, v: (None, get_diagonal(v[0], v[1], states_u)), None, (ham.z, ham.c))[
             1
@@ -64,7 +54,6 @@ def build_caches(problem, states_u):
     )
     return {
         "xsources": xsources,
-        "diag_signs": diag_signs,
         "diagonals": diagonals,
         "states_u": states_u,
     }
@@ -72,56 +61,6 @@ def build_caches(problem, states_u):
 
 def nbytes(arr) -> int:
     return int(np.asarray(arr).nbytes)
-
-
-def signbits_vs_diagonals():
-    header("POC 3: cache_level (1,1) sign bits vs (1,2) full diagonals")
-    print("Claim under test: (1,1) is an 8-16x memory saving for a nearly-free popcount+shift.")
-    print()
-    for num_qubits, num_states, j, real in [
-        (24, 200_000, 50, False),
-        (24, 200_000, 50, True),
-        (24, 200_000, 200, False),
-    ]:
-        p = make_problem(
-            num_qubits,
-            num_states,
-            num_terms=max(j * 4, 200),
-            num_xgroups=j,
-            real_only=real,
-            seed=21,
-        )
-        size = p.states_p.shape[0]
-        states_u = jax.block_until_ready(uniquify_states(p.states_p, size))
-        c = build_caches(p, states_u)
-        vec = jnp.asarray(np.random.default_rng(0).normal(size=size).astype(p.hamiltonian.c.dtype))
-
-        mv11 = functools.partial(
-            apply_h, xsources=c["xsources"], diag_signs=c["diag_signs"], coeffs=p.hamiltonian.c
-        )
-        mv12 = functools.partial(apply_h, xsources=c["xsources"], diagonals=c["diagonals"])
-
-        r11 = jax.block_until_ready(mv11(vec))
-        r12 = jax.block_until_ready(mv12(vec))
-        diff = max_abs_diff(r11, r12)
-
-        t11 = timeit(lambda mv11=mv11, vec=vec: mv11(vec), "(1,1)", trials=5)
-        t12 = timeit(lambda mv12=mv12, vec=vec: mv12(vec), "(1,2)", trials=5)
-
-        b_signs, b_diags = nbytes(c["diag_signs"]), nbytes(c["diagonals"])
-        # (1,1) additionally needs the coefficient array; (1,2) does not. Both keep xsources.
-        b11 = b_signs + nbytes(p.hamiltonian.c)
-        b12 = b_diags
-        print(f"  {p.describe()}")
-        print(
-            f"    memory: (1,1)={b11 / 2**20:8.2f}MB  (1,2)={b12 / 2**20:8.2f}MB  "
-            f"saving={b12 / b11:5.2f}x"
-        )
-        print(
-            f"    matvec: (1,1)={t11.min_s * 1e3:7.2f}ms  (1,2)={t12.min_s * 1e3:7.2f}ms  "
-            f"cost={t11.min_s / t12.min_s:5.2f}x   maxdiff={diff:.2e}"
-        )
-        print()
 
 
 def _partial_matvec_factory(xsources_cached, xsigs_uncached, diagonals, states_u, use_searchsorted):
@@ -200,5 +139,4 @@ def partial_j():
 
 
 if __name__ == "__main__":
-    signbits_vs_diagonals()
     partial_j()

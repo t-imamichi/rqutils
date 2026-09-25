@@ -163,7 +163,7 @@ class TestGrouping:
         """Pure-Z strings all share the all-identity X signature.
 
         That is how one X group ends up holding many Z terms, which is the regime where ``sqd``'s
-        ``compute_diagonal`` had its byte-boundary bug.
+        since-removed ``compute_diagonal`` had its byte-boundary bug.
         """
         strings = ["III", "ZII", "IZI", "ZZI", "IIZ"]
         hamiltonian = PauliSumXZ.from_paulisum((strings, [1.0] * len(strings)))

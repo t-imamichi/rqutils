@@ -2594,7 +2594,8 @@ a key is read out of context, from a dict of nine.
 
 ### ground_locg.body: the batched matvec pair
 
-- **Speed**: 1.61-1.81x on the pair, bit-identical `theta`; all-gathers 6 -> 3 on a 4-device mesh, and
+- **Speed**: 1.61-1.81x on the pair, bit-identical `theta`; all-gathers 3 -> 2 in the compiled loop body on a 4-device mesh (re-measured 2026-09-26; the recorded
+  6 -> 3 does not reproduce), and
   `jnp.stack` of `P('x')` is `P(None, 'x')`. Off in `ground_locg`: a `mat` callable need not batch.
 - **Memory, opposite signs**: +1 vector temp against an elementwise operator; **−16.00 B/slot** (one f64
   complex slot, 0.942x, N=4000..60000) against `sqd`'s, whose unbatched arm holds two gather results live against one `(2, N)` buffer.

@@ -32,7 +32,6 @@ Correctness transfers from either mode; **timings do not**, and this script repo
 """
 
 import argparse
-import itertools
 import os
 import sys
 
@@ -62,7 +61,7 @@ jax.config.update("jax_enable_x64", True)
 import numpy as np
 from _scaling_common import header, init_devices, make_1d_mesh, make_problem
 
-from rqutils.sqd import hproj, sqd
+from rqutils.sqd import _CACHE_LEVELS, hproj, sqd
 
 
 def check_single_vs_sharded():
@@ -125,7 +124,7 @@ def check_all_cache_levels(problem, eig_dense):
     print(
         f"  {'cache_level':>12s}  {'single':>16s}  {'sharded':>16s}  {'|s-1dev|':>10s}  {'|s-dense|':>10s}"
     )
-    for cache_level in sorted(itertools.product((0, 1), (0, 1, 2))):
+    for cache_level in _CACHE_LEVELS:
         single = float(sqd(p.hamiltonian, p.states, return_eigvec=False, cache_level=cache_level))
         with jax.set_mesh(mesh):
             sharded = float(

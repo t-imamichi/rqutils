@@ -1,4 +1,4 @@
-"""The popcount diagonal builders with states partitioned ``P('x', None)``; see ``TestShardedDiagonals``."""
+"""The popcount diagonal builder with states partitioned ``P('x', None)``; see ``TestShardedDiagonals``."""
 
 import jax
 import jax.numpy as jnp
@@ -8,7 +8,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from qiskit.quantum_info import SparsePauliOp
 
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import compute_diagonal, get_diag_signs, get_diagonal
+from rqutils.sqd import get_diagonal
 
 
 def xxz(num_qubits, odd_y):
@@ -53,21 +53,10 @@ def main():
                     jnp.asarray(states), NamedSharding(the_mesh, PartitionSpec("x", None))
                 )
                 for zsig, coeff in zip(ham.z, ham.c):
-                    ref_signs = np.asarray(get_diag_signs(zsig, jnp.asarray(states)))
-                    refs = (
-                        ref_signs,
-                        np.asarray(get_diagonal(zsig, coeff, jnp.asarray(states))),
-                        np.asarray(compute_diagonal(jnp.asarray(ref_signs), coeff)),
-                    )
-                    got_signs = get_diag_signs(zsig, partitioned)
-                    gots = (
-                        got_signs,
-                        get_diagonal(zsig, coeff, partitioned),
-                        compute_diagonal(got_signs, coeff),
-                    )
-                    for ref, got in zip(refs, gots):
-                        bad_spec += "x" not in str(jax.typeof(got).sharding.spec)
-                        bad_value += not np.array_equal(ref, np.asarray(got))
+                    ref = np.asarray(get_diagonal(zsig, coeff, jnp.asarray(states)))
+                    got = get_diagonal(zsig, coeff, partitioned)
+                    bad_spec += "x" not in str(jax.typeof(got).sharding.spec)
+                    bad_value += not np.array_equal(ref, np.asarray(got))
             result[f"{label} {num_devices}"] = [int(ham.x.shape[0]), bad_spec, bad_value]
     emit(result)
 

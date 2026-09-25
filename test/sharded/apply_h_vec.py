@@ -6,7 +6,7 @@ from common import emit, mesh
 from qiskit.quantum_info import SparsePauliOp
 
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import apply_h, get_diag_signs, get_xsource, uniquify_states
+from rqutils.sqd import apply_h, get_xsource, uniquify_states
 
 NUM_QUBITS, NUM_STATES = 6, 23  # 23 is indivisible by 4; 24 is the rounded length
 
@@ -48,13 +48,11 @@ def main() -> None:
     )
     result["committed_diff"] = float(np.abs(np.asarray(committed) - np.asarray(out)).max())
 
-    # An indivisible length must name the size for every diagonal strategy.
+    # An indivisible length must name the size for every `xsignatures=` strategy.
     st = uniquify_states(packed, NUM_STATES)
     short = vec[:NUM_STATES]
     strategies = {
         "zsignatures": {"zsignatures": z, "coeffs": c},
-        "diagonals": {"diagonals": np.ones((x.shape[0], NUM_STATES))},
-        "diag_signs": {"diag_signs": np.stack([get_diag_signs(zg, st) for zg in z]), "coeffs": c},
     }
     result["size"] = size
     result["raised"] = {

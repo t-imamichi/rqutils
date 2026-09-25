@@ -314,21 +314,16 @@ and fills `residual`/`ax_norm` only under `check_residual=True`; pad its input w
   on width (`uint64` keys for `B ≤ 8` bytes, explicit lexicographic beyond) — a **correctness** boundary,
   not a performance one.
 
-**`cache_level=(source_indices, diagonals)`** selects among six matvec strategies, one kernel indexed by
-that 2×3 grid.
+**`cache_level=(source_indices, diagonals)`** selects one of three matvec strategies: `(0, 0)`, the memory
+floor, `(1, 0)` and `(1, 2)`. The other three combinations raise: each is dominated on memory *and* time
+by one of these (`NOTES.md`'s n=100 memory and n=22 six-level timing tables).
 
 - **Prefer `cache_level[0] = 1`.** `get_xsource` setup is 66–97% of a solve — a figure **weighted by call
   count** (the `J`-fold search per matvec against once), *not* headroom for accelerating the precompute,
   which is only 4.5–8.4% of a `(1,*)` solve. Misreading it as the latter is a recorded trap.
-- **Never select `cache_level[1] = 1`; use 0 or 2.** It is slower than `[1] = 0`, which stores *nothing*,
-  because unpacking the cached bits costs about what recomputing the parity costs — it buys bytes and
-  redoes the time. It stays in the API because the sweep is load-bearing, not because it should be
-  chosen.
 - **Which axis dominates is set by `K`**, the Z signatures per X group — a property of the Hamiltonian,
   not the subspace. **Quote `K` with any memory figure and never size from `4 * J * N` alone.**
   `states_size` also rounds **up to a power of two**.
-- **`diag_signs` is not a compression target** — it is already one bit per (state, Z term), so its size
-  is information-theoretic, not slack.
 
 **The public `apply_h` is keyword-only**: name the arrays you have and the strategy follows. Internally
 `run_sqd` calls the private `_apply_h_kernel` with an assembled tuple and `cache_level` bound via
@@ -426,15 +421,17 @@ derive a bound from a callable.
 **`batch_matvec` stacks each group of independent applications into one `(k, n)` call** — the
 steady-state iteration's pair, and `debug=True`'s three diagnostics. Needs no kernel change: `sqd`'s
 `apply_xgrp` indexes `vec.at[..., xsource]` and scales elementwise, both width-agnostic. 1.15–1.21×
-end-to-end at `cache_level=(1, 0)` (1.61–1.81× on the pair alone), and it **halves the sharded
-all-gathers**, 6 → 3, because the operator's gather is paid once per group — `jnp.stack` on a `P('x')`
-vector gives `P(None, 'x')`, so the data axis keeps its partitioning. `run_sqd` defaults to `True`;
-`ground_locg` to `False`, since an arbitrary callable need not accept a batch, and an **array** `mat`
+end-to-end at `cache_level=(1, 0)` (1.61–1.81× on the pair alone), and it **cuts the sharded
+all-gathers** in the compiled loop body **3 → 2** (4 devices, `(1, 0)`; `test/sharded/batch_matvec.py`
+asserts it — the once-recorded 6 → 3 does not reproduce), because the operator's gather is paid once
+per group — `jnp.stack` on a `P('x')`
+vector gives `P(None, 'x')`, so the data axis keeps its partitioning. `run_sqd` always batches;
+`ground_locg` defaults to `False`, since an arbitrary callable need not accept a batch, and an **array** `mat`
 raises — its matvec is a `jax.lax.dot`, which rejects a rank-2 rhs. **`(1, 2)` is the one level that can
 lose**: both axes cached leaves no per-matvec setup to share, so only the stack cost remains — 0.93× at
-N=2k, recovering to 1.04–1.09× by N=8k–30k as it amortizes. Every other level measured 1.20–1.24×. Left
-on by default anyway: `(1, 2)` needs the whole diagonal cache resident, so it is the rarest level. The contract is "broadcasts over a
-leading axis of *any* size", not just 2 — so **any new length check on `vec` must read `shape[-1]`**; a
+N=2k, recovering to 1.04–1.09× by N=8k–30k as it amortizes. Every other level measured 1.20–1.24×.
+`run_sqd` batches it regardless: spinchain's `(1, 2)` solves run at N ≥ 1.5M, far past the crossover. The
+contract is "broadcasts over a leading axis of *any* size", not just 2 — so **any new length check on `vec` must read `shape[-1]`**; a
 `shape[0]` check rejected a valid `(2, N)` call as "vec length 2". **Memory depends on the operator and the two regimes have
 opposite signs** — measured, not reasoned: against `sqd`'s matvec, whole-`run_sqd` temp *falls* a flat
 −16.00 B/slot (0.942×, N=4000–60000), because the unbatched arm holds two gather results live where the
@@ -576,7 +573,7 @@ in it.
   return a silently non-symmetric projection. The check is host-side numpy at 12–14% of `hproj`, on that
   opt-in path only. Pass `np.unique(states, axis=0)` or leave `unique_states=False`.
 - **`apply_h` is keyword-only**; the positional `(scanned, cache_level)` form raises `TypeError`. A hard
-  break rather than a shim, so the six valid input sets become the only constructible ones. Bind the
+  break rather than a shim, so the three valid input sets become the only constructible ones. Bind the
   *arrays* for a matvec thunk (`functools.partial(apply_h, xsources=xs, diagonals=dg)`), not the
   `cache_level`.
 - **`apply_h` places a host `vec` on the live mesh but will not round its length.** With `xsignatures=`
@@ -588,11 +585,12 @@ in it.
   needs no re-pack — which also removes a hazard, `pack_states` not being idempotent. A caller comparing
   the result against an unpacked array breaks loudly on the shape mismatch. Both overloads annotate
   `StateList`, which cannot express the width, so **`ty` will not catch a caller assuming the wrong one**.
-- **`sqd()` does not forward `batch_matvec`**, so a public-API caller gets `run_sqd`'s `True` with no
-  dial. Harmless for every in-tree operator — the kernels are width-agnostic by construction — but a
-  caller wrapping their own matvec through `run_sqd` and hardcoding rank 1 gets a shape error from
-  inside a jitted solver. Call `run_sqd` directly with `batch_matvec=False` to opt out. Unlike the
-  `precond` gap this is not a deliberate deletion, just an unexposed dial.
+- **Three `cache_level`s, `xcache_groups` and `run_sqd(batch_matvec=)` are gone (2026-09-26).** `(0, 1)`,
+  `(0, 2)` and `(1, 1)` raise `ValueError` naming what dominates each — `(0, 0)`, `(1, 0)`, `(1, 2)` — and
+  level 1 took `apply_h(diag_signs=)`, `get_diag_signs` and `compute_diagonal` with it. `xcache_groups=`
+  raises `TypeError`: until sparse pairs ship, a solve `(1, 0)` cannot fit falls back to `(0, 0)`, 7–8×
+  slower. `run_sqd` always batches; `ground_locg` keeps its flag. Evidence: `NOTES.md`, "`cache_level[1] = 1`
+  is dominated on both axes" and "`xcache_groups`: an intermediate count can *raise* peak memory".
 - **`tol` is gone**, replaced by `atol`/`rtol` (see `ground_locg.py` above). `tol=` raises `TypeError`
   with no alias, deliberately: it meant *relative* in one revision and *absolute* in the next, so
   silently resolving it to one of the pair would be the worst option. `tol=x` on the absolute form is

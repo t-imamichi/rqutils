@@ -384,11 +384,9 @@ def assert_imports_without(module, blocked, extra_source=""):
     )
 
 
-# Every (source_indices, diagonals) combination, i.e. all six matvec kernels. Written out rather than
-# derived from `apply_h`'s dispatch: the axis options now live inline in the function (they pair each
-# keyword with its array, which only exists at call time), so there is no module table to read. The
-# grid is small, fixed by the kernel's 2x3 shape, and a seventh strategy would need new tests anyway.
-CACHE_LEVELS = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+# Every supported (source_indices, diagonals) pair, written out rather than read from
+# `rqutils.sqd._CACHE_LEVELS` so a level dropped there fails here instead of vanishing from the sweep.
+CACHE_LEVELS = [(0, 0), (1, 0), (1, 2)]
 
 
 def pack_padded(states):
@@ -427,7 +425,7 @@ def apply_h_kwargs(cache_level, arrays):
         The keyword dict, including ``coeffs`` for the two strategies that compute a diagonal.
     """
     xname = "xsources" if cache_level[0] == 1 else "xsignatures"
-    dname = {0: "zsignatures", 1: "diag_signs", 2: "diagonals"}[cache_level[1]]
+    dname = {0: "zsignatures", 2: "diagonals"}[cache_level[1]]
     kwargs = {xname: arrays[xname], dname: arrays[dname]}
     if cache_level[1] != 2:
         kwargs["coeffs"] = arrays["coeffs"]
@@ -439,18 +437,18 @@ def apply_h_inputs(rng, num_qubits=4, num_terms=6, num_states=12):
 
     A plain function taking ``rng`` rather than a ``@pytest.fixture``, per the suite convention in
     ``conftest``: a fixture drawing from an RNG makes stream position depend on fixture resolution
-    order, which is invisible at the call site. Callers pass their own seeded ``rng``, so the six
+    order, which is invisible at the call site. Callers pass their own seeded ``rng``, so the three
     keyword combinations below all see byte-identical inputs and differ only in which names are used.
 
     Returns a dict of every representation of the same operator, so a test can select one pairing
     without rebuilding the others. The keys are spelled exactly as ``apply_h``'s keyword parameters
-    (``xsignatures``, ``zsignatures``, ``diag_signs``, ``coeffs``, ...), so a caller can splat a
+    (``xsignatures``, ``zsignatures``, ``coeffs``, ...), so a caller can splat a
     selection straight in -- ``**{k: p[k] for k in names}`` -- rather than writing a dict literal that
     re-pairs name to array by hand. That hand-pairing is itself a place a typo silently swaps two
     arrays, which is precisely the hazard ``apply_h``'s keyword form exists to remove.
     """
     from rqutils.paulis.symplectic import PauliSumXZ
-    from rqutils.sqd import get_diag_signs, get_diagonal, get_xsource, uniquify_states
+    from rqutils.sqd import get_diagonal, get_xsource, uniquify_states
 
     strings = real_pauli_strings(num_qubits, num_terms, rng)
     coeffs = rng.normal(size=len(strings))
@@ -466,7 +464,6 @@ def apply_h_inputs(rng, num_qubits=4, num_terms=6, num_states=12):
         "zsignatures": hamiltonian.z,
         "coeffs": hamiltonian.c,
         "xsources": np.stack([np.asarray(get_xsource(x, states_u)) for x in hamiltonian.x]),
-        "diag_signs": np.stack([np.asarray(get_diag_signs(z, states_u)) for z in hamiltonian.z]),
         "diagonals": np.stack(
             [
                 np.asarray(get_diagonal(z, c, states_u).real)

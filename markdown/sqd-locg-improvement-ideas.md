@@ -28,7 +28,8 @@ three prescriptions were falsified by measurement, so read the outcome rather th
   and it needs **no kernel change at all** — `apply_xgrp` already indexes `vec.at[..., xsource]` and
   scales elementwise, so leading-axis broadcast is implicit. The whole change is ~9 lines in `sqd.py`.
 - **"May turn three operator-setup sweeps into two" understates it.** The larger win is fusing the
-  *gather*: on a 4-device mesh the all-gathers drop **6 to 3**, because the operator's gather is paid
+  *gather*: on a 4-device mesh the all-gathers drop **3 to 2** in the compiled loop body (re-measured 2026-09-26;
+  the 6 to 3 first recorded here does not reproduce), because the operator's gather is paid
   once per group instead of twice. That is why the stacked form beats the paired-callable one, and why
   the benefit grows with device count. `jnp.stack` on a `P('x')` vector gives `P(None, 'x')`, so the data
   axis keeps its partitioning and nothing reshards.

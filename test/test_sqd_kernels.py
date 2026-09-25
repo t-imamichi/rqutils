@@ -1,5 +1,5 @@
 """Tests for :mod:`rqutils.sqd`'s building blocks: diagonals, source-index search, uniquification
-and the six matvec kernels. Organized by defect, like ``test_sqd.py``.
+and the three matvec kernels. Organized by defect, like ``test_sqd.py``.
 """
 
 import warnings
@@ -18,9 +18,6 @@ from rqutils.sqd import (
     _pack_scanned,
     _pack_state_keys,
     apply_h,
-    compute_diagonal,
-    get_diag_signs,
-    get_diagonal,
     get_xsource,
     hproj,
     uniquify_states,
@@ -31,66 +28,9 @@ _APPLY_H_ARRAY_KEYS = (
     "xsources",
     "xsignatures",
     "zsignatures",
-    "diag_signs",
     "diagonals",
     "coeffs",
 )
-
-
-class TestComputeDiagonal:
-    """``compute_diagonal`` composes a diagonal from packed sign bits and coefficients."""
-
-    @pytest.mark.parametrize("num_terms", [1, 7, 8, 9, 17])
-    def test_matches_direct_sum(self, num_terms):
-        """The bit offset must wrap at 8, not at 256.
-
-        ``ibit = iterm & 255`` made the shift ``7 - ibit`` negative from ``iterm == 8`` onward, so
-        every term past the first byte read garbage. Measured on 9 terms: 0.71 absolute error. The
-        parametrization brackets the byte boundary deliberately -- 7 passes even with the bug, 8 is
-        the first failure, and 17 crosses into a third byte.
-        """
-        rng = np.random.default_rng(20260804)
-        num_states = 6
-        negative = rng.integers(0, 2, size=(num_states, num_terms)).astype(np.uint8)
-        packed = np.zeros((num_states, (num_terms + 7) // 8), dtype=np.uint8)
-        for term in range(num_terms):
-            packed[:, term // 8] |= (negative[:, term] << (7 - (term % 8))).astype(np.uint8)
-        coeffs = rng.normal(size=num_terms)
-
-        got = np.asarray(compute_diagonal(packed, coeffs))
-        expected = ((1.0 - 2.0 * negative) * coeffs).sum(axis=1)
-        assert np.abs(got - expected).max() < 1e-13
-
-    def test_agrees_with_get_diagonal(self):
-        """The two diagonal paths (``cache_level[1]`` 1 vs 2) must produce the same numbers.
-
-        ``get_diagonal`` recomputes signs from the Z signatures; ``compute_diagonal`` reads them
-        from precomputed packed bits. They are the same quantity by two routes, so this pins the
-        pair together independently of any end-to-end solve.
-        """
-        rng = np.random.default_rng(20260804)
-        num_qubits = 6
-        # Pure-Z strings all share the all-identity X signature, which is how one X group ends up
-        # holding many Z terms -- the regime the & 255 bug lived in.
-        strings = ["I" * num_qubits]
-        while len(strings) < 11:
-            candidate = "".join(rng.choice(["I", "Z"], size=num_qubits))
-            if candidate not in strings:
-                strings.append(candidate)
-        coeffs = rng.normal(size=len(strings))
-        states = rng.integers(0, 2, size=(20, num_qubits)).astype(np.uint8)
-
-        from rqutils.paulis.symplectic import PauliSumXZ
-
-        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        states_p = pack_padded(states)
-        states_u = uniquify_states(states_p, states_p.shape[0])
-        assert hamiltonian.z.shape[0] == 1, "expected a single X group for pure-Z input"
-
-        signs = get_diag_signs(hamiltonian.z[0], states_u)
-        from_signs = np.asarray(compute_diagonal(signs, hamiltonian.c[0]))
-        direct = np.asarray(get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u).real)
-        assert np.abs(from_signs - direct).max() < 1e-13
 
 
 class TestGetXsource:
@@ -528,7 +468,7 @@ class TestApplyHArrayRoles:
         discriminates precisely where shape collides**, and structurally rather than by luck: packed
         signatures are ``uint8`` (``np.packbits`` output) while source indices are ``int32`` positions
         carrying ``-1`` as the absent marker -- a ``uint8`` cannot hold ``-1``, so the two dtypes cannot
-        converge. Same for ``diagonals`` (inexact) against ``diag_signs``/``zsignatures`` (``uint8``).
+        converge. Same for ``diagonals`` (inexact) against ``zsignatures`` (``uint8``).
 
         Still not closed, and deliberately not claimed: swapping two arrays of the *same* role class --
         ``xsignatures`` for ``zsignatures``, say, both ``uint8`` -- remains undetectable here.
@@ -554,16 +494,17 @@ class TestApplyHArrayRoles:
         states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
         states_u = uniquify_states(PauliSumXZ.pack_states(states), 2)
         xsources = np.asarray(get_xsource(hamiltonian.x[0], states_u))[None]
-        with pytest.raises(ValueError, match="xsignatures"):
+        with pytest.raises(ValueError, match="xsignatures= expects"):
             apply_h(
                 np.ones(2),
                 xsignatures=xsources,  # int32 indices where uint8 signatures are meant
-                diagonals=np.zeros(2),
+                zsignatures=hamiltonian.z,
+                coeffs=hamiltonian.c,
                 states=states_u,
             )
 
     def test_signatures_passed_as_diagonals_raise(self):
-        """``diagonals`` is inexact; ``uint8`` there is a misnamed sign-bit or signature array."""
+        """``diagonals`` is inexact; ``uint8`` there is a misnamed signature array."""
         from rqutils.paulis.symplectic import PauliSumXZ
 
         hamiltonian = PauliSumXZ.from_paulisum((["XZ"], [1.0]))
@@ -575,7 +516,7 @@ class TestApplyHArrayRoles:
 
     @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
     def test_every_valid_input_set_is_still_accepted(self, cache_level):
-        """The guard must not reject any of the six the kernel implements."""
+        """The guard must not reject any of the three the kernel implements."""
         arrays = apply_h_inputs(np.random.default_rng(20260825))
         got = np.asarray(
             apply_h(
@@ -607,18 +548,17 @@ class TestMatvecKernels:
 
     @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
     def test_every_cache_level_matches_dense(self, cache_level):
-        """All six resolution paths of the unified kernel, each against the dense product.
+        """Every resolution path of the unified kernel, each against the dense product.
 
-        ``apply_h`` replaced six near-identical functions with one ``cache_level``-indexed kernel.
-        The risk in that collapse is a mis-wired argument slot -- feeding a Z signature where a
-        coefficient belongs, say -- which would still produce a plausible finite vector. Checking
-        every cell of the 2x3 grid against ``project_dense`` (an independent Kronecker construction)
-        rather than against the other kernels is what catches it: cross-kernel agreement alone would
-        pass if the collapse broke all six identically.
+        The risk in one ``cache_level``-indexed kernel is a mis-wired argument slot -- feeding a Z
+        signature where a coefficient belongs, say -- which would still produce a plausible finite
+        vector. Checking every level against ``project_dense`` (an independent Kronecker
+        construction) rather than against the other kernels is what catches it: cross-kernel
+        agreement alone would pass if all of them broke identically.
         """
         p = apply_h_inputs(np.random.default_rng(20260805))
         kwargs = apply_h_kwargs(cache_level, p)
-        needs_states = cache_level[0] == 0 or cache_level[1] == 0
+        needs_states = cache_level != (1, 2)
         got = np.asarray(
             apply_h(p["vector"], states=p["states_u"] if needs_states else None, **kwargs)
         ).real
@@ -628,15 +568,12 @@ class TestMatvecKernels:
         "names",
         [
             ("xsignatures", "zsignatures", "coeffs"),
-            ("xsignatures", "diag_signs", "coeffs"),
-            ("xsignatures", "diagonals"),
             ("xsources", "zsignatures", "coeffs"),
-            ("xsources", "diag_signs", "coeffs"),
             ("xsources", "diagonals"),
         ],
     )
     def test_keyword_form_matches_dense_for_every_combination(self, names):
-        """The keyword form covers all six strategies and each still matches a dense reference.
+        """The keyword form covers all three strategies and each still matches a dense reference.
 
         The keyword names are the only thing selecting the strategy here, so this is what pins the
         keyword-to-digit pairing inside ``apply_h``. A transposed digit there would route a
@@ -652,18 +589,18 @@ class TestMatvecKernels:
     @pytest.mark.parametrize(
         ("names", "match"),
         [
-            (("diag_signs", "coeffs"), "exactly one of xsources="),
+            (("zsignatures", "coeffs"), "exactly one of xsources="),
             (("xsignatures", "xsources", "diagonals"), "exactly one of xsources="),
             (("xsources", "coeffs"), "exactly one of diagonals="),
-            (("xsources", "diag_signs", "diagonals", "coeffs"), "exactly one of diagonals="),
-            (("xsources", "diag_signs"), "requires coeffs="),
+            (("xsources", "zsignatures", "diagonals", "coeffs"), "exactly one of diagonals="),
+            (("xsources", "zsignatures"), "requires coeffs="),
             (("xsources", "diagonals", "coeffs"), "already folds in coeffs="),
         ],
     )
     def test_underspecified_or_overspecified_keyword_calls_raise(self, names, match):
         """Every way of not naming exactly one X source and one diagonal strategy must raise.
 
-        This is the substance of the change: the six valid combinations become the only *constructible*
+        This is the substance of the change: the three valid combinations become the only *constructible*
         ones. Under the positional form each of these was either a silent wrong answer or an opaque
         failure deep inside the scan; here they fail at the call site before any array is read.
         """
@@ -671,6 +608,29 @@ class TestMatvecKernels:
         kwargs = {name: p[name] for name in names}
         with pytest.raises(ValueError, match=match):
             apply_h(p["vector"], states=p["states_u"], **kwargs)
+
+    def test_removed_combinations_raise(self):
+        """``xsignatures=`` with ``diagonals=`` was ``(0, 2)``, and ``diag_signs=`` was ``(*, 1)``.
+
+        ``(0, 2)`` must raise naming its replacement rather than run a dominated level; ``diag_signs=``
+        is no longer a parameter, so it is a ``TypeError`` like any unknown keyword.
+        """
+        p = apply_h_inputs(np.random.default_rng(20260805))
+        with pytest.raises(ValueError, match="requires xsources=.*dominated by"):
+            apply_h(
+                p["vector"],
+                xsignatures=p["xsignatures"],
+                diagonals=p["diagonals"],
+                states=p["states_u"],
+            )
+        with pytest.raises(TypeError, match="diag_signs"):
+            apply_h(
+                p["vector"],
+                xsources=p["xsources"],
+                diag_signs=np.zeros((1, 1), dtype=np.uint8),  # ty: ignore[unknown-argument]
+                coeffs=p["coeffs"],
+                states=p["states_u"],
+            )
 
     def test_no_arrays_at_all_raises(self):
         """Naming nothing names what is missing, rather than failing somewhere downstream."""
@@ -682,7 +642,7 @@ class TestMatvecKernels:
         """The packer's arity is a contract with the kernel, and it is shared by two callers.
 
         ``_apply_h_kernel``'s scan body reads ``val[2]`` only when ``cache_level[1] == 0``, so the
-        3-tuple/2-tuple split is a real contract: the two strategies that *compute* a diagonal need
+        3-tuple/2-tuple split is a real contract: the two levels that *compute* a diagonal need
         the coefficients, the one that reads a precomputed diagonal must not carry them.
 
         Asserted directly because the end-to-end tests do **not** catch a violation. Mutation-tested:
@@ -730,13 +690,13 @@ class TestMatvecKernels:
         # of it (see TestApplyHArrayRoles).
         assert hamiltonian.x.dtype != xsources.dtype, (hamiltonian.x.dtype, xsources.dtype)
 
-    @pytest.mark.parametrize("cache_level", [(0, 0), (0, 1), (0, 2), (1, 0)])
+    @pytest.mark.parametrize("cache_level", [(0, 0), (1, 0)])
     def test_omitting_states_raises(self, cache_level):
-        """Only ``(1, 1)`` and ``(1, 2)`` can run without the state list; the rest must say so.
+        """Only ``(1, 2)`` can run without the state list; the rest must say so.
 
-        ``(1, 1)`` and ``(1, 2)`` read neither signature array, which is what lets a caller drop S
-        after caching. For the other four, a missing S would otherwise surface as an opaque failure
-        deep inside ``get_xsource``/``get_diagonal``.
+        ``(1, 2)`` reads neither signature array, which is what lets a caller drop S after caching.
+        For the other two, a missing S would otherwise surface as an opaque failure deep inside
+        ``get_xsource``/``get_diagonal``.
         """
         # Shapes are irrelevant here -- the guard fires before any array is read -- so one dummy
         # stands in for every name the level asks for.

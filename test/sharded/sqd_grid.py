@@ -1,7 +1,6 @@
 """``sqd`` sharded against single-device over every cache level and mesh size; see ``TestShardedSqd``."""
 
 import functools
-import itertools
 
 import jax
 import jax.numpy as jnp
@@ -12,13 +11,13 @@ from jax.sharding import PartitionSpec
 import rqutils.sqd as sqd_module
 from rqutils.ground_locg import _chebyshev_prefilter
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import sqd
+from rqutils.sqd import _CACHE_LEVELS, sqd
 
 # 37 states, indivisible by every mesh size, pad to 64, which each divides.
 NUM_QUBITS, NUM_STATES, NUM_TERMS, STATES_SIZE = 8, 37, 5, 64
 PREFILTER = (16, 2)
 MESH_SIZES = (1, 2, 4)
-CACHE_LEVELS = sorted(itertools.product((0, 1), (0, 1, 2)))
+CACHE_LEVELS = _CACHE_LEVELS
 
 
 def main() -> None:
