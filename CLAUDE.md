@@ -112,7 +112,7 @@ uv run --extra dev pytest -v -x        # verbose, stop at first failure
 ```
 
 **Run the full extras** — `--extra dev --extra mpl --extra qutip` — or tests **silently skip**. The
-qiskit reference comparisons this file treats as the trustworthy oracle no longer need an extra, since
+qiskit reference comparisons this file treats as the trustworthy oracle need no extra, since
 `qiskit` is a required dependency; `mpl` and `qutip` still do. A fresh worktree gets a bare venv, so
 this bites there first.
 
@@ -447,8 +447,8 @@ leading `i` and the convention's `(-i)^{x·z}` phase, and narrowing it silently 
 and so every transpiled circuit. `cz` is only decomposed on the `QuantumCircuit` path, and is correct
 only up to a uniform `exp(iπ/4)`.
 
-**`examples/svsim.py` is the repo's reference for a correct multi-process path**, and the only one that
-was tested on real nodes before 2026-09-04: it writes `final_state.addressable_shards` per rank with
+**`examples/svsim.py` is the repo's reference for a correct multi-process path**, and the first one
+tested on real nodes: it writes `final_state.addressable_shards` per rank with
 `h5py`, serialized by `MPI.COMM_WORLD` token-passing and gated on `jax.process_index()`, never fetching a
 global array. Follow it rather than inventing a second convention. The asymmetry that let `sqd`'s bug
 survive is worth remembering — `svsim` returns a large distributed array, so addressability had to be
@@ -511,8 +511,8 @@ but emits an `all-gather` per read, each materializing the whole vector on every
 **One line, and prefer none. The ceiling is hard: 1–2 lines inline, 3–5 per docstring paragraph.** Over
 that, it belongs in `NOTES.md` (evidence) or the docstring (user-facing). State the constraint; never
 narrate the code. A measured defect earns **one line plus a `NOTES.md` pointer** — not any length, or the
-clause licenses everything, since here every comment documents a measured defect. This was corrected by
-hand five times in one session; it is the most-violated rule in the file.
+clause licenses everything, since here every comment documents a measured defect. Check every comment
+and docstring you add against it before finishing an edit.
 
 Three failure modes that produce length without content:
 
