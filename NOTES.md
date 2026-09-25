@@ -1403,55 +1403,15 @@ env var, since `sqd` has no such parameter; it was removed and the file restored
 
 ### Sparse transition pairs beat every cache level on memory *and* speed (2026-09-25, prototype)
 
-Item 8 of the 2026-09-25 ideas doc, prototyped in `poc/sparse_pairs.py` on the `sparse-pairs` branch. At
-`(1, *)` the source cache is one `int32` per `(X group, state)` -- `4·J` B/slot, the largest term of a
-`(1, 0)` solve at large `n` -- but on spinchain's open-XXZ Hamiltonians with Hamming-shell subspaces only
-**8--25%** of entries are real transitions. XOR is an involution, so each real transition of a group
-`g != 0` is a pair `(i, j)`; storing `(i, j, g)` once, and computing the diagonal once per pair since
-`H_ji = conj(H_ij)` exactly for one X signature, removes both the placeholder slots and half the work.
-
-Two variants: **P0** recomputes each pair's diagonal per matvec (the `(1, 0)` analogue), **P2** caches
-it per pair. Pairs are scanned in fixed chunks so temporaries are `O(chunk)`; unchunked, pair-sized
-temporaries put both arms *above* `(1, 0)` (988 / 731 B/slot). Every arm matched the `(1, 0)` product on a
-batched `(2, N)` vector, and every solve returned the same eigenvalue in the same iterations. Whole
-`ground_locg` solves, prefilter `(32, 2)`, batched, `states_size = 2^17`, chunk `2^15`, memory from XLA
-(inputs + temp) for the whole solve:
-
-| instance | `(1, 0)` | `(1, 2)` | P0 | P2 |
-| --- | --- | --- | --- | --- |
-| n=60 `type2`, `J=120`, `h=0.095` | 8.73 s, 666 B | 3.49 s, 2577 B | **1.96 s (4.5×), 248 B (−63%)** | **1.39 s (6.3×), 302 B (−55%)** |
-| n=30 `type1`, `J=32`, `h=0.215` | 2.64 s, 309 B | 1.23 s, 817 B | **1.25 s (2.1×), 216 B (−30%)** | **0.97 s (2.7×), 248 B (−20%)** |
-
-For scale, `(0, 0)` on the first instance is 217 B/slot at 8.3× *slower* than `(1, 0)`; P0 is within 14%
-of that memory at 4.5× faster. The gain tracks the placeholder count `J·(1 − h)`, so it grows with `n`.
-Chunk `2^13` leaves memory unchanged (the solver's vectors dominate) and only costs speed.
-
-**Unverified, and each could change the verdict:**
-
-- **GPU.** Scatter-add lowers to atomics there; this is one laptop CPU.
-- **Precompute peak.** The prototype builds pairs from the full `(J, N)` source array, i.e. it pays the
-  `(1, 0)` array once to shed it. A library version must compact one group at a time (`4` B/slot
-  transient) or the peak is no lower than `(1, 0)`'s.
-- **Sharding.** A pair's two endpoints can live on different devices, so the scatter needs a collective
-  that the gather form does not; not attempted.
-- **Hit rate is a property of the subspace.** Hamming-shell draws; a sampler's subspaces may differ.
-
-**Not an XXZ artifact -- the win tracks the hit rate `h`** (`poc/sparse_pairs_general.py`). The pair form is
-general (XOR is an involution for every X signature; `H_ji = conj(H_ij)` for any Hermitian Pauli sum), and
-open vs periodic or 1D vs 2D only changes `J`. What varies is `h`: pairs cost ~`6·h·J` B/slot against `4·J`,
-so memory breaks even near `h ≈ 2/3`, and P0's work scales with `h` rather than with every slot. Measured
-at the high-`h` end, operator bytes and `(2, N)` matvec against `(1, 0)`, each arm checked first:
-
-| fixture | `J` | `h` | P0 | P2 |
-| --- | --- | --- | --- | --- |
-| open XXZ n=60 `type2`, Hamming shells (above) | 120 | 0.095 | −63%, 4.5× (whole solve) | −55%, 6.3× |
-| periodic XXZ n=24, Néel-Krylov (closed under hops) | 25 | 0.42 | −44%, 0.99× | −23%, 2.54× |
-| molecular-like JW n=14, random states (71% of `2^14`) | 872 | 0.71 | −25%, **0.89×** | ≈0%, 4.54× |
-
-So the memory win belongs to subspaces that are sparse relative to the Hamiltonian's moves -- the SQD
-regime at large `n`, where `10^5`--`10^7` states sit in a `2^n` space -- and P0 loses its speed edge as `h`
-rises. P2 was faster everywhere measured, most where diagonals are expensive (8--37 terms per group in the
-molecular fixture); it was not compared against `(1, 2)` on the last two rows.
+Item 8 of the 2026-09-25 ideas doc, on branch `sparse-pairs`. **Every table, fixture and caveat is in
+`poc/sparse-pairs.md`** (from `poc/sparse_pairs.py`); this is the verdict. At `(1, *)` only 8--22% of the
+`4·J` B/slot source cache is real transitions on spinchain's open XXZ; storing each XOR pair once, with its
+diagonal computed once (`H_ji = conj(H_ij)` exactly per X signature), measured on CPU against `(1, 0)`:
+**P0** 4.4--5.3× faster whole solves at −52--63% memory, **−43% setup-inclusive peak** at `2^21`; **C2R**
+3.4--6.2× past the cache at a peak about `(1, 0)`'s. The win tracks the hit rate, not the model -- at high
+`h` CSR costs memory. Two measured lessons: the speedup shrinks with N from **cache locality, not threads**
+(CSR order recovers it), and the setup peak needed a **counting sort** by target, per-group construction
+and no duplicate transients. Open: GPU timing, sharding, sampler subspaces.
 
 ### Partial diagonal cache: *which* groups to cache barely matters, only how many (2026-09-25)
 

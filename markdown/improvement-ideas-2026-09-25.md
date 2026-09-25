@@ -82,10 +82,10 @@ fixture was a single sector (`NOTES.md`, 2026-09-17), so check an actual sampler
 
 The source cache stores one `int32` per `(X group, state)`, `-1` for an absent transition. On spinchain's
 open-XXZ Hamiltonians only 8--25% are real; storing each pair once, with the diagonal computed once per
-pair, measured **4.5× faster than `(1, 0)` at 63% less memory** (n=60, `J=120`) and 2.1× / −30% at n=30,
-same eigenvalue and iterations -- faster than `(1, 2)`, near `(0, 0)`'s memory (`NOTES.md`, "Sparse
-transition pairs beat every cache level"; `poc/sparse_pairs.py`, branch `sparse-pairs`). Open before an
-API: GPU scatter speed, a per-group precompute so the peak drops too, and sharding.
+pair, measured **4.4× faster than `(1, 0)` at 63% less whole-solve memory** (n=60 `type2`) and **5.3× at
+−52%** on the shipped `type1` pattern; setup-inclusive peak −43% at `2^21` (`NOTES.md`, "Sparse transition
+pairs beat every cache level"; `poc/sparse-pairs.md`, branch `sparse-pairs`). Open before an API: GPU
+timing, sharding.
 
 ### 9. Distributed `states` -- **built, blocked on hardware**
 
@@ -115,5 +115,5 @@ a named `states_size` policy. The levers left are the operator's storage (3, 8) 
 1. ~~**7**~~ -- done.
 2. **3** -- measured (order ≤3%); a `J'` dial helps only when `(1, 2)` nearly fits -- it cannot go below
    `(1, 0)`, which is where memory-bound runs already are.
-3. **8** -- prototyped, wins on CPU; next: GPU timing, per-group precompute, then an API.
+3. **8** -- prototyped, wins on CPU, setup peak fixed; next: GPU timing, then an API.
 4. **4**, **9** -- need a real multi-process run; **5** needs real sampler output.
