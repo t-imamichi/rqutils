@@ -444,6 +444,10 @@ an implementation recommendation before its stated gate passes.
 
 ### Make norm reductions combinable
 
+**Done 2026-09-25, and the premise below was wrong**: all 13 all-reduces lie on one dependency
+chain, so the combiner had already merged everything but one pair; 13 -> 12 is the floor without an
+algorithmic change. See `docs/improvement-ideas-2026-09-25.md` section 1.
+
 This is the strongest remaining solver-level opportunity, and the first item to try for multi-node
 scaling. The loop body currently computes several norms through `jnp.linalg.norm`; compiled on a
 four-device mesh, seven of thirteen `all-reduce` operations were isolated single-scalar norm reductions.

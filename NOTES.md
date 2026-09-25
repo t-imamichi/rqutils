@@ -3415,6 +3415,18 @@ question is not "does a warm start help" but "why does anything beat zero-paddin
 `jnp.all(hamiltonian.x[0] == 0)`), so shipping any of this would mean adding a parameter to buy a
 measured non-result.
 
+### `body()`'s all-reduces are one chain; 13 -> 12 is the floor (2026-09-25)
+
+`tests/_sharded_allreduce_count.py`, 4 virtual CPU devices. The loop body compiled to 13 all-reduces
+(arities `[1x7, 2x3, 3x2, 5]`), and a reachability walk over the HLO found **every pair dependent** --
+the combiner had already merged all independent reductions, so the "seven isolated norms" of
+`docs/sqd-locg-improvement-ideas.md` were sequential links, not missed merges. Inlining
+`jnp.linalg.norm`'s formula left 13 (its `@jit` is inlined anyway), and so did reordering the source.
+The one missed merge was `norm_s`/`norm_u`, independent but split across two links; a single stacked
+reduction gives 12. Bit-identical over 18 arms (N 64/1000/5000, f32/f64/c128, batched or not), temp
+flat within +192 B to N=1M. **Below 12 needs fewer sequential reductions**, i.e. dropping a
+`_project_out` or re-orthogonalization pass, which are closed. Speed on real nodes is unmeasured.
+
 ## `precond` was removed; `sqd` defaults to `prefilter=(32, 2)`
 
 2026-08-28, acting on the comparison below.

@@ -1138,6 +1138,24 @@ class TestChebyshevPrefilter:
                 )
 
 
+class TestAllReduceCount:
+    """``body()`` runs 12 chained all-reduces per iteration on a mesh, not 13.
+
+    Every all-reduce in the loop lies on one dependency chain, so XLA's combiner has already merged all
+    it can -- except ``norm_s``/``norm_u``, which are independent yet were left as two links whenever
+    written as two ``norm`` calls (measured 13; source order does not matter). One stacked reduction
+    merges them. The values are bit-identical either way, so only the HLO can pin this.
+    """
+
+    def test_body_has_twelve_allreduces(self):
+        stdout = run_sharded_child("_sharded_allreduce_count.py", "ground_locg all-reduce count")
+        rows = dict(line.split()[1:] for line in stdout.splitlines() if line.startswith("arities"))
+        assert set(rows) == {"0", "1"}, stdout
+        for batch, arities in rows.items():
+            arities = arities.split(",")
+            assert len(arities) == 12, f"batch_matvec={batch}: {len(arities)} all-reduces {arities}"
+
+
 class TestBatchedMatvec:
     """``batch_matvec`` stacks ``body()``'s two independent applications into one ``(2, n)`` call.
 

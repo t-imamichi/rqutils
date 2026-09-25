@@ -1228,10 +1228,12 @@ def _ground_locg_callable(
         theta, kappa = eigenpair_3x3(sas)
         # New vectors
         tmp_s = ycurr * kappa[1] + tmp_p * kappa[2]
-        norm_s = jnp.linalg.norm(tmp_s)
-        tmp_t = tmp_s * (kappa[0] / jnp.where(norm_s == 0.0, 1.0, norm_s)) - xcurr * norm_s
         tmp_u = xcurr * kappa[0] + tmp_s
-        xnext = normalize(tmp_u)
+        # One joint reduction: XLA's combiner leaves two separate norms as two chained all-reduces.
+        su = jnp.stack((tmp_s, tmp_u))
+        norm_s, norm_u = jnp.sqrt(jnp.sum(jnp.real(su * jnp.conj(su)), axis=-1))
+        tmp_t = tmp_s * (kappa[0] / jnp.where(norm_s == 0.0, 1.0, norm_s)) - xcurr * norm_s
+        xnext = normalize(tmp_u, norm_u)
         ynext = normalize(_reorthogonalize(tmp_t, xnext))
         axnext = matvec(xnext, *args)
         rnext = axnext - xnext * theta
