@@ -78,13 +78,14 @@ If `H` conserves a quantity readable from a bitstring (Hamming weight for XXZ, Z
 "symmetry". **Gate:** it only pays when real sampler output spans several sectors -- the warm-start
 fixture was a single sector (`NOTES.md`, 2026-09-17), so check an actual sampler first.
 
-### 8. Sparse transition pairs instead of dense source indices -- **unmeasured**
+### 8. Sparse transition pairs instead of dense source indices -- **prototyped: wins both axes** (2026-09-25)
 
-The source cache stores one `int32` per `(X group, state)`, `-1` for an absent transition, while measured
-hit rates run 2--100%. XOR is an involution, so present transitions pair up; storing each pair once costs
-about `4·h·N` bytes per group against `4·N` -- **~10× less at a 10% hit rate**. Risks recorded in
-`markdown/sqd-locg-improvement-ideas.md` §5: scatter slower than gather, ragged group lengths, and
-distributed ownership of the two directed updates. Needs a prototype before any API.
+The source cache stores one `int32` per `(X group, state)`, `-1` for an absent transition. On spinchain's
+open-XXZ Hamiltonians only 8--25% are real; storing each pair once, with the diagonal computed once per
+pair, measured **4.5× faster than `(1, 0)` at 63% less memory** (n=60, `J=120`) and 2.1× / −30% at n=30,
+same eigenvalue and iterations -- faster than `(1, 2)`, near `(0, 0)`'s memory (`NOTES.md`, "Sparse
+transition pairs beat every cache level"; `poc/sparse_pairs.py`, branch `sparse-pairs`). Open before an
+API: GPU scatter speed, a per-group precompute so the peak drops too, and sharding.
 
 ### 9. Distributed `states` -- **built, blocked on hardware**
 
@@ -112,6 +113,7 @@ a named `states_size` policy. The levers left are the operator's storage (3, 8) 
 ## Order
 
 1. ~~**7**~~ -- done.
-2. **3** -- measured (order ≤3%); build the `J'` count dial.
-3. **8** -- prototype and measure; drop it if scatter loses to gather.
+2. **3** -- measured (order ≤3%); a `J'` dial helps only when `(1, 2)` nearly fits -- it cannot go below
+   `(1, 0)`, which is where memory-bound runs already are.
+3. **8** -- prototyped, wins on CPU; next: GPU timing, per-group precompute, then an API.
 4. **4**, **9** -- need a real multi-process run; **5** needs real sampler output.
