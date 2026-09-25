@@ -36,7 +36,7 @@ def main() -> None:
 
     mesh = jax.make_mesh((MESH_SIZE,), ("x",), (AxisType.Explicit,))
 
-    # Scoped mesh: `hproj` inside must raise, outside must work. This is poc7_sharding.py's pattern,
+    # Scoped mesh: `hproj` inside must raise, outside must work. This is poc/sharding.py's pattern,
     # which builds its dense reference outside the `with` block.
     with jax.set_mesh(mesh):
         try:

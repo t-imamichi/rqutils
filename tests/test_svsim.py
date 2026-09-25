@@ -1,6 +1,6 @@
 """Tests for :mod:`rqutils.svsim`.
 
-Written from ``docs/skqd.md``, which recorded ``svsim`` as *the* blocker for sample-based Krylov
+Written from ``markdowns/skqd.md``, which recorded ``svsim`` as *the* blocker for sample-based Krylov
 quantum diagonalization: ``do_svsim`` never applied the ``(-i)^{x.z}`` factor from the module's own
 documented convention ``Q = (-i)^{x.z} Z^z X^x``. That hit exactly the gates whose X and Z
 signatures overlap -- ``y`` and ``ry`` -- and since the documented workflow transpiles to
@@ -48,7 +48,7 @@ def spec_of(name, qubits, angle=None):
 class TestSymplecticPhase:
     """The ``(-i)^{x.z}`` factor of ``Q = (-i)^{x.z} Z^z X^x`` must actually be applied.
 
-    Its absence was ``docs/skqd.md``'s blocker. These tests target the phase directly rather than
+    Its absence was ``markdowns/skqd.md``'s blocker. These tests target the phase directly rather than
     through a whole circuit, because a single missing factor of ``i`` on one gate type is invisible
     in any check that only looks at magnitudes -- which is exactly how it survived.
     """

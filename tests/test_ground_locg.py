@@ -1,6 +1,6 @@
 """Tests for :mod:`rqutils.ground_locg`.
 
-Organized by defect. Most tests correspond to a numbered item in ``docs/locg.md``, the audit of the
+Organized by defect. Most tests correspond to a numbered item in ``markdowns/locg.md``, the audit of the
 previous implementation of this module; each such test names its item and the measured old failure.
 That audit's closing warning shapes the design here:
 
@@ -596,7 +596,7 @@ class TestZeroResidualAfterSeedStep:
     """``body_iter1`` must guard a zeroed post-seed residual the same way ``body()`` does.
 
     ``body()`` (the main iteration) masks its projected matrix's search-direction diagonal and folds
-    a zeroed direction into ``converged`` -- see items I6/I7 in ``docs/locg.md``. ``body_iter1`` (the
+    a zeroed direction into ``converged`` -- see items I6/I7 in ``markdowns/locg.md``. ``body_iter1`` (the
     one-shot seed step run before the main loop) had no equivalent guard: when the residual after
     ``body_iter0`` is exactly zero, xinit is already an eigenvector and the ``{x, p}`` projected
     matrix has a vanishing row/column 1, which ``eigenpair_2x2`` would otherwise resolve into
@@ -663,7 +663,7 @@ class TestExactEigenvectorStart:
     solve never recovered: ``converged=False`` at every ``maxiter``.
 
     Reported from the ``spinchain`` side as a ``sqd`` dim-2 bug
-    (``docs/rqutils-prefilter-dim2-request.md``); the fault is here, and ``sqd`` only supplied the input
+    (``markdowns/rqutils-prefilter-dim2-request.md``); the fault is here, and ``sqd`` only supplied the input
     that exposed it -- with ``prefilter`` on, a 2-dimensional iterate lands on the eigenvector routinely.
 
     Two rejected fixes are worth recording, because both look right:
@@ -755,7 +755,7 @@ class TestChebyshevPrefilter:
 
     Measured on connected XXZ subspaces (18 configurations, 3 seeds x 3 anisotropies x 2 sizes) with
     ``(16, 4)``: median **1.36x** wall clock, range 1.11-3.07x, 0 regressions, eigenvector overlap
-    1.0000000 against the unfiltered result. ``docs/locg-chebyshev-prefilter.md`` has the tables.
+    1.0000000 against the unfiltered result. ``markdowns/locg-chebyshev-prefilter.md`` has the tables.
 
     Two design points are load-bearing and are pinned below, because both fail *silently*:
 
@@ -769,7 +769,7 @@ class TestChebyshevPrefilter:
       begins far above ``lambda_0`` (measured +5.37 against -5.0), so the interval starts entirely above
       the target and the filter closes 100% of the gap at every bump. The running quotient is preferred
       for needing no spectral input, not for correctness. If you replace it, re-measure wall clock on
-      the XXZ batch in ``docs/locg-chebyshev-prefilter.md`` -- the suite will not tell you.
+      the XXZ batch in ``markdowns/locg-chebyshev-prefilter.md`` -- the suite will not tell you.
 
     **Mutation results, recorded so the coverage is not overestimated.** Caught: discarding the
     filtered vector (2 tests fail). **Not caught**: flipping the sign of the three-term recurrence
@@ -1017,7 +1017,7 @@ class TestChebyshevPrefilter:
         lowest, and indistinguishable from a correct answer by inspection or by a residual check.
 
         Built by hand rather than via qiskit so this runs without the optional extra, and pinned as
-        the smallest case that reproduces -- ``docs/rqutils-prefilter-bug.md`` measured the bound
+        the smallest case that reproduces -- ``markdowns/rqutils-prefilter-bug.md`` measured the bound
         invalid in 16 of 25 XXZ configurations but a wrong *answer* in only 2, both at n=2, Bx=0.
         """
         pauli_x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
@@ -1351,7 +1351,7 @@ class TestDebugOverloadIsCheckable:
 
     ``@overload`` on ``debug: Literal[False]/[True]`` resolves it. Four overloads rather than two,
     because ``debug`` is positional-or-keyword here (unlike ``sqd``'s keyword-only block): one for the
-    keyword form, one for the all-positional form that ``examples/scaling/poc6_mixed_precision.py``
+    keyword form, one for the all-positional form that ``poc/mixed_precision.py``
     uses, and a ``bool`` fallback so a *runtime-computed* flag still gets the union and still requires
     narrowing. That last one is the case an overload set can easily break.
 

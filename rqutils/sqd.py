@@ -138,7 +138,7 @@ caching setting should be adjusted according to the values of :math:`n` and :mat
 **How expensive, concretely: the source-index setup dominates the solve, so this is not a symmetric
 memory-for-speed dial.** Weighted by call count, the :math:`J`-fold :func:`get_xsource` precompute
 measured **66-97%** of an entire solve -- 97.5% at 10 iterations, 66.4% at 200 (3064 ms of setup
-against 8.35 ms per matvec iteration, N=200k, J=50; see ``docs/scaling-pocs.md``). Turning source-index
+against 8.35 ms per matvec iteration, N=200k, J=50; see ``markdowns/scaling-pocs.md``). Turning source-index
 caching *off* therefore pays that cost once per matvec rather than once per solve, which is a far
 larger effect than the :math:`4 J N` bytes it reclaims -- measured end-to-end at N=3k, n=12, J=23,
 ``(0, 2)`` is 10.9x slower than ``(1, 2)`` and ``(0, 0)`` is 7.2x slower than ``(1, 0)``, all four
@@ -560,7 +560,7 @@ def _host_scalar(value: jax.Array | float | bool) -> jax.Array | float | bool:
     #
     # The collective is safe here because `sqd` is not inside a conditional -- every rank that calls it
     # reaches this line. Do not copy this shape into a branch some ranks skip; see the sub-mesh gather
-    # in examples/scaling/poc14_uniquify_sharded.py for the non-collective form that case needs.
+    # in poc/uniquify_sharded.py for the non-collective form that case needs.
     #
     # `process_allgather` rather than a hand-rolled `jit(out_shardings=...)`. Three attempts at the
     # latter each failed on a topology detail this handles already:
@@ -805,7 +805,7 @@ def sqd(
             filter's required upper bound itself as :math:`\sum_k |c_k|`, so the option costs the
             caller nothing to use and there is no bound to get wrong.
 
-            That 1.49x is **below** the 1.88x median ``docs/locg-chebyshev-prefilter.md`` measured on
+            That 1.49x is **below** the 1.88x median ``markdowns/locg-chebyshev-prefilter.md`` measured on
             dense ``ground_locg``, and the gap is the point: the filter spends
             ``cycles * (degree + 1)`` matvecs up front, and :func:`apply_h`'s sparse gather-heavy
             kernel is cheap enough that those cost proportionally more here. Counting *iterations*
@@ -839,7 +839,7 @@ def sqd(
         RuntimeError: If LOBPCG does not converge within ``maxiter``. Previously the convergence flag
             was discarded and the non-converged value was returned as the answer: it is
             ``state.theta``, a valid variational **upper bound**, so finite, real and above the true
-            minimum -- indistinguishable from a correct result by inspection. ``docs/locg.md`` records
+            minimum -- indistinguishable from a correct result by inspection. ``markdowns/locg.md`` records
             that this absence "is the reason I4 could hide", a sign error that made the convergence
             test unsatisfiable so the solver silently never converged. Raise ``maxiter``, or loosen
             ``atol`` / ``rtol``, to proceed.
@@ -937,7 +937,7 @@ def sqd(
     eigval = float(_host_scalar(result[0]))
     # The convergence flag used to be discarded here, and a non-converged run still returns
     # `state.theta` -- a valid variational *upper bound*, so finite, real, and above the true minimum,
-    # i.e. indistinguishable from a correct answer by inspection. docs/locg.md records that this
+    # i.e. indistinguishable from a correct answer by inspection. markdowns/locg.md records that this
     # absence "is the reason I4 could hide": a sign error made the convergence test unsatisfiable, so
     # the solver silently never converged and every answer was the iteration cap's best guess.
     #
@@ -1237,7 +1237,7 @@ def run_sqd(
     """
     # `cache_level` is static, so this is a concrete tuple at trace time and the check runs once per
     # trace rather than once per call. `sqd` validates too; this covers the direct callers, which are
-    # the six examples/scaling scripts -- i.e. the ones most likely to pass an experimental value.
+    # the six poc scripts -- i.e. the ones most likely to pass an experimental value.
     _check_cache_level(cache_level)
     _check_xcache_groups(xcache_groups, cache_level, hamiltonian.x.shape[0])
     _check_prefilter(prefilter)
@@ -1400,7 +1400,7 @@ def run_sqd(
         # raises ShardingTypeError rather than guessing. Without it, sqd() fails outright on ANY
         # multi-device mesh -- not subtly, but before the solver is ever reached. It went unnoticed
         # because nothing in the suite runs a mesh; `XLA_FLAGS=--xla_force_host_platform_device_count`
-        # reproduces it on CPU, which is what examples/scaling/poc7_sharding.py does.
+        # reproduces it on CPU, which is what poc/sharding.py does.
         seed = _spread_seed(states_size, states_u, hamiltonian.c.dtype, sharding)
         # Elementwise under a mask rather than `seed.at[imin].add(...)`, which is the same arithmetic
         # but reads one element out of a *sharded* array: measured on a 4-device mesh, indexing emitted
@@ -1438,7 +1438,7 @@ def run_sqd(
 
     # sum|c_k| bounds lambda_max rigorously -- every Pauli string is unitary, and projecting onto the
     # subspace only shrinks the spectral radius -- and costs no matvec. `ground_locg` cannot derive it
-    # from a callable, and raises rather than guessing (docs/rqutils-prefilter-bug.md). Gated on the
+    # from a callable, and raises rather than guessing (markdowns/rqutils-prefilter-bug.md). Gated on the
     # filter actually running, since degree<=1 or cycles==0 is a documented no-op and computing the
     # bound anyway would add ops to the traced graph for those values.
     filter_runs = prefilter is not None and prefilter[0] > 1 and prefilter[1] > 0
@@ -1488,7 +1488,7 @@ def uniquify_states(states_p: StateList, states_size: int) -> StateList:
     # The int32 ceiling checked where the int32 index is actually created, not only in the public
     # entry points. `sqd()` and `hproj()` check it too -- earlier, with better messages, and before
     # their own O(N) work -- but this function and `get_xsource` are un-underscored and are called
-    # directly by six scripts under examples/scaling/, which is exactly the code that pushes N. Those
+    # directly by six scripts under poc/, which is exactly the code that pushes N. Those
     # call sites reach the iota with neither entry-point guard in the chain.
     #
     # Free: `states_size` is static (see the decorator), so this fires at trace time and costs nothing
@@ -1716,7 +1716,7 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
     pure gather, so it also shards, where a sort does not. Measured on CPU at 12-25x per signature and
     12-17x on the J-fold precompute, and **5.15x at N=64M on an NVIDIA GH200** (a GPU sort is
     well optimized relative to its gather, so the ratio compresses while the direction holds); see
-    `docs/scaling-pocs.md`.
+    `markdowns/scaling-pocs.md`.
 
     The memory leak, re-measured on that GH200 against a pinned copy of the old sort, **did not
     reproduce**: ~0.95 GB of transients at `(5M, 4)` were fully reclaimed after every repetition. That
@@ -1809,7 +1809,7 @@ def get_diag_signs(zsignatures: NDArray[np.uint8], states: StateList) -> jax.Arr
 
     Raises:
         ValueError: If ``zsignatures`` is not 2-D. This function is public and called directly by
-            scripts under ``examples/scaling/``, and the scan below iterates its leading axis: handed
+            scripts under ``poc/``, and the scan below iterates its leading axis: handed
             a 1-D array it scans *scalars* rather than rows, silently returning a wrongly shaped
             result (measured shape ``(4, 1)`` from a 2-element 1-D input) instead of raising. Rank is
             static under ``jax.jit``, so unlike the lex-sortedness precondition this one is

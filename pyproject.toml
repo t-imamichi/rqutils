@@ -33,12 +33,12 @@ dependencies = [
 mpl = ["matplotlib"]
 qutip = ["qutip"]
 # `qiskit` moved to the required dependencies above, but `uv run --extra qiskit ...` appears throughout
-# CLAUDE.md, NOTES.md, docs/ and every examples/scaling/ docstring; deleting the name would make all of
+# CLAUDE.md, NOTES.md, markdowns/ and every poc/ docstring; deleting the name would make all of
 # those fail with "unknown extra" for no benefit, so it stays as an empty alias that installs nothing.
 qiskit = []
 # mpi4py stays an extra deliberately: it needs a working host MPI to build, so requiring it would make
 # every install depend on the system MPI -- and nothing under rqutils/ imports it. Only the
-# multi-process example paths need it (`examples/sqd.py --gpus mpi`, `examples/scaling/*.py
+# multi-process paths need it (`examples/sqd.py --gpus mpi`, `poc/*.py
 # --devices mpi`).
 mpi = ["mpi4py"]
 docs = ["sphinx", "sphinx-rtd-theme"]
@@ -67,7 +67,7 @@ exclude = ["**/*.ipynb"]
 # JAX ships almost no type information, and `jax.jit` converts arguments before the body runs, so a
 # parameter annotated `int` really does have a `.dtype` when read. numpy's stubs are also stricter than
 # the dtype-generic `npmod` convention allows. Tool limitation, not defect -- revisit when JAX ships
-# stubs. Six sibling rules were retired by fixing their sites; `docs/typing-notes.md` has the survey,
+# stubs. Six sibling rules were retired by fixing their sites; `markdowns/typing-notes.md` has the survey,
 # the per-rule counts, and which remaining findings are worth acting on.
 unresolved-attribute = "ignore"
 no-matching-overload = "ignore"

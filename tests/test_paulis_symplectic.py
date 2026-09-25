@@ -6,7 +6,7 @@ build on. Its two conventions are the ones worth pinning, because getting either
 - ``Q = (-i)^{x.z} Z^z X^x`` with the ``(-i)^{popcount(x & z)}`` phase folded into the
   coefficients. **This is the same convention whose omission broke** ``svsim`` -- it dropped the
   factor entirely and corrupted every ``y``/``ry`` gate, which is exactly the class of error a test
-  here would have caught earlier (see ``docs/skqd.md``).
+  here would have caught earlier (see ``markdowns/skqd.md``).
 - **Little-endian qubit ordering**: Qiskit's ``.x``/``.z`` are reversed on ingest, so bit ``q`` of a
   packed signature is qubit ``q``. ``sqd``'s tests cover this transitively; these cover it directly.
 
@@ -473,7 +473,7 @@ class TestAtolIsKeywordOnly:
     throws the signal away. Measured: ``from_paulisum((["ZI", "IZ"], [1 + 1e-4j, 0.5]), 1e-3)`` was
     accepted and returned ``c = [0.5, 1.0]``, with the 1e-4 gone and nothing said.
 
-    Kept as ``atol`` rather than renamed to ``discard_imag_below``, which ``docs/gotchas.md``
+    Kept as ``atol`` rather than renamed to ``discard_imag_below``, which ``markdowns/gotchas.md``
     proposes. ``atol`` is the conventional numpy/scipy spelling and the parameter *is* primarily a
     Hermiticity threshold; the discard is a consequence, and documenting it at the parameter is more
     accurate than a name that describes only the side effect. Keyword-only is what closes the actual

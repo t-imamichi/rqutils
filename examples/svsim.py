@@ -81,7 +81,7 @@ final_state = svsim(circuit)
 # Check the result. Counting nonzero elements is not enough on its own: this script used to assert
 # only "num_nonzero == 2", which passed while the two populated states were |0...0> and |0...01>
 # rather than |0...0> and |1...1> -- it reported a GHZ state it had not produced, and so masked the
-# missing symplectic phase described in docs/skqd.md. Check WHICH states carry the amplitude.
+# missing symplectic phase described in markdowns/skqd.md. Check WHICH states carry the amplitude.
 nonzero = jnp.nonzero(jnp.logical_not(jnp.isclose(final_state, 0.0)))[0]
 logger.info("Number of nonzero elements in the GHZ state: %d", nonzero.shape[0])
 expected_indices = (0, 2**options.num_qubits - 1)

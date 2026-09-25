@@ -9,7 +9,7 @@ Not a pytest module (the leading underscore keeps it uncollected): it must set t
 count before jax initializes, which ``conftest.py`` has already done by collection time.
 
 **All six cache levels, not just the default.** Two distinct sharding bugs lived in the three
-``cache_level[0] == 0`` cells, which nothing covered -- ``examples/scaling/poc7_sharding.py`` and the
+``cache_level[0] == 0`` cells, which nothing covered -- ``poc/sharding.py`` and the
 first version of this script both ran only ``sqd``'s default ``(1, 0)``:
 
 * ``_accumulate_diagonal`` put a rank-2 ``PartitionSpec`` on a rank-1 accumulator, which failed
@@ -21,7 +21,7 @@ first version of this script both ran only ``sqd``'s default ``(1, 0)``:
 That masking is the reason this sweeps the grid rather than sampling it -- one representative cell
 would have reported success at three broken ones.
 
-``examples/scaling/poc7_sharding.py`` remains the thorough arm (it also covers ``return_eigvec``
+``poc/sharding.py`` remains the thorough arm (it also covers ``return_eigvec``
 round-trips and more sizes). Subprocessing it from pytest was measured at 59.7 s against ~1 s here.
 """
 

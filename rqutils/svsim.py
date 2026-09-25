@@ -55,7 +55,7 @@ class CircuitXZ:
     # Q = (-i)^{x.z} Z^z X^x already folded in. Every supported gate has popcount(x & z) in {0, 1},
     # so the folded factor is exactly +i or +1 and no rounding is introduced. Keeping it real would
     # make the phase unrepresentable, which is how it came to be omitted entirely -- see
-    # ``to_circuitxz`` and ``docs/skqd.md``.
+    # ``to_circuitxz`` and ``markdowns/skqd.md``.
     sin: np.ndarray[tuple[int], np.dtype[np.complexfloating]]
     num_qubits: int = field(metadata={"static": True})
 
@@ -161,7 +161,7 @@ def do_svsim(
         )
         # No leading 1.0j here: gate.sin already carries i * (-i)^popcount(x & z) from
         # to_circuitxz. Multiplying by 1.0j again would double-count the rotation's i and drop the
-        # symplectic phase, which is exactly the bug documented in docs/skqd.md.
+        # symplectic phase, which is exactly the bug documented in markdowns/skqd.md.
         out = gate.sin * signs * xstate
         out = jax.lax.cond(gate.cos == 0.0, lambda: out, lambda: out + gate.cos * state)
         return out, None

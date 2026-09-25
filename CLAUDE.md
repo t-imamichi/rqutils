@@ -16,12 +16,12 @@ When a rule needs evidence, it points there rather than restating it.
   type (`PauliSumXZ.from_paulisum` takes a `SparsePauliOp`, `svsim` takes a `QuantumCircuit`) — the
   `HAS_QISKIT` guards stay regardless, since they turn a broken install into a `RuntimeError` at the
   call site rather than an `ImportError` at `import rqutils`. The `qiskit` extra survives as an **empty
-  alias** so the `--extra qiskit` invocations throughout this file, `NOTES.md`, `docs/` and the
-  `examples/scaling/` docstrings keep resolving; it installs nothing.
+  alias** so the `--extra qiskit` invocations throughout this file, `NOTES.md`, `markdowns/` and the
+  `poc/` docstrings keep resolving; it installs nothing.
 - **Every multi-process run needs `--extra mpi`.** `mpi4py` is an extra rather than a dependency because
   it builds against the host MPI, so requiring it would make every install depend on a system MPI, and
   nothing under `rqutils/` imports it — only `examples/sqd.py --gpus mpi` and
-  `examples/scaling/*.py --devices mpi` do, via
+  `poc/*.py --devices mpi` do, via
   `jax.distributed.initialize(cluster_detection_method="mpi4py")`. `mpirun … --devices mpi` without the
   extra raises at that call.
 - **No `timeout` on macOS** (it is GNU coreutils) — use the Bash tool's own timeout.
@@ -57,6 +57,9 @@ When a rule needs evidence, it points there rather than restating it.
 
 ### Docs
 
+`docs/` holds only the published Sphinx source; working notes and request/response memos live in
+`markdowns/`, and proof-of-concept scripts in `poc/` (`examples/` is for user-facing examples).
+
 ```bash
 cd docs && uv run --extra docs make html    # output in docs/build/html
 cd docs && uv run --extra docs make clean   # also removes source/apidoc (not committed)
@@ -69,10 +72,10 @@ warnings" summary line too.
 ## Linting and type checking
 
 ```bash
-uv run --extra dev ruff check rqutils/ tests/ examples/     # lint
-uv run --extra dev ruff format rqutils/ tests/ examples/    # format (line width 100)
+uv run --extra dev ruff check rqutils/ tests/ examples/ poc/     # lint
+uv run --extra dev ruff format rqutils/ tests/ examples/ poc/    # format (line width 100)
 uv run --exact --extra dev --extra mpl --extra qutip --extra docs \
-  ty check rqutils/ tests/ examples/                        # type check
+  ty check rqutils/ tests/ examples/ poc/                   # type check
 ```
 
 All three are clean; keep them that way — and `ty` only **from a venv without the `mpi` extra**, which is
@@ -99,7 +102,7 @@ excluded from both: they get names from IPython magics that static analysis cann
   Count first with `ty check -c 'rules.X="error"'`, then read the diagnostics rather than the count.
   The two patterns that work are a per-line suppression where the stub is genuinely wrong, and
   `@overload` where a runtime flag picks the return shape.
-- **New scripts under `examples/` trip rules the library does not**: **B023** (a `lambda` in a `for` loop
+- **New scripts under `examples/` and `poc/` trip rules the library does not**: **B023** (a `lambda` in a `for` loop
   capturing the loop variable — endemic to benchmark harnesses; fix by binding as a default arg,
   `lambda vec=vec: ...`) and **E402** (imports after the mandatory
   `jax.config.update('jax_enable_x64', True)`, needing `# noqa: E402`). `ruff --fix` resolves neither.
@@ -119,7 +122,7 @@ this bites there first.
 **Don't run the suite for a markdown-only change.** `testpaths = ["tests"]` and
 `python_files = ["test_*.py"]`, so pytest never looks at `*.md` — the result is known before it runs, and
 a green run that could not have been red dilutes the signal. `git status --short` is the check. Ruff and
-`ty` likewise only target `rqutils/ tests/ examples/`. **Docstrings are the exception**: they live in
+`ty` likewise only target `rqutils/ tests/ examples/ poc/`. **Docstrings are the exception**: they live in
 `.py`, so editing one *is* a code change for `ty` and the docs build.
 
 `tests/conftest.py` enables `jax_enable_x64` before any `rqutils` import — every tolerance depends on it
@@ -144,7 +147,7 @@ initializes); the leading underscore keeps them uncollected, as do the scratchpa
 - **Sweep `cache_level`, don't sample it** — bugs hide behind the default `(1, 0)`, and one needed a
   *complex* fixture rather than just the parameter varied.
 - **A physically-motivated fixture can invert a conclusion a synthetic one reaches.** Build it from the
-  Hamiltonian's own structure; `examples/scaling/poc12`'s `xxz_krylov` is the pattern. And **check the
+  Hamiltonian's own structure; `poc/hash_partition`'s `xxz_krylov` is the pattern. And **check the
   fixture exercises the thing under test** — a hop on qubits 0-1 gives a band-limited subspace a 0% hit
   rate, so the search is never called.
 - **For a change that must not alter the trajectory, assert the iteration count, not the energy.** A
@@ -205,7 +208,7 @@ Five reasons a mutant survives that are *not* missing coverage:
   exactly 0.0, so "correct but silently unsharded" is invisible to value comparison.
 - **A guard on a sharding decision may be invisible single-device.** If a change touches resharding, add
   a `tests/_sharded_*.py` case and mutation-test it *there*; `conftest.run_sharded_child` is the driver.
-- **`examples/scaling/poc7_sharding.py` is the fuller harness.** Run it after any change to
+- **`poc/sharding.py` is the fuller harness.** Run it after any change to
   `ground_locg`'s reductions or helper signatures, not just after touching `sqd`.
 - **`svsim` requires `mesh.size` to divide `2^num_qubits`** — documented rather than fixed, since a state
   vector's indices *are* the basis states and cannot be padded. `PartitionSpec(None)` replicates.
@@ -279,7 +282,7 @@ ingest). Terms are grouped by unique X signature, Z groups zero-padded to a rect
 Project a Pauli-sum Hamiltonian onto the subspace spanned by computational-basis bitstrings and solve
 matrix-free. `sqd(...)` is the entry point, `hproj(...)` the dense/debug path — and `hproj` **raises under
 a mesh**, deliberately: it returns a host scipy matrix, so sharding buys it nothing. Call it outside the
-mesh context (`examples/scaling/poc7_sharding.py` is the pattern, building its dense oracle outside its
+mesh context (`poc/sharding.py` is the pattern, building its dense oracle outside its
 own `with jax.set_mesh(...)` block).
 
 **Return shapes.** `sqd` returns 3 values with `return_eigvec=True` (`eigval, eigvec, basis`) and a bare
@@ -365,7 +368,7 @@ that closes `precond` — and `N` is the binding constraint, so this is the regi
 Accuracy is comparable, with `ground_locg` better at the residual floor. Don't switch algorithms without
 redoing that measurement on a physical Hamiltonian.
 
-**Every guard in it is load-bearing and was measured**; `docs/locg.md` catalogues seven defects that each
+**Every guard in it is load-bearing and was measured**; `markdowns/locg.md` catalogues seven defects that each
 failed *silently* (it is stale on scope and line numbers). Don't "simplify" the balancing, the
 re-orthogonalizations or the zero-direction masks, don't unify `body_iter1`'s exclusion bound with
 `body()`'s, and don't reintroduce the one-matmul `_compute_sas` form.
@@ -521,7 +524,7 @@ Three failure modes that produce length without content:
 
 - **Editing by appending** — adding a paragraph instead of rewriting, leaving two explanations of one
   statement and often a now-false opening sentence.
-- **Restating `NOTES.md` or `docs/`.** One statement plus a pointer, wherever a rule would appear twice.
+- **Restating `NOTES.md` or `markdowns/`.** One statement plus a pointer, wherever a rule would appear twice.
 - **A private helper re-explaining its caller.** The public docstring owns the contract; the helper states
   only what is non-obvious at its own site. Three docstrings for one 9-line function is the smell.
 
@@ -555,7 +558,7 @@ in it.
 - **`paulis(dim)`** for multiple subsystems uses `np.einsum` with 3 letters per subsystem, capping at ~17
   subsystems. `sparse=True` for products raises `NotImplementedError`.
 - **`N ≤ 2^31 - 1` subspace states**, enforced (`_MAX_STATES`) in `sqd` and `hproj` *and* on
-  `uniquify_states`' static `states_size`, where the int32 iota is created — `examples/scaling/` scripts
+  `uniquify_states`' static `states_size`, where the int32 iota is created — `poc/` scripts
   call the un-underscored helpers directly and reach the iota with neither entry-point guard in the
   chain. `TestInt32Ceiling` covers both sides.
 - **`hproj(unique_states=True)` raises on unsorted or duplicate-containing input**, where it used to
@@ -568,7 +571,7 @@ in it.
 - **`apply_h` places a host `vec` on the live mesh but will not round its length.** With `xsignatures=`
   the *`states`* count must divide `mesh.size` (`get_xsource` reshards per state); `xsources=` takes any
   length. Rounding is **declined, not unimplemented** — the two precomputed diagonals put the state axis
-  on opposite ends. `docs/rqutils-apply-h-mesh-response.md`; implementation recoverable at `1a339e8`.
+  on opposite ends. `markdowns/rqutils-apply-h-mesh-response.md`; implementation recoverable at `1a339e8`.
 - **`hproj` raises under a mesh**, rather than half-supporting one it was never able to serve.
 - **`sqd(..., packed=True)` returns *packed* states.** One flag governs both directions, so a round trip
   needs no re-pack — which also removes a hazard, `pack_states` not being idempotent. A caller comparing

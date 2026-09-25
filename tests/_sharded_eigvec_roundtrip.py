@@ -8,7 +8,7 @@ this exists to catch.
 
 **Why this arm was missing.** Every other ``tests/_sharded_*.py`` calls ``sqd`` with
 ``return_eigvec=False``, so nothing covered the branch that reshards ``eigvec`` and ``states_u`` back
-to ``PartitionSpec(None)`` before returning. ``examples/scaling/poc7_sharding.py`` covers it (as POC
+to ``PartitionSpec(None)`` before returning. ``poc/sharding.py`` covers it (as POC
 7c) but is measured at 59.7 s subprocessed against ~1 s here, so the POC stays the thorough arm and
 this is the distilled one.
 

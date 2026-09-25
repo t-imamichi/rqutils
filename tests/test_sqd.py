@@ -777,7 +777,7 @@ class TestKeywordOnlyEntryPoints:
     ``states_size`` and did not raise -- it pinned the array to size 1. ``hproj(ham, states, True)``
     is the same shape one function over, where the third parameter is ``unique_states``.
 
-    ``apply_h`` already received this treatment (``docs/rqutils-requests.md`` C1); the public entry
+    ``apply_h`` already received this treatment (``markdowns/rqutils-requests.md`` C1); the public entry
     points were missed. No in-tree caller passed these positionally, so this is a downstream-only
     break.
     """
@@ -810,7 +810,7 @@ class TestInt32Ceiling:
     """``_MAX_STATES`` is enforced where the int32 index is created, not only in the entry points.
 
     ``uniquify_states`` and ``get_xsource`` are un-underscored and are called directly by six scripts
-    under ``examples/scaling/`` -- exactly the code that pushes N -- so those call sites reached the
+    under ``poc/`` -- exactly the code that pushes N -- so those call sites reached the
     int32 iota with neither ``sqd()``'s nor ``hproj()``'s guard in the chain. The guard now also sits
     on ``uniquify_states``' static ``states_size``, which fires at trace time and costs nothing.
 
@@ -868,7 +868,7 @@ class TestHproj:
         rather than a bug. Measured with the naive ``bit q -> column q`` pairing, ``Z`` on qubit 0 over
         codes ``{0, 1}`` gives ``diag == [1, 1]``: no dependence on qubit 0 whatsoever, against the
         correct ``[1, -1]``. That exact defect shipped in the ``subspace`` helper in
-        ``docs/rqutils-precond-request.md`` and propagated to a POC that copied it.
+        ``markdowns/rqutils-precond-request.md`` and propagated to a POC that copied it.
 
         Uncovered until now because every other qiskit test here builds operators from *strings*
         (``SparsePauliOp(["ZI"], ...)``), where character order is what the caller already wrote. Only
@@ -972,10 +972,10 @@ class TestHproj:
         This is the one way the sortedness guard could surprise a caller -- ``uniquify_states`` output
         is otherwise exactly what ``get_xsource`` wants -- so it is pinned rather than left to be
         rediscovered. ``sqd`` trims fillers before returning its basis, which is why
-        ``examples/scaling/poc7_sharding.py`` can hand that basis straight to ``hproj``.
+        ``poc/sharding.py`` can hand that basis straight to ``hproj``.
 
         **This test used to assert the opposite of its own title for the single-filler case**, which is
-        how the parity hole (``docs/gotchas.md`` item 14) survived: rejection rested on two or more
+        how the parity hole (``markdowns/gotchas.md`` item 14) survived: rejection rested on two or more
         ``255`` rows being *duplicates*, so exactly one filler was still strictly increasing and
         passed, and the assertion below read ``is True``. The docstring's stated intent was right and
         the assertion was wrong. There is now an explicit high-bit test in ``_is_lex_sorted``,
@@ -1168,7 +1168,7 @@ class TestSqdMinDiagWeightCancellation:
     """
 
     def test_two_state_diagonal_subspace(self):
-        """THE REPORTED CASE, from ``docs/rqutils-prefilter-bug-response.md`` section 5.
+        """THE REPORTED CASE, from ``markdowns/rqutils-prefilter-bug-response.md`` section 5.
 
         A 2-state subspace of the Bx=0 n=4 Heisenberg chain whose projected Hamiltonian is
         ``diag(-0.75, -0.25)``. The diagonal is ``[0.75, 0.75]``, so ``argmin`` is 0, the weight
@@ -1580,7 +1580,7 @@ class TestUint64KeyWidthBoundary:
     path. What was missing is the guard at the packing function itself. Its docstring said "Only valid
     while ``B <= 8``; :func:`get_xsource` checks that before calling", which is a *comment*: nothing
     enforced it, and ``NOTES.md`` calls the limit "a correctness limit" while
-    ``docs/scaling-pocs.md`` calls it "a hard correctness boundary, asserted rather than documented".
+    ``markdowns/scaling-pocs.md`` calls it "a hard correctness boundary, asserted rather than documented".
     It was in fact neither asserted nor enforced.
 
     The failure is worse than truncation. Byte 0 is the most significant, so at ``B = 9`` its shift is
@@ -1589,9 +1589,9 @@ class TestUint64KeyWidthBoundary:
     differing *only* in byte 0 both pack to key ``0``, as does an all-zero row.
 
     ``B = 9`` is reachable: ``B = ceil((n + 1) / 8)``, so ``n >= 64`` crosses it, and
-    ``docs/scaling-pocs.md`` measures at ``n = 64`` and beyond.
+    ``markdowns/scaling-pocs.md`` measures at ``n = 64`` and beyond.
 
-    The wrapper-type fix ``docs/gotchas.md`` proposes (encoding width in item 7's packed-states type)
+    The wrapper-type fix ``markdowns/gotchas.md`` proposes (encoding width in item 7's packed-states type)
     is deferred, so this is defence-in-depth on a private function: it converts a silent wrong answer
     into a raise for anyone who reaches past ``get_xsource``.
     """
@@ -1652,13 +1652,13 @@ class TestConvergenceIsReported:
     upper bound*, so finite and entirely plausible -- and ``sqd`` wrapped it in ``float()`` and
     returned it as "Calculated ground state energy" with no indication.
 
-    ``docs/locg.md`` records that this absence "is the reason I4 could hide": a sign error made the
+    ``markdowns/locg.md`` records that this absence "is the reason I4 could hide": a sign error made the
     convergence test unsatisfiable, so the solver silently never converged and every answer was the
     iteration cap's best guess. ``sqd`` also exposed no ``maxiter`` or ``tol``, so a caller could
     neither detect the situation nor retry.
 
     Narrow fix, deliberately: ``maxiter``/``tol`` are exposed and non-convergence raises. ``sqd``'s
-    *return shape* is unchanged -- returning a status object is item 11 in ``docs/gotchas.md`` and a
+    *return shape* is unchanged -- returning a status object is item 11 in ``markdowns/gotchas.md`` and a
     much wider break.
 
     The raise lives in ``sqd``, not ``run_sqd``: the latter is ``@jax.jit``-wrapped, so ``converged``
@@ -2092,7 +2092,7 @@ class TestPublicHelperPreconditions:
     """The un-underscored helpers state preconditions; these check the ones that *can* be checked.
 
     ``uniquify_states``, ``get_xsource`` and ``get_diag_signs`` are public and called directly by six
-    scripts under ``examples/scaling/`` -- i.e. exactly the code that pushes ``N`` past where the
+    scripts under ``poc/`` -- i.e. exactly the code that pushes ``N`` past where the
     entry-point guards would have fired. ``NOTES.md`` records that this is how the int32 iota was
     reached "with neither entry-point guard in the chain".
 
@@ -2104,7 +2104,7 @@ class TestPublicHelperPreconditions:
     - ``get_xsource``'s **lex-sortedness** requirement cannot be checked. It is ``@jax.jit``-wrapped,
       so ``states`` arrives as a tracer and its values are unavailable; a host-side scan like
       ``_is_lex_sorted`` is impossible there. This is a structural limit, not an oversight, and it is
-      why ``docs/gotchas.md`` item 10 proposed wrapper types rather than validation.
+      why ``markdowns/gotchas.md`` item 10 proposed wrapper types rather than validation.
     - **Rank and dtype are static under jit**, so those *are* checkable -- and ``get_diag_signs``
       silently accepted a 1-D ``zsignatures`` array, returning a wrongly shaped result rather than
       raising.
@@ -2174,7 +2174,7 @@ class TestPublicHelperPreconditions:
 class TestSingleFillerRow:
     """``_is_lex_sorted`` must reject *one* filler row, not just two or more.
 
-    The parity hole ``docs/gotchas.md`` item 14 names. Filler slots are all-``255`` rows, so **two**
+    The parity hole ``markdowns/gotchas.md`` item 14 names. Filler slots are all-``255`` rows, so **two**
     are duplicates and fail the strictness test -- which is what ``_is_lex_sorted``'s docstring
     claimed made it reject padded input "by design". But a **single** filler row is still strictly
     increasing and passed. Measured: ``uniquify_states(..., 3)`` on a 2-state subspace gives
@@ -2297,7 +2297,7 @@ class TestApplyHArrayRoles:
 
         Going keyword-only removed *mispairing* -- declaring one strategy while having packed the arrays
         for another -- but not *misnaming*: ``apply_h(vec, xsources=x)`` where ``x`` is a signature array
-        was still accepted. ``docs/rqutils-requests.md`` concedes that residue is "much smaller... but it
+        was still accepted. ``markdowns/rqutils-requests.md`` concedes that residue is "much smaller... but it
         is not zero".
 
     ``apply_h``'s own docstring records why a **shape** assertion cannot close it, and that is
@@ -2592,7 +2592,7 @@ class TestShardedSqdPrefilter:
 
     ``tests/_sharded_prefilter.py`` already covers the prefilter on a mesh, but only through
     ``ground_locg`` with a dense ``einsum`` matvec on an unpadded power-of-two vector.
-    ``docs/locg-chebyshev-prefilter.md`` states that gap and defers it here.
+    ``markdowns/locg-chebyshev-prefilter.md`` states that gap and defers it here.
 
     So this covers the one configuration only reachable through ``sqd``: a **padded** subspace whose
     filler slots are masked to zero, partitioned across a mesh, driven through ``apply_h``'s
@@ -2717,7 +2717,7 @@ class TestShardedCacheLevels:
     """Every ``cache_level`` must give the same answer sharded as single-device.
 
     Two distinct sharding defects lived in the three ``cache_level[0] == 0`` cells, and **nothing
-    covered them**: ``examples/scaling/poc7_sharding.py`` and the first version of this test both ran
+    covered them**: ``poc/sharding.py`` and the first version of this test both ran
     only ``sqd``'s default ``(1, 0)``. Measured on a 4-device mesh:
 
     * ``_accumulate_diagonal`` carried its template's *full* sharding spec onto a 1-D accumulator,
@@ -2817,7 +2817,7 @@ class TestShardedHproj:
     It returns a host scipy matrix, so a mesh buys it nothing -- and every mesh-enabled call failed
     anyway, at any subspace size: ``columns[valid]`` is a boolean-mask gather on the partitioned array
     ``get_xsource`` returns, which raises ``ShardingTypeError``. Rejected explicitly rather than
-    half-supported. ``examples/scaling/poc7_sharding.py`` is the pattern that must keep working: it
+    half-supported. ``poc/sharding.py`` is the pattern that must keep working: it
     builds its dense reference with ``hproj`` *outside* its ``with jax.set_mesh(...)`` block.
     """
 
@@ -2974,7 +2974,7 @@ class TestShardedEigvecRoundtrip:
     **The gap this closes.** Every other ``tests/_sharded_*.py`` calls ``sqd`` with
     ``return_eigvec=False``, so the branch that reshards ``eigvec`` and ``states_u`` back to
     ``PartitionSpec(None)`` had no coverage at all -- only
-    ``examples/scaling/poc7_sharding.py``'s POC 7c, which is measured at 59.7 s subprocessed against
+    ``poc/sharding.py``'s POC 7c, which is measured at 59.7 s subprocessed against
     ~1 s here. The POC stays the thorough arm; this is the distilled one.
 
     **It asserts the eigenvector equation, not shapes.** A reshard that dropped or reordered rows
@@ -3277,7 +3277,7 @@ class TestSqdPrefilter:
 
         The n=2 full basis is the smallest reproducer, and ``|lambda_min| > |lambda_max|`` is the
         precondition that makes it one -- asserted, since a fixture that stopped leaning negative
-        would silently stop testing this. ``docs/rqutils-prefilter-bug.md`` has the report.
+        would silently stop testing this. ``markdowns/rqutils-prefilter-bug.md`` has the report.
         """
         num_qubits = 2
         strings, coeffs = [], []

@@ -110,7 +110,7 @@ Numerical considerations
 Naive transcriptions of the steps above are numerically fragile in ways that fail *silently*: they
 return a plausible number that is simply wrong, rather than raising or producing ``NaN``.
 
-The measurements behind each item below were originally recorded in ``docs/locg.md``. **That
+The measurements behind each item below were originally recorded in ``markdowns/locg.md``. **That
 document describes the pre-rewrite module and is now stale** -- its line numbers, its "no pytest
 suite exists" scope note, and several of its severity claims no longer hold, and at least one
 failure mode it measured is no longer reachable now that the defects it compounded with are fixed
@@ -239,7 +239,7 @@ single-vector, prefilter-then-LOBPCG specialization rather than a construction f
 which filter a whole subspace inside a self-consistent loop. In particular the two-level
 complementary-subspace method of [5] is **not** implemented here and would not fit: it filters a
 subspace and solves its complement, against this module's three-vector memory budget. A two-level
-*preconditioner* was separately measured and rejected (0.68-0.98x, ``docs/deflation-preconditioner.md``)
+*preconditioner* was separately measured and rejected (0.68-0.98x, ``markdowns/deflation-preconditioner.md``)
 -- it improved conditioning without opening the gap, which is what the iteration count tracks.
 
 Two properties are load-bearing and neither is inherited from the references. The filter's lower edge
@@ -248,7 +248,7 @@ accurate :math:`\lambda_1` measured faster on a comfortable gap and silently wro
 And the upper edge ``prefilter_hi`` must be a true bound on :math:`\lambda_{\max}`, which no
 matvec-based iteration can supply; a power-iteration estimate returned an *excited* eigenpair with
 ``converged=True``. :func:`_chebyshev_prefilter` records both measurements, and
-``docs/locg-chebyshev-prefilter.md`` has the tuning tables.
+``markdowns/locg-chebyshev-prefilter.md`` has the tuning tables.
 
 Distributed arrays
 ==================
@@ -256,7 +256,7 @@ Distributed arrays
 This function works transparently over distributed (sharded) input :math:`v_0` if the callable
 passed as the ``mat`` argument preserves the sharding in the output. The re-orthogonalization
 described above introduces two additional inner products per iteration, following the same reduction
-pattern as the existing ones. ``examples/scaling/poc7_sharding.py`` exercises this on a four-device
+pattern as the existing ones. ``poc/sharding.py`` exercises this on a four-device
 mesh (virtual CPU devices via ``XLA_FLAGS=--xla_force_host_platform_device_count=4``), agreeing with
 the single-device result to 8.9e-16; real multi-GPU behaviour remains unverified.
 
@@ -277,7 +277,7 @@ Chebyshev-filtered subspace iteration*, J. Comput. Phys. **219**, 172 (2006).
 
 [5]: A. S. Banerjee, L. Lin, P. Suryanarayana, C. Yang, J. E. Pask, *Two-level Chebyshev filter based
 complementary subspace method*, J. Chem. Theory Comput. **14**, 2930 (2018). The provenance
-``docs/locg-chebyshev-prefilter.md`` cites; used in production in DFT-FE. Its two-level
+``markdowns/locg-chebyshev-prefilter.md`` cites; used in production in DFT-FE. Its two-level
 complementary-subspace split is **not** what this module does -- see the note below.
 
 Single-vector LOBPCG API
@@ -580,7 +580,7 @@ def _chebyshev_prefilter(
     under-estimates. The consequence was a silent wrong answer -- the filter damps its own target and
     the solver returns an *excited* eigenpair with ``converged=True`` (measured: the n=2 Heisenberg
     chain returned +0.25 for a true -0.75; the bound was invalid in 16 of 25 XXZ configurations, with
-    wrong answers in 2). ``docs/rqutils-prefilter-bug.md`` has the report and the reproduction.
+    wrong answers in 2). ``markdowns/rqutils-prefilter-bug.md`` has the report and the reproduction.
 
     **No cheap matvec-only upper bound exists** -- a theorem, not a tuning problem (Kuczynski &
     Wozniakowski, SIAM J. Matrix Anal. Appl. 13(4):1094-1122, 1992). So rigour has to come from the
@@ -608,7 +608,7 @@ def _chebyshev_prefilter(
     Filtering alone does not converge: as ``theta`` approaches ``lambda_0`` the lower edge does too, so
     the filter begins attacking its own target and accuracy plateaus around 1e-5 to 1e-7. That is why
     this is a *prefilter* handing off to the full iteration rather than a solver -- see
-    ``docs/locg-chebyshev-prefilter.md`` for both measurements.
+    ``markdowns/locg-chebyshev-prefilter.md`` for both measurements.
 
     Note this does **not** reproduce the depleted-residual failure that makes a power-iteration start
     *worse* than a random one (measured 177 LOBPCG iterations against 77). Power iteration collapses onto
@@ -639,7 +639,7 @@ def _chebyshev_prefilter(
 # Overloads so a caller destructuring the 4-tuple does not have to narrow on `len(result) == 5` first.
 # Annotation only: the implementation signature below is unchanged and is the one sphinx documents.
 # `debug` stays positional-or-keyword here (unlike `sqd`'s keyword-only block), so the overloads repeat
-# the full positional order -- `examples/scaling/poc6_mixed_precision.py` and the benchmark pass
+# the full positional order -- `poc/mixed_precision.py` and the benchmark pass
 # `maxiter` positionally. A `bool` that is not a literal still matches the `bool` overload and gets the
 # union, which is what a runtime-computed flag needs.
 @overload
@@ -822,7 +822,7 @@ def ground_locg(
             residual test every convergence check reads certifies that *an* eigenpair was found, not
             that it is the lowest, so a filter that removed the target from the iterate's span
             returned an excited eigenpair with ``converged=True``
-            (``docs/rqutils-prefilter-bug.md``). With a valid bound the returned eigenpair is the same
+            (``markdowns/rqutils-prefilter-bug.md``). With a valid bound the returned eigenpair is the same
             one to the tolerance the solver was going to reach anyway (measured: eigenvector overlap 1.0000000 against the
             unfiltered result, energies agreeing with ``eigsh(tol=0)`` to 2.8e-14).
 
@@ -849,8 +849,8 @@ def ground_locg(
             the 249- and 573-iteration cases measured 3.6-5.1x at ``degree`` 48-96.
 
             All figures are single-device CPU; the ordering may differ on a GPU, where the
-            matvec-to-bookkeeping cost ratio differs -- ``examples/scaling/poc9_prefilter_gpu.py``
-            sweeps this grid to settle it. See ``docs/locg-chebyshev-prefilter.md`` for the tables,
+            matvec-to-bookkeeping cost ratio differs -- ``poc/prefilter_gpu.py``
+            sweeps this grid to settle it. See ``markdowns/locg-chebyshev-prefilter.md`` for the tables,
             why the filter's lower edge must be the running Rayleigh quotient rather than an
             accurate :math:`\lambda_1`, and why filtering alone does not converge.
         debug: If True, additionally return per-iteration diagnostics. Note that the diagnostic
@@ -1122,7 +1122,7 @@ def _ground_locg_callable(
         # amplifies pure noise until `tmp_p` comes back **parallel to `xcurr`**. `sas` then degenerates
         # -- measured `[[1.9, -1.9], [-1.9, 4.8]]`, whose lowest eigenvalue is 0.96 for a true 1.9 --
         # and the caller saw a `RuntimeError` naming `maxiter` on a problem solved in one iteration
-        # (`docs/rqutils-prefilter-dim2-request.md`).
+        # (`markdowns/rqutils-prefilter-dim2-request.md`).
         #
         # Masking `sas[1, 1]` alone does NOT fix it: the mask fired correctly and the surviving
         # off-diagonal still coupled `x` to the noise. Nor does a scale-relative residual threshold --
