@@ -3502,6 +3502,13 @@ the independence and drops the rebuild.
   residual sits at **max 0.96, median 0.27** of `bound`. The tail is at the floor (`r = 2.9e-15`,
   `bound = 3.0e-15`, floor `4.2e-15`), where the recomputation's own rounding is the discrepancy --
   hence the `max(…, floor)` inside the slack rather than a bare multiple of `bound`.
+- **The slack holds at N = 10⁷, and N does not enter it** (2026-09-25, for spinchain's
+  `rqutils-eigenpair-check-request.md`; `poc/eigenpair_check_scale.py`). On spinchain's eight open-XXZ
+  Hamiltonians at n = 30 (complex, `Σ|c_k|` 19–45) with Hamming-shell subspaces around both Néel states,
+  default tolerance and prefilter, residual ÷ threshold is **0.040–0.097** over N = 10⁵–3·10⁶ and
+  **0.091** at N = 10⁷ (`type1`, δ = 0.5), identical at `(1, 0)` and `(1, 2)`, with no trend in N.
+  Structurally: each `P_k` is a signed permutation and projection only drops entries, so the error in
+  `Hv` has norm at most `γ_m·Σ|c_k|` -- term count, not N -- which the floor term tracks.
 - **Catches what it is for**: a dominant-component sign flip with `converged=True` reads **5.7e+00**
   against a threshold of 7.8e-14. A swap of components 0/1 was a no-op on that fixture (both ~1e-17).
 - **Cost**, `J=120`, `N=30k`, warm, interleaved 9 rounds: `(1,0)` +3.2%, `(1,2)` +7.9%, `(0,0)` +1.5%
