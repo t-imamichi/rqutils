@@ -1436,6 +1436,23 @@ Chunk `2^13` leaves memory unchanged (the solver's vectors dominate) and only co
   that the gather form does not; not attempted.
 - **Hit rate is a property of the subspace.** Hamming-shell draws; a sampler's subspaces may differ.
 
+**Not an XXZ artifact -- the win tracks the hit rate `h`** (`poc/sparse_pairs_general.py`). The pair form is
+general (XOR is an involution for every X signature; `H_ji = conj(H_ij)` for any Hermitian Pauli sum), and
+open vs periodic or 1D vs 2D only changes `J`. What varies is `h`: pairs cost ~`6·h·J` B/slot against `4·J`,
+so memory breaks even near `h ≈ 2/3`, and P0's work scales with `h` rather than with every slot. Measured
+at the high-`h` end, operator bytes and `(2, N)` matvec against `(1, 0)`, each arm checked first:
+
+| fixture | `J` | `h` | P0 | P2 |
+| --- | --- | --- | --- | --- |
+| open XXZ n=60 `type2`, Hamming shells (above) | 120 | 0.095 | −63%, 4.5× (whole solve) | −55%, 6.3× |
+| periodic XXZ n=24, Néel-Krylov (closed under hops) | 25 | 0.42 | −44%, 0.99× | −23%, 2.54× |
+| molecular-like JW n=14, random states (71% of `2^14`) | 872 | 0.71 | −25%, **0.89×** | ≈0%, 4.54× |
+
+So the memory win belongs to subspaces that are sparse relative to the Hamiltonian's moves -- the SQD
+regime at large `n`, where `10^5`--`10^7` states sit in a `2^n` space -- and P0 loses its speed edge as `h`
+rises. P2 was faster everywhere measured, most where diagonals are expensive (8--37 terms per group in the
+molecular fixture); it was not compared against `(1, 2)` on the last two rows.
+
 ### Partial diagonal cache: *which* groups to cache barely matters, only how many (2026-09-25)
 
 Every cached group costs the same bytes (one diagonal per state), but recomputing group `g` costs `K_g`
