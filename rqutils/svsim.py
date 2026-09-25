@@ -50,29 +50,20 @@ class CircuitXZ:
     x: np.ndarray[tuple[int], np.dtype[np.int64]]
     z: np.ndarray[tuple[int], np.dtype[np.int64]]
     cos: np.ndarray[tuple[int], np.dtype[np.floating]]
-    # Complex, not real: this carries i * (-i)^popcount(x & z), i.e. the sine amplitude with both
-    # the leading i of the rotation and the symplectic phase of the convention
-    # Q = (-i)^{x.z} Z^z X^x already folded in. Every supported gate has popcount(x & z) in {0, 1},
-    # so the folded factor is exactly +i or +1 and no rounding is introduced. Keeping it real would
-    # make the phase unrepresentable, which is how it came to be omitted entirely -- see
-    # ``to_circuitxz`` and ``markdown/skqd.md``.
+    # Complex: holds i*(-i)^popcount(x & z), exactly +i or +1 for every supported gate, which a real
+    # dtype cannot represent (NOTES.md, "`svsim`: `sin` is complex128 and must stay so").
     sin: np.ndarray[tuple[int], np.dtype[np.complexfloating]]
     num_qubits: int = field(metadata={"static": True})
 
 
 type GateSpec = tuple[str, int | Sequence[int]] | tuple[str, int | Sequence[int], Any]
-# Name the QuantumCircuit arm here rather than appending it under HAS_QISKIT -- see the
-# optional-dependency rule in CLAUDE.md. No TYPE_CHECKING guard: `to_circuitxz`'s isinstance needs the
-# runtime import anyway.
+# Name the QuantumCircuit arm here, never via a later `|=` (CLAUDE.md, optional dependencies); no
+# TYPE_CHECKING guard, since `to_circuitxz`'s isinstance needs the runtime import anyway.
 type CircuitInput = CircuitXZ | list[GateSpec] | QuantumCircuit
 
 
-# name -> (x bit, z bit, takes an angle). The supported gate set in one place: which gates exist,
-# their symplectic signature, and which are parameterized. Keeping the parameterized set as a
-# separate tuple alongside a per-gate dispatch meant the same fact was spelled twice, and a drift
-# between them would leave `angle` silently stale from the previous loop iteration rather than
-# raising. Note `cz` is absent deliberately -- it is decomposed on the QuantumCircuit path only, and
-# rejected as a raw gate spec (test/test_svsim.py::TestCz::test_cz_as_a_gate_spec_is_rejected).
+# name -> (x bit, z bit, takes an angle): the gate set's only spelling; `cz` is absent on purpose
+# (NOTES.md, "svsim._GATE_XZ: one table for the gate set, and no `cz`").
 _GATE_XZ = {
     "x": (1, 0, False),
     "y": (1, 1, False),
@@ -145,13 +136,8 @@ def do_svsim(
         state_vector = (one_hot_indices == initial_state).astype(np.complex128)
 
     def apply_gate(state, gate):
-        # Build the index iota inside the body, not once outside it. Closing over it instead makes
-        # XLA hoist it into the scan's carry, where a 2^n int64 array stays resident for the whole
-        # simulation on top of the two complex128 statevector buffers the loop already needs --
-        # measured peak temp 2.5x the statevector, invariant in n, against 2.0x when built here (an
-        # iota is loop-invariant, so XLA rematerializes it for free rather than keeping it live).
-        # That is 8 GiB at n=30 and 32 GiB at n=32, on a module whose docstring advertises 32+
-        # qubits. Output is bit-identical either way.
+        # Build the iota in the body, or XLA hoists it into the scan carry as a resident 2^n int64
+        # (NOTES.md, "svsim.do_svsim: build the index iota inside the scan body").
         indices = jnp.arange(dim, dtype=np.int64, out_sharding=out_sharding)
         signs = 1.0 - 2.0 * (jnp.bitwise_count(indices & gate.z) & 1)
         xstate = jax.lax.cond(
@@ -159,9 +145,8 @@ def do_svsim(
             lambda: state,
             lambda: state.at[indices ^ gate.x].get(out_sharding=out_sharding),
         )
-        # No leading 1.0j here: gate.sin already carries i * (-i)^popcount(x & z) from
-        # to_circuitxz. Multiplying by 1.0j again would double-count the rotation's i and drop the
-        # symplectic phase, which is exactly the bug documented in markdown/skqd.md.
+        # No leading 1.0j: gate.sin already carries i*(-i)^popcount(x & z), and another would drop
+        # the phase (NOTES.md, "`svsim`: `sin` is complex128 and must stay so").
         out = gate.sin * signs * xstate
         out = jax.lax.cond(gate.cos == 0.0, lambda: out, lambda: out + gate.cos * state)
         return out, None
@@ -223,9 +208,8 @@ def to_circuitxz(circuit: CircuitInput) -> CircuitXZ:
     sinarr = np.zeros(len(circuit), dtype=np.complex128)
     qmax = 0
     for igate, gate in enumerate(circuit):
-        # Unpack rather than index: GateSpec is a union of a 2-tuple and a 3-tuple, and a
-        # parameterized gate must carry its angle. Indexing gate[2] directly would raise a bare
-        # IndexError further down, with nothing to say which gate was malformed.
+        # Unpack, don't index: a parameterized gate missing its angle must raise naming the gate,
+        # not a bare IndexError further down.
         name, qubit_spec, *rest = gate
         try:
             xbit, zbit, needs_angle = _GATE_XZ[name]
@@ -241,21 +225,12 @@ def to_circuitxz(circuit: CircuitInput) -> CircuitXZ:
         qubits = np.asarray(qubit_spec)
         xarr[igate] = np.sum(np.array(spec[0], dtype=np.int64) << qubits)
         zarr[igate] = np.sum(np.array(spec[1], dtype=np.int64) << qubits)
-        # The module's convention is Q = (-i)^{x.z} Z^z X^x, so the symplectic phase belongs to
-        # every gate whose X and Z signatures overlap -- from the match above, that is y and ry
-        # (x, z, rx, rz, rzz, cz all have x.z == 0). Fold it into the sine amplitude together with
-        # the rotation's own leading i, which is why sinarr is complex. Omitting it left ry off by
-        # exactly a factor of i, and since transpiling to ['rx','ry','rz','rzz'] emits ry
-        # constantly, that corrupted essentially every nontrivial circuit: a 5-qubit GHZ came back
-        # with |overlap| 0.5 against qiskit, and a 6-qubit 4-rep Trotter step with 1e-16.
+        # The (-i)^{x.z} phase of y and ry (the only gates with x.z != 0) folds into sinarr with i
+        # (NOTES.md, "svsim.to_circuitxz: the y/ry phase, and what omitting it cost").
         phase = 1.0j * (-1.0j) ** int(np.bitwise_count(xarr[igate] & zarr[igate]))
         if spec[2] == "pi":
-            # x/y/z are the bare Pauli gates, so they must NOT carry the -i that a pi rotation
-            # would: R_P(pi) = exp(-i pi P / 2) = -i P. Multiplying the pi-rotation amplitude
-            # (-phase) by the compensating +i gives exactly the Pauli. Without this, x and z came
-            # back with a -i global phase relative to qiskit's X and Z -- harmless for a single
-            # circuit, but a global phase stops being global as soon as a caller superposes two
-            # simulations, and these are documented as gate names rather than as rotations.
+            # x/y/z are bare Paulis, not pi-rotations (R_P(pi) = -i P), so +i cancels the -i: a
+            # global phase stops being global once a caller superposes two simulations.
             sinarr[igate] = -phase * 1.0j
         else:
             cosarr[igate] = np.cos(-spec[2] * 0.5)

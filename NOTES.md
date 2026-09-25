@@ -3592,3 +3592,399 @@ Bloch-sampling result (9/9 cells, 13.6–50.3% "capture" — two arms differing 
 with identical distributions); a `p`-sweep optimum that was a `np.unique`+truncation artifact; and
 "top-amplitude selection is a ceiling", which it is not — it maximizes *fidelity* where `λ_min` of a
 projection is variational and rewards connectivity.
+
+## Moved from code comments (2026-09-25)
+
+Evidence that used to sit in `#` comment blocks in `rqutils/`, moved here when those comments were cut
+to the two-line ceiling. Each code site now carries one statement and a pointer to its subsection.
+
+### svsim._GATE_XZ: one table for the gate set, and no `cz`
+
+A separate parameterized-gate tuple kept alongside a per-gate dispatch spelled the same fact twice, and
+a drift between them would leave `angle` silently stale from the previous loop iteration rather than
+raising. `cz` is absent deliberately: it is decomposed on the `QuantumCircuit` path only, and rejected
+as a raw gate spec (`test/test_svsim.py::TestCz::test_cz_as_a_gate_spec_is_rejected`).
+
+### svsim.do_svsim: build the index iota inside the scan body
+
+Closing over the iota makes XLA hoist it into the scan's carry, where a `2^n` int64 array stays resident
+for the whole simulation on top of the two complex128 statevector buffers the loop already needs.
+Measured peak temp **2.5x** the statevector, invariant in n, against **2.0x** when built in the body (an
+iota is loop-invariant, so XLA rematerializes it for free rather than keeping it live). That is 8 GiB
+at n=30 and 32 GiB at n=32, on a module whose docstring advertises 32+ qubits. Output is bit-identical
+either way.
+
+### svsim.to_circuitxz: the y/ry phase, and what omitting it cost
+
+x, z, rx, rz, rzz and cz all have `x·z == 0`, so the `(-i)^{x·z}` phase belongs to y and ry only.
+Omitting it left `ry` off by exactly a factor of `i`, and since transpiling to `['rx','ry','rz','rzz']`
+emits `ry` constantly, that corrupted essentially every nontrivial circuit: a 5-qubit GHZ came back with
+|overlap| **0.5** against qiskit, and a 6-qubit 4-rep Trotter step with **1e-16**. See also "`svsim`:
+`sin` is complex128 and must stay so".
+
+### qprint._process: compress before phase work
+
+Only terms above the cutoff are ever printed, so normalizing every element's phase and then discarding
+all but a handful is pure waste, paid again on every repr since `output='text'` returns the object for a
+lazy `__repr__`. Measured on a 5-term printout of a dim-2^20 input: **25 ms -> 5.3 ms**. Selecting first
+also bounds the wrap-around loop by the term count rather than the input size. The later compression
+does the same for the wrap-around loop and the two `normalize_phase` passes. The `global_phase='mean'`
+offset is the exception: a mean over every element by definition, so it is taken before compressing.
+
+### qprint._qobj_data: two qutip defects
+
+- `dims[0]` is the row (ket) space and `dims[1]` the column (bra) space. For a bra `dims[0]` is the
+  trivial `[1]`, so taking it unconditionally raised "Product of subsystem dimensions 1 and qobj
+  dimension 3 do not match" for every bra. Operators have both sides populated and are unaffected.
+- `Qobj.full()`, not `Qobj.data`: in qutip 4 `.data` was a scipy sparse matrix, so `qobj.data.data`
+  reached its value buffer, but qutip 5 wraps the payload in its own Dense/CSR class with no `.data`.
+  The chained access raised "'qutip.core.data.dense.Dense' object has no attribute 'data'" and made
+  every Qobj input fail. `.full()` returns a dense ndarray in both versions.
+
+### qprint.QPrintBraKet._add_labels: unravel per term
+
+Precomputing a `len(dim) x objdim` table to read one element per term out of costs **168 MB and
+16.7 ms** at dim 2^20 over 20 subsystems, against **0.009 ms** for unravelling the handful of indices
+actually printed.
+
+### qprint.QPrintMatrix._make_lines: always emit the amplitude
+
+Suppressing an exact `1` is correct where a basis label follows (`\frac{IZ}{2}` reads better than
+`1\frac{IZ}{2}`), but a matrix element has no label, so dropping it left the cell empty and produced
+`\begin{pmatrix} & 0 & 0 & 0 \\ ...`, a malformed matrix missing its first entry.
+
+### paulis.symplectic.pack_states: the 0/1 check
+
+Checked before `astype`, which would erase the evidence: 256 wraps to 0 and -1 to 255. min/max rather
+than `(states == 0) | (states == 1)`: one pass instead of two comparisons and an OR, measured **1.05 ms
+against 4.14 ms** at N=1M, n=32. Equivalent for the integer and bool dtypes it receives, since the only
+values in [0, 1] are 0 and 1.
+
+### paulis.symplectic.from_paulisum: no quadratic group-bys
+
+- Summing duplicate strings' coefficients with a one-hot matmul materialized a dense
+  `(n_unique, n_terms)` mask to express a group-by: **64 MB and 27.5 ms** at 4000 terms / 2000 groups,
+  growing quadratically (400 MB at 10000/5000, OOM past that), against **0.03 ms** for the scatter-add.
+  `np.add.at` rather than `np.bincount` because `coeffs` is still complex there (the Hermiticity check
+  narrows it later) and bincount takes real weights only.
+- Bucketing the terms by X signature by rescanning `indices` once per signature was the same quadratic
+  shape — **15.9 ms** at 5000 groups against **0.3 ms** for one stable sort — and it also re-ran the
+  uint8 conversion per group. `indices` is already each term's group id, so sorting it groups the
+  terms and the cumulative counts give each group's slice.
+
+### paulis.symplectic.from_paulisum: the Hermiticity tolerance
+
+Checked once rather than per branch so both ingest paths agree: the Qiskit branch always raised, while
+the tuple branch used to warn and silently take `.real` under `force_real=True`, discarding the imaginary
+part of a non-Hermitian operator rather than rejecting it.
+
+The comparison is against `atol`, not exact zero. A mathematically Hermitian operator whose Pauli
+coefficients were obtained numerically carries rounding at the 1e-16 level: conjugating a Hermitian
+matrix by a non-Clifford circuit and decomposing the result — the standard way to build a rotated
+Hamiltonian — was rejected by the exact test **18 times out of 18** (n = 3, 4, 5 x 6 seeds) at a largest
+|imag| of **3.3e-16**, while those operators' own hermiticity error reached **2.7e-15**. The residue being
+rejected was an order of magnitude smaller than the property it tested for.
+
+Not a return to `force_real`, which took `.real` on genuinely nonzero imaginary parts. The default sits
+~4 orders above the observed rounding and many below any physical coefficient; pass a smaller `atol` to
+tighten it, or 0.0 to restore the exact test.
+
+### paulis.symplectic.from_paulisum: why `atol` is keyword-only
+
+As a second positional, `from_paulisum(op, 1e-3)` read naturally as a `simplify` tolerance or a
+coefficient cutoff (both plausible, since `simplify()` is called on ingest) and instead raised the
+Hermiticity threshold by nine orders. The loosened check does not merely permit the operator: the
+following `.real` throws the imaginary part away. Measured:
+`from_paulisum((["ZI", "IZ"], [1 + 1e-4j, 0.5]), 1e-3)` was accepted and returned `c = [0.5, 1.0]`, the
+1e-4 silently gone.
+
+### paulis.symplectic: the pad bit is unconditional
+
+As an opt-in flag the pad bit was an invariant nothing could enforce: the signature side and the state
+side lived in separate call sites with no check that they agreed. When they disagreed every matrix
+element landed in the wrong column and the result stayed symmetric, so eigvalsh returned a plausible
+wrong ground energy — that is how `hproj` shipped broken. The X side goes through `pack_states`, the
+method consumers pad their states with, so both halves of the alignment contract are one code path. The
+Z signatures are `(n_xgroups, n_zterms, n_qubits)` and pad axis 2 rather than axis 1, so they cannot
+reuse it; the operation is otherwise identical. `svsim` builds `CircuitXZ` itself and never calls this.
+
+### paulis.general.paulis: cache the returned array itself
+
+Storing a `.copy()` and returning the original left a second, writeable allocation alive per key for the
+process lifetime: retained memory measured **2.00x** the result at `dim=(2,)*6` (537 MB for a 268 MB
+basis) against **1.00x** now. It also made the warm return writeable while the cold one was read-only, so
+no caller could have depended on writeability without already hitting that inconsistency.
+
+### paulis.general.pauli_matrices: sparse is derived and frozen
+
+- **Derived from the dense basis.** The CSR branch this replaced re-derived the shell ordering and the
+  `sqrt(2/(k(k+1)))` diagonal normalization by hand as data/indices/indptr triplets — a second spelling
+  of the most bug-prone convention in the module, where a divergence would be silent because each branch
+  stayed internally consistent. Verified identical (max abs diff 0.0, equal nnz) for dim 2 through 6
+  before the swap.
+- **Frozen buffers.** The function memoizes and returns the cached object, so every caller shares one set
+  of CSR instances: measured, `pauli_matrices(3, sparse=True)[1] /= 2` shifted the cached values by 0.5
+  max abs, still Hermitian, so every later `components()` call returned plausible and consistently wrong
+  coefficients.
+- **Read-only rather than a copy on return.** Copying on every cache hit measured **276 us against
+  0.10 us** (2698x slower) at dim=6. `setflags` on the three buffers blocks `/=`, `*=`, `data[i] = ...`
+  and `mat[i, j] = ...` at their source, costs 1.15 ms cold at dim=6, and leaves `toarray`, `@` and
+  every other read untouched. A caller who wants to rescale calls `.copy()` first, as the dense path
+  already requires.
+
+### paulis.general.components: ungated normalize_dim, required dim
+
+`normalize_dim` runs for every npmod: gating it left `components(m, dim=3, npmod=jnp)` raising "object of
+type 'int' has no len()" from the return statement, naming nothing (the general case is "`paulis/general`:
+the `npmod` gating bug"). `dim` is required because inferring it from the matrix shape was silently
+ambiguous: a 4x4 matrix inferred `(4,)`, one 4-level qudit, where the caller may have meant `(2, 2)`. Both
+pass the `prod(dim)` check and yield 16 valid coefficients, but in different bases: the
+`2**(len(dim) - 2)` normalization is 0.5 for one subsystem against 1.0 for two, so the coefficient vectors
+differ in norm by sqrt(2) (measured 1.4142135623730951) with nothing to say which the caller received.
+
+### paulis.general.labels: fold the affixes in
+
+The prefix goes into the seed and the suffix into the last subsystem's per-label list. Two extra
+whole-array `np.char.add` passes over `np.full(out.shape, ...)` at the end cost **47-58%** of the call at
+10 qubits, where the latex prefix alone was a 25 MB array holding one repeated 7-char string. Replacing
+`np.full` with a scalar does not help: `np.char.add` densifies it anyway.
+
+### ground_locg._check_tols: the accept-anything cutoffs
+
+Every normalized vector satisfies `‖Hv − Ev‖ ≤ ‖H‖` (since `|E| ≤ ‖H‖`), so a bound reaching `‖H‖` makes
+the first iterate report convergence on an arbitrary eigenpair with `converged=True`. Measured on both
+arms: `atol=100` against `‖H‖=17` converged in one iteration, and on the superseded `* n * 10` scale
+`rtol=1e-8` at `n=2^20` gave a bound of 4.2 against `‖H‖=20` (history in "`atol`/`rtol`: the pair is
+right, and `rtol`'s scale took two tries to get right (2026-09-01)"). For `rtol` the scale is
+`‖Hv‖ + |E| ≤ 2‖H‖`, hence the cutoff `rtol >= 0.5`. For `atol` the bound is compared against
+`opnorm_bound = Σ|c_k|`, an over-estimate of `‖H‖₂` (measured **1.56-1.90x** on 1D XXZ), so it errs toward
+accepting. Both are deliberately loose: they catch accept-anything without second-guessing a caller who
+wants a sloppy solve.
+
+### ground_locg debug diagnostics: `reltol` became `rtol_scale`
+
+Renamed 2026-09-01: the value is the scale `‖Ax‖ + |θ|` that `rtol` multiplies, never a tolerance. A
+`debug=True` caller reading `diag["reltol"]` now gets a KeyError rather than a number ~2|λ_min| where the
+old name promised a floor near eps·‖A‖ — off by ~1e16 against what it claimed. `rtol_scale` rather than
+the local's bare `scale`: the local sits three lines from `rtol * scale`, while a key is read on its own
+out of a dict of nine.
+
+### ground_locg.body: the batched matvec pair
+
+- **Speed and collectives.** Measured 1.61-1.81x on the pair, bit-identical `theta`; on a 4-device mesh it
+  halves the all-gathers, 6 -> 3, because the operator's gather is paid once for the pair. `jnp.stack` of
+  a `P('x')` vector is `P(None, 'x')`, so nothing reshards. Off by default in `ground_locg` because an
+  arbitrary `mat` callable need not accept a batch.
+- **Memory has opposite signs by operator.** The stack is a real materialization. Against an elementwise
+  operator (no gather to save) temp rises one vector; against `sqd`'s it falls a flat **−16.00 B/slot**
+  (one f64 complex slot, 0.942x, N=4000..60000), because the unbatched arm holds two gather results live
+  where the batched arm holds one `(2, N)` buffer. Don't restore the two-call form to save memory.
+- **Vectors need not round identically.** XLA may pick a different contraction order for a `(k, N)`
+  operand than an `(N,)`. With atol=rtol=0 and `debug=True` at dim=32, an elementwise-diagonal operator
+  gives exactly 0.0 on every diagnostic while a dense einsum/matmul moves `y` by **1.1e-9**. On a
+  near-degenerate `sqd` subspace `y` moved **0.56** while `theta` still agreed to **2.2e-15**, the
+  eigenvector rotating inside an invariant subspace. Judge this by `theta`, never a vector norm, and
+  don't reach for compensated summation (closed; CLAUDE.md, "Closed investigations").
+
+The three `debug=True` diagnostic matvecs batch the same way and cannot change the trajectory, since
+`diagnostics` is `scan`'s output, never its carry.
+
+### ground_locg.body: the convergence test's scale
+
+`‖r‖ < max(atol, rtol·(‖Ax‖ + |θ|))` — `max`, not `min`, since either tolerance suffices. `atol` lets a
+caller with a fixed requirement (a downstream guard at 1e-6) have it hold at every dimension; `rtol` is a
+fraction of the operator magnitude, as in `np.allclose` and scipy, so it needs the `(‖Ax‖ + |θ|)` factor
+(‖r‖ has units of ‖A‖) and nothing else. The pre-2026-08-31 `* n * 10` factor made `rtol=1e-8` at
+`n=2^20` a bound of 4.2 against `‖A‖ = 20`. `abs(theta)` rather than `+theta`: the sum must not cancel
+for either sign, and a ground-state search is typically negative-definite; the natural-looking
+`norm(Ax) - theta` was measured going **negative** for a positive-definite operator, making the test
+unsatisfiable.
+
+### ground_locg: promote xinit up front
+
+The projected matrix inherits `xinit`'s dtype at the seed step but the operator's inside the loop, so a
+lower-precision `xinit` made `while_loop`'s carry types disagree on `theta`. Independently, a complex
+operator with a real `xinit` (complex128 `mat`, float64 `xinit`, a natural and previously-working call)
+kept `xinit` real through `compute_sas`'s scatter, which raised FutureWarning/ComplexWarning and silently
+discarded the imaginary part of the projected matrix — a correctness bug, not a noisy warning. One
+promotion fixes both, so it is not a carry-type workaround to remove later. `eval_shape` reads the
+operator dtype without a matvec, and `astype` on a matching dtype is a no-op.
+
+### ground_locg: the `rtol=None` default
+
+Only `rtol` takes None; `atol` defaults to 0.0 because a derived absolute bound is exactly the
+unintuitive thing the pair replaced. 4·eps, not eps: the scale `‖Ax‖ + |θ|` is ~2‖A‖, so `rtol = eps`
+would target 2·eps·‖A‖, only 2x the measured floor of eps·‖A‖, whose constant spans 0.49-1.26 over 27
+samples. 4·eps gives 8x the floor, the same 3.2x margin over the worst observed constant that
+`residual_floor` uses. Derived from the operator dtype (`work_dtype`), not the initial guess: a float32
+`xinit` on a complex128 problem would otherwise loosen it by nine orders of magnitude.
+
+### ground_locg._project_out: sources for the two-pass form
+
+Interspersing the normalization with the subtraction, rather than subtracting twice then normalizing, is
+Algorithm 5 ("Modified orthogonalization procedure") of Duersch, Shao, Yang & Gu, *A Robust and
+Efficient Implementation of LOBPCG*, arXiv:1704.07458, whose loop likewise alternates `U -= V (V^T M U)`
+with an orthonormalization pass. The block form there needs SVQB to resolve rank deficiency across
+columns; at block size 1 `normalize` is the whole content.
+
+Two passes rather than a convergence test is the "twice is enough" criterion, due to Kahan and analyzed
+in Parlett, *The Symmetric Eigenvalue Problem* (1980), Sec. 6.9. SLEPc technical report STR-1,
+"Orthogonalization Routines in SLEPc" (Hernandez, Roman, Tomas & Vidal, 2007), is the practical treatment
+and makes the same attribution. Its URL now redirects: reach it from the "SLEPc Technical Reports"
+section of <https://slepc.upv.es/documentation/> rather than the older `/documentation/reports/str1.pdf`
+path. `_reorthogonalize`'s pass count is fixed at 2 for the same reason; see "The fixed 2-pass
+re-orthogonalization beats `diaglib`'s adaptive loop on its own metric (2026-09-02)".
+
+### ground_locg.eigenpair_3x3: the discriminant form
+
+`disc` is Cardano's `p^3 - q^2` for `q = -13.5 * c0` (182.25 == 13.5**2), written out in `c1` and `c0`
+rather than as the recognizable `p*p*p - q*q` because it is measurably more accurate: **1.16e-16** mean
+relative error against **1.92e-16** for the factored form over 200k random inputs versus exact rational
+arithmetic, holding that ~1.7x margin all the way down the near-degenerate sweep where `disc -> 0` and
+cancellation is worst. Reason: `p = -3*c1` rounds once and cubing triples that error, whereas 27.0 is
+exact in binary, so `c1` enters the cube unrounded. Don't simplify it into the textbook form.
+
+### sqd._host_scalar: one path on every rank
+
+- **The branch must not depend on this rank's view of the array.** An earlier version returned early when
+  `addressable_shards` was non-empty, a per-rank property: measured on 4 nodes, two ranks printed a
+  result while two raised "spans non-addressable devices" from the same call. Had those two returned
+  early while the others entered the collective, the job would have hung at the barrier instead —
+  strictly worse. The version before that read an empty `addressable_shards` as "already host-side" and
+  handed the unreadable array to the caller's `float()`, raising the very error the function exists to
+  prevent. `jax.process_count()` is the same on every rank, so every rank takes the same path.
+- **The collective is safe only because every rank calling `sqd` reaches it.** Don't copy this shape into
+  a branch some ranks skip; `poc/uniquify_sharded.py`'s sub-mesh gather is the non-collective form.
+- **`process_allgather` rather than a hand-rolled `jit(out_shardings=...)`**, whose attempts each failed on
+  a topology detail: a bare `PartitionSpec` resolves against the context mesh and raises "jit requires a
+  non-empty mesh in context" outside `set_mesh`; a `NamedSharding` built from `value.sharding.mesh`
+  replicates only across that array's mesh — one device on a 1-device solve — so 3 of 4 ranks still had
+  no addressable shard and the `[0]` raised `IndexError`. `tiled=True` is required: `process_allgather`
+  rejects `tiled=False` for the non-addressable case.
+- **The result's shape depends on addressability.** A non-addressable rank-0 input comes back as a
+  scalar, while a fully addressable one is expanded to `(1,)` and gathered to `(process_count,)` even
+  under `tiled=True`. Measured on 4 nodes: the 1-device row returned shape (4,) and `float()` raised "only
+  0-dimensional arrays can be converted to Python scalars". Every entry is the same scalar, so
+  `.reshape(-1)[0]` is exact for both shapes without branching on addressability.
+
+Background: "`sqd` could not return its own eigenvalue multi-process, and I audited past it once
+(2026-09-04)".
+
+### sqd.sqd: `packed=True` skips the pack
+
+`pack_states` is not idempotent: a second pass reads each byte as one bit. Unpacked `[N, num_qubits]` is
+~7.7x the packed width at n=100, and both arrays are live at once during the pack, so a caller already
+holding the packed form was paying an 8x expansion plus a transient peak — **2.40 GB against 0.31 GB** at
+n=100, N=24M — for nothing. `run_sqd` has always taken the packed form.
+
+### sqd.sqd: pad the input states too
+
+`states_p` is a traced argument of `run_sqd`, so its leading dimension is part of the jit cache key.
+Leaving it at the raw input length retraced the whole solver on every distinct `len(states)`, what
+`states_size` exists to prevent: measured **0.44 s per call against 0.064 s** once the shape repeats.
+`uniquify_states` already pins every array it derives, so this was the one shape still leaking the input
+length through.
+
+### sqd.hproj: `shape=` is mandatory
+
+Without it scipy infers the extent from the largest index present, so a trailing basis state that no
+term couples into is dropped and the matrix comes back too small — measured **41x41 for a 53-state
+subspace** with local two-site js operators. Silent: the result is still symmetric, so eigvalsh returns a
+plausible wrong ground energy. When nothing survives, the index arrays are empty and scipy raises
+("cannot infer dimensions from zero sized index arrays"), though the projection is legitimately the
+zero matrix then.
+
+### sqd._spread_seed: reshard the filler mask
+
+`vec` is built sharded unconditionally (the iota takes `out_sharding`), but `run_sqd` reshards `states_u`
+only inside `if cache_level[0] == 1`, because the uncached branch needs it replicated for the
+`get_xsource` searches. So at `cache_level[0] == 0` the predicate arrived replicated while `vec` was
+partitioned, and `jnp.where` rejected the pair ("select `which` must be scalar or have the same sharding
+as cases") on every mesh for (0, 0), (0, 1) and (0, 2), the three levels no sharding test covered. It was
+masked by `_accumulate_diagonal`'s rank bug, which failed all six earlier in the call. Fixed here rather
+than in the caller because this function decides `vec`'s sharding, so it owns the requirement.
+
+### sqd.vinit_from_min_diag: `.real` on both branches
+
+A Hermitian operator's projected diagonal is real by construction, but `diagonals` carries
+`hamiltonian.c`'s dtype, complex128 whenever any Pauli string has an odd Y count (the folded `(-i)^{x·z}`
+phase). `jnp.max`/`argmin` reject complex input, so `cache_level[1] == 2` raised `TypeError: lt does not
+accept dtype complex128` for every such Hamiltonian — single-device, no mesh involved. The uncached
+branch took `.real` and worked, which made the asymmetry easy to miss.
+
+### sqd.run_sqd: the initial-vector guards
+
+`vinit_from_min_diag` weights the minimum-diagonal state heavily — the best single guess, and it keeps
+the heuristic's fast convergence — but adds the spread seed underneath rather than returning a one-hot.
+
+- **Sign:** "`vinit_from_min_diag`'s weight must carry the seed's sign, or it cancels it" has the
+  measurements and why the unreachable `sign == 0` branch stays.
+- **One-hot:** "`sqd`: why the initial vector is a spread, not a one-hot". The measured case was a
+  14-state subspace splitting 4+10, where `sqd` returned **−1.293**, the exact minimum of the block holding
+  the seed, against a true **−2.191** in the other block — a genuine eigenvalue, so nothing downstream
+  could detect it. `vinit_nodiag` has the sharper form: `e_0` violates `ground_locg`'s non-vanishing
+  overlap precondition whenever state 0 is decoupled from the rest of the subspace (every xsource from it
+  lands outside, so row 0 of the projected H is identically zero). `e_0` is then a true eigenvector with
+  eigenvalue 0, the zero-residual guard correctly reports convergence, and `sqd` returns 0.0 with
+  `converged=True`. Reproduced on a 9-state IIIX subspace whose true answer is −1.
+- **Mask, not index:** "Indexing a *sharded* array to read one element emits an `all-gather` of the whole
+  vector" (3 all-gathers against 0, bit-identical at several `imin`).
+- **`out_sharding` is mandatory:** the original form was a scatter into a sharded operand, which cannot
+  resolve its output sharding unambiguously (the update might land on any device), so JAX raised
+  `ShardingTypeError` rather than guessing. Without it `sqd()` failed on any multi-device mesh before the
+  solver was reached, unnoticed because nothing in the suite then ran a mesh;
+  `XLA_FLAGS=--xla_force_host_platform_device_count` reproduces it on CPU, as `poc/sharding.py` does.
+  **Still mandatory in today's mask form**, re-measured 2026-09-25: dropping `out_sharding` from the
+  `broadcasted_iota` leaves it replicated against the partitioned seed, and the `where` raises
+  `ShardingTypeError: select 'which' must be scalar or have the same sharding as cases` on a 4-device
+  mesh (a diagonal first X group, so `vinit_from_min_diag` runs).
+
+### sqd.uniquify_states: lexsort on uint64 words
+
+`lax.sort` compares key operands one at a time, so `num_keys=B` costs O(B) per comparison — 13 columns at
+n=100. Packing to `ceil(B/8)` words makes it 2, and the permutation is identical because
+`_pack_state_words` is order-preserving. Measured **1.79x at n=30 through 5.06x at n=127** (N=200k); this
+sort dominates the function, which in turn measured 14-27x `get_xsource` at every width.
+
+It trades memory for speed: the words are an extra `[N, ceil(B/8)]` uint64 buffer, and rounding B up to a
+multiple of 8 widens each row by `8*ceil(B/8) - B` bytes — worst at n=64 (B=9 -> 16 bytes, +7/row), free
+at n=127 (B=16). Measured 1.09-1.69x compiled temp bytes at N=1M: negligible here (0.07-0.17 GB at
+N=24M) but 6-15 GB at the 2^31 ceiling, so the wrong trade for an out-of-core design whose whole point is
+bounding memory (see "Replacing that sort out-of-core: prototyped and rejected (2026-08-29)").
+
+### sqd._is_lex_sorted: the filler test
+
+Two or more fillers are duplicates and so fail the strictness test, which is what the "rejects a padded
+result by design" claim rested on — but a single filler is still strictly increasing and used to pass.
+`hproj` has no filler-masking step, so that row became a spurious basis state: one row and column too
+large, still symmetric, and measured **−1.118034 against a true −1.0**. The test is on the packed byte
+because `pack_states` makes byte 0 < 128 for every genuine state, so 255 is unambiguous; unpacking a
+filler at n=2 gives [1, 1], a legitimate state, so an unpacked-side check could not work.
+
+O(1): fillers are all-255 rows and sort to the end, so if any is present the last row carries one. A full
+`np.any(states[:, 0] >> 7)` measured **5.25 ms at N=10M against 0.00012 ms**, ~4.4x the cost of the
+adjacent-row pass it was prepended to, for the same answer.
+
+### sqd.get_xsource: search on uint64 words
+
+A level costs `ceil(B/8)` comparisons instead of B — 2 rather than 13 at n=100 — and the packing is one
+pass. The word form is what makes this path affordable past n=60: the byte form measured an ~8x
+per-state cliff across the B > 8 boundary (**15 ns/state at n=60, 189 at n=100**). Invariant: `lo` is the
+count of rows strictly less than the target, so after `ceil(log2(N)) + 1` halvings it is the insertion
+point.
+
+### sqd._accumulate_diagonal: the output sharding
+
+The output is 1-D of length `template.shape[0]` while the template may be 2-D — `get_diagonal` passes
+the `(N, nbytes)` state list — and `jnp.zeros` rejects a rank-2 spec on a rank-1 aval ("Length of
+sharding.spec (2) must be equal to aval's ndim (1)"). That raise fired on every sharded `sqd` call at
+every `cache_level`, because `run_sqd`'s `vinit_from_min_diag` reaches `get_diagonal` unconditionally. A
+bare `PartitionSpec` is rejected when no mesh context is active, the ordinary single-device path, hence
+the `NamedSharding`.
+
+### sqd.compute_diagonal: the bit offset wraps at 8
+
+`iterm & 7` is the bit offset within the selected byte. With `& 255` the shift `7 - ibit` goes negative
+from `iterm=8` onward, i.e. as soon as an X group holds more than 8 Z terms, and the composed diagonal is
+silently wrong: measured **0.71 absolute error on 9 terms, and a 25% error in the end-to-end
+eigenvalue**.

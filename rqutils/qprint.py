@@ -234,9 +234,7 @@ class QPrintBase(ABC):
         self.amp_cutoff = amp_cutoff
         self.lhs_label = lhs_label
 
-        # One definition of what a MatrixDimension normalizes to, shared with paulis/general.py --
-        # the module this one already calls components()/labels() from, and which keys its memoization
-        # dicts on exactly that tuple(int) form.
+        # Shared with paulis/general.py, which keys its memoization dicts on this tuple(int) form.
         self._dim = None if dim is None else pmatrix.normalize_dim(dim)
 
         self._qobj, self._data = self._qobj_data(qobj)
@@ -359,23 +357,16 @@ class QPrintBase(ABC):
         else:
             global_amp = ""
 
-        # Select the surviving terms *before* the phase pipeline below, not after. Only terms above
-        # the cutoff are ever printed, so normalizing the phase of every element first and then
-        # discarding all but a handful is pure waste -- and it is waste paid again on every repr,
-        # since output='text' returns this object for a lazy __repr__. Measured on a 5-term printout
-        # of a dim-2^20 input: 25 ms -> 5.3 ms. It also bounds the wrap-around loop below by the term
-        # count rather than the input size.
-        #
-        # Show only terms with absamp < max(absamp) * amp_cutoff
+        # Select surviving terms before the phase pipeline, so it costs the term count, not the
+        # input size, on every lazy repr (NOTES.md, "qprint._process: compress before phase work").
         amp_atol = np.amax(absamp) * self.amp_cutoff
         amp_is_zero = np.isclose(np.zeros_like(absamp), absamp, atol=amp_atol)
         # convert into list of tuples
         kept = np.logical_not(amp_is_zero).nonzero()
         term_indices = list(zip(*kept))
 
-        # Shift the phases. The offset under global_phase='mean' is a full-array reduction by
-        # definition -- the mean is over every element, not just the printed ones -- so it has to be
-        # taken before the compression below.
+        # Shift before the compression below: global_phase='mean' averages every element, not just
+        # the printed ones.
         phase_offset = 0.0
         if self.global_phase is not None:
             if self.global_phase == "mean":
@@ -385,12 +376,8 @@ class QPrintBase(ABC):
 
             phase -= phase_offset
 
-        # Compress to the surviving terms before normalizing anything further. Everything from here
-        # on is read only at the kept positions, so running the wrap-around loop and the two
-        # normalize_phase passes over all 2^n elements and then discarding all but a handful is pure
-        # waste -- and waste paid again on every repr, since output='text' returns this object for a
-        # lazy __repr__. `term_indices` still holds the original (possibly 2-d) indices, which is what
-        # _add_labels needs; these flat arrays are indexed by term position instead.
+        # Compress to the kept positions before further normalization (see the selection above);
+        # `term_indices` keeps the original indices for `_add_labels`; these arrays index by term.
         absamp = absamp[kept]
         phase = phase[kept]
 
@@ -479,19 +466,13 @@ class QPrintBase(ABC):
         """
         if HAS_QUTIP and isinstance(qobj, Qobj):
             if self._dim is None:
-                # dims[0] is the row (ket) space and dims[1] the column (bra) space. For a bra,
-                # dims[0] is the trivial [1] and the real subsystem structure is in dims[1], so
-                # taking dims[0] unconditionally raised "Product of subsystem dimensions 1 and qobj
-                # dimension 3 do not match" for every bra. Operators have both sides populated and
-                # are unaffected either way.
+                # dims[1] holds a bra's subsystem structure, so dims[0] alone rejected every bra
+                # (NOTES.md, "qprint._qobj_data: two qutip defects").
                 row_dims, column_dims = tuple(qobj.dims[0]), tuple(qobj.dims[1])
                 self._dim = column_dims if np.prod(row_dims) == 1 else row_dims
 
-            # Qobj.full(), not Qobj.data: in qutip 4 `.data` was a scipy sparse matrix, so
-            # `qobj.data.data` reached its value buffer, but qutip 5 wraps the payload in its own
-            # Dense/CSR class which has no `.data` -- the chained access raised
-            # "'qutip.core.data.dense.Dense' object has no attribute 'data'" and made every Qobj
-            # input fail. `.full()` returns a dense ndarray in both versions.
+            # Qobj.full(), not Qobj.data: qutip 5's Dense/CSR wrapper has no `.data`, so the qutip 4
+            # idiom failed every Qobj input (NOTES.md, "qprint._qobj_data: two qutip defects").
             qobj = np.asarray(qobj.full())
             data = qobj
         elif isinstance(qobj, scipy.sparse.csr_matrix):
@@ -545,10 +526,8 @@ class QPrintBase(ABC):
             elif term.sign == -1:
                 line_expr += "-"
 
-            # Track whether anything numeric precedes the label, rather than inspecting the string
-            # afterwards: text-mode labels carry the multiplication sign as a prefix
-            # (QPrintPauli._add_labels), and both the amplitude and the phase can be absent, so only
-            # the caller knows whether that "*" has a left operand.
+            # Track whether anything numeric precedes the label: text labels carry a "*" prefix, and
+            # amplitude and phase may both be absent, so only here is it known if "*" has operands.
             wrote_amp = term.amp != "1"
             if wrote_amp:
                 line_expr += term.amp
@@ -557,10 +536,8 @@ class QPrintBase(ABC):
             line_expr += phase_expr
 
             label = term.label
-            # A dangling separator: the amplitude is suppressed when it is exactly "1", which
-            # rendered a unit-coefficient Pauli term as "- *IZ/2" instead of "- IZ/2". The latex path
-            # was unaffected because its labels carry no separator, so the two renderers disagreed on
-            # the same term -- which is why this survived: neither output looks wrong on its own.
+            # Drop the "*" left dangling by a suppressed "1" amplitude ("- *IZ/2"); latex has none
+            # (NOTES.md, "`qprint`: test the full `fmt` × `output` grid, not a diagonal of it").
             if not wrote_amp and not phase_expr and label.startswith("*"):
                 label = label[1:]
             line_expr += label
@@ -723,9 +700,8 @@ class QPrintBraKet(QPrintBase):
             if has_bra:
                 col_labels = np.unravel_index(self._qobj.indices, self._dim)
         else:
-            # Dense: unravel per term rather than precomputing a len(dim) x objdim table to read one
-            # element per term out of. That table costs 168 MB and 16.7 ms at dim 2^20 over 20
-            # subsystems, against 0.009 ms for the handful of indices actually printed.
+            # Dense: unravel per term, never a precomputed len(dim) x objdim table (NOTES.md,
+            # "qprint.QPrintBraKet._add_labels: unravel per term").
             row_labels = col_labels = None
 
         def subsystem_indices(labels, flat_index):
@@ -938,10 +914,8 @@ class QPrintMatrix(QPrintBase):
             if term.sign == -1:
                 element += "-"
 
-            # Always emit the amplitude, even when it is exactly "1". Suppressing it is correct where
-            # a basis label follows -- "\frac{IZ}{2}" reads better than "1\frac{IZ}{2}" -- but a
-            # matrix element has no label, so dropping the 1 left the cell empty and produced
-            # "\begin{pmatrix} & 0 & 0 & 0 \\ ...", a malformed matrix missing its first entry.
+            # Always emit the amplitude, even "1": a matrix cell has no label to stand in for it
+            # (NOTES.md, "qprint.QPrintMatrix._make_lines: always emit the amplitude").
             element += term.amp
 
             element += self._format_phase(term.phase, mode)

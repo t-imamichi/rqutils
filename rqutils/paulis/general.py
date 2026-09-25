@@ -145,10 +145,8 @@ def paulis(dim: MatrixDimension, sparse: bool = False) -> NDArray[np.complex128 
     if len(dim) == 1:
         return pauli_matrices(dim[0], sparse=sparse)
 
-    # Raise before building anything: the sparse product path does not exist, and the dense body
-    # below is the whole function, so guarding it with an else put 25 lines a level deeper and left
-    # `matrix_array`'s definedness for the reader to prove. The cache is keyed on `dim` alone for the
-    # same reason -- with this raise unconditional, a `sparse` axis could only ever hold False.
+    # Raise before building anything: the sparse product path does not exist, which is also why the
+    # cache is keyed on `dim` alone.
     if sparse:
         raise NotImplementedError("Need an hour")
 
@@ -158,10 +156,8 @@ def paulis(dim: MatrixDimension, sparse: bool = False) -> NDArray[np.complex128 
     subsystems = [pauli_matrices(d) for d in dim]
     num_sub = len(subsystems)
 
-    # Compose Pauli products
-    # (d1**2, d1, d1) x (d2**2, d2, d2) -> (d1**2, d2**2, d1*d2, d1*d2)
-    #      a   b   c         d   e   f          a      d     be     cf
-    # be and cf are reshaped into 1 dimension each
+    # (d1**2, d1, d1) x (d2**2, d2, d2) -> (d1**2, d2**2, d1*d2, d1*d2), i.e. abc,def -> ad(be)(cf),
+    # with be and cf each reshaped into one axis.
     chars = string.ascii_letters
     if num_sub * 3 > len(chars):
         raise NotImplementedError(
@@ -180,11 +176,8 @@ def paulis(dim: MatrixDimension, sparse: bool = False) -> NDArray[np.complex128 
     shape = tuple(d**2 for d in dim) + (int(np.prod(dim)),) * 2
     matrix_array = np.einsum(indices, *subsystems).reshape(shape) / (2 ** (num_sub - 1))
 
-    # Cache and return the same immutable array, as pauli_matrices does. Storing a `.copy()` and
-    # returning the original left a second, writeable allocation alive per key for the process
-    # lifetime: retained memory measured 2.00x the result at dim=(2,)*6 (537 MB for a 268 MB basis)
-    # against 1.00x now. It also made the warm return writeable while the cold return was read-only,
-    # so no caller could have depended on writeability without already hitting that inconsistency.
+    # Cache and return the same read-only array, as pauli_matrices does; a stored `.copy()` doubled
+    # retained memory (NOTES.md, "paulis.general.paulis: cache the returned array itself").
     matrix_array.setflags(write=False)
     _pauli_products[dim] = matrix_array
     return matrix_array
@@ -228,27 +221,11 @@ def pauli_matrices(dim: int, sparse: bool = False) -> NDArray[np.complex128 | np
     matrices *= np.sqrt(2.0 / norm)[:, None, None]
 
     if sparse:
-        # Derived from the dense basis rather than built as a second, independent construction. The
-        # CSR branch this replaces re-derived the shell ordering and the sqrt(2/(k(k+1))) diagonal
-        # normalization by hand as data/indices/indptr triplets -- a second spelling of the one
-        # convention CLAUDE.md flags as most bug-prone here, where a divergence would be silent
-        # because each branch stayed internally consistent. Verified identical (max abs diff 0.0 and
-        # equal nnz) for dim 2 through 6 before the swap.
+        # Derived from the dense basis, never a second construction of the normalization convention
+        # (NOTES.md, "paulis.general.pauli_matrices: sparse is derived and frozen").
         matrices = np.array([csr_array(mat) for mat in matrices])
-        # Freeze each operator's buffers, not the object array holding them. This function memoizes
-        # and returns the cached object directly, so without this every caller shares one set of CSR
-        # instances and an in-place rescale corrupts the basis for the process lifetime: measured
-        # `pauli_matrices(3, sparse=True)[1] /= 2` shifting the cached values by 0.5 max abs, with the
-        # result still Hermitian, so every later `components()` call returned plausible and
-        # consistently wrong coefficients. Normalization is the invariant CLAUDE.md calls the most
-        # bug-prone in this module, which is exactly the thing an in-place `/=` is reaching for.
-        #
-        # Read-only buffers rather than a copy on return, and the gap is not marginal: copying on
-        # every cache hit measured 276 us against 0.10 us for returning the cached object, i.e. 2698x
-        # slower, at dim=6. `setflags` on the three buffers blocks `/=`, `*=`, `data[i] = ...` and
-        # `mat[i, j] = ...` at their source, costs one loop per `dim` at build time (1.15 ms cold for
-        # dim=6), and leaves `toarray`, `@` and every other read untouched. A caller who genuinely
-        # wants to rescale calls `.copy()` first, as the dense path already requires.
+        # Freeze the operators' buffers: the cached instances are shared, so a rescale corrupts them
+        # (NOTES.md, "paulis.general.pauli_matrices: sparse is derived and frozen").
         for mat in matrices:
             mat.data.setflags(write=False)
             mat.indices.setflags(write=False)
@@ -294,16 +271,8 @@ def components(
             contracting dimensions to have the same shape"). Validate before tracing if you need the
             named error.
     """
-    # normalize_dim runs for every npmod -- `len(dim)` below needs a sequence either way, and
-    # gating it left `components(m, dim=3, npmod=jnp)` raising "object of type 'int' has no len()"
-    # from the return statement, naming nothing. Only the *validation* below belongs behind the gate,
-    # per CLAUDE.md's npmod rule.
-    # `dim` is required: inferring it from the matrix shape was ambiguous in a silent way. A 4x4
-    # matrix inferred (4,) -- one 4-level qudit -- where the caller may have meant (2, 2). Both pass
-    # the prod(dim) check below and both yield 16 valid coefficients, but they are decompositions in
-    # different bases: the 2**(len(dim) - 2) normalization is 0.5 for one subsystem against 1.0 for
-    # two, so the coefficient vectors differ in norm by sqrt(2) (measured 1.4142135623730951) with
-    # nothing to say which the caller received.
+    # normalize_dim is ungated, since `len(dim)` needs a sequence for every npmod, and `dim` is
+    # required (NOTES.md, "paulis.general.components: ungated normalize_dim, required dim").
     dim = normalize_dim(dim)
 
     if npmod is np and np.prod(dim) != matrix.shape[-1]:
@@ -351,11 +320,8 @@ def labels(
     # sequence, and broadcasting the scalar onto it makes the declared type wrong from here down.
     symbols = (symbol,) * len(dim) if symbol is None or isinstance(symbol, str) else symbol
 
-    # Normalization affixes. Folded into the construction below -- the prefix into the seed and the
-    # suffix into the last subsystem's per-label list -- rather than applied as two extra whole-array
-    # np.char.add passes over np.full(out.shape, ...) at the end. Those passes cost 47-58% of the
-    # call at 10 qubits, where the latex prefix alone was a 25 MB array holding one repeated 7-char
-    # string. Replacing np.full with a scalar does not help: np.char.add densifies it anyway.
+    # Normalization affixes, folded into the seed and the last subsystem's labels, never whole-array
+    # np.char.add passes (NOTES.md, "paulis.general.labels: fold the affixes in").
     pre, post = "", ""
     if norm and len(dim) >= 2:
         if len(dim) == 2:

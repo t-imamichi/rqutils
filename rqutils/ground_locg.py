@@ -303,16 +303,8 @@ from numpy.typing import DTypeLike, NDArray
 
 _SQRT3 = math.sqrt(3.0)
 
-# ground_locg's return is (eigval, eigvec, niter, converged), with the per-iteration diagnostics
-# appended when debug=True. Deliberately plain tuple aliases rather than a dataclass: the arity, not
-# the anonymity of the positions, is what a type checker needs to see here, and `ground_locg` is
-# published API that every caller destructures positionally (sqd.py, two scaling POCs, a benchmark
-# under examples/). A caller reading the fifth element must narrow first, `assert len(result) == 5`.
-#
-# `@overload` on `debug: Literal[True]/[False]` would give a checker the arity without narrowing, the
-# way `sqd` does it for `return_eigvec`. Untried here: it is what the `invalid-assignment` ignore in
-# pyproject.toml currently absorbs (19 diagnostics, mostly this destructuring), so it is a real
-# candidate rather than a rejected one.
+# Plain tuple aliases, not a dataclass: `ground_locg` is published API that callers destructure
+# positionally; the overloads below give a checker the arity (5 elements only with debug=True).
 _Result = tuple[float, NDArray, int, bool]
 _DebugResult = tuple[float, NDArray, int, bool, dict[str, jax.Array]]
 
@@ -457,17 +449,8 @@ def _check_tols(atol: Any, rtol: Any, opnorm_bound: float, dtype: DTypeLike) -> 
             "solve would exhaust maxiter. Set atol to the residual you need, or rtol=None to use "
             "4*eps as a fraction of (||Hv|| + |E|)."
         )
-    # A bound that reaches ||H|| is not a tolerance, it is an accept-anything: every normalized vector
-    # satisfies ||Hv - Ev|| <= ||H|| (since |E| <= ||H||), so the first iterate reports convergence and
-    # the returned eigenpair is arbitrary -- with converged=True, the failure mode this module keeps
-    # guarding against. Measured on BOTH arms: atol=100 against ||H||=17 converged in *one* iteration,
-    # and on the superseded `* n * 10` rtol scale, rtol=1e-8 at n=2^20 gave a bound of 4.2 vs ||H||=20.
-    #
-    # The condition is on the bound, not on which parameter produced it, so both arms are checked. For
-    # `rtol` the scale is `||Hv|| + |E| <= 2||H||`, so the cutoff is rtol >= 0.5. For `atol` the bound is
-    # the value itself, compared against `opnorm_bound` -- which is sum|c_k|, an over-estimate of ||H||_2
-    # (measured 1.56-1.90x on 1D XXZ), so this errs toward accepting. Both are deliberately loose: they
-    # catch the accept-anything case without second-guessing a caller who wants a sloppy solve.
+    # A bound reaching ||H|| accepts any vector (||Hv - Ev|| <= ||H||), so both arms are checked,
+    # loosely (NOTES.md, "ground_locg._check_tols: the accept-anything cutoffs").
     if rtol is not None and float(rtol) >= 0.5:
         raise ValueError(
             f"rtol={float(rtol):.3e} makes the convergence bound reach the operator norm "
@@ -636,12 +619,8 @@ def _chebyshev_prefilter(
     return jax.lax.scan(cycle, normalize(vector), None, length=cycles)[0]
 
 
-# Overloads so a caller destructuring the 4-tuple does not have to narrow on `len(result) == 5` first.
-# Annotation only: the implementation signature below is unchanged and is the one sphinx documents.
-# `debug` stays positional-or-keyword here (unlike `sqd`'s keyword-only block), so the overloads repeat
-# the full positional order -- `poc/mixed_precision.py` and the benchmark pass
-# `maxiter` positionally. A `bool` that is not a literal still matches the `bool` overload and gets the
-# union, which is what a runtime-computed flag needs.
+# Annotation only; the overloads repeat the full positional order because callers pass `maxiter`
+# positionally (`poc/mixed_precision.py`), and a non-literal bool gets the union.
 @overload
 def ground_locg(
     mat: Callable[[jax.Array], jax.Array] | jax.Array,
@@ -938,10 +917,8 @@ def ground_locg(
             batch_matvec=batch_matvec,
         )
     if batch_matvec:
-        # Rejected rather than ignored for the reason the `Raises:` entry gives. Not merely "there is
-        # no caller-supplied matvec": the one this path builds is a `jax.lax.dot`, which rejects a
-        # rank-2 rhs outright ("dimension_numbers must be specified when not performing simple
-        # un-batched ... products"), so batching here needs a different contraction, not a flag.
+        # Rejected, not ignored: this path's matvec is a `jax.lax.dot`, which rejects a rank-2 rhs,
+        # so batching needs a different contraction rather than a flag.
         raise ValueError("`batch_matvec` applies only when `mat` is a callable, not an array")
     return _ground_locg_matrix(
         mat,
@@ -972,11 +949,8 @@ def _ground_locg_matrix(
     if jnp.issubdtype(xinit.dtype, jnp.integer):
         vspace = (mat.shape[1], mat.dtype)
 
-    # The array path can always supply its own rigorous bound, so a caller never has to. Gershgorin
-    # rather than anything iterative: see _chebyshev_prefilter on why no matvec-based estimate is one.
-    # Gated on the filter actually running, matching `run_sqd`: `degree <= 1` or `cycles == 0` is a
-    # documented no-op, and computing an O(N^2) reduction for those values put it in the traced graph
-    # anyway -- measured +6.1% on a 2048-dim solve with `prefilter=(16, 0)`.
+    # Gershgorin, never an iterative estimate (see _chebyshev_prefilter), and only when the filter
+    # runs (NOTES.md, "Validation belongs to the module that owns the gate").
     if prefilter is not None and prefilter[0] > 1 and prefilter[1] > 0 and prefilter_hi is None:
         prefilter_hi = _gershgorin_bound(mat)
 
@@ -1053,14 +1027,8 @@ def _ground_locg_callable(
         return sas
 
     def diagnostics(xcurr, ycurr, rcurr, theta, kappa=None, scale=None, converged=None):
-        # Three independent applications, so they batch exactly as body()'s pair does -- see the
-        # comment there for why stacking preserves sharding. Worth doing despite this being the
-        # `debug=True` path only: it runs the full `maxiter` with no early exit, so it is the most
-        # matvec-heavy path in the module.
-        #
-        # Batching here cannot change the trajectory: `diagnostics` is `scan`'s *output*, never part of
-        # its carry, so nothing it computes feeds back. Any `debug=True` divergence therefore comes from
-        # `body()`'s batched pair, not from this call -- see the note there.
+        # Batched like body()'s pair, and it cannot change the trajectory: `diagnostics` is scan's
+        # output, never its carry, so any debug=True divergence comes from body()'s pair.
         if batch_matvec:
             mvs = tuple(matvec(jnp.stack((xcurr, ycurr, rcurr)), *args))
         else:
@@ -1085,14 +1053,8 @@ def _ground_locg_callable(
             "rho": rho,
             "kappa": kappa,
             "sas": sas,
-            # Renamed from "reltol" 2026-09-01: the value is the scale `||Ax|| + |theta|` that `rtol`
-            # multiplies, never a tolerance. A `debug=True` caller reading `diag["reltol"]` now gets a
-            # KeyError rather than a number ~2|lambda_min| where the old name promised a floor near
-            # eps*||A|| -- loud, and the old name was off by ~1e16 against what it claimed.
-            #
-            # `rtol_scale` here, not the local's bare `scale`: the local sits three lines from
-            # `rtol * scale` so context disambiguates it, while a key is read on its own out of a dict
-            # of nine, where "scale" could be any of several quantities in this solver.
+            # `rtol_scale`, formerly "reltol": the scale rtol multiplies, never a tolerance
+            # (NOTES.md, "ground_locg debug diagnostics: `reltol` became `rtol_scale`").
             "rtol_scale": scale,
             "converged": converged,
         }
@@ -1108,44 +1070,15 @@ def _ground_locg_callable(
         return seed, diag
 
     def body_iter1(xcurr, rcurr, axcurr, rho):
-        # Same zero-search-direction guard as body(), adapted from 3x3 to this step's 2x2 projected
-        # matrix (basis {x, p} rather than {x, y, p}). An exactly-zero residual means xcurr is
-        # already an eigenvector -- e.g. sqd.py's diagonal-Hamiltonian path seeds xinit as the exact
-        # one-hot ground state, so this is not a corner case. Without the guard, eigenpair_2x2 sees a
-        # sas whose row/col 1 vanish and, for a positive-definite operator, spuriously selects that
-        # null direction: theta collapses towards 0 instead of reporting rho, the true answer.
-        #
-        # `_project_out` rather than a bare `normalize(rcurr)`, which is what `body()` has always
-        # used and what this step was missing. A bare normalize divides by the residual norm however
-        # small it is: an `xinit` that *is* an eigenvector in floating point leaves a residual at the
-        # rounding floor (measured 3.1e-16 on the 2x2 `[[2.9, 1], [1, 2.9]]`), and dividing by that
-        # amplifies pure noise until `tmp_p` comes back **parallel to `xcurr`**. `sas` then degenerates
-        # -- measured `[[1.9, -1.9], [-1.9, 4.8]]`, whose lowest eigenvalue is 0.96 for a true 1.9 --
-        # and the caller saw a `RuntimeError` naming `maxiter` on a problem solved in one iteration
-        # (`markdown/spinchain/rqutils-prefilter-dim2-request.md`).
-        #
-        # Masking `sas[1, 1]` alone does NOT fix it: the mask fired correctly and the surviving
-        # off-diagonal still coupled `x` to the noise. Nor does a scale-relative residual threshold --
-        # measured, `|r| = 8.07e-16` against a floor of `7.99e-16` on a neighbouring instance, i.e. a
-        # 1% margin deciding correctness, and a looser floor pins `theta = rho` when the iterate is
-        # *not* an eigenvector. `_project_out` needs no threshold: it renormalizes, subtracts again,
-        # and returns exactly zero when the norm collapses below 0.99, which is precisely "this
-        # direction was rounding noise". It also returns the norm, so no separate reduction is needed.
+        # Zero-direction guard as in body(), on {x, p}: `_project_out`, never a bare normalize
+        # (NOTES.md, "A rounding-floor residual is not zero, and `== 0.0` is the wrong guard").
         tmp_p, norm_p = _project_out((xcurr,), rcurr)
         r_is_zero = norm_p == 0.0
         tmp_p = normalize(tmp_p, norm_p)
         # Reuse Ax from body_iter0 rather than recomputing it inside compute_sas.
         sas = compute_sas((xcurr, tmp_p), (axcurr, matvec(tmp_p, *args)))
-        # Lift the p diagonal out of contention, serving the same purpose as body()'s mask on
-        # sas[2, 2]: the excluded value strictly exceeds any entry still in play, so Rayleigh-Ritz
-        # cannot pick it. With p excluded, the 2x2 solve collapses onto x alone, returning
-        # theta = rho (the Rayleigh quotient of xcurr, already computed in body_iter0 and passed in)
-        # and kappa = [1, 0], so xnext == xcurr below and no new search direction is introduced.
-        #
-        # Note this bound is *not* body()'s formula specialized to one surviving entry: that form
-        # gives rho + |rho| + 1, which is merely 1.0 for the negative rho of a ground-state search.
-        # Both bounds are valid -- each exceeds the only retained entry, sas[0, 0] = rho -- but they
-        # are different expressions, so don't "unify" them without redoing the bound argument.
+        # Lift p out of contention so theta = rho and xnext == xcurr; not body()'s bound specialized
+        # (NOTES.md, "`ground_locg`: `body_iter1`'s exclusion bound is not `body()`'s specialized").
         excluded = 2.0 * jnp.abs(rho) + 1.0
         sas = jnp.where(r_is_zero, sas.at[1, 1].set(excluded.astype(sas.dtype)), sas)
         theta, kappa = eigenpair_2x2(sas)
@@ -1155,12 +1088,8 @@ def _ground_locg_callable(
         ynext = normalize(_reorthogonalize(tmp_t, xnext))
         axnext = matvec(xnext, *args)
         rnext = axnext - theta * xnext
-        # As in body(): a zeroed residual means {x} (here, in place of {x, y}) already spans the
-        # relevant space, so no further iteration can lower theta. Report convergence immediately.
-        #
-        # This flag must seed the loop state rather than a hardcoded False, or while_loop would
-        # spend an iteration re-deriving what is already known -- and, worse, feed a zeroed search
-        # direction into body()'s Rayleigh-Ritz step.
+        # A zeroed residual means {x} already spans the relevant space: seed the flag, not False, or
+        # while_loop feeds a zeroed search direction into body()'s Rayleigh-Ritz step.
         state = _State(
             niter=0, converged=r_is_zero, theta=theta, x=xnext, y=ynext, r=rnext, ax=axnext
         )
@@ -1176,52 +1105,20 @@ def _ground_locg_callable(
         if log_level <= logging.DEBUG:
             jax.debug.print("LOCG iteration {}", state.niter)
 
-        # Residual basis selection. R should already be orthogonal to X, but projecting out both X
-        # and P is needed for good residual convergence. _project_out only guarantees |tmp_p| >= 0.99
-        # while the Rayleigh-Ritz step below assumes an orthonormal basis, so tmp_p is renormalized:
-        # a short one scales sas[2, 2] by |tmp_p|^2, a spuriously low diagonal that gets selected in
-        # place of the true minimizer under a large positive shift.
-        #
+        # Project out both X and P, then renormalize: _project_out only guarantees |tmp_p| >= 0.99,
+        # and a short tmp_p scales sas[2, 2] into a spurious minimum under a large positive shift.
         tmp_p, norm_p = _project_out((xcurr, ycurr), rcurr)
         p_is_zero = norm_p == 0.0
         tmp_p = normalize(tmp_p, norm_p)
-        # Projected eigensolve. xcurr is the previous iteration's xnext, so its image is already
-        # known -- three matvecs per iteration instead of four.
-        #
-        # The two remaining applications are independent, so they go out as one (2, N) batch when
-        # `batch_matvec` is set. Measured 1.61-1.81x on the pair, bit-identical, and on a 4-device
-        # mesh it halves the all-gathers, 6 -> 3, because the gather inside the operator is paid once
-        # for the pair instead of twice. `jnp.stack` of a `P('x')` vector is `P(None, 'x')` -- the
-        # batch axis is replicated and the partitioned axis keeps its position, so nothing reshards.
-        # Off by default because an arbitrary `mat` callable need not accept a batch.
-        #
-        # The `jnp.stack` is a real materialization, not a view, so whether it costs memory depends on
-        # the operator -- and the two regimes have opposite signs, which is why this is measured rather
-        # than reasoned about. Against an elementwise operator (no gather to save) temp rises one
-        # vector. Against `sqd`'s, temp *falls* a flat -16.00 B/slot -- one f64 complex slot, measured
-        # across N=4000..60000, 0.942x -- because the unbatched arm holds two separate gather results
-        # live where the batched arm holds one (2, N) buffer. So it is not a time-for-memory trade in
-        # the configuration that ships; don't "restore" the two-call form to save memory.
-        #
-        # `theta` is bit-identical, but the carried *vectors* need not be, and the cause is the operator
-        # rather than this code: XLA may pick a different contraction order for a (k, N) operand than
-        # for an (N,), so a batched call is not required to round identically. Measured with
-        # atol=rtol=0 and `debug=True` at dim=32: an elementwise-diagonal operator gives exactly 0.0 on
-        # every diagnostic, while a dense einsum/matmul moves `y` by 1.1e-9 -- same fixture, same code,
-        # so the discriminator is the contraction, not a defect here. The divergence has no useful
-        # magnitude: on a near-degenerate `sqd` subspace `y` moved 0.56 while `theta` still agreed to
-        # 2.2e-15, because the eigenvector is free to rotate inside an invariant subspace. Judge this
-        # by `theta`, never by a vector norm. Don't reach for compensated summation -- that family is
-        # closed (module docstring and NOTES.md).
+        # xcurr's image is carried, so three matvecs, not four; the independent pair batches as one
+        # (2, N) call, judged by theta (NOTES.md, "ground_locg.body: the batched matvec pair").
         if batch_matvec:
             aycurr, ap = matvec(jnp.stack((ycurr, tmp_p)), *args)
         else:
             aycurr, ap = matvec(ycurr, *args), matvec(tmp_p, *args)
         sas = compute_sas((xcurr, ycurr, tmp_p), (axcurr, aycurr, ap))
-        # A zeroed tmp_p leaves sas row/col 2 empty, and for a positive-definite A the resulting
-        # zero diagonal is the smallest eigenvalue, so Rayleigh-Ritz would pick the null direction
-        # and the normalizations below would divide by zero. Lift it out of contention; the
-        # p_is_zero case is reported as convergence instead (see below).
+        # A zeroed tmp_p leaves a zero diagonal Rayleigh-Ritz would pick for a positive-definite A,
+        # then divide by; lift it out, and report p_is_zero as convergence below.
         diag_xy = jnp.diagonal(sas).real[:2]
         excluded = jnp.max(diag_xy) + jnp.sum(jnp.abs(diag_xy)) + 1.0
         sas = jnp.where(p_is_zero, sas.at[2, 2].set(excluded.astype(sas.dtype)), sas)
@@ -1238,23 +1135,8 @@ def _ground_locg_callable(
         axnext = matvec(xnext, *args)
         rnext = axnext - xnext * theta
         norm_rnext = jnp.linalg.norm(rnext)
-        # Two independent tolerances, satisfied by EITHER -- hence `max`, not `min`:
-        #
-        #     ||r|| < max(atol, rtol * (||Ax|| + |theta|))
-        #
-        # `atol` bounds the residual absolutely, so a caller with a fixed requirement (a downstream
-        # guard at 1e-6) can name it and have it hold at every dimension. `rtol` is a *fraction of the
-        # operator magnitude* -- the conventional meaning, as in `np.allclose` and `scipy` -- so it needs
-        # the `(||Ax|| + |theta|)` factor and nothing else: ||r|| has units of ||A||, and dividing by
-        # something with those units is what makes `rtol` dimensionless.
-        #
-        # Do NOT reintroduce the pre-2026-08-31 `* n * 10` factor on the scale: it made `rtol=1e-8` at
-        # n=2^20 a bound of 4.2 against ||A|| = 20, so the first iterate "converged" on a wrong answer.
-        # The module docstring has the measurements; `sqd` rejects an `rtol` whose bound reaches ||A||.
-        #
-        # `abs(theta)` rather than `+theta`: the sum must not cancel for either sign of theta, and a
-        # ground-state search is typically negative-definite. The natural-looking `norm(Ax) - theta` was
-        # measured going *negative* for a positive-definite operator, making the test unsatisfiable.
+        # ||r|| < max(atol, rtol * (||Ax|| + |theta|)), either arm sufficing: no `n` factor, and
+        # `abs` so it cannot cancel (NOTES.md, "ground_locg.body: the convergence test's scale").
         scale = jnp.linalg.norm(axnext) + jnp.abs(theta)
         # A zeroed search direction means {x, y} already spans the residual: we are at a stationary
         # point of the Rayleigh quotient and no further iteration can lower theta.
@@ -1280,34 +1162,21 @@ def _ground_locg_callable(
 
     xinit = normalize(xinit)
 
-    # The projected matrix inherits xinit's dtype at the seed step but the operator's inside the
-    # loop, so a lower-precision xinit makes while_loop's carry types disagree on theta. Promote up
-    # front. eval_shape reads the operator dtype without spending a matrix-vector product, and
-    # astype on a matching dtype is a no-op, so the common path is unaffected.
-    #
-    # This promotion is also deliberately what fixes a second, independent problem for a complex
-    # operator paired with a real xinit -- e.g. complex128 mat with float64 xinit, a natural and
-    # previously-working way to call this function. Without it, xinit stayed real through
-    # compute_sas's scatter, which raised FutureWarning/ComplexWarning and silently discarded the
-    # imaginary part of the projected matrix -- a correctness bug for a genuinely complex operator,
-    # not merely a noisy warning. Promoting xinit up front means it is never a carry-type workaround
-    # to remove later; both problems share the same fix.
+    # Promote xinit to the operator dtype up front (eval_shape, no matvec): it keeps the carry types
+    # agreeing and a complex sas complex (NOTES.md, "ground_locg: promote xinit up front").
     work_dtype = jnp.result_type(
         xinit.dtype, jax.eval_shape(lambda vec: matvec(vec, *args), xinit).dtype
     )
     xinit = xinit.astype(work_dtype)
 
-    # After the dtype promotion, so the filter's Chebyshev recurrence runs at the operator's
-    # precision rather than a lower-precision xinit's, and before body_iter0, so rho_init below is
-    # the filtered vector's Rayleigh quotient and maxiter=0 still reports something meaningful.
+    # After the dtype promotion (the recurrence runs at operator precision) and before body_iter0
+    # (so rho_init is the filtered vector's Rayleigh quotient and maxiter=0 stays meaningful).
     if prefilter is not None:
         degree, cycles = prefilter
         if degree > 1 and cycles > 0:
             if prefilter_hi is None:
-                # Deliberately a raise, not a fallback to an iterative estimate: the estimate is what
-                # returned an excited eigenpair with converged=True, and no matvec-only method can be
-                # made rigorous (see _chebyshev_prefilter). Callers holding a Pauli sum have the bound
-                # for free as sum|c_k|, which is what rqutils.sqd passes.
+                # A raise, never an iterative-estimate fallback; Pauli-sum callers have sum|c_k|
+                # (NOTES.md, "No matvec-only upper bound on `λ_max` exists").
                 raise ValueError(
                     "prefilter_hi is required when mat is a callable: it must be a true upper bound "
                     "on lambda_max, and nothing computable from matvec alone can guarantee that. "
@@ -1324,18 +1193,8 @@ def _ground_locg_callable(
     rho_init = seed.rho
 
     if rtol is None:
-        # Only `rtol` takes None; `atol` defaults to 0.0 instead, because a "derived absolute bound" is
-        # exactly the unintuitive thing this pair replaced -- an absolute residual is either a number the
-        # caller wants or it is not wanted at all.
-        #
-        # 4*eps, not eps: the scale is now `||Ax|| + |theta|` ~ 2*||A||, so `rtol = eps` would target
-        # 2*eps*||A||, only 2x the measured floor of eps*||A|| -- and that floor's constant spans
-        # 0.49-1.26 over 27 samples, so a 2x target sits inside the noise. 4*eps gives 8x the floor,
-        # which is the same 3.2x margin over the worst observed constant that `residual_floor` uses.
-        #
-        # Derive it from the operator dtype, not from the initial guess: a float32 xinit on a complex128
-        # problem would otherwise silently loosen this by nine orders of magnitude. `work_dtype` is
-        # already that promotion.
+        # Only rtol takes None: 4*eps of the operator dtype (never xinit's), 8x the residual floor
+        # (NOTES.md, "ground_locg: the `rtol=None` default").
         rtol = 4.0 * float(jnp.finfo(work_dtype).eps)
 
     state, diag1 = body_iter1(seed.x, seed.r, seed.ax, rho_init)
@@ -1420,32 +1279,18 @@ def _subtract_projections(basis, vector):
 
 
 def _project_out(basis, vector):
-    # Interspersing the normalization with the subtraction, rather than subtracting twice and then
-    # normalizing, is Algorithm 5 ("Modified orthogonalization procedure") of Duersch, Shao, Yang &
-    # Gu, *A Robust and Efficient Implementation of LOBPCG*, arXiv:1704.07458 -- its loop likewise
-    # alternates `U -= V (V^T M U)` with an orthonormalization pass. The block form there needs SVQB
-    # to resolve rank deficiency across columns; at block size 1 `normalize` is the whole content.
-    #
-    # Two passes rather than a convergence test is the "twice is enough" criterion, due to Kahan and
-    # analyzed in Parlett, *The Symmetric Eigenvalue Problem* (1980), Sec. 6.9. SLEPc technical
-    # report STR-1, "Orthogonalization Routines in SLEPc" (Hernandez, Roman, Tomas & Vidal, 2007),
-    # is the practical treatment and makes the same attribution; note its URL now redirects -- reach
-    # it from the "SLEPc Technical Reports" section of https://slepc.upv.es/documentation/ rather
-    # than the older /documentation/reports/str1.pdf path. `_reorthogonalize`'s pass count is fixed
-    # at 2 for the same reason, measured; see its docstring and CLAUDE.md.
+    # Algorithm 5 of Duersch et al. (arXiv:1704.07458) at block size 1, two passes by "twice is
+    # enough" (NOTES.md, "ground_locg._project_out: sources for the two-pass form").
     for _ in range(2):
         vector = normalize(_subtract_projections(basis, vector))
 
-    # Must end on a subtraction of the original basis, not the orthonormalization: near convergence
-    # with R = 0, catastrophic cancellation re-introduces (X, P) components into U and ruins the
-    # Rayleigh-Ritz conditioning. Suspicious vectors are zeroed to keep [basis, U] zero-or-orthogonal.
+    # End on a subtraction of the basis, not a normalization: near convergence (R = 0) cancellation
+    # re-introduces (X, P) components; suspicious vectors are zeroed to keep [basis, U] orthogonal.
     for _ in range(2):
         vector = _subtract_projections(basis, vector)
 
-    # Note the postcondition: the returned vector is either exactly zero or has norm >= 0.99. It is
-    # NOT normalized -- callers feeding it to a standard Rayleigh-Ritz step must renormalize. The
-    # norm is returned alongside it because every caller needs it for exactly that, plus the
-    # zero test; recomputing it outside would be a second O(N) reduction over a huge vector.
+    # Postcondition: exactly zero or norm >= 0.99, NOT normalized; the norm is returned so callers
+    # renormalize and zero-test without a second O(N) reduction.
     norm = jnp.linalg.norm(vector)
     return vector * (norm >= 0.99).astype(vector.dtype), jnp.where(norm >= 0.99, norm, 0.0)
 
@@ -1471,9 +1316,8 @@ def eigenpair_2x2(mat: jax.Array) -> tuple[jax.Array, jax.Array]:
     delta = (d[0] - d[1]) * 0.5
     offd = balanced[1, 0]
     rad = jnp.hypot(delta, jnp.abs(offd))
-    # Null vector of T + rad I = [[delta + rad, conj(offd)], [offd, rad - delta]], which is
-    # singular. Row 1 gives [-conj(offd), delta + rad] and row 2 gives [rad - delta, -offd]; the two
-    # are parallel, but each cancels when its own pivot is small, so select on the sign of delta.
+    # Null vector of singular T + rad I: rows give [-conj(offd), delta + rad], [rad - delta, -offd],
+    # parallel but each cancelling when its pivot is small, so select on the sign of delta.
     vec = jnp.where(
         delta >= 0.0,
         jnp.array([-offd.conjugate(), (delta + rad).astype(mat.dtype)]),
@@ -1497,9 +1341,8 @@ def _nullvec_3x3(mat: jax.Array) -> jax.Array:
     :math:`O(\\epsilon \\|M\\|^2)`, close enough to a genuinely small rank-2 cross product that any
     fixed cutoff misclassifies one case or the other.
     """
-    # Rank 2 (simple eigenvalue): the null vector is conj(col_i x col_j). Any single pair can be
-    # rank deficient, in which case its cross product vanishes and points nowhere useful, so all
-    # three pairings are offered.
+    # Rank 2: the null vector is conj(col_i x col_j), but any one pair can be rank deficient and
+    # vanish, so all three pairings are offered.
     cands = [
         jnp.cross(mat[:, 0], mat[:, 1]).conjugate(),
         jnp.cross(mat[:, 1], mat[:, 2]).conjugate(),
@@ -1560,14 +1403,8 @@ def eigenpair_3x3(mat: jax.Array) -> tuple[jax.Array, jax.Array]:
         - jnp.prod(bd)
         - 2.0 * (balanced[0, 2] * balanced[1, 0] * balanced[2, 1]).real
     )
-    # Both radicands are non-negative for a Hermitian matrix; clamp them against rounding.
-    # disc is Cardano's p^3 - q^2 for q = -13.5 * c0 (182.25 == 13.5**2), deliberately written out
-    # in c1 and c0 rather than as the recognizable p*p*p - q*q: this grouping is measurably *more
-    # accurate*, 1.16e-16 mean relative error against 1.92e-16 for the factored form over 200k
-    # random inputs versus exact rational arithmetic, and it holds that ~1.7x margin all the way
-    # down the near-degenerate sweep where disc -> 0 and cancellation is worst. Reason: p = -3*c1
-    # rounds once and cubing triples that error, whereas 27.0 is exact in binary so c1 enters the
-    # cube unrounded. Don't "simplify" this into the textbook form.
+    # Radicands clamped against rounding; disc is Cardano's p^3 - q^2 (q = -13.5*c0) kept in c1, c0,
+    # never p*p*p - q*q (NOTES.md, "ground_locg.eigenpair_3x3: the discriminant form").
     p = jnp.maximum(-3.0 * c1, 0.0)
     disc = jnp.maximum(-27.0 * c1 * c1 * c1 - 182.25 * c0 * c0, 0.0)
     phi = jnp.atan2(jnp.sqrt(disc), -13.5 * c0) / 3.0

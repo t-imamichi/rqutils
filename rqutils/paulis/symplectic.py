@@ -162,11 +162,8 @@ class PauliSumXZ:
                 for both :func:`rqutils.sqd.sqd` and :func:`rqutils.sqd.hproj`, and the scan is
                 ``O(N*n)`` on an array :func:`numpy.packbits` is about to walk anyway.
         """
-        # Checked before `astype`, which would erase the evidence: 256 wraps to 0 and -1 to 255,
-        # so an "is it 0 or 1?" test on the converted array cannot see what the caller passed.
-        # min/max rather than `(states == 0) | (states == 1)`: one pass instead of two comparisons
-        # and an OR, measured 1.05 ms against 4.14 ms at N=1M, n=32. Equivalent for the integer and
-        # bool dtypes this receives, since the only values in [0, 1] are 0 and 1.
+        # Checked before `astype`, which erases the evidence (256 -> 0, -1 -> 255); min/max, 1 pass
+        # (NOTES.md, "paulis.symplectic.pack_states: the 0/1 check").
         states = np.asarray(states)
         if states.size and (states.min() < 0 or states.max() > 1):
             bad = states[(states != 0) & (states != 1)]
@@ -245,12 +242,8 @@ class PauliSumXZ:
             coeffs = coeffs[nonzero]
             paulis = paulis[nonzero]
             paulis, indices = np.unique(paulis, axis=0, return_inverse=True)
-            # Sum the duplicate strings' coefficients with a scatter-add, not a one-hot matmul. The
-            # matmul materialized a dense (n_unique, n_terms) mask to express a group-by: 64 MB and
-            # 27.5 ms at 4000 terms / 2000 groups, growing quadratically (400 MB at 10000/5000, and
-            # OOM past that), against 0.03 ms here. np.add.at rather than np.bincount because coeffs
-            # is still complex at this point -- the Hermiticity check below is what narrows it -- and
-            # bincount takes real weights only.
+            # Scatter-add, never a one-hot matmul (quadratic); np.add.at as coeffs is still complex
+            # (NOTES.md, "paulis.symplectic.from_paulisum: no quadratic group-bys").
             summed = np.zeros(paulis.shape[0], dtype=coeffs.dtype)
             np.add.at(summed, indices, coeffs)
             coeffs = summed
@@ -269,40 +262,16 @@ class PauliSumXZ:
         else:
             raise ValueError("Unsupported input type")
 
-        # A complex coefficient on a Pauli string means the operator is not Hermitian, which every
-        # consumer of this class assumes. Checked here rather than per-branch so both ingest paths
-        # agree: the Qiskit branch always raised, while the tuple branch used to warn and silently
-        # take .real under force_real=True -- discarding the imaginary part of a non-Hermitian
-        # operator rather than rejecting it.
-        #
-        # The comparison is against `atol`, not exact zero. A mathematically Hermitian operator whose
-        # Pauli coefficients were obtained *numerically* carries rounding at the 1e-16 level, and an
-        # exact test refuses it: conjugating a Hermitian matrix by a non-Clifford circuit and
-        # decomposing the result -- the standard way to build a rotated Hamiltonian -- was measured to
-        # be rejected 18 times out of 18 (n = 3, 4, 5 x 6 seeds) at a largest coefficient |imag| of
-        # 3.3e-16, while those same operators' own hermiticity error reached 2.7e-15. The residue
-        # being rejected was an order of magnitude *smaller* than the property it was testing for.
-        #
-        # This is NOT a return to force_real. That took .real on operators with genuinely nonzero
-        # imaginary parts, discarding real signal; the tolerance still rejects those loudly and only
-        # accepts values indistinguishable from zero at float64. The default sits ~4 orders above the
-        # observed rounding and many orders below any physical coefficient, so the two cases stay
-        # cleanly separated; pass a smaller `atol` to tighten it, or 0.0 to restore the exact test.
+        # Non-Hermitian input raises on both ingest paths, tested against `atol` so rounding passes
+        # (NOTES.md, "paulis.symplectic.from_paulisum: the Hermiticity tolerance").
         imag = np.abs(coeffs.imag)
         if np.any(imag > atol):
             raise ValueError(
                 "Coefficients of Paulis must be real for the Hamiltonian to be Hermitian; "
                 f"largest |imag| is {imag.max():.3e}, above atol={atol:.3e}."
             )
-        # Discard the sub-atol rounding rather than carrying it: every downstream consumer indexes
-        # `.c` expecting a real dtype where the folded phase permits one.
-        #
-        # This line is why `atol` is keyword-only. As a second positional, `from_paulisum(op, 1e-3)`
-        # read naturally as a `simplify` tolerance or a coefficient cutoff -- both plausible, since
-        # `simplify()` is called on ingest -- and instead raised the Hermiticity threshold by nine
-        # orders. The loosened check then does not merely permit the operator: this `.real` throws the
-        # imaginary part away. Measured, `from_paulisum((["ZI", "IZ"], [1 + 1e-4j, 0.5]), 1e-3)` was
-        # accepted and returned c = [0.5, 1.0], with the 1e-4 silently gone.
+        # Drop the sub-atol rounding so `.c` can be real; this `.real` is why `atol` is keyword-only
+        # (NOTES.md, "paulis.symplectic.from_paulisum: why `atol` is keyword-only").
         coeffs = coeffs.real
 
         # Find unique X signatures together with correspondence pointers
@@ -312,11 +281,8 @@ class PauliSumXZ:
         shape = (xsignatures.shape[0], np.max(counts))
         zsignatures = np.zeros(shape + zbits.shape[-1:], dtype=np.uint8)
         phcoeffs = np.zeros(shape, dtype=np.complex128)
-        # Bucket the terms by X signature with one stable sort instead of rescanning `indices` once
-        # per signature. The rescan was the same quadratic shape as the mask matmul above -- 15.9 ms
-        # at 5000 groups, against 0.3 ms here -- and it also re-ran the uint8 conversion per group.
-        # `indices` is already the group id of each term, so sorting it groups the terms, and the
-        # cumulative counts give each group's slice.
+        # One stable sort on the group ids, never a rescan per signature (NOTES.md,
+        # "paulis.symplectic.from_paulisum: no quadratic group-bys").
         order = np.argsort(indices, kind="stable")
         bounds = np.concatenate(([0], np.cumsum(counts)))
         zbits_u8 = zbits.astype(np.uint8)
@@ -329,28 +295,13 @@ class PauliSumXZ:
             iphases = np.sum(xsig & zsigs, axis=1) & 3
             phcoeffs[isig, : counts[isig]] = coeffs[ipaulis] * phase_table[iphases]
 
-        # Narrow to float64 when the folded phase left everything real, i.e. when every Pauli string
-        # has an even number of Ys. An odd-Y string cannot be real in this convention -- the
-        # (-i)^{x.z} phase turns real input complex -- so `.c` stays complex128 there by
-        # construction, not by mistake. Callers restricted to float64 (a backend with no complex128,
-        # say) check `.c.dtype`; there is deliberately no flag to request realness, since no flag can
-        # grant it.
+        # Narrow to float64 only when every string has an even Y count; odd-Y is complex128 by
+        # design (NOTES.md, "`paulis/symplectic`: why there is no `force_real` flag").
         if np.all(phcoeffs.imag == 0.0):
             phcoeffs = phcoeffs.real
 
-        # Insert the dummy identity Pauli at bit position 0 and pack. This is unconditional rather
-        # than opt-in: as a flag it was an invariant nothing could enforce, since the signature side
-        # and the state side lived in separate call sites with no check that they agreed. When they
-        # disagreed every matrix element landed in the wrong column, and the result stayed symmetric,
-        # so eigvalsh returned a plausible wrong ground energy -- that is how hproj shipped broken.
-        #
-        # The X side goes through pack_states, the same method consumers pad their states with, so the
-        # two halves of the alignment contract are one code path and not two that must agree. The Z
-        # signatures are (n_xgroups, n_zterms, n_qubits), so they pad axis 2 rather than axis 1 and
-        # cannot reuse it; the operation is otherwise identical.
-        #
-        # svsim, the only other consumer of this representation, is unaffected: it builds CircuitXZ
-        # itself and never calls this method.
+        # The pad bit is unconditional and the X side reuses pack_states: one alignment code path
+        # (NOTES.md, "paulis.symplectic: the pad bit is unconditional").
         xsignatures = cls.pack_states(xsignatures)
         zsignatures = np.packbits(np.pad(zsignatures, {2: (1, 0)}), axis=-1)
         return cls(xsignatures, zsignatures, phcoeffs, num_qubits)

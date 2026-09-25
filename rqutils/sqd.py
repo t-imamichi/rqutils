@@ -222,27 +222,22 @@ from rqutils.ground_locg import (
 from rqutils.paulis.symplectic import PauliSumXZ
 
 LOG = logging.getLogger(__name__)
-# Largest subspace size representable in the int32 indices used throughout (uniquify_states' iota,
-# get_xsource's output). Documented in the module docstring as the hard scaling limit; enforced in
-# sqd() and hproj() so an overflow raises instead of silently permuting the subspace.
+# Subspace positions are int32 throughout, so the size is capped and enforced to raise on overflow
+# (NOTES.md, "The `N ≤ 2^31 - 1` ceiling: why it is enforced where it is").
 _MAX_STATES = 2**31 - 1
 
 if TYPE_CHECKING:
     from qiskit.quantum_info import SparsePauliOp
 
-# All three arms must be named here, not added by a later `HamiltonianInput |= SparsePauliOp`: a `type`
-# statement is evaluated statically, so the augmented assignment leaves the arm invisible to a checker.
-# Safe without a runtime branch because the statement is lazy -- nothing reads `__value__`, so the
-# TYPE_CHECKING-only import is never resolved. Both pinned by TestHamiltonianInputIsCheckable.
+# Name all three arms here, never via a later `|=`: a `type` statement is static, and lazy, so the
+# TYPE_CHECKING-only import is never resolved. Pinned by TestHamiltonianInputIsCheckable.
 type HamiltonianInput = PauliSumXZ | tuple[Sequence[str], Sequence[Number]] | SparsePauliOp
 type Vector = np.ndarray[tuple[int], np.dtype[np.inexact]]
 type StateList = np.ndarray[tuple[int, int], np.dtype[np.uint8]]
 
 
-# Which dtype kind each `apply_h` keyword's array must have. `u` is an unsigned integer (packed
-# bytes), `i` a signed integer (positions, which use -1 as an absent marker), `fc` float or complex.
-# This is the discriminator a shape check cannot provide: at n=15 with a 2-state subspace, X
-# signatures and X sources are both (2, 2), but never both uint8.
+# Dtype kind per `apply_h` keyword: `u` packed bytes, `i` positions (-1 = absent), `fc` float or
+# complex. It separates arrays whose shapes collide, (2, 2) at n=15 with 2 states.
 _ARRAY_ROLE_KINDS = {
     "xsignatures": ("u", "packed X signatures (uint8, from PauliSumXZ)"),
     "xsources": ("i", "X source indices (int32, from get_xsource; -1 marks absent)"),
@@ -545,52 +540,13 @@ def _host_scalar(value: jax.Array | float | bool) -> jax.Array | float | bool:
         # needed. This is also the only branch a CPU test suite can reach -- see TestHostScalar.
         return value
 
-    # Multi-process. Replicate onto every process before reading, unconditionally.
-    #
-    # **The branch must not depend on this rank's view of the array.** An earlier version returned
-    # early when `addressable_shards` was non-empty, which is a *per-rank* property: measured on 4
-    # nodes, two ranks printed a result while two raised "spans non-addressable devices" from the same
-    # call. Had those two returned early while the others entered the collective below, the job would
-    # have hung at the barrier instead of failing -- strictly worse. `jax.process_count()` is the same
-    # on every rank, so every rank takes the same path.
-    #
-    # (The version before *that* one was worse still: `if not shards: return value` read an empty
-    # `addressable_shards` as "already host-side" and handed the unreadable array to the caller's
-    # `float()`, which raised the very error this function exists to prevent.)
-    #
-    # The collective is safe here because `sqd` is not inside a conditional -- every rank that calls it
-    # reaches this line. Do not copy this shape into a branch some ranks skip; see the sub-mesh gather
-    # in poc/uniquify_sharded.py for the non-collective form that case needs.
-    #
-    # `process_allgather` rather than a hand-rolled `jit(out_shardings=...)`. Three attempts at the
-    # latter each failed on a topology detail this handles already:
-    #
-    # * a bare `PartitionSpec` is resolved against the *context* mesh, so it raises "jit requires a
-    #   non-empty mesh in context" wherever the caller sits outside `set_mesh`;
-    # * a `NamedSharding` built from `value.sharding.mesh` fixes that but replicates only across **that
-    #   array's** mesh, which on a 1-device solve is one device -- so the result still had no
-    #   addressable shard on 3 of 4 ranks and the `[0]` raised `IndexError`.
-    #
-    # `tiled=True` is required for the non-addressable case -- `process_allgather` rejects
-    # `tiled=False` there outright.
-    #
-    # **The result's shape depends on addressability, so normalize it rather than trusting it.** The two
-    # branches inside `process_allgather` disagree for the same rank-0 input: a non-addressable array is
-    # replicated and comes back as a scalar, while a *fully addressable* one is expanded to `(1,)` and
-    # gathered to `(process_count,)` -- its `ndim == 0` test forces the expansion even under
-    # `tiled=True`. Measured on 4 nodes: the 1-device row is fully addressable, returned shape (4,), and
-    # `float()` raised "only 0-dimensional arrays can be converted to Python scalars".
-    #
-    # Every entry is the same number, since all ranks computed the same scalar, so `.reshape(-1)[0]`
-    # is exact for both shapes -- and does not branch on addressability, which is the per-rank property
-    # this function already learned not to test.
+    # Multi-process: gather unconditionally, branching only on process_count (the same on every
+    # rank), then read reshape(-1)[0] (NOTES.md, "sqd._host_scalar: one path on every rank").
     return np.asarray(process_allgather(value, tiled=True)).reshape(-1)[0]
 
 
-# Overloads so a caller destructuring the 3-tuple does not have to narrow first. `return_eigvec` is a
-# plain bool, so without these the declared return is the full union and every
-# `eigval, eigvec, subdims = sqd(...)` reads as unpacking a `float`. Annotation only -- the
-# implementation signature below is unchanged, and sphinx documents that one.
+# Overloads so `eigval, eigvec, basis = sqd(...)` type-checks without narrowing; annotation only,
+# sphinx documents the implementation signature below.
 @overload
 def sqd(
     hamiltonian: HamiltonianInput,
@@ -861,23 +817,13 @@ def sqd(
     _check_cache_level(cache_level)
     _check_prefilter(prefilter)
     if states_size is None:
-        # Default to the next power of two at or above the input length. All-distinct and growing
-        # dimensions are the *normal* SQD access pattern -- an SKQD run walks one per Krylov rung plus
-        # one per recovery round -- so a default of states.shape[0] pins no shape and retraces the
-        # solver every call. Bucketing collapses that to O(log N) traces: measured 1.25x over five
-        # dimensions 60..260 at n=10 and 1.43x over five rungs at n=13, energies bit-identical.
-        # Padding is unobservable (filler is excluded from the projection and trimmed from the
-        # returned basis); pass states.shape[0] explicitly for the old behaviour.
+        # Next power of two: growing distinct sizes are the normal SQD pattern, so O(log N) retraces
+        # (NOTES.md, "`states_size`'s power-of-two padding").
         states_size = 1 << max((states.shape[0] - 1).bit_length(), 1)
     if states_size < states.shape[0]:
         raise ValueError("states_size smaller than the states array length")
-    # The 2^31 ceiling the module docstring calls a hard limit, actually enforced. Subspace positions
-    # are int32 throughout -- uniquify_states' iota, and get_xsource's returned indices with -1 as the
-    # absent marker -- so a size at or above 2^31 wraps to a negative index and yields a corrupted
-    # permutation rather than an error: a plausible finite answer, the failure mode this module keeps
-    # guarding against. Note a wrapped index is -2147483648, not -1, so the absent-marker test cannot
-    # even catch it. Unreachable on current hardware (2^31 states is already 4.3 GB of packed states
-    # before any vector), which is exactly why the check is cheap insurance rather than a cost.
+    # A wrapped int32 index is -2147483648, not the -1 absent marker, so nothing downstream catches
+    # it (NOTES.md, "The `N ≤ 2^31 - 1` ceiling: why it is enforced where it is").
     if states_size > _MAX_STATES:
         raise ValueError(
             f"states_size {states_size} exceeds the {_MAX_STATES} limit imposed by int32 subspace "
@@ -885,10 +831,8 @@ def sqd(
         )
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
-    # Whether `atol` is reachable depends on the operator's scale, so this needs `.c`. Checked here and
-    # not in `run_sqd` because that is jitted -- sum|c_k| is traced there, and a traced value cannot
-    # raise. This is the outermost point where it is concrete, and it must come after the PauliSumXZ
-    # conversion above, which is what supplies `.c`.
+    # After the conversion above (it supplies `.c`) and not in run_sqd, which is jitted: sum|c_k| is
+    # traced there, and a traced value cannot raise.
     _check_tols(atol, rtol, float(np.abs(hamiltonian.c).sum()), hamiltonian.c.dtype)
     states = _check_states_shape(states, hamiltonian.num_qubits, packed)
 
@@ -896,19 +840,11 @@ def sqd(
         LOG.debug("Adjusting states_size to make the array divisible by %d", mesh.size)
         states_size += mesh.size - resid
 
-    # `packed=True` hands over `pack_states`' own output, so skip the pack rather than repeat it --
-    # it is not idempotent, and a second pass reads each byte as one bit. The saving is the caller's:
-    # unpacked `[N, num_qubits]` is ~7.7x the packed width at n=100, and both arrays are live at once
-    # during the pack, so a caller already holding the packed form was paying an 8x expansion plus a
-    # transient peak (2.40 GB against 0.31 GB at n=100, N=24M) for nothing. Nothing downstream
-    # changes: `run_sqd` has always taken the packed form.
+    # `packed=True` skips the pack: pack_states is not idempotent, and re-expanding costs the caller
+    # ~8x (NOTES.md, "sqd.sqd: `packed=True` skips the pack").
     states_p = states if packed else PauliSumXZ.pack_states(states)
-    # Pad the *input* up to states_size too, not just the internal arrays. states_p is a traced
-    # argument of run_sqd, so its leading dimension is part of the jit cache key: leaving it at the
-    # raw input length retraces the whole solver on every distinct len(states), which is precisely
-    # what states_size exists to prevent (measured 0.44 s per call versus 0.064 s once the shape
-    # repeats). uniquify_states already pins every array it derives, so this was the one shape that
-    # still leaked the input length through.
+    # Pad the input to states_size too: its leading dimension is part of run_sqd's jit cache key
+    # (NOTES.md, "sqd.sqd: pad the input states too").
     states_p = _pad_states(states_p, states_size)
 
     LOG.debug("Starting SQD with array size %s", states_size)
@@ -928,14 +864,8 @@ def sqd(
     )
     LOG.info("Found ground eigenpair in %f seconds.", time.time() - start)
     eigval = float(_host_scalar(result.eigval))
-    # The convergence flag used to be discarded here, and a non-converged run still returns
-    # `state.theta` -- a valid variational *upper bound*, so finite, real, and above the true minimum,
-    # i.e. indistinguishable from a correct answer by inspection. markdown/locg.md records that this
-    # absence "is the reason I4 could hide": a sign error made the convergence test unsatisfiable, so
-    # the solver silently never converged and every answer was the iteration cap's best guess.
-    #
-    # Raised here rather than in `run_sqd` because that function is @jax.jit-wrapped, so `converged`
-    # is a traced boolean there and cannot be branched on at trace time.
+    # Raise here because run_sqd is jitted: an unconverged theta is a finite upper bound, not
+    # distinguishable by inspection; markdown/locg.md's I4 hid behind the discarded flag.
     if not bool(_host_scalar(result.converged)):
         raise RuntimeError(
             f"LOBPCG did not converge in maxiter={maxiter} iterations (atol={atol!r}, "
@@ -967,18 +897,8 @@ def sqd(
         )
     if return_eigvec:
         eigvec, states_u, subspace_dim = result.eigvec, result.states, result.subspace_dim
-        # `packed` now governs BOTH directions: a caller who hands over packed states gets packed
-        # states back, so a round trip through `sqd` needs no re-pack. The returned rows are the same
-        # array `run_sqd` searched, sliced to the genuine uniques.
-        #
-        # Deliberately not a separate `return_packed` flag. Two independent flags make four
-        # combinations of which two are round trips and two are conversions, and `sqd` is not a
-        # conversion utility -- `PauliSumXZ.pack_states`/`unpack_states` are, and a caller wanting
-        # the other width calls one of them. One flag keeps input and output in the same convention
-        # by construction.
-        #
-        # `hamiltonian.num_qubits`, not `states.shape[1]`: the latter is the *packed* width on the
-        # `packed=True` path, which would unpack to the wrong qubit count.
+        # One `packed` flag governs both directions, so a round trip needs no re-pack (sqd is not a
+        # converter). num_qubits, not states.shape[1], which is the packed width on that path.
         basis_states = (
             states_u[:subspace_dim]
             if packed
@@ -1038,11 +958,8 @@ def hproj(
             "hproj does not support sharding: it builds a host-side scipy matrix, so a mesh buys "
             "nothing. Call it outside the mesh context, or use sqd() for a sharded solve."
         )
-    # Same int32 ceiling sqd() enforces, since hproj reaches get_xsource too and its returned
-    # positions are int32 with -1 as the absent marker. Checked here, before the O(N) sortedness scan
-    # and the np.unique below: it is an O(1) look at a shape, so it costs nothing to do first and
-    # reports the real problem rather than letting a doomed call spend time first: after the scan it
-    # would pay the whole O(N) pass over a subspace it is about to reject anyway.
+    # sqd()'s int32 ceiling, checked before the O(N) scan and np.unique below
+    # (NOTES.md, "The `N ≤ 2^31 - 1` ceiling: why it is enforced where it is").
     if states.shape[0] > _MAX_STATES:
         raise ValueError(
             f"subspace of {states.shape[0]} states exceeds the {_MAX_STATES} limit imposed by int32 "
@@ -1051,9 +968,8 @@ def hproj(
     if not unique_states:
         states = np.unique(states, axis=0)
     else:
-        # get_xsource binary-searches into `states`, so unsorted rows silently produced a wrong,
-        # non-symmetric matrix. Validated rather than documented away, at 12-14% of hproj and only on
-        # this opt-in path -- the branch above is sorted by construction and pays nothing.
+        # get_xsource binary-searches `states`, so unsorted rows gave a wrong non-symmetric matrix;
+        # checked at 12-14% of hproj, on this opt-in path only.
         if not _is_lex_sorted(states):
             raise ValueError(
                 "unique_states=True requires `states` to be uniquified and lex-sorted, but the "
@@ -1069,13 +985,8 @@ def hproj(
     rows = np.tile(np.arange(states.shape[0])[None, :], (columns.shape[0], 1))[valid]
     data = np.array(elements[valid])
     cols = np.array(columns[valid])
-    # shape= is mandatory here, not cosmetic: without it scipy infers the extent from the largest
-    # index present, so a trailing basis state that no term couples into is dropped and the matrix
-    # comes back too small (measured 41x41 for a 53-state subspace with local two-site js
-    # operators). That truncation is silent -- the result is still symmetric, so eigvalsh returns a
-    # plausible wrong ground energy. When nothing at all survives, the index arrays are empty and
-    # scipy cannot infer any extent, raising instead ("cannot infer dimensions from zero sized
-    # index arrays"); the projection is legitimately the zero matrix in that case.
+    # shape= is mandatory: scipy otherwise infers the extent and silently drops uncoupled trailing
+    # states (NOTES.md, "sqd.hproj: `shape=` is mandatory").
     dim = states.shape[0]
     return csr_array(coo_array((data, (rows, cols)), shape=(dim, dim)))
 
@@ -1099,9 +1010,8 @@ def _hproj_cols_elems(hamiltonian: PauliSumXZ, states_p: StateList) -> tuple[jax
     """
 
     def get_from_one(_, ham):
-        # `ham` is a PackedArrays, so these read by name. As a bare tuple this was
-        # `ham[0]`/`ham[1]`/`ham[2]`, where swapping the first two type-checks and silently
-        # computes with X and Z exchanged -- `x` and `z` are same-dtype integer arrays.
+        # Read by name: x and z are same-dtype integer arrays, so swapped positions type-check and
+        # silently compute with X and Z exchanged.
         columns = get_xsource(ham.x, states_p)
         diagonals = get_diagonal(ham.z, ham.c, states_p)
         return None, (columns, diagonals)
@@ -1144,9 +1054,8 @@ def _spread_seed(
     carry no basis state, so weight there would place the iterate partly outside the subspace.
     """
     index = jax.lax.broadcasted_iota(jnp.uint32, (states_size,), 0, out_sharding=sharding)
-    # Two xorshift-multiply rounds (the constants are Murmur-style mixers): enough that consecutive
-    # indices give uncorrelated outputs, which is all that is needed to avoid an accidental
-    # orthogonality against any one eigenvector.
+    # Two xorshift-multiply rounds (Murmur-style constants): enough to decorrelate consecutive
+    # indices, so the seed is not accidentally orthogonal to any one eigenvector.
     mixed = index ^ (index >> 16)
     mixed = mixed * jnp.uint32(0x7FEB352D)
     mixed = mixed ^ (mixed >> 15)
@@ -1154,16 +1063,8 @@ def _spread_seed(
     mixed = mixed ^ (mixed >> 16)
     # Map to [-1, 1). The distribution does not matter, only that no entry is systematically zero.
     vec = mixed.astype(dtype) * (2.0 / float(2**32)) - 1.0
-    # Reshard the predicate to match `vec` rather than assuming it already does. `vec` is built
-    # sharded unconditionally (the iota above takes `out_sharding`), but `states_u`'s sharding depends
-    # on the caller: `run_sqd` reshards it only inside `if cache_level[0] == 1`, because the
-    # uncached branch still needs the replicated array for the `get_xsource` searches. So at
-    # cache_level[0] == 0 the predicate arrives replicated while `vec` is partitioned, and
-    # `jnp.where` rejects the pair -- "select `which` must be scalar or have the same sharding as
-    # cases". That raised on every mesh for (0, 0), (0, 1) and (0, 2), the three levels no sharding
-    # test covered; it was previously masked by _accumulate_diagonal's rank bug, which failed all six
-    # earlier in the call. Fixed here rather than by resharding states_u in the caller: this function
-    # is what decides `vec`'s sharding, so it owns the requirement that the mask agree with it.
+    # Reshard the mask to `vec`: states_u arrives replicated at cache_level[0] == 0, and this
+    # function owns vec's sharding (NOTES.md, "sqd._spread_seed: reshard the filler mask").
     filler = _is_filler(states_u) == 1
     if sharding is not None:
         filler = jax.reshard(filler, sharding)
@@ -1249,9 +1150,7 @@ def run_sqd(
         check_residual: Recompute ``||Hv - Ev||`` and ``||Hv||`` at ``cache_level=(0, 0)`` after the
             solve, into ``residual`` and ``ax_norm``. :func:`sqd` turns it on and raises on the result.
     """
-    # `cache_level` is static, so this is a concrete tuple at trace time and the check runs once per
-    # trace rather than once per call. `sqd` validates too; this covers the direct callers, which are
-    # the six poc scripts -- i.e. the ones most likely to pass an experimental value.
+    # Static, so this runs once per trace; sqd validates too, and this covers direct poc/ callers.
     _check_cache_level(cache_level)
     _check_xcache_groups(xcache_groups, cache_level, hamiltonian.x.shape[0])
     _check_prefilter(prefilter)
@@ -1264,9 +1163,8 @@ def run_sqd(
 
     states_u = uniquify_states(states_p, states_size)
 
-    # `xcache_groups` splits the X groups in two: the first `ncached` get precomputed source indices,
-    # the rest keep their raw signatures and are searched inside every matvec. `None` means "all",
-    # which is the pre-existing behaviour and the only value that traces the single-arm graph.
+    # The first `ncached` X groups get precomputed sources, the rest search inside every matvec;
+    # `None` means all, the only value that traces the single-arm graph.
     njgroups = hamiltonian.x.shape[0]
     ncached = njgroups if xcache_groups is None else xcache_groups
     partial_xcache = cache_level[0] == 1 and ncached < njgroups
@@ -1279,13 +1177,8 @@ def run_sqd(
             lambda _, x: (None, get_xsource(x, states_u)), None, hamiltonian.x[:ncached]
         )[1]
         if sharding and not partial_xcache:
-            # We will not be performing sorts on states any more - shard the array.
-            #
-            # Skipped when the cache is partial: the uncached groups still search `states_u` inside
-            # every matvec, and `get_xsource` requires it **replicated** -- a partitioned `[N, B]`
-            # fails outright ("Unmapped values passed to vmap cannot be sharded along the mesh axis
-            # you are vmapping over"). Resharding here would turn a memory dial into a crash on any
-            # mesh, which is why the condition is `not partial_xcache`.
+            # Shard states_u now no sort follows, except under a partial cache: get_xsource needs it
+            # replicated ("Unmapped values passed to vmap cannot be sharded"), so it would crash.
             if log_level <= logging.DEBUG:
                 jax.debug.print("Sharding states array")
 
@@ -1308,15 +1201,8 @@ def run_sqd(
             (hamiltonian.z, hamiltonian.c),
         )[1]
 
-    # Assemble the per-X-group arrays apply_h scans over. This stays a Python-level branch on the
-    # static cache_level: the *packing* must be static too, or the tuple structure would become part
-    # of the traced arguments and retrace on every call.
-    #
-    # Selected with if/elif rather than a dict literal keyed on cache_level[1]: `diag_signs` and
-    # `diagonals` are assigned only inside their own branches above, so a dict literal -- which
-    # evaluates every value before indexing -- raises UnboundLocalError on the levels that skipped
-    # them. The layout itself is shared with apply_h through _pack_scanned; only the choice of which
-    # array to hand it is local.
+    # Static Python branch on cache_level, keeping the packing out of the traced arguments; if/elif,
+    # not a dict literal, which evaluates arrays other levels never assigned (UnboundLocalError).
     xgroup = xsources if cache_level[0] == 1 else hamiltonian.x
     if cache_level[1] == 0:
         diagonal_arg = hamiltonian.z
@@ -1325,13 +1211,8 @@ def run_sqd(
     else:
         diagonal_arg = diagonals
     scanned = _pack_scanned(cache_level, xgroup, diagonal_arg, hamiltonian.c)
-    # A partial cache needs a *second* scanned tuple: the cached and uncached groups carry different
-    # X arrays (int32 indices against uint8 signatures), so they cannot share one leading axis. The
-    # matvec becomes the sum of two kernels, one per arm -- verified exact against the single-arm form
-    # for all six cache_levels at every J' (test/test_sqd.py::TestPartialXCache).
-    #
-    # The diagonal axis is sliced identically in both arms and is orthogonal to the split: it is
-    # indexed by X group, so group k's diagonal data travels with whichever arm holds group k.
+    # A partial cache needs a second scanned tuple (int32 indices and uint8 signatures cannot share
+    # an axis), summed with the first; diagonals slice identically in both (TestPartialXCache).
     scanned_tail = None
     if partial_xcache:
         scanned = _pack_scanned(
@@ -1343,17 +1224,14 @@ def run_sqd(
             diagonal_arg[ncached:],
             hamiltonian.c[ncached:],
         )
-    # (1, 2) reads neither signature array, so it needs no states at all -- which is what lets the
-    # caller drop S entirely under the most aggressive caching (see the module docstring).
-    # `partial_xcache` forces states back on: the uncached arm searches them every matvec.
+    # (1, 2) reads no signature array, so needs no states, unless `partial_xcache`, whose uncached
+    # arm searches them every matvec.
     needs_states = cache_level[0] == 0 or cache_level[1] == 0 or partial_xcache
-    # cache_level is bound here rather than passed through args: ground_locg splats args
-    # positionally (matvec(vec, *args)), so a static_argnames entry would never see it and the
-    # tuple would be traced -- retracing the kernel on every matvec call in the solver loop.
+    # Bind cache_level via partial, not static_argnames: ground_locg splats args positionally, so it
+    # would be traced and retrace the kernel every matvec.
     if partial_xcache:
-        # Both arms' cache_levels are bound statically for the same reason, and the two kernels are
-        # summed rather than fused: see the `scanned_tail` comment above. `args` gains the tail tuple,
-        # so it stays traced data while both cache_levels stay static.
+        # Both arms' cache_levels are bound statically likewise; the kernels are summed, not fused,
+        # so `args` gains the tail tuple as traced data.
         def matvec(  # type: ignore[misc]
             vec: jax.Array,
             scanned: tuple,
@@ -1375,71 +1253,26 @@ def run_sqd(
             diagonal = diagonals[0]
         else:
             diagonal = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u)
-        # `.real` on both branches, not just the uncached one. A Hermitian operator's projected
-        # diagonal is real by construction, but `diagonals` carries `hamiltonian.c`'s dtype, which is
-        # complex128 whenever any Pauli string has an odd Y count (the folded `(-i)^{x.z}` phase makes
-        # it so -- see PauliSumXZ). The `jnp.max`/`argmin` below reject complex input outright, so
-        # cache_level[1] == 2 raised `TypeError: lt does not accept dtype complex128` for every such
-        # Hamiltonian -- on a single device, with no mesh involved. The uncached branch took `.real`
-        # and worked, which is what made the asymmetry easy to miss.
+        # `.real` on both branches: `diagonals` is complex128 for odd-Y strings, and max/argmin
+        # reject complex (NOTES.md, "sqd.vinit_from_min_diag: `.real` on both branches").
         diagonal = diagonal.real
-        # Set the fill-in components to the maximum value so that argmin only sees the valid entries.
-        # No reshard needed, unlike `_spread_seed`: `diagonal` derives from `states_u`, so predicate
-        # and operand specs track by construction (verified P(None) and P('x') on both).
+        # Filler slots get the max so argmin sees only genuine entries; no reshard, unlike
+        # _spread_seed, since `diagonal` derives from states_u (verified P(None) and P('x')).
         diagonal = jnp.where(_is_filler(states_u) == 1, jnp.max(diagonal), diagonal)
         imin = jnp.argmin(diagonal)
-        # Weight the minimum-diagonal state heavily -- it is the best single guess available, and
-        # keeping it dominant preserves this heuristic's fast convergence -- but add the spread seed
-        # underneath rather than returning a bare one-hot.
-        #
-        # THE WEIGHT CARRIES THE SEED'S OWN SIGN, and that is what stops it cancelling. A plain
-        # `.add(1.0)` subtracts where the seed component is negative, and `_spread_seed` maps index 0
-        # to *exactly* -1.0, so `argmin(diagonal) == 0` zeroed the component at the very index this
-        # heuristic had declared most important -- sqd then returned a wrong eigenvalue with
-        # converged=True. Structural rather than a special case on index 0, because near-cancellation
-        # is reachable at many indices; the sign form bounds |vinit[imin]| into [1, 2) for any seed.
-        # `NOTES.md` has the measurements.
-        #
-        # A pure one-hot cannot leave its own connected component: Krylov iteration only ever
-        # reaches states linked to the seed by a nonzero matrix element, so if the projected
-        # Hamiltonian splits into disconnected blocks (routine for a sampled subspace, where whole
-        # groups of bitstrings may share no Pauli-induced transition), the solver returns that
-        # block's minimum and reports convergence. Measured on a 14-state subspace that splits 4+10:
-        # sqd returned -1.293, the exact minimum of the block holding the seed, against a true
-        # minimum of -2.191 in the other block. The answer was a genuine eigenvalue, just not the
-        # lowest one -- so nothing downstream could detect it.
-        #
-        # out_sharding is mandatory here, not decorative: a scatter into a sharded operand cannot
-        # resolve its output sharding unambiguously (the update might land on any device), so JAX
-        # raises ShardingTypeError rather than guessing. Without it, sqd() fails outright on ANY
-        # multi-device mesh -- not subtly, but before the solver is ever reached. It went unnoticed
-        # because nothing in the suite runs a mesh; `XLA_FLAGS=--xla_force_host_platform_device_count`
-        # reproduces it on CPU, which is what poc/sharding.py does.
+        # Min-diagonal weight takes the seed's sign, over the spread, never a one-hot; out_sharding
+        # is mandatory (NOTES.md, "sqd.run_sqd: the initial-vector guards").
         seed = _spread_seed(states_size, states_u, hamiltonian.c.dtype, sharding)
-        # Elementwise under a mask rather than `seed.at[imin].add(...)`, which is the same arithmetic
-        # but reads one element out of a *sharded* array: measured on a 4-device mesh, indexing emitted
-        # 3 `all-gather`s to fetch that scalar, materializing the whole `states_size` vector on every
-        # device. At this module's sizes (`_MAX_STATES` is 2**31 - 1) that is exactly the full-vector
-        # collective `ground_locg`'s single-vector memory budget exists to avoid. The mask form emits
-        # none, and is bit-identical (verified at several `imin`).
-        #
-        # jnp.sign, not jnp.copysign: the seed is complex whenever `hamiltonian.c` is, and copysign
-        # rejects complex input. sign(z) = z/|z| keeps the phase, so the update reinforces.
-        # The zero branch is unreachable below the `_MAX_STATES` ceiling -- `NOTES.md` records why it
-        # stays, so do not read a surviving mutant here as dead code.
+        # Mask, not `seed.at[imin]` (an all-gather); jnp.sign, not copysign (complex seed); keep the
+        # unreachable zero branch (NOTES.md, "sqd.run_sqd: the initial-vector guards").
         sign = jnp.sign(seed)
         direction = jnp.where(sign == 0, 1.0, sign)
         selected = jax.lax.broadcasted_iota(imin.dtype, (states_size,), 0, out_sharding=sharding)
         return seed + jnp.where(selected == imin, direction, jnp.zeros_like(seed))
 
     def vinit_nodiag():
-        # No diagonal to rank states by, so the spread seed is all there is. A one-hot here is not
-        # merely suboptimal but wrong: ground_locg's documented precondition is a non-vanishing
-        # overlap with v0, and e_0 violates it outright whenever state 0 is decoupled from the rest
-        # of the subspace (every xsource from it lands outside, so row 0 of the projected H is
-        # identically zero). e_0 is then a true eigenvector with eigenvalue 0, the zero-residual
-        # guard correctly reports convergence, and sqd returns 0.0 -- silently, with
-        # converged=True. Reproduced on a 9-state IIIX subspace whose true answer is -1.
+        # The spread seed, never e_0: a decoupled e_0 is an exact eigenvector at 0, so sqd returned
+        # 0.0 with converged=True (NOTES.md, "sqd.run_sqd: the initial-vector guards").
         return _spread_seed(states_size, states_u, hamiltonian.c.dtype, sharding)
 
     if log_level <= logging.DEBUG:
@@ -1450,11 +1283,8 @@ def run_sqd(
     if log_level <= logging.DEBUG:
         jax.debug.print(f"Starting minimization with cache_level {cache_level}")
 
-    # sum|c_k| bounds lambda_max rigorously -- every Pauli string is unitary, and projecting onto the
-    # subspace only shrinks the spectral radius -- and costs no matvec. `ground_locg` cannot derive it
-    # from a callable, and raises rather than guessing (markdown/spinchain/rqutils-prefilter-bug.md). Gated on the
-    # filter actually running, since degree<=1 or cycles==0 is a documented no-op and computing the
-    # bound anyway would add ops to the traced graph for those values.
+    # sum|c_k| rigorously bounds lambda_max (Pauli strings are unitary; projecting only shrinks it),
+    # which a callable cannot supply (NOTES.md, "No matvec-only upper bound on `λ_max` exists").
     filter_runs = prefilter is not None and prefilter[0] > 1 and prefilter[1] > 0
     prefilter_hi = jnp.abs(hamiltonian.c).sum() if filter_runs else None
     eigval, eigvec, _, converged = ground_locg(
@@ -1499,31 +1329,15 @@ def uniquify_states(states_p: StateList, states_size: int) -> StateList:
         ValueError: If ``states_size`` exceeds :data:`_MAX_STATES`, the ceiling imposed by the int32
             iota below.
     """
-    # The int32 ceiling checked where the int32 index is actually created, not only in the public
-    # entry points. `sqd()` and `hproj()` check it too -- earlier, with better messages, and before
-    # their own O(N) work -- but this function and `get_xsource` are un-underscored and are called
-    # directly by six scripts under poc/, which is exactly the code that pushes N. Those
-    # call sites reach the iota with neither entry-point guard in the chain.
-    #
-    # Free: `states_size` is static (see the decorator), so this fires at trace time and costs nothing
-    # per call. A traced value could not be compared at all.
+    # Also checked here, where the int32 iota is created: poc/ calls this directly, and it is free
+    # at trace time (NOTES.md, "The `N ≤ 2^31 - 1` ceiling: why it is enforced where it is").
     if states_size > _MAX_STATES:
         raise ValueError(
             f"states_size {states_size} exceeds the {_MAX_STATES} limit imposed by the int32 index "
             "below; beyond it the iota wraps negative and the subspace is silently permuted"
         )
-    # Lexsort on uint64 words rather than the raw uint8 columns. `lax.sort` compares key operands one
-    # at a time, so `num_keys=B` costs O(B) per comparison -- 13 columns at n=100. Packing to
-    # ceil(B/8) words makes it 2, and the permutation is identical because `_pack_state_words` is
-    # order-preserving. Measured 1.79x at n=30 through 5.06x at n=127 (N=200k); this sort dominates
-    # the function, which in turn measured 14-27x `get_xsource` at every width.
-    #
-    # This trades memory for speed: the words are an extra `[N, ceil(B/8)]` uint64 buffer, and packing
-    # rounds B up to a multiple of 8, so it widens the data by `8*ceil(B/8) - B` bytes per row. Worst
-    # case is n=64 (B=9 -> 16 bytes, +7/row); n=127 (B=16) is free. Measured 1.09-1.69x compiled temp
-    # bytes at N=1M. Negligible at the sizes here (0.07-0.17 GB at N=24M) but 6-15 GB at the 2^31
-    # ceiling, so it is the wrong trade for an out-of-core design, whose whole point is bounding
-    # memory -- see NOTES.md for the chunked-merge prototype this ruled out.
+    # Lexsort on uint64 words, not uint8 columns: lax.sort pays per key and the order is identical;
+    # it trades memory for speed (NOTES.md, "sqd.uniquify_states: lexsort on uint64 words").
     words = _pack_state_words(states_p)
     iota = jax.lax.broadcasted_iota(np.int32, (states_p.shape[0],), 0)
     perm = jax.lax.sort((*words.T, iota), dimension=0, num_keys=words.shape[1])[-1]
@@ -1609,18 +1423,8 @@ def _is_lex_sorted(states: NDArray[np.uint8]) -> bool:
     Slice to the real rows first (`~_is_filler(states)`) if you hold a padded array; `sqd` already
     trims before returning its basis.
     """
-    # Any filler row disqualifies the array, and this must be tested *independently* of sortedness.
-    # Two or more fillers are duplicates and so fail the strictness test below, which is what the
-    # "rejects a padded result by design" claim rested on -- but a SINGLE filler is still strictly
-    # increasing and used to pass. hproj has no filler-masking step, so that row became a spurious
-    # basis state: one row and column too large, still symmetric, and measured -1.118034 against a
-    # true -1.0. The test is on the packed byte because pack_states makes byte 0 < 128 for every
-    # genuine state, so 255 is unambiguous -- unpacking a filler at n=2 gives [1, 1], a legitimate
-    # state, which is why an unpacked-side check could not work.
-    # O(1), not a pass over the column: fillers are all-255 rows and `pack_states` guarantees byte 0
-    # < 128 for every genuine state, so they sort to the end -- if any filler is present the LAST row
-    # carries one. A full `np.any(states[:, 0] >> 7)` measured 5.25 ms at N=10M against 0.00012 ms
-    # here, i.e. ~4.4x the cost of the adjacent-row pass it was prepended to, for the same answer.
+    # Any filler disqualifies, tested apart from sortedness (a lone filler is strictly increasing);
+    # fillers sort last, so the last row decides (NOTES.md, "sqd._is_lex_sorted: the filler test").
     if states.shape[0] and states[-1, 0] >= 128:
         return False
     if states.shape[0] < 2:
@@ -1772,12 +1576,8 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
         pos = jnp.minimum(pos, size - 1)
         found = keys[pos] == target_keys
     else:
-        # Explicit binary search, on uint64 words rather than uint8 bytes: a level costs ceil(B/8)
-        # comparisons instead of B (2 rather than 13 at n=100), and the packing is one pass. The
-        # word form is what makes this path affordable past n=60 -- the byte form measured an ~8x
-        # per-state cliff across the B > 8 boundary (15 ns/state at n=60, 189 at n=100).
-        # Invariant unchanged: lo is the count of rows strictly less than the target, so after
-        # ceil(log2(N)) + 1 halvings lo is the insertion point.
+        # Binary search on uint64 words, not bytes: ceil(B/8) comparisons per level instead of B
+        # (NOTES.md, "sqd.get_xsource: search on uint64 words"). lo counts rows below the target.
         swords = _pack_state_words(states)
         twords = _pack_state_words(targets)
 
@@ -1878,14 +1678,8 @@ def _accumulate_diagonal(
         signs = 1.0 - 2.0 * sign_bit(iterm)
         return diagonal + coeffs[iterm] * signs, iterm + 1
 
-    # Carry over only the *leading* axis of the template's sharding. The output is 1-D of length
-    # template.shape[0] while the template may be 2-D -- `get_diagonal` passes the (N, nbytes) state
-    # list -- and jnp.zeros rejects a rank-2 spec on a rank-1 aval ("Length of sharding.spec (2) must
-    # be equal to aval's ndim (1)"). That raise fired on *every* sharded sqd call, at every
-    # cache_level, because run_sqd's vinit_from_min_diag reaches get_diagonal unconditionally.
-    #
-    # Rebuilt as a NamedSharding rather than a bare PartitionSpec: the spec alone is rejected when no
-    # mesh context is active, which is the ordinary single-device path.
+    # Only the template's leading-axis sharding (2-D template, 1-D output), as a NamedSharding so it
+    # works with no mesh (NOTES.md, "sqd._accumulate_diagonal: the output sharding").
     sharding = jax.typeof(template).sharding
     init = jnp.zeros(
         template.shape[0],
@@ -1900,10 +1694,8 @@ def compute_diagonal(diag_signs: NDArray[np.uint8], coeffs: NDArray[np.inexact])
     """Compute the diagonals from the sign bits and coefficients."""
 
     def sign_bit(iterm):
-        # iterm & 7, not iterm & 255: this is the bit offset WITHIN the selected byte, so it must
-        # wrap at 8. With & 255 the shift 7 - ibit goes negative from iterm=8 onward, i.e. as soon as
-        # an X group holds more than 8 Z terms, and the composed diagonal is silently wrong
-        # (measured: 0.71 absolute error on 9 terms, and a 25% error in the end-to-end eigenvalue).
+        # iterm & 7, not & 255: the bit offset within the byte must wrap at 8, or X groups over 8 Z
+        # terms go silently wrong (NOTES.md, "sqd.compute_diagonal: the bit offset wraps at 8").
         return (diag_signs[:, iterm // 8] >> (7 - (iterm & 7))) & 1
 
     return _accumulate_diagonal(coeffs, diag_signs, sign_bit)
@@ -2066,9 +1858,8 @@ def apply_h(
             disagrees with ``vec``'s trailing axis, or if its row count does not divide the device
             count.
     """
-    # Each axis is one list of (keyword name, cache_level digit, array). Pairing the three together
-    # means an axis is filtered, validated and unpacked from a single place -- no name-to-digit table
-    # to keep in step with a separate name-to-array lookup, and no dict built only to be read back.
+    # One (keyword, cache_level digit, array) list per axis, so each is filtered, validated and
+    # unpacked in one place with no name-to-digit table to keep in step.
     xgiven = [
         opt
         for opt in (("xsources", 1, xsources), ("xsignatures", 0, xsignatures))
@@ -2103,26 +1894,13 @@ def apply_h(
         raise ValueError(f"apply_h: {dname}= requires coeffs=")
 
     cache_level = (xaxis, daxis)
-    # `_apply_h_kernel` checks this too, so it looks gratuitous -- three independent reviewers read it
-    # that way. It is not: the ORDER matters. The role check below must run after it, because a caller
-    # who has passed the wrong arrays *and* omitted `states` needs to hear about the missing input set
-    # first (it is what they must fix regardless), and the kernel's copy runs after both. Removing this
-    # line makes the dtype error surface instead, which `TestMatvecKernels::test_omitting_states_raises`
-    # catches. Keep them in step if either message changes.
+    # Not redundant with the kernel's check: the missing-input-set error must precede the role check
+    # below (TestMatvecKernels::test_omitting_states_raises); keep the messages in step.
     if (xaxis == 0 or daxis == 0) and states is None:
         raise ValueError(f"states is required for cache_level={cache_level}")
 
-    # Dtype closes part of the misnaming residue -- see this function's docstring for what it does and
-    # does not reach. A *shape* check cannot: X signatures and X sources are both exactly (2, 2) at
-    # n=15 with a 2-state subspace, which is why the positional form was deleted rather than asserted.
-    # Dtype separates them structurally at precisely that point: packed signatures are uint8 (packbits
-    # output) while source indices are int32 positions using -1 as the absent marker, and a uint8
-    # cannot hold -1.
-    #
-    # Ordered last on purpose. The checks above concern the input *set* -- which arrays were named, and
-    # whether they are mutually consistent -- and a caller must fix those first regardless of dtypes.
-    # Running the role check after them keeps it strictly additive: it never displaces an error that
-    # was already being raised.
+    # Dtype separates what shape cannot (uint8 signatures vs int32 sources, both (2, 2) at n=15);
+    # last, so it only adds errors and never displaces an input-set error raised above.
     _check_array_role(xname, xarray)
     _check_array_role(dname, darray)
 
