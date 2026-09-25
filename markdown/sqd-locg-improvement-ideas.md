@@ -117,10 +117,11 @@ compiled variant; this is a memory-budget setting, not a parameter to sweep casu
 3. **A diagonal split reintroduces the `13 * N` state array at the one level that had eliminated it.**
    `needs_states` is `cache_level[0] == 0 or cache_level[1] == 0 or partial_xcache`, so `(1, 2)` is
    uniquely able to drop `S` entirely -- and a `(1, 0)` tail arm searches `states_u` every matvec, which
-   turns that back on. The trade still wins at large `K`: a half split returns `~4*K` B/slot against
-   13 B/slot of states plus 16 B/slot of temp, so +371 B/slot at `K=100`. But it **goes net-negative
-   below about `K = 7`**, which is where this dial should refuse rather than silently cost memory. Quote
-   `K` with any figure here, as `CLAUDE.md` requires.
+   turns that back on. The trade still wins at large `J`: a half split returns `~4*J` B/slot (8 B per cached group)
+   against 13 B/slot of states plus 16 B/slot of temp, so +371 B/slot at `J=100`. But it **goes
+   net-negative below about `J = 7`**, which is where this dial should refuse rather than silently cost
+   memory. (Written as `K` until 2026-09-25: the fixture had `J = 100` and `K = 99`, and the arithmetic is
+   per group, so it is `J`.)
 
 See `NOTES.md`, "A partial *diagonal* cache works" and "The diagonal split at large `N`".
 
@@ -676,7 +677,7 @@ production priorities; the new module-level ideas are experiments until their wo
    the larger lever. Before fixing the API to a prefix count, test whether equal-byte selection by group
    cost `K_g` improves whole-solve time. Regardless of policy, read the three obstacles in section 2 --
    especially that the split reintroduces the `13 * N` state array and goes net-negative below about
-   `K = 7`.
+   `J = 7` groups.
 2. **Section 4 -- a device-returning path.** It is an API shape rather than a performance hypothesis, and
    section 3's memory relief is pointless while the return path re-replicates. Measured: +7 all-gathers
    and `P(None)` on both outputs. Return padded arrays plus `subspace_dim`; dynamic trimming conflicts with

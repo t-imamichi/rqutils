@@ -1432,6 +1432,33 @@ against 48.8 s, **1.023×**, same eigenvalue to 12 digits and the same 107 itera
   argsort over `.c`, but it is worth ≤3% on these fixtures and 0% on spin chains; the dial that matters
   is `J'`, whose half-memory point costs 2.45× (the entry above).
 
+### Partial diagonal cache on XXZ: the identity group is the best byte, not most of the win (2026-09-25)
+
+The 1D periodic XXZ chain (`Jz = 1`, `poc/sqd_multinode.py`'s `xxz_hamiltonian` and
+`xxz_krylov_states`, the Néel-Krylov subspace) puts every diagonal term in the identity-X group, which
+sorts first: `K_g = [n, 2, 2, ...]` over `J = n + 1` groups. Three arms, each checked against the
+full-cache product -- `J' = 0` (`(1, 0)`), `J' = 1` (the identity group cached, the rest `(1, 0)`, the
+two-kernel form above) and `J' = J` (`(1, 2)`) -- timed as whole `ground_locg` solves driven as `run_sqd`
+drives them (prefilter `(32, 2)`, batched), memory from XLA `memory_analysis` of the whole solve
+(inputs + temp). `N = 60000`, `states_size = 65536`, warm, one laptop CPU:
+
+| n | `(1, 0)` | `J' = 1` | `(1, 2)` |
+| --- | --- | --- | --- |
+| 24 | 555 ms, 11.5 MiB | **441 ms (1.26×), 13.1 MiB** | 196 ms (2.83×), 23.8 MiB |
+| 32 | 1123 ms, 13.6 MiB | **814 ms (1.38×), 15.1 MiB** | 325 ms (3.46×), 29.8 MiB |
+
+Eigenvalue and iteration count identical across arms (44 and 59 iterations).
+
+- **The identity group is a third of the recompute, not most of it.** It holds `n` of the `3n` terms
+  (the `n` hops have `K = 2` each), and the solve fits the linear-in-`K`-left model of the entry above:
+  removing a third of the terms predicts 436 ms at n=24, measured 441. A prediction that it would
+  recover "nearly all" of the full-cache speed was wrong for exactly this reason.
+- **But it is the best byte by far**: ~73 ms saved per MiB at n=24, against ~29 ms for the whole cache,
+  because it is `1/(n+1)` of the store and a third of the work. Further hop groups buy linearly.
+- **Ordering is moot on XXZ**: a prefix *is* largest-first.
+- **The dial only matters when `(1, 2)` does not fit.** `(1, 2)`'s store is `8·(n+1)` B/slot; `J' = 1`
+  costs ~24 B/slot (its 8 B store plus the 16 B/slot two-kernel temp).
+
 ### The diagonal split at large `N`: the overhead is a *ratio*, and "flat 1.1 MB" was an artifact (2026-08-30)
 
 The entry above left one load-bearing claim unmeasured — peak temp memory "flat at 1.1 MB across every

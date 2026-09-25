@@ -54,7 +54,8 @@ whole-solve overhead from +3.2%/+7.9% to **+0.9%/+0.6%** at `(1, 0)`/`(1, 2)`. `
 
 The only unbuilt item measured through real `sqd()` solves: half the diagonal memory for 2.45× the
 full-cache solve time, bit-identical (`NOTES.md`, 2026-08-30). `xcache_groups` is the pattern on the
-other axis. Limits: net-negative below about `K = 7`, and must not be combined with `xcache_groups`.
+other axis. Limits: net-negative in *memory* below about `J = 7` groups (the split reintroduces `states` plus 16 B/slot
+of temp), and must not be combined with `xcache_groups`.
 
 **The ordering question is answered (2026-09-25): order barely matters.** At equal bytes, caching the
 largest `K_g` first beats a prefix by only **1.02--1.03×** (whole solve 1.023×) on a molecular-like JW
