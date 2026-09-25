@@ -714,16 +714,15 @@ removes the single-device *sort* but **distributes nothing** (sequential merge, 
 host), and a real multi-node uniquify needs a range-partitioned shuffle, for which chunk-local sorting
 is the per-node kernel and not the algorithm.
 
+## Memory at scale: the source cache, the diagonals, and their pre-filters
+
 ### At n=100 the binding constraint is the xsources cache, not the sort (2026-08-29)
 
 Scaling attention has been on `uniquify_states`' sort because it sets the `2^31` ceiling. But an actual
 n=100 solve is dominated by something else. Budget at `B = 13`, `J = 50`, `cache_level[0] = 1`:
 
-| N | states | vectors (~6) | **xsources `[J,N]` int32** | total |
-| --- | --- | --- | --- | --- |
-| 2^24 (17M) | 0.2 GB | 1.6 GB | **3.4 GB** | 5.2 GB |
-| 2^28 (268M) | 3.5 GB | 25.8 GB | **53.7 GB** | 82.9 GB |
-| 2^31 (2147M) | 27.9 GB | 206.2 GB | **429.5 GB** | 663.6 GB |
+At `N = 2^28` the cache is 53.7 of 82.9 GB, and at `2^31` 429.5 of 663.6 GB; the per-term table is
+`markdown/xsources-cache-budget.md` §1.
 
 The cache is **65% of the footprint** at `J = 50` — the largest single object, 8× the state list. So
 `CLAUDE.md`'s "prefer `cache_level[0] = 1`" is right at the sizes it was measured at and *becomes
@@ -1044,12 +1043,9 @@ the data collapses to `cap = N`, which is correct and worthless.
 **The overflow check is free; deriving the cap is not.** The check is `mask.sum()`, and the mask is
 already computed:
 
-| variant | time | vs baseline | overhead |
-| --- | --- | --- | --- |
-| baseline `searchsorted` | 67.2 ms | 1.00× | — |
-| BF, cap given, no check | 24.8 ms | 2.70× | — |
-| BF, cap given, **with check** | 24.8 ms | 2.71× | **-0.3%** (noise) |
-| BF, cap **derived** + check | 31.7 ms | 2.12× | +27.6% |
+Baseline `searchsorted` 67.2 ms; a given cap 24.8 ms both with and without the check (2.71×/2.70×, so the
+check's -0.3% is noise); a derived cap 31.7 ms (2.12×, +27.6%). Table:
+`markdown/xsources-cache-budget.md` §5.
 
 Counting costs **0.04 ms** on top of the mask at N=4M. The 27.6% is not the sum — it is the *second
 pass*, since deriving runs the mask once to count and again to search.
@@ -1085,12 +1081,8 @@ The two ideas above are complementary — cache the `J'` groups that fit, BF-fil
 rest — so they were measured together. n=100, N=600k, J=16, `p = 1%` filter at **0.72 MB** against a full
 cache of 38.4 MB. Fully-cached matvec is the reference at 6.2 ms. **Every arm verified exact against it.**
 
-| cached `J'` | cache | recompute, plain | recompute, + BF | BF gain | vs full cache |
-| --- | --- | --- | --- | --- | --- |
-| 0 | 0 MB | 447.4 ms | **47.4 ms** | **9.43×** | 7.71× |
-| 4 | 9.6 MB | 336.5 ms | **38.6 ms** | **8.73×** | 6.27× |
-| 8 | 19.2 MB | 162.6 ms | **28.5 ms** | **5.70×** | 4.64× |
-| 12 | 28.8 MB | 112.6 ms | **20.0 ms** | **5.64×** | 3.25× |
+Recompute plain → with the filter: 447.4 → 47.4 ms at `J' = 0` (9.43×, 7.71× the full cache), down to
+112.6 → 20.0 ms at `J' = 12` (5.64×, 3.25×). Per-`J'` table: `markdown/xsources-cache-budget.md` §4.
 
 **The filter earns its 0.72 MB at every point on the dial**, not just at `J' = 0`: 5.6–9.4× on whatever
 portion is recomputed. And because it is built once per subspace and shared by every group, its cost does
@@ -1123,11 +1115,8 @@ The exact membership bitmap in the rank-select family is `2^n / 8` bytes, so it 
 how sparse the subspace is — it indexes the *Hilbert space*. **A Bloom filter sizes by `N` instead**, so
 the `2^n` term disappears entirely:
 
-| target FP | bits/item | k | at N=24M | at N=2^31 | exact bitmap, any N |
-| --- | --- | --- | --- | --- | --- |
-| 10% | 4.79 | 3 | 14 MB | 1.3 GB | n=30: 0.13 GB |
-| 1% | 9.59 | 7 | 29 MB | 2.6 GB | n=34: 2.15 GB |
-| 0.1% | 14.38 | 10 | 43 MB | 3.9 GB | n=40: **137 GB** |
+At 1% FP: 9.59 bits/item, k = 7, 29 MB at `N = 24M` and 2.6 GB at `2^31`, against an exact bitmap of 2.15
+GB at n=34 and **137 GB** at n=40. Table for 10%/1%/0.1%: `markdown/xsources-cache-budget.md` §3.
 
 **False positives are safe here, and that is not generally true of a filter.** `get_xsource` ends with
 an explicit equality test (`found = keys[pos] == target_keys`, and `jnp.all(W[pos] == Wt)` on the wide
@@ -1725,6 +1714,8 @@ SQD Hamiltonians; the *direction* is a property of the algorithms (CG versus ste
 `ground_locg`'s own primitives, not a patched `ground_locg`, so it shares the primitives but not the
 prefilter or the `body_iter0` seeding. Vector counts at `2^31` are arithmetic on measured B/slot.
 
+## Sharding `states` and `uniquify_states`
+
 ### Distributing `states` is feasible: hash-by-prefix ownership plus a local search (2026-08-30)
 
 The `13 * N` replicated state list is the one term the `(0, 0)` floor cannot shed — 27.9 GB **per
@@ -2306,6 +2297,8 @@ shardability, not speed. Two pieces of real work remain before it could replace 
 splitter selection is host-side numpy (one device sees the sample), and reassembly into the
 `[states_size, B]` contract is not implemented — the POC returns `[NSH, cap, NW]` blocks.
 
+## Convergence: the residual floor and `atol`/`rtol`
+
 ### A rounding-floor residual is not zero, and `== 0.0` is the wrong guard
 
 2026-08-28, from `markdown/spinchain/rqutils-prefilter-dim2-request.md`. `body_iter1` formed its search direction as a
@@ -2530,6 +2523,8 @@ only 2x the floor, inside the 0.49–1.26 spread of the floor's own constant.
 default (4.60 → 2.49 ms warm, best of 5, N=800). An earlier draft carried over 1.96x, measured against the
 `n · 10` default — a different quantity. A tolerance ratio is only meaningful beside the definition it was
 taken under, which is the same trap the requester's own table fell into.
+
+## The eigensolver: Davidson, re-orthogonalization, `Ax` reuse, restarts
 
 ### Davidson vs `ground_locg`: the two regimes split, and memory is the axis that decides it (2026-09-02)
 
@@ -2983,6 +2978,8 @@ One deviation shows even a careful implementation carves out unproven exceptions
 matrix without the orthogonality justification, commenting that it "seems to be OK even with very badly
 conditioned B matrices". Not applicable at `B = I`.
 
+## Multi-node and multi-process runs
+
 ### Multi-node, one GPU per node: five harness failures before the library's own surfaced (2026-09-04)
 
 A 4-node cluster with a single GPU per node. `mpirun` is not optional there -- it is the only way to
@@ -3248,6 +3245,8 @@ serve.
 how many shards it expected.** A length check is the whole difference between exact and silently
 partial.
 
+## GPU runs: the prefilter optimum and compile memory
+
 ### The GPU prefilter sweep: the peak transfers, its location does not (2026-09-04)
 
 `poc/prefilter_gpu.py` on one CUDA device, `n=26`, `N=1048576`, `J=30`. Full table in
@@ -3403,6 +3402,8 @@ at `N=200k/1M/5M`, but the two larger sizes carry the script's own not-kernel-do
 sort arm grew 1.03x and 1.23x for a 5x `N` increase, against a fixed ~1.46 s floor. A floor that
 dominates *suppresses* the ratio, so those are lower bounds on an unmeasured value and **should not be
 quoted** until the floor is identified. Claim 3 (multi-GPU speed) is unrun: one physical device.
+
+## Warm starts, collectives and the eigenpair check (2026-09)
 
 ### Warm-starting the growing subspace: four hypotheses eliminated, and the fixture gate is the result (2026-09-17)
 
