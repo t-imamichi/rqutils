@@ -1,6 +1,6 @@
 # Response: `tol` now *is* the eigen-residual, and the floor has no dimension dependence
 
-Reply to `markdown/rqutils-tol-request.md`, from the `rqutils` side. Branch `dev`, version still `0.2.0`
+Reply to `markdown/spinchain/rqutils-tol-request.md`, from the `rqutils` side. Branch `dev`, version still `0.2.0`
 (unreleased).
 
 > # ⚠️ SUPERSEDED 2026-09-01 — `tol` no longer exists
@@ -12,7 +12,7 @@ Reply to `markdown/rqutils-tol-request.md`, from the `rqutils` side. Branch `dev
 > ‖Hv − Ev‖₂  <  max(atol, rtol · (‖Hv‖ + |E|))
 > ```
 >
-> satisfying **either** arm. See `markdown/rqutils-atol-rtol-request.md` and its response for the reasoning;
+> satisfying **either** arm. See `markdown/spinchain/rqutils-atol-rtol-request.md` and its response for the reasoning;
 > §6 below has been rewritten with the working call, and §1 and §5.1 carry inline notes where their
 > conclusions no longer hold.
 >

@@ -1,6 +1,6 @@
 # Response: `apply_h` places `vec` for you; it will not round the length
 
-Reply to `markdown/rqutils-apply-h-mesh-request.md`, from the `rqutils` side. Branch `dev`, version still
+Reply to `markdown/spinchain/rqutils-apply-h-mesh-request.md`, from the `rqutils` side. Branch `dev`, version still
 `0.2.0` (unreleased). Measured on 4 virtual CPU devices, the same harness the request used.
 
 > **Status: half shipped, deliberately.** Ask (1) — accept a plain numpy `vec`, placing it internally —

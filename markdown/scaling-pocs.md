@@ -271,4 +271,4 @@ and per this document's own warning that number means nothing; the claim is shar
 **Not production-ready.** Splitter selection is host-side numpy, and reassembly into the
 `[states_size, B]` contract is unimplemented (the POC returns `[NSH, cap, NW]` blocks). Capacity
 overflow drops rows, but the kernel returns the overflow count so a caller can raise — unlike the
-rank-select `cap` in `markdown/rqutils-multiobs-response.md` §5.3, which had no detectable failure.
+rank-select `cap` in `markdown/spinchain/rqutils-multiobs-response.md` §5.3, which had no detectable failure.

@@ -196,7 +196,7 @@ a guard whose reachability the ceiling currently forecloses.
 
 ### No matvec-only upper bound on `λ_max` exists, so the prefilter takes one from structure
 
-2026-08-28, fixing `markdown/rqutils-prefilter-bug.md`. `_lambda_max_bound` used 10 power steps, which
+2026-08-28, fixing `markdown/spinchain/rqutils-prefilter-bug.md`. `_lambda_max_bound` used 10 power steps, which
 converge to the largest-*magnitude* eigenvalue; on a negative-leaning spectrum that is `λ_min`, the
 Chebyshev interval inverts, and the filter damps its own target — an **excited** eigenpair returned
 with `converged=True` (n=2 Heisenberg: +0.25 for a true −0.75).
@@ -385,7 +385,7 @@ both.
 
 ### `apply_h` under a mesh: placement shipped, rounding declined (2026-09-15)
 
-`markdown/rqutils-apply-h-mesh-request.md` asked for two things: place a host `vec` internally, and round the
+`markdown/spinchain/rqutils-apply-h-mesh-request.md` asked for two things: place a host `vec` internally, and round the
 length up to `mesh.size` as `sqd` does. Placement shipped. Rounding was built (`1a339e8`), measured, and
 withdrawn (`82c204b`) — the response doc carries the full argument; the four facts worth keeping here:
 
@@ -2227,7 +2227,7 @@ Four findings, each of which cost a wrong turn:
 - **Capacity overflow is detectable, which is what makes this shippable.** Static shapes force a
   per-shard capacity and an undersized one drops rows (16,090 lost at slack 1.05). But the kernel
   *returns the overflow count*, so a caller can raise. Contrast the rank-select prototype
-  (`markdown/rqutils-multiobs-response.md` §5.3), whose analogous `cap` had no detectable failure mode —
+  (`markdown/spinchain/rqutils-multiobs-response.md` §5.3), whose analogous `cap` had no detectable failure mode —
   that is why one is a candidate and the other is not.
 
 Timings are 1.70–2.32x against the incumbent on 4 virtual CPU devices, reported only to show the
@@ -2238,7 +2238,7 @@ splitter selection is host-side numpy (one device sees the sample), and reassemb
 
 ### A rounding-floor residual is not zero, and `== 0.0` is the wrong guard
 
-2026-08-28, from `markdown/rqutils-prefilter-dim2-request.md`. `body_iter1` formed its search direction as a
+2026-08-28, from `markdown/spinchain/rqutils-prefilter-dim2-request.md`. `body_iter1` formed its search direction as a
 bare `normalize(rcurr, norm_r)`. An `xinit` that *is* an eigenvector in floating point leaves a residual
 at the **rounding floor** — 3.1e-16 on `[[2.9, 1], [1, 2.9]]` — so the `norm_r == 0.0` guard missed it,
 the division amplified pure noise until `tmp_p` came back **parallel to `xcurr`**, and `sas` degenerated
@@ -2272,9 +2272,9 @@ class and is caught by `TestDtypes` instead. The test says so rather than implyi
 
 ### The eigen-residual floor is `eps·‖H‖` with no dimension dependence, and `tol` is now absolute (2026-08-31)
 
-From `markdown/rqutils-tol-request.md` (the `spinchain` side asked for a `tol` that means the eigen-residual,
+From `markdown/spinchain/rqutils-tol-request.md` (the `spinchain` side asked for a `tol` that means the eigen-residual,
 so their solver criterion and their `_RESIDUAL_TOLERANCE = 1e-6` guard would be one number). Shipped;
-reply in `markdown/rqutils-tol-response.md`.
+reply in `markdown/spinchain/rqutils-tol-response.md`.
 
 **The question that had to be settled first.** An absolute `tol` is only safe if it stays satisfiable as
 `N` grows. The old test was `‖r‖ < tol·(‖Ax‖ + |θ|)·N·10`, whose `N·10` factor *asserts* an `O(N)`
@@ -2392,7 +2392,7 @@ every arm, but that is the well-conditioned regime, not a promise.
 
 ### `atol`/`rtol`: the pair is right, and `rtol`'s scale took two tries to get right (2026-09-01)
 
-From `markdown/rqutils-atol-rtol-request.md`; reply in `markdown/rqutils-atol-rtol-response.md`. `tol` is gone,
+From `markdown/spinchain/rqutils-atol-rtol-request.md`; reply in `markdown/spinchain/rqutils-atol-rtol-response.md`. `tol` is gone,
 convergence is `‖r‖ < max(atol, rtol·(‖Hv‖ + |E|))`, either arm sufficing.
 
 **The pair itself was never in doubt** — a purely relative test cannot name a residual, a purely absolute
@@ -3551,7 +3551,7 @@ code reproduces 2.76x median with 0 regressions. The fixture family, not the cod
 
 ## Preconditioners and subspace selection: a closed investigation
 
-Full record in `markdown/rqutils-precond-request.md` and `markdown/sdp-lower-bound.md`. Summarized here
+Full record in `markdown/spinchain/rqutils-precond-request.md` and `markdown/sdp-lower-bound.md`. Summarized here
 because the conclusion is easy to re-litigate.
 
 **What shipped:** `ground_locg(precond=None | callable)`, an approximate inverse `M⁻¹` applied to the

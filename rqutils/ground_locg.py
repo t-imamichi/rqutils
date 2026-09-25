@@ -580,7 +580,7 @@ def _chebyshev_prefilter(
     under-estimates. The consequence was a silent wrong answer -- the filter damps its own target and
     the solver returns an *excited* eigenpair with ``converged=True`` (measured: the n=2 Heisenberg
     chain returned +0.25 for a true -0.75; the bound was invalid in 16 of 25 XXZ configurations, with
-    wrong answers in 2). ``markdown/rqutils-prefilter-bug.md`` has the report and the reproduction.
+    wrong answers in 2). ``markdown/spinchain/rqutils-prefilter-bug.md`` has the report and the reproduction.
 
     **No cheap matvec-only upper bound exists** -- a theorem, not a tuning problem (Kuczynski &
     Wozniakowski, SIAM J. Matrix Anal. Appl. 13(4):1094-1122, 1992). So rigour has to come from the
@@ -822,7 +822,7 @@ def ground_locg(
             residual test every convergence check reads certifies that *an* eigenpair was found, not
             that it is the lowest, so a filter that removed the target from the iterate's span
             returned an excited eigenpair with ``converged=True``
-            (``markdown/rqutils-prefilter-bug.md``). With a valid bound the returned eigenpair is the same
+            (``markdown/spinchain/rqutils-prefilter-bug.md``). With a valid bound the returned eigenpair is the same
             one to the tolerance the solver was going to reach anyway (measured: eigenvector overlap 1.0000000 against the
             unfiltered result, energies agreeing with ``eigsh(tol=0)`` to 2.8e-14).
 
@@ -1122,7 +1122,7 @@ def _ground_locg_callable(
         # amplifies pure noise until `tmp_p` comes back **parallel to `xcurr`**. `sas` then degenerates
         # -- measured `[[1.9, -1.9], [-1.9, 4.8]]`, whose lowest eigenvalue is 0.96 for a true 1.9 --
         # and the caller saw a `RuntimeError` naming `maxiter` on a problem solved in one iteration
-        # (`markdown/rqutils-prefilter-dim2-request.md`).
+        # (`markdown/spinchain/rqutils-prefilter-dim2-request.md`).
         #
         # Masking `sas[1, 1]` alone does NOT fix it: the mask fired correctly and the surviving
         # off-diagonal still coupled `x` to the noise. Nor does a scale-relative residual threshold --

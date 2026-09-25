@@ -1,6 +1,6 @@
 # Response: the batched gather is declined on evidence, and two scalable wins landed elsewhere
 
-Reply to `markdown/rqutils-multiobs-request.md`, from the `rqutils` side. Branch `dev`, version still
+Reply to `markdown/spinchain/rqutils-multiobs-request.md`, from the `rqutils` side. Branch `dev`, version still
 `0.2.0` (unreleased).
 
 **All three of your asks are declined, with measurements.** But the investigation turned up two real

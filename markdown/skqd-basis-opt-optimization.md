@@ -5,8 +5,8 @@ need the `rqutils` repo to do this work; everything below is self-contained.
 
 **Target file.** `spinchain/skqd/basis_opt.py` (906 lines as of 2026-08-27).
 
-**Direction — note this differs from its neighbours.** `markdown/rqutils-requests.md` and
-`markdown/rqutils-precond-request.md` are *inbound*: written from the `spinchain` side, asking `rqutils`
+**Direction — note this differs from its neighbours.** `markdown/spinchain/rqutils-requests.md` and
+`markdown/spinchain/rqutils-precond-request.md` are *inbound*: written from the `spinchain` side, asking `rqutils`
 to change. This document is *outbound* — written from `rqutils`, describing work to be done in
 `spinchain`. Nothing here asks for an `rqutils` change; see §6 for the one piece that might
 eventually become one.
@@ -513,7 +513,7 @@ Three reasons to build it in `spinchain` first regardless:
 1. **The oracle that matters lives here.** The test worth trusting is not "does the closure table
    look right" but "does `basis_optimize` return the same energy and `best_start`" — which can only
    run where `basis_optimize` lives.
-2. **`markdown/rqutils-requests.md` is evidence-first by construction.** Every item there states the
+2. **`markdown/spinchain/rqutils-requests.md` is evidence-first by construction.** Every item there states the
    call site, a self-contained reproduction, and what `spinchain` deletes if it lands. This spec has
    the reproduction and the speedups but no integrated deletion count yet. A1's history is the
    cautionary case: it shipped, was recorded as adopted, and the 54-line deletion is still not in

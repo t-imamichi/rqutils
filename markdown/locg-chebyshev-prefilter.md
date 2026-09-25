@@ -11,7 +11,7 @@
 > `_lambda_max_bound` **is deleted.** Its 10-step power iteration converged to the largest-*magnitude*
 > eigenvalue, so on a negative-leaning spectrum the filter interval inverted and `ground_locg` returned
 > an **excited** eigenpair with `converged=True`. Report and reproduction:
-> `markdown/rqutils-prefilter-bug.md`; reply and migration: `markdown/rqutils-prefilter-bug-response.md`.
+> `markdown/spinchain/rqutils-prefilter-bug.md`; reply and migration: `markdown/spinchain/rqutils-prefilter-bug-response.md`.
 >
 > What that changes in the text below:
 >

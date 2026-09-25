@@ -1,6 +1,6 @@
 # Response: the prefilter bound is fixed, and how to adapt
 
-Reply to `markdown/rqutils-prefilter-bug.md`, from the `rqutils` side. Branch `dev`, version still
+Reply to `markdown/spinchain/rqutils-prefilter-bug.md`, from the `rqutils` side. Branch `dev`, version still
 `0.2.0` (unreleased). Fix in `568b173`; the report was recorded verbatim first, in `0873a4c`, so the
 premise was reproduced against the unfixed tree before anything changed.
 

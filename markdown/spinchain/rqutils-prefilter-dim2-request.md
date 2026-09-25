@@ -2,7 +2,7 @@
 
 > ## Disposition (2026-08-28): **confirmed, root-caused, and FIXED at the root**
 >
-> **Reply to the reporter: `markdown/rqutils-prefilter-dim2-response.md`** — the explicit answer they
+> **Reply to the reporter: `markdown/spinchain/rqutils-prefilter-dim2-response.md`** — the explicit answer they
 > asked for in §5 (neither option 1 nor 2; the root fix), plus the two rejected fixes and why the
 > defect was not dim-2-specific.
 >
@@ -221,13 +221,13 @@ subspaces are a documented limitation rather than an unknown.
 ## 6. Not requested: forwarding `precond` through `sqd`
 
 For the record, since an earlier draft of this file asked for it and
-`markdown/rqutils-precond-request.md` is still in our tree. We had observed that `precond` was reachable on
+`markdown/spinchain/rqutils-precond-request.md` is still in our tree. We had observed that `precond` was reachable on
 `ground_locg` but not through `sqd()`, which is the only path `spinchain` uses, and were about to ask
 for the same one-line forward that `prefilter` received.
 
 **Withdrawn** — you have since told us the preconditioner was measured useless and removed. We have not
-re-measured that and are not disputing it; the 1.79x in `markdown/rqutils-precond-request.md` was iteration
+re-measured that and are not disputing it; the 1.79x in `markdown/spinchain/rqutils-precond-request.md` was iteration
 count on `scipy`'s `lobpcg`, which is exactly the kind of proxy that §4 of your last reply showed can
 mislead about the quantity that matters. Note the removal is **not** in the revision we have installed
 (`4b7be94` still carries `precond` on `ground_locg`), so we will see it arrive with the next lockfile
-bump; no action needed. We will drop `markdown/rqutils-precond-request.md` or mark it withdrawn on our side.
+bump; no action needed. We will drop `markdown/spinchain/rqutils-precond-request.md` or mark it withdrawn on our side.

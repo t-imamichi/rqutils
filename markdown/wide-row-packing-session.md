@@ -4,7 +4,7 @@
 `ty` clean, all sharded subprocess harnesses passing. **Nothing pushed** — and `git fetch` fails in this
 environment, so verify against the remote from a networked shell before trusting the local ref.
 
-The task was to verify `markdown/rqutils-multiobs-request.md` — a drafted change request against
+The task was to verify `markdown/spinchain/rqutils-multiobs-request.md` — a drafted change request against
 `get_xsource`, written from the `spinchain` side. All three of its asks turned out to be wrong. But the
 profiling done to check them found a real defect in two places, and not where the request was pointing.
 
@@ -395,5 +395,5 @@ confirmation that `N = 2^31` is inherently multi-node.
 Code is **181 insertions / 32 deletions** across `rqutils/sqd.py` and `test/test_sqd.py`. The other
 ~1,121 lines are `docs/`, `NOTES.md`, and the POC.
 
-Related: `markdown/rqutils-multiobs-request.md` (the request), `markdown/rqutils-multiobs-response.md` (the
+Related: `markdown/spinchain/rqutils-multiobs-request.md` (the request), `markdown/spinchain/rqutils-multiobs-response.md` (the
 reply, from the `rqutils` side), `markdown/scaling-pocs.md` §11, `NOTES.md` under the `N ≤ 2^31 - 1` ceiling.

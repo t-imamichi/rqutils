@@ -1,6 +1,6 @@
 # Response: the dim-2 raise is fixed at the root, and nothing to adapt
 
-Reply to `markdown/rqutils-prefilter-dim2-request.md`, from the `rqutils` side. Branch `dev`, version still
+Reply to `markdown/spinchain/rqutils-prefilter-dim2-request.md`, from the `rqutils` side. Branch `dev`, version still
 `0.2.0` (unreleased). Fix in `8358180`.
 
 **You asked for an explicit answer, so: neither (1) nor (2) — we took (3).** The underlying

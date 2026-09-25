@@ -6,7 +6,7 @@ sizes, and it *increases* iteration count in every single configuration.** Harne
 `ground_locg`'s `precond` argument, which it depended on. Recover it from `26a9b7b` if the
 measurement ever needs re-running; every number below was taken with it. CPU-only, see §5.
 
-This was the last untried deterministic candidate. `markdown/rqutils-precond-request.md:697` named it — "a
+This was the last untried deterministic candidate. `markdown/spinchain/rqutils-precond-request.md:697` named it — "a
 two-level / deflation preconditioner exploiting the near-block structure of a sampled 1D chain" — and
 called it speculative. It is now closed, which closes the deterministic preconditioning line entirely.
 
@@ -15,7 +15,7 @@ called it speculative. It is now closed, which closes the deterministic precondi
 ## 1. Why it was worth trying, and why that reasoning was sound
 
 Six routes to a Jacobi-style shift were previously measured and rejected, all for one root cause: no
-viable *lower* bound on the projected operator's minimum. `markdown/rqutils-precond-request.md:786` then
+viable *lower* bound on the projected operator's minimum. `markdown/spinchain/rqutils-precond-request.md:786` then
 retracted the assumption that a tighter bound on `H` was ever the route — `ground_locg` sees
 `hproj(H, subspace)`, whose minimum sits 0.64–1.06× of the projected spectral width **above**
 `λ_min(H)`, so no bound on `H`, however tight, can reach the shift the 1.79× used.
@@ -99,7 +99,7 @@ iteration count, this was left open rather than built.
 ## 6. What this closes
 
 With this, every deterministic candidate in `markdown/locg-next-candidates.md` and the preconditioning line
-in `markdown/rqutils-precond-request.md` is measured and rejected. Combined with the randomized families
+in `markdown/spinchain/rqutils-precond-request.md` is measured and rejected. Combined with the randomized families
 (also all rejected — block Krylov, sketching, stochastic RQ minimization, randomized warm start), **the
 search around `ground_locg` is closed on CPU.** The two live threads are unchanged and both are
 measurement, not algorithm work:

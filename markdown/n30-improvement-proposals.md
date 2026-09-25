@@ -77,7 +77,7 @@ dispatch overhead, which vanishes exactly where it would matter.
 The cost is elsewhere: one operator costs **70 vector-passes' worth of time** (230 ms/op at dim 6M
 against 3.3 ms for a `vdot` over the same array), so this is not bandwidth. It is the `searchsorted`
 in `get_xsource` — a random-access gather of `S ^ X` into a 24M-element sorted array, once per
-operator. Request written up in [`rqutils-multiobs-request.md`](rqutils-multiobs-request.md).
+operator. Request written up in [`rqutils-multiobs-request.md`](spinchain/rqutils-multiobs-request.md).
 
 ## 4. Make the js contraction opt-out — recommend
 

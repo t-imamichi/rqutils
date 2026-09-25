@@ -177,7 +177,7 @@ For completeness, three things we checked and are **not** asking for:
 
 - **Forwarding `precond` through `sqd`.** Moot — `precond` is deleted, and you measured that literal
   Jacobi on the raw indefinite projected `H` fails to converge outright and anti-composes with the
-  prefilter. Our `markdown/rqutils-precond-request.md` is marked withdrawn.
+  prefilter. Our `markdown/spinchain/rqutils-precond-request.md` is marked withdrawn.
 - **A `dim <= 2` prefilter guard.** Unnecessary after `8358180` fixed the eigenvector-`xinit` defect at
   the root. Verified here: 0/36 failures across dims 2-40, real and complex.
 - **Anything about the convergence flag.** `sqd` raises on non-convergence, with a message that

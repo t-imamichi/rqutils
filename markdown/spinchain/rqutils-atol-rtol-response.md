@@ -1,6 +1,6 @@
 # Response: `atol` and `rtol` shipped, but `rtol` is not the scale you asked for
 
-Reply to `markdown/rqutils-atol-rtol-request.md`, from the `rqutils` side. Branch `atol-rtol`, version still
+Reply to `markdown/spinchain/rqutils-atol-rtol-request.md`, from the `rqutils` side. Branch `atol-rtol`, version still
 `0.2.0` (unreleased).
 
 > **Status: shipped, with one deliberate departure from the ask.** The pair exists,

@@ -39,7 +39,7 @@ structure is not pathologically slow. The claim this POC supports is *shardabili
 **The capacity is a correctness parameter, but a safe one.** An undersized `cap` drops rows -- measured
 16,090 lost at slack 1.05 -- but the function *returns the overflow count*, so a caller can raise
 instead of silently truncating. That is the difference from the rank-select prototype in
-`markdown/rqutils-multiobs-response.md` §5.3, whose analogous `cap` had no detectable failure. Slack must
+`markdown/spinchain/rqutils-multiobs-response.md` §5.3, whose analogous `cap` had no detectable failure. Slack must
 exceed the splitter imbalance; 1.35 was sufficient in every fixture here, and the padded array is
 `slack` times the input.
 

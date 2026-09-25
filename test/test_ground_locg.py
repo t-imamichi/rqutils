@@ -663,7 +663,7 @@ class TestExactEigenvectorStart:
     solve never recovered: ``converged=False`` at every ``maxiter``.
 
     Reported from the ``spinchain`` side as a ``sqd`` dim-2 bug
-    (``markdown/rqutils-prefilter-dim2-request.md``); the fault is here, and ``sqd`` only supplied the input
+    (``markdown/spinchain/rqutils-prefilter-dim2-request.md``); the fault is here, and ``sqd`` only supplied the input
     that exposed it -- with ``prefilter`` on, a 2-dimensional iterate lands on the eigenvector routinely.
 
     Two rejected fixes are worth recording, because both look right:
@@ -1017,7 +1017,7 @@ class TestChebyshevPrefilter:
         lowest, and indistinguishable from a correct answer by inspection or by a residual check.
 
         Built by hand rather than via qiskit so this runs without the optional extra, and pinned as
-        the smallest case that reproduces -- ``markdown/rqutils-prefilter-bug.md`` measured the bound
+        the smallest case that reproduces -- ``markdown/spinchain/rqutils-prefilter-bug.md`` measured the bound
         invalid in 16 of 25 XXZ configurations but a wrong *answer* in only 2, both at n=2, Bx=0.
         """
         pauli_x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)

@@ -1,14 +1,14 @@
 # rqutils change request: let `tol` mean the eigen-residual
 
 One request against `rqutils` on branch `dev` (installed rev `c400fae`), written from the `spinchain`
-side. A separate ask from `markdown/rqutils-requests.md` (whose C1/C2/C3 shipped and are adopted, and whose
-A1 was rejected) and from `markdown/rqutils-precond-request.md` (withdrawn); it depends on none of them.
+side. A separate ask from `markdown/spinchain/rqutils-requests.md` (whose C1/C2/C3 shipped and are adopted, and whose
+A1 was rejected) and from `markdown/spinchain/rqutils-precond-request.md` (withdrawn); it depends on none of them.
 
 > **Status: NOT SENT.** Drafted from the `tol` measurements recorded in `NOTES.md`'s seed-variance
 > entry. Nothing in `spinchain` passes `tol` today, so every timing in that entry and in `CONFIG.md`
 > is at the machine-epsilon default this file is about.
 >
-> Read `markdown/rqutils-precond-request.md`'s status block before acting on this one. That request was
+> Read `markdown/spinchain/rqutils-precond-request.md`'s status block before acting on this one. That request was
 > built on iteration counts measured with **scipy's lobpcg** — a different solver on a different
 > operator — and upstream found the capability unusable on the only path `spinchain` has. The figures
 > below are measured through `sqd()` itself on this repo's own operators, which is the difference that

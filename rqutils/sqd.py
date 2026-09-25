@@ -1452,7 +1452,7 @@ def run_sqd(
 
     # sum|c_k| bounds lambda_max rigorously -- every Pauli string is unitary, and projecting onto the
     # subspace only shrinks the spectral radius -- and costs no matvec. `ground_locg` cannot derive it
-    # from a callable, and raises rather than guessing (markdown/rqutils-prefilter-bug.md). Gated on the
+    # from a callable, and raises rather than guessing (markdown/spinchain/rqutils-prefilter-bug.md). Gated on the
     # filter actually running, since degree<=1 or cycles==0 is a documented no-op and computing the
     # bound anyway would add ops to the traced graph for those values.
     filter_runs = prefilter is not None and prefilter[0] > 1 and prefilter[1] > 0

@@ -13,7 +13,7 @@ Roughly 40 `sqd()` calls, no code change, ~15 minutes of compute on hardware tha
 
 **Why `rqutils` cannot produce it.** The fixture is a production SKQD subspace. Every `rqutils` fixture is
 1D XXZ, where the relative spectral gap and `N` are **correlated**, so no sweep here can separate them —
-this is stated as the blocking reason in `markdown/rqutils-tol-response.md` §2 and left explicitly open in
+this is stated as the blocking reason in `markdown/spinchain/rqutils-tol-response.md` §2 and left explicitly open in
 `NOTES.md`. It has now blocked a second investigation (`markdown/skqd-warmstart-negative-result.md`), which
 is why it is being asked for directly rather than worked around a third time.
 
@@ -26,7 +26,7 @@ is why it is being asked for directly rather than worked around a third time.
 `spinchain`'s own profile of the n=13 job: sampling 50%, **`sqd()` solve 25%**, configuration recovery
 8%, observable contraction 5%. The solve is the largest phase the project controls.
 
-And its cost is not where a shape-based estimate would put it. From `markdown/rqutils-precond-request.md`,
+And its cost is not where a shape-based estimate would put it. From `markdown/spinchain/rqutils-precond-request.md`,
 at **fixed** shape, varying only which subspace is drawn:
 
 | n | dim | min iters | median | max | spread | wall min → max |
@@ -45,8 +45,8 @@ removing the 699-iteration case is worth ~40% of the solve phase. Every optimiza
 
 ## 2. The specific claim to settle
 
-`markdown/rqutils-tol-request.md` argued that the slow draws are slow because *the last digits are
-expensive*, so a residual-targeted `tol` should compress the variance. `markdown/rqutils-tol-response.md` §2
+`markdown/spinchain/rqutils-tol-request.md` argued that the slow draws are slow because *the last digits are
+expensive*, so a residual-targeted `tol` should compress the variance. `markdown/spinchain/rqutils-tol-response.md` §2
 could not confirm it, and the data pointed the other way — iterations track the **relative spectral gap**
 rather than `N`:
 
@@ -142,7 +142,7 @@ Stated in advance so the request is not open-ended:
   be a clean, free signal) so a caller can resample rather than pay 699 iterations. That work is not
   worth starting on speculation.
 
-Either way the open claim in `NOTES.md` and `markdown/rqutils-tol-response.md` §2 gets closed with a
+Either way the open claim in `NOTES.md` and `markdown/spinchain/rqutils-tol-response.md` §2 gets closed with a
 measurement instead of staying open through a third investigation.
 
 ## 5. What this request is not

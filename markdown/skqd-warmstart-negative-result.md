@@ -164,7 +164,7 @@ break conservation **within a fixed-weight subspace**, that assumption is worth 
 ### 5.2 Near-degeneracy is absent, so that explanation is out too
 
 §3's wrong-eigenvalue outcome at dim=12000 suggested degeneracy (and `recovery.py`'s reproducibility
-does depend on which degenerate member gets picked — see `markdown/rqutils-requests-2.md`). Measured:
+does depend on which degenerate member gets picked — see `markdown/spinchain/rqutils-requests-2.md`). Measured:
 
 | dim | relgap, `(E₁−E₀)` over `abs(E₀)` |
 | --- | --- |
@@ -197,7 +197,7 @@ thousand times tighter than anything this operator family reaches.
 
    It would also break something `spinchain` currently relies on. `recovery.py::recover_configurations`
    has *observed* reproducibility only because `_spread_seed` makes the chosen eigenvector a
-   deterministic function of the subspace (`markdown/rqutils-requests-2.md`; an early version gave 5
+   deterministic function of the subspace (`markdown/spinchain/rqutils-requests-2.md`; an early version gave 5
    different recovered bases in 6 identically-seeded runs). A caller-supplied start makes it a function
    of the caller's history instead, so round *k*'s vector decides round *k+1*'s degenerate member — the
    reproducibility regression that file asks to have *strengthened*, arriving through a new door.

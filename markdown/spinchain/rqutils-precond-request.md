@@ -37,7 +37,7 @@
 > "❌ A convenience default on `sqd`".
 
 One request against `rqutils` on branch `dev` (installed rev `3da1b46`), written from the `spinchain`
-side. It is the follow-up to `markdown/rqutils-requests.md`, whose C1/C2/C3 shipped and are adopted; this
+side. It is the follow-up to `markdown/spinchain/rqutils-requests.md`, whose C1/C2/C3 shipped and are adopted; this
 is a separate ask against a different module and does not depend on any of them.
 
 **Ask in one line:** let the caller supply an approximate inverse `M⁻¹` to `ground_locg`, applied to

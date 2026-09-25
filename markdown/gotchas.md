@@ -97,7 +97,7 @@ This repo has already made the make-it-unrepresentable move twice, and both work
   because `cache_level` selected positionally how `scanned`'s members were read and nothing could
   check the two agreed -- measured **0.44 max abs error** from one mispairing, and at `n = 15` with a
   2-state subspace even the *shapes* collide at `(2, 2)`, so no assertion could have closed it
-  (`markdown/rqutils-requests.md` C1).
+  (`markdown/spinchain/rqutils-requests.md` C1).
 
 Items 1, 4, 5 and 6 below are that same move applied to states validation, cache level and array
 identity. (Item 2 is *not* — the MSB/LSB split is intentional, and the move there is documentation.)
@@ -202,7 +202,7 @@ So "switch to LSB-first" is cheap but buys nothing on its own; making the conven
 the change with the payoff.
 
 **A worked instance -- this bug was live in the repo's own harness.** The `subspace` helper in
-`markdown/rqutils-precond-request.md` paired `bit q -> column q` with an `xxz` operator built by
+`markdown/spinchain/rqutils-precond-request.md` paired `bit q -> column q` with an `xxz` operator built by
 `SparsePauliOp.from_sparse_list`, which is qubit-indexed. Measured, `Z` on qubit 0 over codes
 `{0, 1}`:
 
@@ -308,7 +308,7 @@ use case, so this one is nearly free.
 Verified signature: `(vec, states, xsignatures, xsources, zsignatures, diag_signs, diagonals,
 coeffs)` -- eight parameters, most of them same-typed integer arrays. Going keyword-only removed
 *mispairing* but not *misnaming*: `apply_h(vec, xsources=x)` where `x` is a signature array is still
-accepted. `markdown/rqutils-requests.md` concedes this: "That residue is much smaller... but it is not
+accepted. `markdown/spinchain/rqutils-requests.md` concedes this: "That residue is much smaller... but it is not
 zero."
 
 **Breaking fix.** Distinct `NewType`s per array role (`XSignatures`, `XSources`, `ZSignatures`,
@@ -475,7 +475,7 @@ cannot receive a wide table.
 
 ## Already closed by a breaking change -- do not redo
 
-From `CLAUDE.md`, `NOTES.md`, `markdown/rqutils-requests.md`, `markdown/skqd.md`, `markdown/locg.md`,
+From `CLAUDE.md`, `NOTES.md`, `markdown/spinchain/rqutils-requests.md`, `markdown/skqd.md`, `markdown/locg.md`,
 `markdown/scaling-pocs.md`:
 
 | gotcha | measured consequence | how it was closed |

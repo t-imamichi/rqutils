@@ -7,7 +7,7 @@ rejected — and of the withdrawn [`rqutils-precond-request.md`](rqutils-precond
 on none of them and is against a different call site.
 
 > **Status: DRAFTED, not yet sent.** Every number below is measured in-tree at n=30; the profile it
-> comes from is [`n30-improvement-proposals.md`](n30-improvement-proposals.md).
+> comes from is [`n30-improvement-proposals.md`](../n30-improvement-proposals.md).
 >
 > **This is the lowest-priority request of the three**, and deliberately so: `spinchain` can sidestep the
 > whole cost by making the contraction opt-out, because the observable in question does not enter the
@@ -97,7 +97,7 @@ redundancy, so a similar payoff should not be assumed.
 
 `skqd/core.py`'s `js_projection` phase stops being a fifth of a large replay, which removes the
 motivation for the `[solver] js = false` opt-out in
-[`n30-improvement-proposals.md`](n30-improvement-proposals.md) §4 — a config key we would rather not add.
+[`n30-improvement-proposals.md`](../n30-improvement-proposals.md) §4 — a config key we would rather not add.
 `sqd_backend.expvals` would pass its operator stack straight through instead of looping, and its
 docstring paragraph about hoisting the packing per operator would shrink to a note that the batching is
 upstream's.

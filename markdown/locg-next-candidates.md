@@ -156,7 +156,7 @@ over the accumulated basis, restart from the Ritz vector at a fixed basis size.
 **It works, which distinguishes it from every other preconditioner tried here.** Energies correct to
 1e-11 or better in all cases. The reason is the shift: Davidson uses `(diag(A) - θI)^{-1}` with `θ` the
 *current* eigenvalue estimate, which is free, where the rejected Jacobi arm used `diag(A)^{-1}`, whose
-mixed signs on an indefinite operator destroy descent (0.29–0.35×). `markdown/rqutils-precond-request.md`
+mixed signs on an indefinite operator destroy descent (0.29–0.35×). `markdown/spinchain/rqutils-precond-request.md`
 closed the *lower-bound* shift; this one needs no bound at all.
 
 **But it does not beat the shipped prefilter.** Best setting `m=16`, 6 sweeps (connected XXZ):

@@ -573,7 +573,7 @@ in it.
 - **`apply_h` places a host `vec` on the live mesh but will not round its length.** With `xsignatures=`
   the *`states`* count must divide `mesh.size` (`get_xsource` reshards per state); `xsources=` takes any
   length. Rounding is **declined, not unimplemented** — the two precomputed diagonals put the state axis
-  on opposite ends. `markdown/rqutils-apply-h-mesh-response.md`; implementation recoverable at `1a339e8`.
+  on opposite ends. `markdown/spinchain/rqutils-apply-h-mesh-response.md`; implementation recoverable at `1a339e8`.
 - **`hproj` raises under a mesh**, rather than half-supporting one it was never able to serve.
 - **`sqd(..., packed=True)` returns *packed* states.** One flag governs both directions, so a round trip
   needs no re-pack — which also removes a hazard, `pack_states` not being idempotent. A caller comparing

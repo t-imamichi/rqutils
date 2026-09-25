@@ -1,7 +1,7 @@
 # rqutils change request: keep both an absolute and a relative `tol`
 
 One request against `rqutils` on branch `dev` (installed rev `d55f067`), written from the `spinchain`
-side. It is a follow-up to `markdown/rqutils-tol-request.md`, which asked for `tol` to become an absolute
+side. It is a follow-up to `markdown/spinchain/rqutils-tol-request.md`, which asked for `tol` to become an absolute
 eigen-residual bound and **got what it asked for** — this asks for the relative form back *alongside*
 it, not instead of it.
 

@@ -357,7 +357,7 @@ Recorded so these are not mistaken for unexplored options. All measured on this 
   and measures 1.79× median on a *shifted* operator, and the diagonal is already computed for free at
   `cache_level[1]=2`. Applied to the unshifted operator it hits `maxiter=1000` at every size and lands
   12–14 Hartree off: the mixed-sign diagonal destroys the descent direction. Consistent with
-  `markdown/rqutils-precond-request.md` closing that line.
+  `markdown/spinchain/rqutils-precond-request.md` closing that line.
 
 - **Host-side `ints_to_matrix` in the recovery loop.** Rebuilt on the whole subspace every round, so
   it looked like a candidate. Measured **1.4–5.1%** of a solve (2.9 ms vs 201 ms at dim=20000; 42.6 ms
@@ -389,7 +389,7 @@ Recorded so these are not mistaken for unexplored options. All measured on this 
   `np.random.normal` (86 vs 77), so it is already near-optimal for this solver.
 
 - **Randomized `lambda_max` estimate to enable a valid Jacobi preconditioner.** The premise was that
-  `markdown/rqutils-precond-request.md` closed the shift line for want of a *lower* bound on `H`, whereas a
+  `markdown/spinchain/rqutils-precond-request.md` closed the shift line for want of a *lower* bound on `H`, whereas a
   positive-definite preconditioner only needs an *upper* bound — which `k` matvecs of power iteration
   estimate cheaply. Measured **0.29–0.35×**: iterations went 77→258 at n=20. Energies correct
   (≤1.2e-14), 3× slower. The shift makes `1/(s - diag)` positive everywhere, so the preconditioner is
@@ -414,7 +414,7 @@ Recorded so these are not mistaken for unexplored options. All measured on this 
   Parity arrives at ~24 rounds and asymptotes to 1.04× at 64 — but at the shipped
   `RecoveryOptions.rounds = 5` (6 solves) the ladder is **0.74×** and tight sizing **0.63×**.
 
-  So **C3's power-of-two default is correct**, for the reason `markdown/rqutils-requests.md` already gives:
+  So **C3's power-of-two default is correct**, for the reason `markdown/spinchain/rqutils-requests.md` already gives:
   its 1.20× came *from* the bucketing. The padding waste is real and is not addressable by shape
   tuning — only by making `states_size` dynamic, which `CLAUDE.md` says it exists specifically to
   prevent. That is the trade by design, not an oversight.
@@ -478,7 +478,7 @@ Recorded so these are not mistaken for unexplored options. All measured on this 
   ARPACK to 1e-14, true relative residuals 6.5e-10 to 2.6e-9, `converged=True`), and iteration count
   anticorrelates with the relative gap at −0.92 across 27 XXZ cases. There is no inefficiency to
   recover, so the levers remain the two already documented — the criterion (§3, §4) and the gap
-  (preconditioning, closed in `markdown/rqutils-precond-request.md`).
+  (preconditioning, closed in `markdown/spinchain/rqutils-precond-request.md`).
 
   Three reasons this was not pursued further, all worth checking before anyone does: ARPACK is host-side
   and single-threaded, so every matvec crosses the JAX/NumPy boundary (`np.asarray` per call) and it

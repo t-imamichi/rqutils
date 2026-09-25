@@ -107,7 +107,7 @@ def site_occupancy(states, vec):
     """Per-site occupation probabilities from the current eigenvector (arXiv:2605.29521 §II.A).
 
     This is what `skqd/recovery.py::_site_occupancy` computes: square the eigenvector's components and
-    sum the weight of every state that has site q occupied. `markdown/rqutils-requests-2.md` notes the
+    sum the weight of every state that has site q occupied. `markdown/spinchain/rqutils-requests-2.md` notes the
     occupancy is arbitrary under degeneracy -- irrelevant here, since the fixture only needs a
     distribution that MOVES between rounds, not a canonical one.
     """

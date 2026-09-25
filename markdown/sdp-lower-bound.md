@@ -7,7 +7,7 @@ on this machine unless labelled otherwise.
 
 ## Why this was asked
 
-`markdown/rqutils-precond-request.md` records a shifted-Jacobi preconditioner for `ground_locg` whose
+`markdown/spinchain/rqutils-precond-request.md` records a shifted-Jacobi preconditioner for `ground_locg` whose
 blocker is the *shift*: the operator `sqd` builds is indefinite, so `1/diag(H)` flips sign and a
 shift `sigma <= lambda_min` is needed to make `H - sigma*I` positive definite. Every cheap estimator
 for `sigma` has been rejected as too loose -- a coefficient-sum bound at 4.14-8.14x over-shift, a

@@ -515,7 +515,7 @@ class TestApplyHArrayRoles:
 
         Going keyword-only removed *mispairing* -- declaring one strategy while having packed the arrays
         for another -- but not *misnaming*: ``apply_h(vec, xsources=x)`` where ``x`` is a signature array
-        was still accepted. ``markdown/rqutils-requests.md`` concedes that residue is "much smaller... but it
+        was still accepted. ``markdown/spinchain/rqutils-requests.md`` concedes that residue is "much smaller... but it
         is not zero".
 
     ``apply_h``'s own docstring records why a **shape** assertion cannot close it, and that is

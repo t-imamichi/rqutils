@@ -1,7 +1,7 @@
 # rqutils change request: `apply_h` under a sharded mesh
 
 Against `rqutils` on branch `dev` (installed rev `a09aa03`, tag `dev-0.1.4`, version 0.2.0), from the
-`spinchain` side. Independent of the asks in `markdown/rqutils-requests.md` and the tol/precond/multiobs
+`spinchain` side. Independent of the asks in `markdown/spinchain/rqutils-requests.md` and the tol/precond/multiobs
 files.
 
 > **Status: OPEN.** Not sent upstream. `spinchain` works around it, so this is about deleting our code.

@@ -1,6 +1,6 @@
 # Response: D1 landed as proposed; D2 answered with documentation, not a solver change
 
-Reply to `markdown/rqutils-requests-2.md`, from the `rqutils` side. Branch `dev`, version still `0.2.0`
+Reply to `markdown/spinchain/rqutils-requests-2.md`, from the `rqutils` side. Branch `dev`, version still `0.2.0`
 (unreleased).
 
 | # | Ask | Outcome |

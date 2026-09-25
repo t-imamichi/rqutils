@@ -464,7 +464,7 @@ class TestKeywordOnlyEntryPoints:
     ``states_size`` and did not raise -- it pinned the array to size 1. ``hproj(ham, states, True)``
     is the same shape one function over, where the third parameter is ``unique_states``.
 
-    ``apply_h`` already received this treatment (``markdown/rqutils-requests.md`` C1); the public entry
+    ``apply_h`` already received this treatment (``markdown/spinchain/rqutils-requests.md`` C1); the public entry
     points were missed. No in-tree caller passed these positionally, so this is a downstream-only
     break.
     """
@@ -589,7 +589,7 @@ class TestSqdMinDiagWeightCancellation:
     """
 
     def test_two_state_diagonal_subspace(self):
-        """THE REPORTED CASE, from ``markdown/rqutils-prefilter-bug-response.md`` section 5.
+        """THE REPORTED CASE, from ``markdown/spinchain/rqutils-prefilter-bug-response.md`` section 5.
 
         A 2-state subspace of the Bx=0 n=4 Heisenberg chain whose projected Hamiltonian is
         ``diag(-0.75, -0.25)``. The diagonal is ``[0.75, 0.75]``, so ``argmin`` is 0, the weight
@@ -1732,7 +1732,7 @@ class TestSqdPrefilter:
 
         The n=2 full basis is the smallest reproducer, and ``|lambda_min| > |lambda_max|`` is the
         precondition that makes it one -- asserted, since a fixture that stopped leaning negative
-        would silently stop testing this. ``markdown/rqutils-prefilter-bug.md`` has the report.
+        would silently stop testing this. ``markdown/spinchain/rqutils-prefilter-bug.md`` has the report.
         """
         num_qubits = 2
         strings, coeffs = [], []

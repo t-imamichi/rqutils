@@ -49,7 +49,7 @@ class TestHproj:
         rather than a bug. Measured with the naive ``bit q -> column q`` pairing, ``Z`` on qubit 0 over
         codes ``{0, 1}`` gives ``diag == [1, 1]``: no dependence on qubit 0 whatsoever, against the
         correct ``[1, -1]``. That exact defect shipped in the ``subspace`` helper in
-        ``markdown/rqutils-precond-request.md`` and propagated to a POC that copied it.
+        ``markdown/spinchain/rqutils-precond-request.md`` and propagated to a POC that copied it.
 
         Uncovered until now because every other qiskit test here builds operators from *strings*
         (``SparsePauliOp(["ZI"], ...)``), where character order is what the caller already wrote. Only

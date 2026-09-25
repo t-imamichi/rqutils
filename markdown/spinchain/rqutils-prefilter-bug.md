@@ -2,7 +2,7 @@
 
 > ## Disposition (2026-08-28): **confirmed in full, FIXED**
 >
-> **Reply to the reporter, with migration steps: `markdown/rqutils-prefilter-bug-response.md`.**
+> **Reply to the reporter, with migration steps: `markdown/spinchain/rqutils-prefilter-bug-response.md`.**
 > It also carries one correction to this report (§4) and a **second, unrelated `sqd` defect** found
 > while validating the fix — the min-diagonal weight cancelling the spread seed, which affected every
 > `sqd` call and not just prefiltered ones. That is **also fixed** (§5); nothing is left blocked.
@@ -91,8 +91,8 @@
 
 One bug report against `rqutils` on branch `dev` (installed rev `a013322`, reporting version 0.2.0),
 written from the `spinchain` side. It concerns the `prefilter` option added to
-`ground_locg`/`sqd` after `markdown/rqutils-precond-request.md` was filed, and is independent of every
-request in `markdown/rqutils-requests.md`.
+`ground_locg`/`sqd` after `markdown/spinchain/rqutils-precond-request.md` was filed, and is independent of every
+request in `markdown/spinchain/rqutils-requests.md`.
 
 **Bug in one line:** `_lambda_max_bound` returns an estimate of the eigenvalue of largest
 *magnitude*, not of the algebraic *maximum*, so on an operator whose spectrum leans negative the
