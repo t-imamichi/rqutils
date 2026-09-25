@@ -799,8 +799,8 @@ def sqd(
             that this absence "is the reason I4 could hide", a sign error that made the convergence
             test unsatisfiable so the solver silently never converged. Raise ``maxiter``, or loosen
             ``atol`` / ``rtol``, to proceed.
-        EigenpairCheckError: If the solve converged but ``||Hv - Ev||``, recomputed after it at
-            ``cache_level=(0, 0)``, exceeds 10x the convergence bound (or the residual floor).
+        EigenpairCheckError: If the solve converged but ``||Hv - Ev||``, recomputed after it without
+            any cached diagonal, exceeds 10x the convergence bound (or the residual floor).
         ValueError: If ``states_size`` is smaller than ``states.shape[0]``, or if it exceeds
             :math:`2^{31} - 1`, the ceiling imposed by the int32 indices used for subspace positions
             (beyond it an index wraps negative and the subspace is silently permuted); or if either
@@ -890,7 +890,7 @@ def sqd(
     if not residual <= threshold:  # `not <=` so a NaN residual raises too
         raise EigenpairCheckError(
             f"LOBPCG reported convergence, but the returned pair fails an independent check: "
-            f"||Hv - Ev|| recomputed at cache_level=(0, 0) is {residual:.3e}, above {threshold:.3e} "
+            f"||Hv - Ev|| recomputed after the solve is {residual:.3e}, above {threshold:.3e} "
             f"({_RESIDUAL_SLACK:g}x the convergence bound {bound:.3e}). The eigenvector is "
             "inconsistent with its eigenvalue, which raising `maxiter` or loosening a tolerance "
             "cannot fix; please report it with the Hamiltonian and states."
@@ -1147,8 +1147,9 @@ def run_sqd(
             path and exists to keep the A/B runnable. Default ``True``, unlike
             :func:`rqutils.ground_locg.ground_locg`'s ``False``, which cannot assume an arbitrary
             callable accepts a batch. Static, being forwarded by keyword.
-        check_residual: Recompute ``||Hv - Ev||`` and ``||Hv||`` at ``cache_level=(0, 0)`` after the
-            solve, into ``residual`` and ``ax_norm``. :func:`sqd` turns it on and raises on the result.
+        check_residual: Recompute ``||Hv - Ev||`` and ``||Hv||`` after the solve, into ``residual``
+            and ``ax_norm``, from recomputed diagonals (and a fresh search unless ``xsources`` were
+            all cached). :func:`sqd` turns it on and raises on the result.
     """
     # Static, so this runs once per trace; sqd validates too, and this covers direct poc/ callers.
     _check_cache_level(cache_level)
@@ -1299,20 +1300,24 @@ def run_sqd(
         log_level=log_level,
         batch_matvec=batch_matvec,
     )
-    # (0, 0) reads signatures directly, which needs `states_u` replicated, as does the return.
-    if sharding and (return_eigvec or check_residual):
-        states_u = jax.reshard(states_u, PartitionSpec(None))
     result = SqdResult(eigval, converged)
     if check_residual:
-        # (0, 0) whatever level solved, so a defect in one cache level cannot vouch for itself.
-        scanned_ref = _pack_scanned((0, 0), hamiltonian.x, hamiltonian.z, hamiltonian.c)
-        ax = _apply_h_kernel(eigvec, scanned_ref, states_u, cache_level=(0, 0))
+        # Diagonals always recomputed, so no cached one vouches for itself; full xsources are reused,
+        # since redoing the J-fold search was ~90% of the check (NOTES.md, "`EigenpairCheckError`").
+        level, xgroup = (
+            ((1, 0), xsources)
+            if cache_level[0] == 1 and not partial_xcache
+            else ((0, 0), hamiltonian.x)
+        )
+        scanned_ref = _pack_scanned(level, xgroup, hamiltonian.z, hamiltonian.c)
+        ax = _apply_h_kernel(eigvec, scanned_ref, states_u, cache_level=level)
         result = result._replace(
             residual=jnp.linalg.norm(ax - eigval * eigvec), ax_norm=jnp.linalg.norm(ax)
         )
     if return_eigvec:
         if sharding:
             eigvec = jax.reshard(eigvec, PartitionSpec(None))
+            states_u = jax.reshard(states_u, PartitionSpec(None))
         subspace_dim = jnp.searchsorted(_is_filler(states_u), 1)
         result = result._replace(eigvec=eigvec, states=states_u, subspace_dim=subspace_dim)
     return result

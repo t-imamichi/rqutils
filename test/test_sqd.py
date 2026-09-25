@@ -1100,6 +1100,36 @@ class TestEigenpairCheck:
         # Callers retry on this substring (non-convergence); a wrong pair must not match it.
         assert "did not converge" not in str(excinfo.value)
 
+    def test_the_check_reuses_cached_xsources_but_never_a_cached_diagonal(self):
+        """The check must rebuild every diagonal, and must not redo the search when all xsources are cached.
+
+        Redoing the J-fold search was ~90% of the check (3.2% of a (1, 0) solve, against 0.3% reusing
+        the cache), while a cached diagonal is what it exists to cross-check. Counted as named call
+        sites in the jaxpr; (0, 0) and (1, 0) are skipped, where the check's kernel is the solve's and
+        JAX prints the shared jaxpr once.
+        """
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        rng = np.random.default_rng(3)
+        h = PauliSumXZ.from_paulisum((real_pauli_strings(4, 6, rng), rng.normal(size=6).tolist()))
+        states_p = pack_padded(unique_states(12, 4, rng))
+
+        def calls(level, **kwargs):
+            def count(check):
+                traced = jax.make_jaxpr(
+                    lambda a, b: run_sqd(a, b, 16, False, level, check_residual=check, **kwargs)
+                )(h, states_p)
+                return str(traced).count("name=get_xsource"), str(traced).count("name=get_diagonal")
+
+            (search_off, diag_off), (search_on, diag_on) = count(False), count(True)
+            return search_on - search_off, diag_on - diag_off
+
+        for level in [(1, 1), (1, 2)]:
+            assert calls(level) == (0, 1), f"{level}: (extra searches, extra diagonal builds)"
+        # Where some group has no cached source index, the check searches afresh.
+        assert calls((0, 2))[0] == 1
+        assert calls((1, 0), xcache_groups=1)[0] == 1
+
 
 class TestAtolAndRtol:
     """Convergence is ``||r|| < max(atol, rtol * (||Hv|| + |E|))`` -- either arm suffices.

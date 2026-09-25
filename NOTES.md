@@ -3433,8 +3433,8 @@ if run outside the sandbox.
 
 ### `EigenpairCheckError`: an independent residual after every `sqd` solve (2026-09-25)
 
-`sqd` recomputes `‖Hv − Ev‖` and `‖Hv‖` at `cache_level=(0, 0)` after the solve, whatever level solved,
-and raises `EigenpairCheckError` (a `RuntimeError` subclass) above `10 × max(bound, residual_floor)`,
+`sqd` recomputes `‖Hv − Ev‖` and `‖Hv‖` after the solve (at `cache_level=(0, 0)` as first built; see the
+revision below) and raises `EigenpairCheckError` (a `RuntimeError` subclass) above `10 × max(bound, residual_floor)`,
 where `bound` is the solver's own `max(atol, rtol·(‖Hv‖+|E|))` with the exact `‖Hv‖`. Motivated by
 spinchain's `sqd_backend._eigen_residual`, which repacked, re-uniquified and re-built the operator to
 check the same thing; all of that was rqutils code except the `(0, 0)` kernel, so doing it here keeps
@@ -3451,9 +3451,21 @@ the independence and drops the rebuild.
   matvec is cheap and the check's `(0,0)` one is not.
 - **Must not say "did not converge"**: spinchain's `sqd_with_retry` retries on that substring, and a
   wrong pair retried at `maxiter=100_000` is the outcome it forbids. Pinned by the test.
-- Under a mesh the check needs `states_u` replicated, so `return_eigvec=False` with `cache_level[0]=1`
-  now reshards it back once (it was replicated before the precompute, so the peak does not rise).
-  Multi-process: both reads go through `_host_scalar`, replicated, so every rank raises together.
+- Multi-process: both reads go through `_host_scalar`, replicated, so every rank raises together.
+- **Revised the same day: the check reuses a full `xsources` cache.** Timing the candidate kernels on the
+  fixture above (warm, 15 interleaved rounds) showed the `(0,0)` check matvec at **80.5 ms** against
+  **7.7 ms** for `(1,0)` on the cached `xsources` and 2.2 ms for the `(1,2)` solve kernel: ~90% of the
+  check was redoing the `J`-fold `get_xsource` search. So when every group's source index is cached the
+  check runs `(1,0)` on that array; otherwise (`cache_level[0]=0`, or a partial `xcache_groups`) it keeps
+  `(0,0)`. It always rebuilds the diagonal from signatures, so a cached diagonal never vouches for
+  itself. Whole-solve cost after: `(1,0)` **+0.9%** (was 3.2%), `(1,1)` +0.3%, `(1,2)` **+0.6%** (was
+  7.9%), temp +0.25–0.35 MiB. **What this gives up is small**: the `(0,0)` arm never had
+  *function* independence -- it calls the same `get_xsource` and `get_diagonal` the solve does -- so the
+  only thing no longer re-derived is the source-index array the precompute scan built. At `(1,0)` the
+  check kernel equals the solve's, as `(0,0)`'s already did for a `(0,0)` solve. The check now runs on
+  the solve's `states_u` layout, so a check-only sharded call no longer reshards `states_u` back.
+  Pinned by `TestEigenpairCheck.test_the_check_reuses_cached_xsources_but_never_a_cached_diagonal`,
+  which counts named `pjit` call sites; the always-`(0,0)` and solve's-own-kernel mutants each fail it.
 
 ## `precond` was removed; `sqd` defaults to `prefilter=(32, 2)`
 

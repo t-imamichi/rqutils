@@ -1,6 +1,8 @@
 # `sqd` now checks its own eigenpair: `EigenpairCheckError`, and what it means for `sqd_backend.py`
 
 From the `rqutils` side, unprompted. Commit `bed4757` on `dev`, version still `0.2.0` (unreleased).
+**Revised the same day** on `reorg-layout`: the check now reuses a full `xsources` cache, cutting its
+cost from +3.2–7.9% to +0.3–0.9% (§1, §5).
 
 > **Status: shipped, always on.** After every solve, `sqd()` recomputes `‖Hv − Ev‖` independently and
 > raises `EigenpairCheckError` if the pair it is about to return is not an eigenpair — the
@@ -32,10 +34,14 @@ raise EigenpairCheckError  if not r <= threshold   # `not <=`, so a NaN residual
 
 - **`rtol=None` resolves to `4·eps`** of the coefficient dtype, exactly as the solver resolves it, so
   the check tests the same criterion the solve used.
-- **The matvec always runs at `cache_level=(0, 0)`**, whatever level the solve used. `(0, 0)` reads the
-  raw X/Z signatures and caches nothing, so a defect confined to one cache level's kernel cannot
-  vouch for itself. That was the one real source of independence in your guard (`_apply_projected`
-  pins `(0, 0)` for the same reason), and it is kept.
+- **The check never uses a cached diagonal**: it rebuilds every diagonal from the Z signatures, so a
+  defect in the `(1, 1)`/`(1, 2)` diagonal caches cannot vouch for itself. **It reuses the source
+  indices when all of them are cached** (`cache_level[0] = 1`, no partial `xcache_groups`) and searches
+  afresh otherwise. Redoing the search was ~90% of the original check's cost.
+- **One difference from your guard, stated plainly**: `_apply_projected` pins `(0, 0)`, so it also
+  re-derives the source-index array. The rqutils check no longer does when that array is cached. What
+  that gives up is narrow: both call the same `get_xsource`, so only a defect in the precompute scan
+  that builds the array would slip past, not one in the search itself.
 - **The residual is logged at `INFO`** on the `rqutils.sqd` logger:
   `Independent eigen-residual 6.145e-16 (threshold 7.802e-14).` Your per-solve `residual=` log line
   can read from there instead, or stay — see §5.
@@ -126,28 +132,23 @@ field from your log line.
 
 ## 5. Cost
 
-One `(0, 0)` matvec per solve. Measured at `J=120` X groups, `N=30k` states, warm, 9 interleaved rounds:
+One matvec per solve. Measured at `J=120` X groups, `N=30k` states, warm, 9 interleaved rounds:
 
-| `cache_level` | spinchain `DiagCache` | time | XLA temp |
-|---|---|---|---|
-| `(1, 0)` | — (sqd default) | +3.2% (9/9) | +0.50 MiB |
-| `(1, 2)` | `SPEED` | +7.9% (9/9) | +0.60 MiB |
-| `(0, 0)` | — | +1.5% (6/9, noise) | +0.25 MiB |
+| `cache_level` | spinchain `DiagCache` | time (first version) | time (revised) | XLA temp (revised) |
+|---|---|---|---|---|
+| `(1, 0)` | — (sqd default) | +3.2% | **+0.9%** | +0.25 MiB |
+| `(1, 1)` | — | — | **+0.3%** | +0.35 MiB |
+| `(1, 2)` | `SPEED` | +7.9% | **+0.6%** | +0.35 MiB |
 
-`(1, 2)` pays most because its own matvec is cheap and the check's `(0, 0)` one is not. **Net for
-spinchain**: your guard costs about 6% of a warm solve (its own repack, re-uniquify lexsort, operator
-rebuild and matvec), all of which goes away. So `SPEED` comes out roughly even, and every other level —
-including `MEMORY` — comes out ahead. These are CPU figures at one size; A/B on your own shipped job
-before quoting a number.
+**Net for spinchain**: your guard costs about 6% of a warm solve (its own repack, re-uniquify lexsort,
+operator rebuild and a `(0, 0)` matvec), all of which goes away, so every level now comes out ahead,
+`SPEED` included. These are CPU figures at one size; A/B on your own shipped job before quoting a number.
 
-There is no flag to turn the check off in `sqd()`. If the +8% at `SPEED` ever matters, ask; the
-plumbing (`run_sqd(check_residual=…)`) already exists.
+There is no flag to turn the check off in `sqd()`; the plumbing (`run_sqd(check_residual=…)`) exists.
 
 ## 6. Sharding and multi-process
 
-- Under a mesh, the `(0, 0)` matvec needs `states` replicated. With `return_eigvec=True` it already is
-  at that point; with `return_eigvec=False` and `cache_level[0] = 1` rqutils now reshards it back once.
-  It was replicated before the precompute, so peak memory does not rise.
+- The check runs on the solve's own `states` layout, so it adds no reshard of `states`.
 - Both scalars go through `_host_scalar`, the same non-collective read as the eigenvalue. They are
   replicated, so every rank takes the same branch and raises together — no collective sits inside the
   conditional.

@@ -289,7 +289,7 @@ own `with jax.set_mesh(...)` block).
 
 **Return shapes.** `sqd` returns 3 values with `return_eigvec=True` (`eigval, eigvec, basis`) and a bare
 `float` otherwise — not a 5-tuple; the convergence flag and subspace dim are consumed inside `sqd`,
-which raises on non-convergence. It also recomputes the residual at `(0, 0)` after every solve and
+which raises on non-convergence. It also recomputes the residual after every solve, never from a cached diagonal, and
 raises `EigenpairCheckError` — a distinct subclass, and its message must never say "did not converge",
 since callers retry on that substring. `run_sqd` returns a `SqdResult` named tuple (optional fields `None`)
 and fills `residual`/`ax_norm` only under `check_residual=True`; pad its input with `_pad_states`. `hproj` returns a scipy `csr_array`, so `np.asarray()` on it yields a
