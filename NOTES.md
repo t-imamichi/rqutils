@@ -3427,6 +3427,26 @@ reduction gives 12. Bit-identical over 18 arms (N 64/1000/5000, f32/f64/c128, ba
 flat within +192 B to N=1M. **Below 12 needs fewer sequential reductions**, i.e. dropping a
 `_project_out` or re-orthogonalization pass, which are closed. Speed on real nodes is unmeasured.
 
+### `process_allgather` gathers per leaf: a pytree does not merge `sqd`'s two host reads (2026-09-25)
+
+`docs/sqd-locg-improvement-ideas.md` §11 recorded, as verified, that passing `(eigval, converged)` to
+`process_allgather` as one pytree would make one collective instead of two. Read from JAX 0.11.2's
+source, it is `jax.tree.map(_pjit, in_tree)`: each leaf goes through `_handle_array_process_allgather`
+separately, with its own `jit`. **One call, still two collectives** -- "accepts a pytree" was true and
+answered a different question.
+
+The per-leaf handler also has two branches, and the one `sqd` normally takes may move no data. A rank-0
+result on the full mesh is `P()` but not fully addressable, so it goes through
+`jit(identity, out_shardings=P())` onto the layout it already has. Only a **fully addressable** input --
+a 1-device solve inside a multi-process world, `poc15`'s first row -- builds a process-spanning array and
+really gathers. Merging would need a single stacked `(2,)` array (`converged` cast to float is exact), and
+it saves one dispatch per solve against a loop of hundreds of iterations at 12 all-reduces each. Not
+built: the payoff is below noise, and the change sits on the host-read path that has already shipped
+broken four times, which a laptop cannot exercise -- a two-rank localhost cluster
+(`jax.distributed.initialize` plus gloo CPU collectives) was tried and the sandbox denies the
+coordinator's `bind`. Such a cluster would be the first local multi-process test for `_host_scalar`
+if run outside the sandbox.
+
 ## `precond` was removed; `sqd` defaults to `prefilter=(32, 2)`
 
 2026-08-28, acting on the comparison below.

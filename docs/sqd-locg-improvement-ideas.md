@@ -420,6 +420,10 @@ under-measured heuristic a public name is the part to resist.
 
 ### 11. Gather scalar results once per solve
 
+**Dropped 2026-09-25: the "verified" pytree claim below is wrong** -- `process_allgather` maps a
+per-leaf gather over the tree, so a pytree is one call but still two collectives. See `NOTES.md`,
+"`process_allgather` gathers per leaf".
+
 The public `sqd` wrapper reads the eigenvalue and convergence flag through two separate `_host_scalar`
 calls. In a multi-process job each invokes `process_allgather`. Packing the two scalar values into one
 small array or pytree before host transfer could remove one process-wide collective per solve.
@@ -631,7 +635,8 @@ not fit this module's current capacity objective.
    selecting groups by `K_g` beats the measured prefix policy.
 2. **Distributed output capacity:** add a device-returning SQD path before investing in distributed
    states, since the current return path re-replicates both O(N) outputs.
-3. **Multi-node latency:** make norm reductions combinable, then combine the two scalar host gathers.
+3. **Multi-node latency:** make norm reductions combinable (done, 13 -> 12). The scalar-gather merge is
+   dropped -- see section 11.
 4. **Repeated growing-subspace workflow:** add safe continuation starts; test a sorted-unique input path
    only when the producer already guarantees that invariant.
 5. **Repeated solves of one fixed projection:** measure a preparation/solve boundary before designing it.
@@ -684,9 +689,8 @@ production priorities; the new module-level ideas are experiments until their wo
    cost and shape recompilation before building. The spread component is mandatory.
 5. **Focused SQD follow-up -- validated sorted-unique input.** Measure only on a producer that already
    maintains the invariant; this is omission of work, not another `np.unique` implementation.
-6. **Section 11 -- one collective for the two scalars.** Mechanical, verified free (`process_allgather`
-   takes a mixed-dtype pytree), multi-process only. Do it opportunistically and make the public timing
-   synchronize the same result without adding another host read.
+6. **Section 11 -- dropped.** A pytree gather is still one collective per leaf; see section 11. The
+   public-timing fix stands on its own: synchronize the logged time without adding another host read.
 7. **Focused SQD follow-up -- preparation/solve boundary.** Proceed only if a real workload repeatedly
    solves one unchanged projection. Do not apply it to growing bases whose caches are invalidated.
 8. **Section 9 -- GPU prefilter tuning.** Blocked on CUDA hardware; nothing to do here.

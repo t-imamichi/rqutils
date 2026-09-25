@@ -32,10 +32,15 @@ it; `poc15` on real nodes is the harness. Going below 12 needs an *algorithmic* 
 `_project_out` passes, the two re-orthogonalization passes and the final `norm_y` are each sequential
 by construction, and every one is load-bearing (`CLAUDE.md`, "Every guard in it is load-bearing").
 
-### 2. One collective for `sqd`'s two host scalars
+### 2. One collective for `sqd`'s two host scalars -- **dropped, the premise was wrong** (2026-09-25)
 
-`sqd.py`'s `_host_scalar(result[0])` and `_host_scalar(result[-1])` are two `process_allgather`s;
-`process_allgather` takes a mixed-dtype pytree, already verified. Mechanical, multi-process only.
+A pytree does not merge the gathers: `process_allgather` is `jax.tree.map` over a per-leaf handler, so
+`(eigval, converged)` is still two collectives from one call. And the common case may move no data --
+a `P()` scalar on the full mesh takes the non-addressable branch, a `jit(identity)` onto the same `P()`
+spec. Only a fully addressable input (a 1-device solve on a multi-process world) really gathers across
+ranks. Stacking into one `(2,)` array would merge them, but saves one dispatch per solve against
+hundreds of iterations, and the multi-process path is unverifiable in the sandbox (localhost bind is
+denied). `NOTES.md` has the entry.
 
 ## Memory
 
