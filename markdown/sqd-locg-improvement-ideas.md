@@ -70,7 +70,7 @@ Two findings worth carrying forward, both of which contradicted an initial readi
 The contract is that `mat` broadcasts over a leading axis of **any** size, not just 2: `debug=True`'s
 diagnostics send three. `ground_locg` defaults to `False` (an arbitrary callable need not batch) and an
 array `mat` raises, its matvec being a `jax.lax.dot` that rejects a rank-2 rhs. See `CLAUDE.md`'s
-`ground_locg` section, and `test/_sharded_batch_matvec.py` for the sharding case.
+`ground_locg` section, and `test/sharded/batch_matvec.py` for the sharding case.
 
 **Not batchable, checked:** the Chebyshev prefilter (its terms are a sequential recurrence) and
 `body()`'s third matvec (downstream of Rayleigh--Ritz).

@@ -1,21 +1,15 @@
-"""Print the ``all-reduce`` arities in ``ground_locg``'s compiled loop body on a 4-device mesh.
-
-Driven as a subprocess by ``test_ground_locg.py::TestAllReduceCount``, which owns the rationale. Not a
-pytest module: the virtual device count must be set before jax initializes.
-"""
+"""``all-reduce`` arities in ``ground_locg``'s compiled loop body on a mesh; see ``TestAllReduceCount``."""
 
 import re
 
 import jax
-
-jax.config.update("jax_enable_x64", True)
-
 import jax.numpy as jnp
-from jax.sharding import AxisType, NamedSharding, PartitionSpec
+from common import emit, mesh
+from jax.sharding import NamedSharding, PartitionSpec
 
 from rqutils.ground_locg import ground_locg
 
-N, MESH_SIZE = 1024, 4
+N = 1024
 
 
 def matvec(vec, diag, off):
@@ -39,9 +33,10 @@ def allreduce_arities(text):
 
 
 def main() -> None:
-    mesh = jax.make_mesh((MESH_SIZE,), ("x",), axis_types=(AxisType.Explicit,))
-    with jax.set_mesh(mesh):
-        spec = NamedSharding(mesh, PartitionSpec("x"))
+    the_mesh = mesh(4)
+    arities = {}
+    with jax.set_mesh(the_mesh):
+        spec = NamedSharding(the_mesh, PartitionSpec("x"))
         diag = jax.device_put(jnp.linspace(-1.0, 1.0, N), spec)
         xinit = jax.device_put(jnp.ones(N) / N**0.5, spec)
         for batch in (False, True):
@@ -50,8 +45,10 @@ def main() -> None:
                     matvec, x, (d, 0.3), maxiter=50, batch_matvec=batch
                 )
             )
-            body = while_body(solve.lower(xinit, diag).compile().as_text())
-            print(f"arities {int(batch)} {','.join(map(str, allreduce_arities(body)))}")
+            arities[str(batch)] = allreduce_arities(
+                while_body(solve.lower(xinit, diag).compile().as_text())
+            )
+    emit(arities)
 
 
 if __name__ == "__main__":

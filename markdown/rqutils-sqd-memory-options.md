@@ -116,7 +116,7 @@ at the midpoint) and neither does the peak.
 If you run on a mesh: a partial cache keeps `states` **replicated**, where a full cache reshards it after
 the precompute. That is not a regression, it is required — the uncached groups search `states` inside
 every matvec and `get_xsource` cannot take a partitioned array. So on a mesh, `xcache_groups` trades the
-source cache against a replicated state list rather than against nothing. `test/_sharded_partial_xcache.py`
+source cache against a replicated state list rather than against nothing. `test/sharded/partial_xcache.py`
 sweeps 21 `(cache_level, J')` cells on a 4-device mesh against the single-device baseline.
 
 ## 4. What we suggest

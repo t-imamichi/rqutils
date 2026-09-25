@@ -2587,180 +2587,75 @@ class TestComplexCoefficientsAcrossCacheLevels:
             )
 
 
-class TestShardedSqdPrefilter:
-    """``sqd(prefilter=...)`` must agree sharded and single-device, and keep the vector partitioned.
+class TestShardedSqd:
+    """``sqd`` must agree sharded and single-device at every ``cache_level`` and mesh size.
 
-    ``test/_sharded_prefilter.py`` already covers the prefilter on a mesh, but only through
-    ``ground_locg`` with a dense ``einsum`` matvec on an unpadded power-of-two vector.
-    ``markdown/locg-chebyshev-prefilter.md`` states that gap and defers it here.
+    **Swept over the whole grid, not sampled**, because two sharding defects lived in the three
+    ``cache_level[0] == 0`` cells that nothing covered, and the first masked the second:
 
-    So this covers the one configuration only reachable through ``sqd``: a **padded** subspace whose
-    filler slots are masked to zero, partitioned across a mesh, driven through ``apply_h``'s
-    gather-heavy irregular kernel instead of a dense matmul. The filter calls that matvec
-    ``cycles * (degree + 1)`` times before the solver's first iteration, so a sharding fault there gets
-    far more exposure than one LOBPCG step would give it.
+    * ``_accumulate_diagonal`` carried its template's rank-2 spec onto a rank-1 accumulator ("Length
+      of sharding.spec (2) must be equal to aval's ndim (1)"), failing **all six** levels.
+    * ``_spread_seed``'s ``jnp.where`` mixed a replicated predicate with a partitioned ``vec``, because
+      ``run_sqd`` reshards ``states_u`` only when ``cache_level[0] == 1``: ``ShardingTypeError`` on the
+      three uncached levels. Fixing the first bug turned six failures into three, not none.
 
-    Swept over all six ``cache_level`` values, not sampled: ``cache_level`` selects which kernel the
-    filter calls, and ``TestShardedCacheLevels`` records two sharding bugs that lived in the three
-    ``cache_level[0] == 0`` cells where one representative cell reported success.
+    Runs with ``prefilter=(16, 2)`` on a **padded** subspace (37 states to 64), the one prefilter
+    configuration only ``sqd`` reaches: filler masked to zero, partitioned, through ``apply_h``'s
+    gather-heavy kernel -- which the filter calls ``cycles * (degree + 1)`` times before the first
+    iteration. ``TestChebyshevPrefilter`` covers the dense, unpadded case.
 
-    **Asserts the spec, not only the energy.** Measured, all 18 energy cases agree to 4e-16 or better
-    whether or not partitioning survives -- per ``CLAUDE.md`` a replicated run agrees with
-    single-device to exactly 0.0, so "correct but silently unsharded" is invisible to value
-    comparison. The child therefore also prints the prefilter's output sharding.
+    **Asserts the spec, not only the energy**: all 18 energies agree to 4e-16 whether or not the
+    partitioning survives, since a replicated run matches single-device exactly.
     """
 
     def test_every_cache_level_agrees_sharded_and_single_device(self):
-        stdout = run_sharded_child("_sharded_sqd_prefilter.py", "sqd prefilter")
-
-        energies = {}
-        specs = {}
-        for line in stdout.strip().splitlines():
-            parts = line.split()
-            if parts[:1] == ["energy"] and len(parts) == 6:
-                key = (int(parts[1]), int(parts[2]), int(parts[3]))
-                energies[key] = (float(parts[4]), float(parts[5]))
-            elif parts[:1] == ["spec"] and len(parts) == 5:
-                specs[(int(parts[1]), parts[2])] = (parts[3], parts[4])
-
-        # Assert both case sets are complete before checking values: a child that died partway would
-        # otherwise pass on whatever it managed to print.
-        expected_energies = sorted(
-            (devices, *level) for devices in (1, 2, 4) for level in CACHE_LEVELS
-        )
-        expected_specs = sorted(
-            (devices, label) for devices in (1, 2, 4) for label in ("part", "repl")
-        )
-        for name, got, want in (
-            ("energy", sorted(energies), expected_energies),
-            ("spec", sorted(specs), expected_specs),
-        ):
-            assert got == want, (
-                f"child did not run the full {name} grid: got {got}, expected {want}\n"
-                f"{stdout[-2000:]}"
-            )
-
-        for key, (single, sharded) in sorted(energies.items()):
-            assert single == pytest.approx(sharded, abs=1e-12), (
-                f"devices={key[0]} cache_level={key[1:]}: sharded {sharded} disagrees with "
-                f"single-device {single}"
-            )
-        for (devices, label), (vinit_spec, filtered_spec) in sorted(specs.items()):
-            assert filtered_spec == vinit_spec, (
-                f"devices={devices} {label}: the prefilter returned {filtered_spec} for a "
-                f"{vinit_spec} input -- it is not sharding-transparent"
-            )
-        # And the partitioned arm must actually be partitioned, or the check above is vacuous.
-        for devices in (2, 4):
-            assert specs[(devices, "part")][1] == "P('x',)", (
-                f"devices={devices}: the partitioned arm came back "
-                f"{specs[(devices, 'part')][1]}, so nothing was sharded and this test proves nothing"
-            )
+        got = run_sharded_child("sqd_grid")
+        for devices in ("1", "2", "4"):
+            for level in map(str, CACHE_LEVELS):
+                single, sharded = got["single"][level], got["sharded"][devices][level]
+                assert single == pytest.approx(sharded, abs=1e-12), (
+                    f"devices={devices} cache_level={level}: sharded {sharded} vs single {single}"
+                )
+            for label in ("part", "repl"):
+                vinit_spec, filtered_spec = got["specs"][devices][label]
+                assert filtered_spec == vinit_spec, (
+                    f"devices={devices} {label}: the prefilter returned {filtered_spec} for a "
+                    f"{vinit_spec} input -- it is not sharding-transparent"
+                )
+        # The partitioned arm must actually be partitioned, or the check above is vacuous.
+        for devices in ("2", "4"):
+            assert got["specs"][devices]["part"][1] == "P('x',)", got["specs"][devices]
 
 
 class TestShardedBatchMatvec:
     """``batch_matvec`` must give the same answer sharded, and must keep the data axis partitioned.
 
-    Batching stacks ``ground_locg``'s two independent per-iteration vectors into one ``(2, N)`` array,
-    which moves the partitioned axis from position 0 to position 1. That is safe because ``jnp.stack``
-    on a ``P('x')`` vector yields ``P(None, 'x')`` -- the new batch axis is replicated and the data axis
-    keeps its partitioning -- so no resharding and no collective is introduced. Measured on a 4-device
-    mesh: all-gathers drop 6 to 3 against the two-call path, because the gather inside the operator is
-    paid once for the pair instead of twice.
+    Batching stacks ``ground_locg``'s two per-iteration vectors into ``(2, N)``, moving the partitioned
+    axis to position 1. ``jnp.stack`` on a ``P('x')`` vector yields ``P(None, 'x')``, so nothing
+    reshards and no collective appears -- measured, all-gathers drop 6 to 3 because the operator's
+    gather is paid once per pair.
 
-    **The spec assertion is the half a value comparison cannot make.** A stack that partitioned the
-    batch axis instead (``P('x', None)``), or one that silently replicated the whole array, both agree
-    with the single-device answer to exactly 0.0 -- the first would be wrong for a mesh that does not
-    divide 2, the second correct but unsharded. So the child prints the spec and this checks it.
-
-    Goes through ``run_sqd`` rather than ``sqd``: the public entry point does not forward
-    ``batch_matvec``, so there is no other reachable call site.
+    **The spec assertion is the half values cannot make**: a stack partitioning the batch axis
+    (``P('x', None)``) or replicating everything both agree with single-device to exactly 0.0. Goes
+    through ``run_sqd`` because ``sqd`` does not forward ``batch_matvec``.
     """
 
     def test_batched_and_unbatched_agree_sharded(self):
-        stdout = run_sharded_child("_sharded_batch_matvec.py", "sqd batch_matvec")
-
-        energies, specs = {}, None
-        for line in stdout.strip().splitlines():
-            parts = line.split(maxsplit=1)
-            if parts[0] == "energy":
-                batch, single, sharded = parts[1].split()
-                energies[int(batch)] = (float(single), float(sharded))
-            elif parts[0] == "spec":
-                specs = parts[1]
-
-        # Assert both arms ran before checking values: a child that died after the unbatched arm would
-        # otherwise pass on the one line it managed to print.
-        assert sorted(energies) == [0, 1], (
-            f"expected both batch_matvec arms, got {sorted(energies)}:\n{stdout[-2000:]}"
-        )
-        for batch, (single, sharded) in sorted(energies.items()):
+        got = run_sharded_child("batch_matvec")
+        energies = got["energies"]
+        for batch in ("False", "True"):
+            single, sharded = energies[batch]
             assert single == pytest.approx(sharded, abs=1e-12), (
-                f"batch_matvec={bool(batch)}: single-device {single} against sharded {sharded}"
+                f"batch_matvec={batch}: single-device {single} against sharded {sharded}"
             )
-        # Batching must not change the answer on either topology.
-        assert energies[0][0] == pytest.approx(energies[1][0], abs=1e-12), (
-            f"single-device: batched {energies[1][0]} against unbatched {energies[0][0]}"
-        )
-        assert energies[0][1] == pytest.approx(energies[1][1], abs=1e-12), (
-            f"sharded: batched {energies[1][1]} against unbatched {energies[0][1]}"
-        )
-        assert specs is not None, f"child printed no spec line:\n{stdout[-2000:]}"
-        assert specs == "('x',) (None, 'x')", (
-            f"stacking must leave the data axis partitioned and replicate the batch axis, got {specs}"
-            f" -- P('x', None) would partition the batch axis, and an all-None spec would mean "
-            f"sharding was dropped; both agree with single-device to exactly 0.0"
-        )
-
-
-class TestShardedCacheLevels:
-    """Every ``cache_level`` must give the same answer sharded as single-device.
-
-    Two distinct sharding defects lived in the three ``cache_level[0] == 0`` cells, and **nothing
-    covered them**: ``poc/sharding.py`` and the first version of this test both ran
-    only ``sqd``'s default ``(1, 0)``. Measured on a 4-device mesh:
-
-    * ``_accumulate_diagonal`` carried its template's *full* sharding spec onto a 1-D accumulator,
-      while ``get_diagonal`` passes the 2-D ``(N, nbytes)`` state list -- so a rank-2
-      ``PartitionSpec`` met a rank-1 ``jnp.zeros`` ("Length of sharding.spec (2) must be equal to
-      aval's ndim (1)"). This failed **all six** levels.
-    * ``_spread_seed``'s ``jnp.where`` mixed a replicated predicate with a partitioned ``vec``:
-      ``vec`` is built sharded unconditionally, but ``run_sqd`` reshards ``states_u`` only inside
-      ``if cache_level[0] == 1`` (the uncached branch still needs the replicated array for
-      ``get_xsource``). Raised ``ShardingTypeError`` on ``(0, 0)``, ``(0, 1)`` and ``(0, 2)``.
-
-    **The first bug masked the second** -- it raised earlier in the call, so fixing it turned six
-    failures into three rather than none. That is why this sweeps the whole grid instead of sampling
-    a representative cell: one cell reported success while three were broken.
-
-    Runs as a subprocess because the virtual device count has to be set before jax initializes, and
-    ``conftest`` has already imported it by collection time. The child script lives in
-    ``test/_sharded_cache_levels.py`` rather than an inline string so ruff and ty check it -- as a
-    blob, an ``ImportError`` there would surface as a nonzero exit, indistinguishable from the
-    regression this exists to catch, under an assertion message blaming the sharding.
-    """
-
-    def test_every_cache_level_agrees_sharded_and_single_device(self):
-        stdout = run_sharded_child("_sharded_cache_levels.py", "sqd")
-
-        seen = {}
-        for line in stdout.strip().splitlines():
-            parts = line.split()
-            if len(parts) != 4:
-                continue
-            i, j, single, sharded = int(parts[0]), int(parts[1]), float(parts[2]), float(parts[3])
-            seen[(i, j)] = (single, sharded)
-
-        # Assert the grid is complete before checking values: a child that died after two levels
-        # would otherwise pass on the two it managed to print.
-        assert sorted(seen) == CACHE_LEVELS, (
-            f"expected all of {CACHE_LEVELS}, got {sorted(seen)} -- the child did not run the full "
-            f"grid:\n{stdout[-2000:]}"
-        )
-        for cache_level, (single, sharded) in sorted(seen.items()):
-            assert single == pytest.approx(sharded, abs=1e-12), (
-                f"cache_level={cache_level}: sharded {sharded} disagrees with single-device {single}"
+        for arm, name in ((0, "single-device"), (1, "sharded")):
+            assert energies["False"][arm] == pytest.approx(energies["True"][arm], abs=1e-12), (
+                f"{name}: batched {energies['True'][arm]} against unbatched {energies['False'][arm]}"
             )
+        assert got["specs"] == ["P('x',)", "P(None, 'x')"], (
+            f"stacking must keep the data axis partitioned and replicate the batch axis, got "
+            f"{got['specs']}"
+        )
 
 
 class TestShardedApplyHVec:
@@ -2775,40 +2670,26 @@ class TestShardedApplyHVec:
     """
 
     def test_host_vec_is_placed_and_indivisible_length_names_the_size(self):
-        stdout = run_sharded_child("_sharded_apply_h_vec.py", "apply_h")
-
-        got = dict(line.split(maxsplit=1) for line in stdout.strip().splitlines() if " " in line)
-        # Completeness before values: a child that died partway would otherwise pass on what it got.
-        assert set(got) == {
-            "batched_agrees",
-            "batched_shape",
-            "committed",
-            "diag_signs_named",
-            "diagonals_named",
-            "mismatch_named",
-            "placed",
-            "spec",
-            "xsources_len",
-            "zsignatures_named",
-        }, f"child did not print every case, got {sorted(got)}:\n{stdout[-2000:]}"
-        assert float(got["placed"]) == pytest.approx(4.738728797964961e-02, rel=1e-9)
+        got = run_sharded_child("apply_h_vec")
+        assert got["placed"] == pytest.approx(4.738728797964961e-02, rel=1e-9)
         # Replicated, not partitioned -- a partitioned vec hits `get_diagonal`'s vmap.
         assert got["spec"] == "P(None,)", f"expected a replicated result, got {got['spec']}"
         # Exactly 0.0: the two arms must agree bit-for-bit, not merely to a tolerance.
-        assert float(got["committed"]) == 0.0, "a device-committed vec disagreed with a host vec"
+        assert got["committed_diff"] == 0.0, "a device-committed vec disagreed with a host vec"
         for name in ("zsignatures", "diagonals", "diag_signs"):
-            assert got[f"{name}_named"] == "True", f"{name}= did not name the required length"
-        # The length check reads shape[-1]: the kernel broadcasts over a leading batch axis of any
-        # size, and reading shape[0] rejected a valid (2, 24) vec as "vec length 2".
-        assert got["batched_shape"] == "2x24", f"batched vec reshaped: {got['batched_shape']}"
-        assert float(got["batched_agrees"]) == 0.0, (
-            "a batched row disagreed with the unbatched call"
-        )
-        # The check must read `states`, not `vec`: reading `vec`'s length let a divisible vec with an
+            message = got["raised"][name]
+            assert message is not None and str(got["size"]) in message, (
+                f"{name}= did not name the required length: {message!r}"
+            )
+        # The check must read `states`, not `vec`: reading `vec` let a divisible vec with an
         # indivisible states through to the raw jax error this replaces.
-        assert got["mismatch_named"] == "True", "a vec/states length mismatch was not named"
+        mismatch = got["raised"]["mismatch"]
+        assert mismatch is not None and mismatch.startswith("apply_h:"), mismatch
+        # The length check reads shape[-1]: reading shape[0] rejected a valid (2, 24) vec.
+        assert got["batched_shape"] == [2, 24], got["batched_shape"]
+        assert got["batched_diff"] == 0.0, "a batched row disagreed with the unbatched call"
         # `xsources=` does no search, so no reshard and no divisibility requirement.
-        assert int(got["xsources_len"]) == 23, f"xsources length was changed: {got['xsources_len']}"
+        assert got["xsources_len"] == 23, f"xsources length was changed: {got['xsources_len']}"
 
 
 class TestShardedHproj:
@@ -2817,33 +2698,19 @@ class TestShardedHproj:
     It returns a host scipy matrix, so a mesh buys it nothing -- and every mesh-enabled call failed
     anyway, at any subspace size: ``columns[valid]`` is a boolean-mask gather on the partitioned array
     ``get_xsource`` returns, which raises ``ShardingTypeError``. Rejected explicitly rather than
-    half-supported. ``poc/sharding.py`` is the pattern that must keep working: it
-    builds its dense reference with ``hproj`` *outside* its ``with jax.set_mesh(...)`` block.
+    half-supported. ``poc/sharding.py`` is the pattern that must keep working: it builds its dense
+    reference with ``hproj`` *outside* its ``with jax.set_mesh(...)`` block.
     """
 
     def test_hproj_rejects_a_mesh_and_works_outside_one(self):
-        stdout = run_sharded_child("_sharded_hproj.py", "hproj")
-
-        got = dict(line.split(maxsplit=1) for line in stdout.strip().splitlines() if " " in line)
-        assert set(got) == {
-            "after_scope_agrees",
-            "global_raised_23",
-            "global_raised_24",
-            "no_mesh_shapes",
-            "scoped_raised",
-        }, f"child did not print every case, got {sorted(got)}:\n{stdout[-2000:]}"
+        got = run_sharded_child("hproj")
         # Without a mesh both sizes work: hproj never cared about mesh divisibility.
-        assert got["no_mesh_shapes"] == "[23, 24]", (
-            f"unsharded hproj broke: {got['no_mesh_shapes']}"
-        )
-        assert got["scoped_raised"] == "True", "hproj did not reject a scoped mesh"
+        assert got["no_mesh_shapes"] == [23, 24], got["no_mesh_shapes"]
+        assert got["scoped_rejects"], "hproj did not reject a scoped mesh"
         # A divisible count is not a loophole -- rejection is unconditional.
-        for n in (23, 24):
-            assert got[f"global_raised_{n}"] == "True", f"hproj accepted a mesh at {n} states"
+        assert got["global_rejects"] == [True, True], got["global_rejects"]
         # Exactly 0.0: leaving the mesh context must restore the single-device result bit-for-bit.
-        assert float(got["after_scope_agrees"]) == 0.0, (
-            "hproj differed after the mesh context exited"
-        )
+        assert got["after_scope_diff"] == 0.0, "hproj differed after the mesh context exited"
 
 
 class TestHostScalar:
@@ -2968,34 +2835,24 @@ class TestHostScalar:
 class TestShardedEigvecRoundtrip:
     """``return_eigvec=True`` on a mesh must return a genuine eigenvector of its own basis.
 
-    Runs as a subprocess for the same reason as ``TestShardedCacheLevels``: the virtual device count
-    has to be set before jax initializes.
+    The only sharded arm through the branch that reshards ``eigvec`` and ``states_u`` back to
+    ``P(None)`` before returning; ``poc/sharding.py``'s POC 7c covers it too but costs 59.7 s.
 
-    **The gap this closes.** Every other ``test/_sharded_*.py`` calls ``sqd`` with
-    ``return_eigvec=False``, so the branch that reshards ``eigvec`` and ``states_u`` back to
-    ``PartitionSpec(None)`` had no coverage at all -- only
-    ``poc/sharding.py``'s POC 7c, which is measured at 59.7 s subprocessed against
-    ~1 s here. The POC stays the thorough arm; this is the distilled one.
-
-    **It asserts the eigenvector equation, not shapes.** A reshard that dropped or reordered rows
-    still returns an array of the right shape and dtype, and the eigenvalue is computed separately --
-    so ``‖H v - E v‖ / ‖v‖`` against a dense projection *of the returned basis* is what couples the
-    two arrays, which are resharded independently and would otherwise each look plausible alone. The
-    eigenvalue is checked against the dense minimum as well, since a residual test alone is satisfied
-    by any eigenpair, including an excited one.
+    **It asserts the eigenvector equation, not shapes.** A reshard that dropped or reordered rows keeps
+    the shape and dtype, and the two arrays are resharded independently, so ``‖H v - E v‖ / ‖v‖``
+    against a dense projection *of the returned basis* is what couples them. The eigenvalue is checked
+    against the dense minimum too, since any eigenpair satisfies the residual test.
     """
 
     def test_returned_eigenvector_satisfies_its_own_projection(self):
-        stdout = run_sharded_child("_sharded_eigvec_roundtrip.py", "sqd")
-        assert "OK" in stdout, stdout
-        assert "FAIL" not in stdout, stdout
+        got = run_sharded_child("eigvec_roundtrip")
+        assert got["eigvec_len"] == got["basis_rows"] <= 30, got
+        assert got["relative_residual"] < 1e-10, got
+        assert got["eigval"] == pytest.approx(got["reference"], abs=1e-9), got
 
 
 class TestShardedPartialXCache:
     """A partial source-index cache must agree with single-device on a 4-device mesh.
-
-    Runs as a subprocess for the same reason as ``TestShardedCacheLevels``: the virtual device count
-    has to be set before jax initializes.
 
     **This is the only test that can see the guard it exists for.** ``run_sqd`` reshards ``states_u``
     after the precompute because no further searches happen -- true for a full cache, false for a
@@ -3006,30 +2863,14 @@ class TestShardedPartialXCache:
     """
 
     def test_partial_cache_agrees_with_single_device_on_a_mesh(self):
-        stdout = run_sharded_child("_sharded_partial_xcache.py", "sqd")
-
-        single = None
-        seen = {}
-        for line in stdout.strip().splitlines():
-            parts = line.split()
-            if parts[:1] == ["single"] and len(parts) == 2:
-                single = float(parts[1])
-            elif parts[:1] == ["mesh"] and len(parts) == 5:
-                seen[(int(parts[1]), int(parts[2]), int(parts[3]))] = float(parts[4])
-
-        assert single is not None, f"child printed no single-device baseline:\n{stdout[-2000:]}"
-        # Assert the grid is complete before checking values, so a child that died partway through
-        # cannot pass on the cells it managed to print.
-        expected = {(1, j, n) for j in (0, 1, 2) for n in range(7)}
-        assert set(seen) == expected, (
-            f"expected {len(expected)} (cache_level, xcache_groups) cells, got {len(seen)} -- the "
-            f"child did not run the full sweep:\n{stdout[-2000:]}"
-        )
-        for key, value in sorted(seen.items()):
-            assert value == pytest.approx(single, abs=1e-12), (
-                f"cache_level=({key[0]}, {key[1]}), xcache_groups={key[2]}: sharded {value} "
-                f"disagrees with single-device {single}"
-            )
+        got = run_sharded_child("partial_xcache")
+        for j in (0, 1, 2):
+            for ncached in range(7):
+                value = got["sharded"][f"(1, {j}) {ncached}"]
+                assert value == pytest.approx(got["single"], abs=1e-12), (
+                    f"cache_level=(1, {j}), xcache_groups={ncached}: sharded {value} disagrees "
+                    f"with single-device {got['single']}"
+                )
 
 
 class TestSqdPrefilter:
@@ -3365,36 +3206,17 @@ class TestShardedDiagonals:
     the easy half of the rule that only elementwise ops and reductions survive a partitioned axis,
     unlike ``uniquify_states``' ``cumsum``, which reduces *along* the sharded axis and cannot.
 
-    Carried as the last unverified mechanism of the distributed-``states`` design and measured rather
-    than assumed, because "should be free" is exactly the claim this repo requires evidence for. The
-    child asserts the **spec and the values together**: a replicated run agrees to exactly 0.0, so a
-    silently unsharded builder is invisible to value comparison, and a spec check alone would not
-    catch a wrong sign.
+    The child checks the **spec and the values together**: a replicated run agrees to exactly 0.0, so
+    a silently unsharded builder is invisible to value comparison, and a spec check alone would not
+    catch a wrong sign. Both coefficient dtypes, since an odd-Y string makes ``.c`` complex.
     """
 
     def test_diagonal_builders_shard_and_agree_with_single_device(self):
-        pytest.importorskip("qiskit")
-        stdout = run_sharded_child("_sharded_diagonals.py", "diagonal builders")
-
-        seen = {}
-        for line in stdout.strip().splitlines():
-            parts = line.split()
-            if len(parts) == 5:
-                seen[(parts[0], int(parts[1]))] = (int(parts[2]), int(parts[3]), int(parts[4]))
-
-        # Assert the grid is complete before checking it, so a child that died partway through
-        # cannot pass on the cells it managed to print.
-        expected = {(dtype, n) for dtype in ("real", "complex") for n in (2, 4)}
-        assert set(seen) == expected, f"child printed {sorted(seen)}:\n{stdout[-2000:]}"
-
-        for (dtype, num_devices), (groups, bad_spec, bad_value) in sorted(seen.items()):
-            assert groups > 1, (
-                f"{dtype}/{num_devices}: only {groups} X groups, fixture is degenerate"
-            )
-            assert bad_spec == 0, (
-                f"{dtype}/{num_devices}: {bad_spec} outputs lost their 'x' spec -- the builder ran "
-                "correctly but unsharded, which value comparison alone cannot see"
-            )
-            assert bad_value == 0, (
-                f"{dtype}/{num_devices}: {bad_value} outputs differ from single-device"
-            )
+        got = run_sharded_child("diagonals")
+        for dtype in ("real", "complex"):
+            for num_devices in (2, 4):
+                groups, bad_spec, bad_value = got[f"{dtype} {num_devices}"]
+                case = f"{dtype}/{num_devices}"
+                assert groups > 1, f"{case}: only {groups} X groups, fixture is degenerate"
+                assert bad_spec == 0, f"{case}: {bad_spec} outputs lost their 'x' spec"
+                assert bad_value == 0, f"{case}: {bad_value} outputs differ from single-device"

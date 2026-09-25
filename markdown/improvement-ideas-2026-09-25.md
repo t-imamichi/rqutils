@@ -12,7 +12,7 @@ working set is already the minimum for a 3-dim Rayleigh--Ritz basis.
 
 The 2026-09-16 section proposed that `body()`'s seven single-scalar all-reduces were isolated norms
 hidden from XLA's combiner by `jnp.linalg.norm`'s boundary. Measured on a 4-device CPU mesh
-(`test/_sharded_allreduce_count.py`):
+(`test/sharded/allreduce_count.py`):
 
 - **Baseline: 13 all-reduces per iteration**, arities `[1×7, 2×3, 3×2, 5]` -- the doc's figure reproduces.
 - **All 13 lie on a single dependency chain; zero independent pairs.** The combiner had already merged

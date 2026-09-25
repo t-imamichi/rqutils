@@ -1102,34 +1102,19 @@ class TestChebyshevPrefilter:
         deliberately absent: explicit sharding rejects ``dim % mesh.size != 0`` at ``device_put``, so
         they are unreachable here (they are ``sqd``'s concern, where ``uniquify_states`` pads).
         """
-        stdout = run_sharded_child("_sharded_prefilter.py", "ground_locg prefilter")
-        rows = {}
-        reference = None
-        for line in stdout.splitlines():
-            parts = line.split()
-            if parts[0] == "reference":
-                reference = float(parts[1])
-                continue
-            rows[parts[0]] = (float(parts[1]), int(parts[2]), parts[3], parts[4])
-        # Assert the case set is complete before checking values: a child that died partway would
-        # otherwise pass on whatever it managed to print.
-        assert reference is not None
-        expected = {
-            f"{n}:{spec}:{kind}"
-            for n in (1, 2, 4)
-            for spec in ("part", "repl")
-            for kind in ("plain", "prefiltered")
-        }
-        assert set(rows) == expected, (
-            f"incomplete child output: {sorted(set(expected) - set(rows))}"
-        )
-        for label, (energy, iters, converged, spec) in rows.items():
-            assert converged == "True", f"{label} did not converge on the mesh"
-            assert abs(energy - reference) < 1e-10, f"{label} gave {energy}, expected {reference}"
-            want = "P(None,)" if ":repl:" in label else "P('x',)"
-            assert spec == want, f"{label} sharding changed: {spec} (wanted {want})"
+        got = run_sharded_child("locg_prefilter")
+        rows, reference = got["rows"], got["reference"]
         for n in (1, 2, 4):
             for spec in ("part", "repl"):
+                for kind in ("plain", "prefiltered"):
+                    label = f"{n}:{spec}:{kind}"
+                    energy, _, converged, out_spec = rows[label]
+                    assert converged, f"{label} did not converge on the mesh"
+                    assert abs(energy - reference) < 1e-10, (
+                        f"{label} gave {energy}, not {reference}"
+                    )
+                    want = "P(None,)" if spec == "repl" else "P('x',)"
+                    assert out_spec == want, f"{label} sharding changed: {out_spec} (wanted {want})"
                 plain = rows[f"{n}:{spec}:plain"][1]
                 filtered = rows[f"{n}:{spec}:prefiltered"][1]
                 assert filtered < plain, (
@@ -1148,12 +1133,9 @@ class TestAllReduceCount:
     """
 
     def test_body_has_twelve_allreduces(self):
-        stdout = run_sharded_child("_sharded_allreduce_count.py", "ground_locg all-reduce count")
-        rows = dict(line.split()[1:] for line in stdout.splitlines() if line.startswith("arities"))
-        assert set(rows) == {"0", "1"}, stdout
-        for batch, arities in rows.items():
-            arities = arities.split(",")
-            assert len(arities) == 12, f"batch_matvec={batch}: {len(arities)} all-reduces {arities}"
+        got = run_sharded_child("allreduce_count")
+        for batch in ("False", "True"):
+            assert len(got[batch]) == 12, f"batch_matvec={batch}: {len(got[batch])} {got[batch]}"
 
 
 class TestBatchedMatvec:

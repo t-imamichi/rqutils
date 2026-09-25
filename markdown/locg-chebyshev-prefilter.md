@@ -35,7 +35,7 @@
 
 **Status.** **Implemented** on branch `locg-chebyshev` as `ground_locg(prefilter=(degree, cycles))`,
 default `None`. 12 tests in `test/test_ground_locg.py::TestChebyshevPrefilter` plus
-`test/_sharded_prefilter.py`; suite 549 → 560. In-tree measurement reproduces the prototype: 18/18
+`test/sharded/locg_prefilter.py`; suite 549 → 560. In-tree measurement reproduces the prototype: 18/18
 configurations faster, median **1.36×**, range 1.11–3.07×, no regressions — at `(16, 4)`, which the
 `(degree, cycles)` sweep in §3.1 has since superseded: **use `(32, 2)`**, measured 1.88× median over 27
 configurations at fewer matvecs. Sharding verified on a
@@ -45,7 +45,7 @@ Sharding coverage is 1/2/4 devices x partitioned/replicated (12 cases), assertin
 Ragged mesh splits are **not** swept because they are unreachable: explicit sharding rejects
 `dim % mesh.size != 0` at `device_put`, before `ground_locg` runs. That is `sqd`'s concern, where
 `uniquify_states` pads to a power of two — **now covered** by
-`test/_sharded_sqd_prefilter.py` / `test_sqd.py::TestShardedSqdPrefilter` (2026-08-28): the padded
+`test/sharded/sqd_grid.py` / `test_sqd.py::TestShardedSqd` (2026-08-28): the padded
 subspace and `apply_h`'s gather-heavy matvec on a mesh, swept over 1/2/4 devices x all six
 `cache_level`s, asserting the prefilter's output *spec* as well as the energy.
 

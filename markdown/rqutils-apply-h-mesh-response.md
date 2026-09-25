@@ -29,13 +29,13 @@ jax.typeof(_).sharding                       # NamedSharding(AbstractMesh(()), P
 
 An `isinstance` guard passes that straight through to the identical error. I shipped the `isinstance`
 form first and mutation-testing killed it, so the test suite now pins the committed-array arm
-(`test/_sharded_apply_h_vec.py`, `committed` arm, asserted to agree with the host arm at exactly 0.0).
+(`test/sharded/apply_h_vec.py`, `committed` arm, asserted to agree with the host arm at exactly 0.0).
 
 Nine lines, one call site in the public wrapper. `run_sqd`/`ground_locg` call the private
 `_apply_h_kernel` directly and never reach it, which is correct — they build their vector on-device via
 `_spread_seed`. `apply_h` used *as* `ground_locg`'s `matvec` callable traces inside the solver's jit,
 where `jax.sharding.get_mesh()` raises outright, so the placement is skipped under tracing. That last
-point cost a red test before it was handled; `test/_sharded_sqd_prefilter.py` is the arm that caught it.
+point cost a red test before it was handled; `test/sharded/sqd_grid.py` is the arm that caught it.
 
 ## 2. Why ask (2) is declined
 

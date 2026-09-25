@@ -84,10 +84,10 @@ failing when the class path is wrong, so a mis-copied class name looks like a pa
 
 ### The prefilter's only `sqd`-specific sharding case: padded subspace meets partitioned vector
 
-2026-08-28. `test/_sharded_prefilter.py` covers the prefilter on a mesh, but only through
+2026-08-28. `test/sharded/locg_prefilter.py` covers the prefilter on a mesh, but only through
 `ground_locg` with a dense `einsum` matvec on an unpadded power-of-two vector —
 `markdown/locg-chebyshev-prefilter.md` said so and deferred the rest to `sqd`. That deferral is now closed
-by `test/_sharded_sqd_prefilter.py`.
+by `test/sharded/sqd_grid.py`.
 
 What is only reachable through `sqd`: a **padded** subspace whose filler slots are masked to zero,
 partitioned across a mesh, driven through `apply_h`'s gather-heavy irregular kernel rather than a dense
@@ -368,7 +368,7 @@ virtual devices are meaningless (they share one CPU) — correctness only.
 
 ### Why `svsim`'s sharding coverage was added last, and what it found
 
-`test_svsim.py::TestShardedOutput` (subprocessing `test/_sharded_svsim.py`) was checked because the
+`test_svsim.py::TestShardedOutput` (subprocessing `test/sharded/svsim.py`) was checked because the
 same axis in `sqd` hid three defects. `svsim` had none: it takes `out_sharding` as an explicit
 parameter and threads it through every array-creating op, rather than resharding conditionally partway
 through as `run_sqd` does.
@@ -421,7 +421,7 @@ for it (`ShardingTypeError`). Pre-existing — confirmed against `1a339e8^`.
 It was fixed first (host transfer before masking, plus a divisibility check), then the fix was
 **withdrawn** for an explicit `ValueError`: `hproj` returns a host scipy matrix, `spinchain` never calls
 it, and every in-tree caller — `poc/sharding.py` (7a, 7c), `poc/davidson_xxz`, `poc/prefilter_cycles_e2e`,
-`test/_sharded_eigvec_roundtrip.py` — already calls it *outside* its `with jax.set_mesh(...)` block as
+`test/sharded/eigvec_roundtrip.py` — already calls it *outside* its `with jax.set_mesh(...)` block as
 the unsharded oracle. **Rejecting removed 17 lines and two bug classes**, one of them a limitation only
 documentable, never testable: the host transfer is single-process by construction, and virtual devices are
 one process.
@@ -430,10 +430,10 @@ The check precedes the `np.unique`/`_is_lex_sorted` pass, for the same reason `_
 `get_abstract_mesh().empty` is O(1), so a doomed call should not pay the O(N) sort. 0.57 ms to reject 4096
 states.
 
-### Why `test/_sharded_*.py` are files rather than inline strings
+### Why `test/sharded/*.py` are files rather than inline strings
 
-The leading underscore keeps them uncollected; `test_sqd.py::TestShardedCacheLevels` subprocesses
-`_sharded_cache_levels.py` under `XLA_FLAGS=--xla_force_host_platform_device_count=4`, because the
+Not named `test_*`, so pytest does not collect them; `test_sqd.py::TestShardedSqd` subprocesses
+`test/sharded/sqd_grid.py` under `XLA_FLAGS=--xla_force_host_platform_device_count=4`, because the
 virtual device count must be set before jax initializes and `conftest.py` has already imported it by
 collection time. They live in files so ruff and ty check them — as a `textwrap.dedent` blob an
 `ImportError` would surface as a nonzero exit, indistinguishable from the sharding regression the test
@@ -2188,7 +2188,7 @@ contract — `vec` must be promotable to the coefficient dtype — and `PauliSum
 whenever any Pauli string has an odd Y count. Worth knowing, unrelated to this work, and *not* fixed
 here.
 
-**Pinned by `test/_sharded_diagonals.py` and mutation-verified.** Dropping the single
+**Pinned by `test/sharded/diagonals.py` and mutation-verified.** Dropping the single
 `out_sharding=jax.typeof(states).sharding` on `get_diag_signs`' `init` accumulator makes the whole
 builder run **correctly but unsharded**: `bad_value = 0` — every value still bit-identical — while
 `bad_spec` goes to 42/44. **A value-only test passes that mutant silently**, which is the concrete
@@ -2828,7 +2828,7 @@ a different axis.
 pointless and unshardable. `jnp.sum` is already tree-reduced — relative error ~1.5e-16, flat in N, against
 10–25× worse for naive sequential — and a blocked Kahan `compute_sas` leaves the residual floor
 **bit-identical** (7.8019e-15 at dim=256, 1.9374e-06 at dim=1024) with identical per-seed iteration counts.
-It also *fails* `test/_sharded_prefilter.py`: compensation needs sequential accumulation over blocks, so
+It also *fails* `test/sharded/locg_prefilter.py`: compensation needs sequential accumulation over blocks, so
 it reshapes a partitioned axis and `lax.scan` raises `0th dimension of all xs should be replicated. Got
 P('x',)`. **Any compensated reduction here is incompatible with the sharded path**, independent of whether
 it helped. θ's error only rivals `‖r‖` at the floor anyway (4.4e-16 against 1.6e-15), and above it
@@ -3401,7 +3401,7 @@ measured non-result.
 
 ### `body()`'s all-reduces are one chain; 13 -> 12 is the floor (2026-09-25)
 
-`test/_sharded_allreduce_count.py`, 4 virtual CPU devices. The loop body compiled to 13 all-reduces
+`test/sharded/allreduce_count.py`, 4 virtual CPU devices. The loop body compiled to 13 all-reduces
 (arities `[1x7, 2x3, 3x2, 5]`), and a reachability walk over the HLO found **every pair dependent** --
 the combiner had already merged all independent reductions, so the "seven isolated norms" of
 `markdown/sqd-locg-improvement-ideas.md` were sequential links, not missed merges. Inlining

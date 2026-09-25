@@ -477,20 +477,10 @@ class TestShardedOutput:
     )
 
     def test_sharding_does_not_change_the_state_vector(self):
-        stdout = run_sharded_child("_sharded_svsim.py", "svsim")
-
-        seen = {}
-        for line in stdout.strip().splitlines():
-            parts = line.split(maxsplit=2)
-            if len(parts) != 3:
-                continue
-            seen[parts[0]] = (float(parts[1]), parts[2])
-
-        # Completeness before values: a child dying after two cases would otherwise pass on those two.
-        assert set(seen) == self.EXPECTED_CASES, (
-            f"expected {sorted(self.EXPECTED_CASES)}, got {sorted(seen)} -- the child did not run "
-            f"every case:\n{stdout[-2000:]}"
-        )
+        seen = run_sharded_child("svsim")
+        # Not a completeness guard (the child emits only after every case), but a renamed case would
+        # otherwise escape the spec loop below.
+        assert set(seen) == self.EXPECTED_CASES, sorted(seen)
         for label, (diff, spec) in sorted(seen.items()):
             assert diff == pytest.approx(0.0, abs=1e-13), (
                 f"{label}: sharded state vector differs from single-device by {diff}"

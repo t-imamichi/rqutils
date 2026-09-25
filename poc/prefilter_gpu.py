@@ -27,7 +27,7 @@ loosens by ~9 orders and the counts are meaningless).
 ``fmt_ratio``, which refuses to call a difference inside the measured spread a win. A result under the
 noise floor is the honest answer, not a failure of the script.
 
-**Claim 3: it stays sharding-transparent on real devices.** ``test/_sharded_prefilter.py`` verifies
+**Claim 3: it stays sharding-transparent on real devices.** ``test/sharded/locg_prefilter.py`` verifies
 the output *spec* is preserved across 1/2/4 virtual devices and both partitioned and replicated
 inputs, but virtual devices share one physical backend -- per ``CLAUDE.md``, timings under them are
 meaningless and only correctness transfers. This script asserts the spec on real devices and reports

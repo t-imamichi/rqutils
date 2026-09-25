@@ -124,10 +124,12 @@ check` still applies, since codespell and rumdl read markdown. **Docstrings are 
 `test/conftest.py` enables `jax_enable_x64` before any `rqutils` import — every tolerance depends on it
 — and holds the shared reference helpers, each validated against qiskit before being trusted. It also
 configures caches taking the suite from ~53 s cold to ~12–20 s warm under `-n auto`. One `test/test_<module>.py`
-per module. `test/_sharded_*.py` are subprocessed under
+per module. `test/sharded/*.py` are subprocessed under
 `XLA_FLAGS=--xla_force_host_platform_device_count=4` (the device count must be set before jax
-initializes); the leading underscore keeps them uncollected. The scratchpad notebooks are in `tests/`,
-outside `testpaths`.
+initializes) by `conftest.run_sharded_child`; not named `test_*`, so pytest does not collect them. Each
+imports `common` first and prints one JSON object through `common.emit` after every case has run, so a
+child that dies partway fails rather than passing on a partial grid. The scratchpad notebooks are in
+`tests/`, outside `testpaths`.
 
 ### Writing tests
 
@@ -204,7 +206,7 @@ Five reasons a mutant survives that are *not* missing coverage:
 - **Assert the sharding *spec*, not just the values.** A replicated run agrees with single-device to
   exactly 0.0, so "correct but silently unsharded" is invisible to value comparison.
 - **A guard on a sharding decision may be invisible single-device.** If a change touches resharding, add
-  a `test/_sharded_*.py` case and mutation-test it *there*; `conftest.run_sharded_child` is the driver.
+  a `test/sharded/*.py` case and mutation-test it *there*; `conftest.run_sharded_child` is the driver.
 - **`poc/sharding.py` is the fuller harness.** Run it after any change to
   `ground_locg`'s reductions or helper signatures, not just after touching `sqd`.
 - **`svsim` requires `mesh.size` to divide `2^num_qubits`** — documented rather than fixed, since a state

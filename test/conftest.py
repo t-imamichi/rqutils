@@ -23,6 +23,7 @@ stream position depend on fixture ordering, which is invisible at the call site 
 Please keep new fixtures as plain functions taking ``rng``.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -259,35 +260,26 @@ def collapsing_states(num_draws, num_qubits, rng):
     return draws
 
 
-def run_sharded_child(script_name, subject, num_devices=4):
-    """Run a ``test/_sharded_*.py`` script under virtual devices and return its stdout.
+def run_sharded_child(name, num_devices=4):
+    """Run ``test/sharded/<name>.py`` under ``num_devices`` virtual devices and return its JSON result.
 
-    Multi-device coverage has to go through a subprocess: the virtual device count comes from
-    ``XLA_FLAGS=--xla_force_host_platform_device_count``, which XLA reads at backend initialization,
-    and this module has already imported jax by collection time. The child scripts live in files
-    rather than ``textwrap.dedent`` blobs so ruff and ty check them -- as a blob, an ``ImportError``
-    from a rename would surface as a nonzero exit, indistinguishable from the regression under test.
-
-    A plain function, not a ``@pytest.fixture``: the prohibition at the top of this module is about
-    RNG stream position depending on fixture ordering, and this draws no RNG in the parent (each
-    child seeds itself).
-
-    ``check=False`` is deliberate -- the caller-facing assertion here reports the child's stderr,
-    which is far more useful than ``CalledProcessError``'s bare exit code for a jax sharding raise.
+    A subprocess because XLA reads the virtual device count at backend initialization, and this module
+    has already imported jax by collection time (``test/sharded/common.py`` has the rest). A plain
+    function rather than a fixture: it draws no RNG in the parent, each child seeding itself.
 
     Args:
-        script_name: Basename of the script in this directory, e.g. ``"_sharded_svsim.py"``.
-        subject: Named in the failure message, e.g. ``"svsim"``.
+        name: Script basename without ``.py``, e.g. ``"svsim"``.
         num_devices: Virtual device count to request.
 
     Returns:
-        The child's stdout. Callers parse their own line protocol and **must** assert their case set
-        is complete before checking values, or a child that dies partway passes on what it printed.
+        The dict the child passed to ``common.emit``. The child prints it only after every case ran, so
+        one that dies partway fails here rather than passing on a partial result.
     """
     here = os.path.dirname(os.path.abspath(__file__))
-    script = os.path.join(here, script_name)
-    assert os.path.exists(script), f"missing sharding harness at {script}"
+    script = os.path.join(here, "sharded", f"{name}.py")
+    assert os.path.exists(script), f"missing sharded child at {script}"
     env = {**os.environ, "XLA_FLAGS": f"--xla_force_host_platform_device_count={num_devices}"}
+    # check=False: the child's stderr says far more about a jax sharding raise than an exit code.
     proc = subprocess.run(
         [sys.executable, script],
         capture_output=True,
@@ -296,8 +288,8 @@ def run_sharded_child(script_name, subject, num_devices=4):
         env=env,
         cwd=os.path.dirname(here),
     )
-    assert proc.returncode == 0, f"sharded {subject} raised:\n{proc.stderr[-3000:]}"
-    return proc.stdout
+    assert proc.returncode == 0, f"sharded child {name} raised:\n{proc.stderr[-3000:]}"
+    return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
 def assert_type_checks(probe_source, subject, rules=("invalid-argument-type",)):
