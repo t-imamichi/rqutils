@@ -3,8 +3,9 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 **This file holds only the rules.** Every measurement, post-mortem, rejected alternative and dated
-record lives in **`NOTES.md`**, or in the `poc/*.md` write-up a NOTES entry points to — read it before changing anything here that looks redundant or
-over-engineered, because most of it is load-bearing for a reason someone had to find the hard way.
+record lives in **`NOTES.md`**, or in the `poc/*.md` write-up a NOTES entry points to — read it before
+changing anything here that looks redundant or over-engineered, because most of it is load-bearing for a
+reason someone had to find the hard way.
 When a rule needs evidence, it points there rather than restating it.
 
 ## Environment
@@ -61,6 +62,14 @@ When a rule needs evidence, it points there rather than restating it.
 
 `docs/` holds only the published Sphinx source; working notes and request/response memos live in
 `markdown/`, and proof-of-concept scripts in `poc/`.
+
+**A POC's results go in a `poc/<name>.md` write-up beside its script, not in `NOTES.md`.** Follow
+`poc/sparse-pairs.md`: a provenance line (script, hardware, date), numbered sections by topic rather
+than by date, a "What it means" and an "Open" section, and a closing section on the script checked
+against its argparse. A superseded claim is stated once, in its final form, with what was retracted.
+Say so when no committed script reproduces a number. `NOTES.md` keeps the entry's `###` heading
+byte-identical — code, this file and `markdown/` cite headings as pointers — under a 1–4 line verdict
+ending in `` `poc/<name>.md` §N ``.
 
 **`examples/` and `tests/` (the scratchpad notebooks) are the original files from `main`; don't touch
 them unless asked.** New tests go in `test/`, new scripts in `poc/`.
@@ -526,7 +535,7 @@ Three failure modes that produce length without content:
 
 - **Editing by appending** — adding a paragraph instead of rewriting, leaving two explanations of one
   statement and often a now-false opening sentence.
-- **Restating `NOTES.md` or `markdown/`.** One statement plus a pointer, wherever a rule would appear twice.
+- **Restating `NOTES.md`, `markdown/` or a `poc/*.md` write-up.** One statement plus a pointer, wherever a rule would appear twice.
 - **A private helper re-explaining its caller.** The public docstring owns the contract; the helper states
   only what is non-obvious at its own site. Three docstrings for one 9-line function is the smell.
 
