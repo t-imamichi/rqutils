@@ -137,7 +137,7 @@ from _scaling_common import fmt_ratio, header, init_devices, make_1d_mesh, timei
 from qiskit.quantum_info import SparsePauliOp
 
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import _host_scalar, run_sqd, sqd
+from rqutils.sqd import _host_scalar, _pad_states, run_sqd, sqd
 
 CACHE_LEVEL = tuple(int(x) for x in options.cache_level.split(","))
 
@@ -250,10 +250,7 @@ def peak_temp_bytes(hamiltonian, states, mesh=None) -> int | None:
     states_size = 1 << max((states_p.shape[0] - 1).bit_length(), 1)
     if mesh is not None and (resid := states_size % mesh.size) != 0:
         states_size += mesh.size - resid
-    if (deficit := states_size - states_p.shape[0]) > 0:
-        states_p = np.append(
-            states_p, np.full((deficit, states_p.shape[1]), 255, dtype=np.uint8), axis=0
-        )
+    states_p = _pad_states(states_p, states_size)
     fn = jax.jit(lambda h, s: run_sqd(h, s, states_size, True, cache_level=CACHE_LEVEL))
     try:
         if mesh is None:
@@ -303,16 +300,12 @@ def solve(hamiltonian, states, mesh=None, retain=False):
     states_size = 1 << max((states_p.shape[0] - 1).bit_length(), 1)
     if mesh is not None and (resid := states_size % mesh.size) != 0:
         states_size += mesh.size - resid
-    if (deficit := states_size - states_p.shape[0]) > 0:
-        states_p = np.append(
-            states_p, np.full((deficit, states_p.shape[1]), 255, dtype=np.uint8), axis=0
-        )
+    states_p = _pad_states(states_p, states_size)
 
     def run():
-        # eigval, eigvec, basis, subspace_dim, converged -- every one a live jax.Array.
         out = run_sqd(hamiltonian, states_p, states_size, True, cache_level=CACHE_LEVEL)
-        assert bool(_host_scalar(out[-1])), "run_sqd did not converge"
-        return float(_host_scalar(out[0])), out[1], out[2]
+        assert bool(_host_scalar(out.converged)), "run_sqd did not converge"
+        return float(_host_scalar(out.eigval)), out.eigvec, out.states
 
     if mesh is None:
         return run()

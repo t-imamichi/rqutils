@@ -55,8 +55,7 @@ def prefilter_specs(strings, coeffs, states):
     """
     hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs))
     states_p = PauliSumXZ.pack_states(states)
-    padding = np.full((STATES_SIZE - len(states_p), states_p.shape[1]), 255, dtype=np.uint8)
-    states_p = np.append(states_p, padding, axis=0)
+    states_p = sqd_module._pad_states(states_p, STATES_SIZE)
     specs = {}
     for num_devices in MESH_SIZES:
         specs[num_devices] = {}

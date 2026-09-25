@@ -35,6 +35,7 @@ import scipy.sparse.linalg as sla
 from rqutils.ground_locg import ground_locg
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import (
+    _pad_states,
     _spread_seed,
     apply_h,
     get_diagonal,
@@ -155,8 +156,7 @@ def build_round(strings, coeffs, states):
     hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs))
     states_p = PauliSumXZ.pack_states(states)
     size = 1 << int(np.ceil(np.log2(states_p.shape[0])))
-    padding = np.full((size - len(states_p), states_p.shape[1]), 255, dtype=np.uint8)
-    packed = uniquify_states(np.append(states_p, padding, axis=0), size)
+    packed = uniquify_states(_pad_states(states_p, size), size)
     arrays = hamiltonian.arrays
     xsources = jax.numpy.stack([get_xsource(x, packed) for x in arrays.x])
     diagonals = jax.numpy.stack(

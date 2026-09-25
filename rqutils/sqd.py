@@ -202,7 +202,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from numbers import Number
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, overload
 
 import jax
 import jax.core
@@ -909,14 +909,7 @@ def sqd(
     # what states_size exists to prevent (measured 0.44 s per call versus 0.064 s once the shape
     # repeats). uniquify_states already pins every array it derives, so this was the one shape that
     # still leaked the input length through.
-    #
-    # 255 is the correct filler, and for the same reason uniquify_states uses it: an all-ones row
-    # sorts to the end of the lexsort, and its high bit in byte 0 is what _is_filler tests. A genuine
-    # state can never collide with it, because PauliSumXZ.pack_states' pad bit forces byte 0 < 128.
-    if (deficit := states_size - states_p.shape[0]) > 0:
-        states_p = np.append(
-            states_p, np.full((deficit, states_p.shape[1]), 255, dtype=np.uint8), axis=0
-        )
+    states_p = _pad_states(states_p, states_size)
 
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
@@ -934,7 +927,7 @@ def sqd(
         check_residual=True,
     )
     LOG.info("Found ground eigenpair in %f seconds.", time.time() - start)
-    eigval = float(_host_scalar(result[0]))
+    eigval = float(_host_scalar(result.eigval))
     # The convergence flag used to be discarded here, and a non-converged run still returns
     # `state.theta` -- a valid variational *upper bound*, so finite, real, and above the true minimum,
     # i.e. indistinguishable from a correct answer by inspection. markdown/locg.md records that this
@@ -943,7 +936,7 @@ def sqd(
     #
     # Raised here rather than in `run_sqd` because that function is @jax.jit-wrapped, so `converged`
     # is a traced boolean there and cannot be branched on at trace time.
-    if not bool(_host_scalar(result[-1])):
+    if not bool(_host_scalar(result.converged)):
         raise RuntimeError(
             f"LOBPCG did not converge in maxiter={maxiter} iterations (atol={atol!r}, "
             f"rtol={rtol!r}). The value it "
@@ -959,7 +952,7 @@ def sqd(
             "principle; `rtol` is a fraction of (||Hv|| + |E|) instead. A genuinely "
             "ill-conditioned subspace is the rarer cause."
         )
-    residual, ax_norm = (float(_host_scalar(v)) for v in result[-3:-1])
+    residual, ax_norm = (float(_host_scalar(v)) for v in (result.residual, result.ax_norm))
     eps = float(np.finfo(hamiltonian.c.dtype).eps)
     bound = max(atol, (4.0 * eps if rtol is None else rtol) * (ax_norm + abs(eigval)))
     threshold = _RESIDUAL_SLACK * max(bound, _residual_floor_of(hamiltonian))
@@ -973,7 +966,7 @@ def sqd(
             "cannot fix; please report it with the Hamiltonian and states."
         )
     if return_eigvec:
-        eigvec, states_u, subspace_dim = result[1:-3]
+        eigvec, states_u, subspace_dim = result.eigvec, result.states, result.subspace_dim
         # `packed` now governs BOTH directions: a caller who hands over packed states gets packed
         # states back, so a round trip through `sqd` needs no re-pack. The returned rows are the same
         # array `run_sqd` searched, sliced to the genuine uniques.
@@ -1177,6 +1170,31 @@ def _spread_seed(
     return jnp.where(filler, jnp.zeros_like(vec), vec)
 
 
+def _pad_states(states_p: StateList, states_size: int) -> StateList:
+    """``states_p`` padded to ``states_size`` rows with the ``255`` filler :func:`run_sqd` expects.
+
+    An all-ones row sorts last and sets byte 0's high bit, which ``_is_filler`` tests; a genuine
+    state never collides, since the pad bit keeps its byte 0 below 128.
+    """
+    deficit = states_size - states_p.shape[0]
+    if deficit < 0:
+        raise ValueError(f"{states_p.shape[0]} states exceed states_size={states_size}")
+    filler = np.full((deficit, states_p.shape[1]), 255, dtype=np.uint8)
+    return np.append(states_p, filler, axis=0)
+
+
+class SqdResult(NamedTuple):
+    """What :func:`run_sqd` returns; the optional fields are ``None`` unless requested."""
+
+    eigval: jax.Array
+    converged: jax.Array
+    eigvec: jax.Array | None = None
+    states: jax.Array | None = None
+    subspace_dim: jax.Array | None = None
+    residual: jax.Array | None = None
+    ax_norm: jax.Array | None = None
+
+
 @jax.jit(
     static_argnames=[
         "states_size",
@@ -1204,15 +1222,12 @@ def run_sqd(
     log_level: int = logging.INFO,
     batch_matvec: bool = True,
     check_residual: bool = False,
-) -> tuple:
-    """JIT-compiled part of the SQD function.
+) -> SqdResult:
+    """JIT-compiled part of the SQD function; returns a :class:`SqdResult`.
 
-    Returns the eigenvalue, optionally the eigenvector/basis/dimension, and **the convergence flag as
-    the last element**. The flag used to be discarded here, which is what let a non-converged
-    ``theta`` -- a valid variational upper bound, so finite and plausible -- reach the caller as the
-    answer. It is returned rather than checked because this function is ``@jax.jit``-wrapped, so
-    ``converged`` is a traced boolean and cannot be branched on at trace time; :func:`sqd` raises on
-    it once the value is concrete.
+    ``converged`` is returned rather than checked because this function is ``@jax.jit``-wrapped, so it
+    is a traced boolean here; :func:`sqd` raises on it once concrete. It used to be discarded, which
+    let a non-converged ``theta`` -- a valid variational upper bound, so plausible -- pass as the answer.
 
     Args:
         maxiter: Maximum LOBPCG iterations, forwarded to :func:`rqutils.ground_locg.ground_locg`.
@@ -1232,8 +1247,7 @@ def run_sqd(
             :func:`rqutils.ground_locg.ground_locg`'s ``False``, which cannot assume an arbitrary
             callable accepts a batch. Static, being forwarded by keyword.
         check_residual: Recompute ``||Hv - Ev||`` and ``||Hv||`` at ``cache_level=(0, 0)`` after the
-            solve and insert both just before the convergence flag. Off by default so direct callers'
-            positional unpackings keep their meaning; :func:`sqd` turns it on and raises on the result.
+            solve, into ``residual`` and ``ax_norm``. :func:`sqd` turns it on and raises on the result.
     """
     # `cache_level` is static, so this is a concrete tuple at trace time and the check runs once per
     # trace rather than once per call. `sqd` validates too; this covers the direct callers, which are
@@ -1458,20 +1472,20 @@ def run_sqd(
     # (0, 0) reads signatures directly, which needs `states_u` replicated, as does the return.
     if sharding and (return_eigvec or check_residual):
         states_u = jax.reshard(states_u, PartitionSpec(None))
-    checks = ()
+    result = SqdResult(eigval, converged)
     if check_residual:
         # (0, 0) whatever level solved, so a defect in one cache level cannot vouch for itself.
         scanned_ref = _pack_scanned((0, 0), hamiltonian.x, hamiltonian.z, hamiltonian.c)
         ax = _apply_h_kernel(eigvec, scanned_ref, states_u, cache_level=(0, 0))
-        checks = (jnp.linalg.norm(ax - eigval * eigvec), jnp.linalg.norm(ax))
-    result = (eigval,)
+        result = result._replace(
+            residual=jnp.linalg.norm(ax - eigval * eigvec), ax_norm=jnp.linalg.norm(ax)
+        )
     if return_eigvec:
         if sharding:
             eigvec = jax.reshard(eigvec, PartitionSpec(None))
         subspace_dim = jnp.searchsorted(_is_filler(states_u), 1)
-        result += (eigvec, states_u, subspace_dim)
-    # Convergence last, so the existing positional unpackings above keep their meaning.
-    return result + checks + (converged,)
+        result = result._replace(eigvec=eigvec, states=states_u, subspace_dim=subspace_dim)
+    return result
 
 
 @jax.jit(static_argnames=["states_size"])

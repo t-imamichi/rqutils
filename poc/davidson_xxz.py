@@ -21,7 +21,7 @@ import scipy.sparse.linalg as spla
 
 from rqutils.ground_locg import _chebyshev_prefilter, ground_locg
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import apply_h, get_diagonal, get_xsource, hproj, uniquify_states
+from rqutils.sqd import _pad_states, apply_h, get_diagonal, get_xsource, hproj, uniquify_states
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--num-qubits", type=int, default=20)
@@ -99,8 +99,7 @@ def build(nq, rungs, cap, delta, bx, seed):
     hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs))
     states_p = PauliSumXZ.pack_states(states)
     size = 1 << int(np.ceil(np.log2(states_p.shape[0])))
-    padding = np.full((size - len(states_p), states_p.shape[1]), 255, dtype=np.uint8)
-    packed = uniquify_states(np.append(states_p, padding, axis=0), size)
+    packed = uniquify_states(_pad_states(states_p, size), size)
     arrays = hamiltonian.arrays
     xsources = jax.numpy.stack([get_xsource(x, packed) for x in arrays.x])
     diagonals = jax.numpy.stack(

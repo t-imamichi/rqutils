@@ -2083,7 +2083,7 @@ class TestAtolAndRtol:
         hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_p = PauliSumXZ.pack_states(states)
         result = run_sqd(hamiltonian, states_p, states_p.shape[0], False, (1, 0), maxiter=1)
-        theta, converged = float(result[0]), bool(result[-1])
+        theta, converged = float(result.eigval), bool(result.converged)
         assert not converged
         assert np.isfinite(theta) and theta > reference, (theta, reference)
 
