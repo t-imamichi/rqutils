@@ -16,7 +16,8 @@ Arms (the identity-X group is always a plain ``d_0 * v``; every other arm scans 
 * ``seg``          -- C2 as one unchunked ``segment_sum``;
 * ``...+RCM``      -- states relabelled by reverse Cuthill--McKee first.
 
-Subcommands (fixture: spinchain's open-XXZ ``xxz`` with Hamming-shell subspaces, ``poc/eigenpair_check_scale``):
+Subcommands (fixture: spinchain's open-XXZ ``xxz``, ``poc/eigenpair_check_scale``; ``--subspace`` picks
+Hamming shells or ``recovery``, grown by spinchain-style ranked H-expansion from a small shell core):
 
 * ``matvec``  -- ns/state of one ``(2, N)`` matvec per arm over sizes, each checked against ``(1,0)``;
 * ``solve``   -- whole ``ground_locg`` solves at one size, with XLA memory (inputs + temp);
@@ -61,6 +62,7 @@ from rqutils.sqd import (
     get_diagonal,
     get_xsource,
     run_sqd,
+    sqd,
     uniquify_states,
 )
 
@@ -260,9 +262,74 @@ def relabel(t, s, g, d, perm):
     return nt[order], ns[order], g[order], d[order]
 
 
-def spinchain_problem(n, pattern, delta, size):
-    ham = PauliSumXZ.from_paulisum(xxz(n, delta, *patterns(n)[pattern]))
-    return ham, hamming_shells(n, size, np.random.default_rng(0))
+def term_masks(op):
+    """``(x, z, coef)`` per Pauli term of a ``SparsePauliOp``, as ``uint64`` masks (qubit q = bit q).
+
+    ``coef`` folds in ``(-i)^{|x&z|}``, so ``<s^x|P|s> = coef * (-1)^{|z & (s^x)|}``.
+    """
+    w = np.uint64(1) << np.arange(op.num_qubits, dtype=np.uint64)
+    x = (op.paulis.x.astype(np.uint64) * w).sum(axis=1).astype(np.uint64)
+    z = (op.paulis.z.astype(np.uint64) * w).sum(axis=1).astype(np.uint64)
+    phase = (-1j) ** ((op.paulis.x & op.paulis.z).sum(axis=1) + op.paulis.phase)
+    return x, z, op.coeffs * phase
+
+
+def to_codes(states):
+    return (states.astype(np.uint64) << np.arange(states.shape[1], dtype=np.uint64)).sum(axis=1)
+
+
+def recovery_scores(masks, codes, v):
+    """``(c, |<c|H|v>|)`` for every ``c`` in H's one-hop reach of sorted ``codes`` and outside it."""
+    x, z, coef = masks
+    cand, amp = [], []
+    for xg in np.unique(x[x != 0]):
+        c = codes ^ xg
+        pos = np.searchsorted(codes, c).clip(max=len(codes) - 1)
+        out = codes[pos] != c
+        c, vs = c[out], v[out]
+        a = np.zeros(len(c), complex)
+        for zk, ck in zip(z[x == xg], coef[x == xg]):
+            a += (
+                ck * (1 - 2 * (np.bitwise_count(c & zk) & 1).astype(np.int8)) * vs
+            )  # uint8: 1-2 wraps
+        cand.append(c)
+        amp.append(a)
+    uniq, inv = np.unique(np.concatenate(cand), return_inverse=True)
+    score = np.zeros(len(uniq), complex)
+    np.add.at(score, inv, np.concatenate(amp))
+    return uniq, np.abs(score)
+
+
+def recovery_subspace(op, n, size, seed_size=1 << 12):
+    """``size`` states grown like spinchain's recovery: Hamming shells, then ranked H-expansion rounds.
+
+    Each round solves ``sqd`` on the current subspace and admits the top ``|<c|H|v>|`` of its one-hop
+    reach, doubling it (the last round fills to ``size``). No pruning: spinchain also drops rows the
+    eigenvector drives below ``weight_tol``, which would free budget for more of the same coupled rows.
+    """
+    ham = PauliSumXZ.from_paulisum(op)
+    masks = term_masks(op)
+    codes = np.sort(to_codes(hamming_shells(n, min(seed_size, size), np.random.default_rng(0))))
+    while len(codes) < size:
+        states = ((codes[:, None] >> np.arange(n, dtype=np.uint64)) & np.uint64(1)).astype(np.uint8)
+        _, vec, basis = sqd(ham, states, rtol=1e-8)
+        order = np.argsort(to_codes(np.asarray(basis)))
+        v = np.asarray(vec)[: len(codes)][order]
+        cand, score = recovery_scores(masks, codes, v)
+        take = min(len(codes), size - len(codes), len(cand))
+        assert take > 0, "the H-reach is exhausted before reaching size"
+        codes = np.sort(np.concatenate([codes, cand[np.argsort(-score, kind="stable")[:take]]]))
+    return ((codes[:, None] >> np.arange(n, dtype=np.uint64)) & np.uint64(1)).astype(np.uint8)
+
+
+def spinchain_problem(n, pattern, delta, size, subspace="shells"):
+    op = xxz(n, delta, *patterns(n)[pattern])
+    if subspace == "recovery":  # cached: growing to 2^21 solves sqd up to 2^20
+        path = f"/tmp/sparse_pairs_recovery_n{n}_{pattern}_d{delta}_{size}.npy"
+        if not os.path.exists(path):
+            np.save(path, recovery_subspace(op, n, size))
+        return PauliSumXZ.from_paulisum(op), np.load(path)
+    return PauliSumXZ.from_paulisum(op), hamming_shells(n, size, np.random.default_rng(0))
 
 
 def operators(ham, states, size, arms):
@@ -453,13 +520,15 @@ def cmd_matvec(args) -> None:
     if "(1,0)" not in arms:
         arms = ["(1,0)", *arms]
     print(
-        f"n={args.num_qubits} {args.pattern} delta={args.delta}, chunk {CHUNK}, "
+        f"n={args.num_qubits} {args.pattern} {args.subspace} delta={args.delta}, chunk {CHUNK}, "
         f"XLA_FLAGS={os.environ.get('XLA_FLAGS', 'default')}: ns/state, then operator B/slot"
     )
     print(f"{'size':>6} " + " ".join(f"{a:>10}" for a in arms))
     for log2 in args.log2_sizes:
         size = 1 << log2
-        ham, states = spinchain_problem(args.num_qubits, args.pattern, args.delta, size)
+        ham, states = spinchain_problem(
+            args.num_qubits, args.pattern, args.delta, size, args.subspace
+        )
         ops, info = operators(ham, states, size, arms)
         rng = np.random.default_rng(1)
         vec = jnp.asarray(rng.normal(size=(2, size)) * (1 + 0.5j)).at[:, len(states) :].set(0)
@@ -483,12 +552,12 @@ def cmd_matvec(args) -> None:
 def cmd_solve(args) -> None:
     arms = args.arms or ["(1,0)", "(1,2)", "P0", "P2", "C0i16", "C2R"]
     size = 1 << args.log2_size
-    ham, states = spinchain_problem(args.num_qubits, args.pattern, args.delta, size)
+    ham, states = spinchain_problem(args.num_qubits, args.pattern, args.delta, size, args.subspace)
     ops, info = operators(ham, states, size, set(arms) | {"(1,0)"})
     vinit = run_sqd_vinit(ham, info["su"], size, info["d0"])
     bound = float(np.abs(np.asarray(ham.c)).sum())
     print(
-        f"n={args.num_qubits} {args.pattern} delta={args.delta}, states_size 2^{args.log2_size}, "
+        f"n={args.num_qubits} {args.pattern} {args.subspace} delta={args.delta}, states_size 2^{args.log2_size}, "
         f"hit {info['hit']:.3f}; whole solves, memory = XLA inputs + temp"
     )
     print(f"{'arm':>7} {'solve s':>8} {'iters':>5} {'eigval':>20} {'B/slot':>7}")
@@ -542,7 +611,7 @@ def peak_child(args) -> dict:
 def cmd_peak(args) -> None:
     arms = args.arms or ["(1,0)", "P0", "P2", "C0i16", "C2R"]
     print(
-        f"n={args.num_qubits} {args.pattern} delta={args.delta}: peak RSS above baseline, fresh process per arm"
+        f"n={args.num_qubits} {args.pattern} {args.subspace} delta={args.delta}: peak RSS above baseline, fresh process per arm"
     )
     print(
         f"{'size':>9} {'arm':>7} {'peak MiB':>9} {'B/slot':>7} {'setup s':>8} {'warm s':>8} {'eigval':>18}"
@@ -552,7 +621,10 @@ def cmd_peak(args) -> None:
     for log2 in args.log2_sizes:
         size = 1 << log2
         path = os.path.join(workdir, f"sparse_pairs_states_{log2}.npy")
-        np.save(path, spinchain_problem(args.num_qubits, args.pattern, args.delta, size)[1])
+        np.save(
+            path,
+            spinchain_problem(args.num_qubits, args.pattern, args.delta, size, args.subspace)[1],
+        )
         for arm in arms:
             cmd = [
                 sys.executable,
@@ -634,6 +706,7 @@ def main() -> None:
         p.add_argument("--num-qubits", type=int, default=60)
         p.add_argument("--pattern", default="type2")
         p.add_argument("--delta", type=float, default=0.5)
+        p.add_argument("--subspace", choices=("shells", "recovery"), default="shells")
         p.add_argument("--arms", nargs="+", choices=ARMS)
         p.add_argument("--rounds", type=int, default=7)
         if name in ("matvec", "peak"):

@@ -1300,9 +1300,11 @@ Item 8 of the 2026-09-25 ideas doc, on branch `sparse-pairs`. **Every table, fix
 diagonal computed once (`H_ji = conj(H_ij)` exactly per X signature), measured on CPU against `(1, 0)`:
 **P0** 4.4--5.3× faster whole solves at −52--63% memory, **−43% setup-inclusive peak** at `2^21`; **C2R**
 3.4--6.2× past the cache at a peak about `(1, 0)`'s. The win tracks the hit rate, not the model -- at high
-`h` CSR costs memory. Two measured lessons: the speedup shrinks with N from **cache locality, not threads**
-(CSR order recovers it), and the setup peak needed a **counting sort** by target, per-group construction
-and no duplicate transients. Open: GPU timing, sharding, sampler subspaces.
+`h` CSR costs memory. On a spinchain-style recovery-grown subspace (`h` 0.16--0.17 at n=60, 0.354 at
+n=20) the memory win holds at `2^21` -- P0 −75%, C2R −34% of `(1, 0)`'s operator -- but P0's speed past
+the cache thins to 1.20--1.51×. Two measured lessons: the speedup shrinks with N from **cache locality,
+not threads** (CSR order recovers it), and the setup peak needed a **counting sort** by target, per-group
+construction and no duplicate transients. Open: GPU timing, sharding, a pruned recovery subspace.
 
 ### Partial diagonal cache: *which* groups to cache barely matters, only how many (2026-09-25)
 

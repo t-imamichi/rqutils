@@ -15,7 +15,8 @@ term by term). The identity-X group has no pairs and stays `d_0 ⊙ v`.
 
 Fixtures are spinchain's `xxz` builder verbatim (`poc/eigenpair_check_scale.py`) at `δ = 0.5` with
 Hamming-shell subspaces around both Néel states: n=60 `type2` (`J = 120`, uniform `Bx`) and `type1`
-(`J = 32` at n=30, 62 at n=60, the pattern every shipped config uses). Every arm is checked against the
+(`J = 32` at n=30, 62 at n=60, the pattern every shipped config uses); §5 adds `type3`/`type4` and a
+subspace grown the way spinchain's recovery grows one. Every arm is checked against the
 `(1, 0)` product (or its relabelled rows) before timing; every solve returned the same eigenvalue.
 
 ## The arms
@@ -148,6 +149,35 @@ interleaved (an earlier un-interleaved baseline read P0 at 0.89× on the molecul
 C2R stay faster (not compared against `(1, 2)` on these two rows). Sampled SQD subspaces at large `n`
 (`10^5`–`10^7` states in a `2^n` space) are the low-`h` case.
 
+**The other two patterns change nothing.** `type3` is `type2` plus end-site `By` and `type4` is `type1` plus
+end-site `Bz`; neither adds an X signature, so `J` and `h` are their partners' and so are the numbers. At
+`2^21`, `type3` gives P0 1.51× and C2R 3.27× (`type2`: 1.6×, 3.4×) and `type4` P0 2.12× and C2R 6.16×
+(`type1`: 2.2×, 6.2×), with operator B/slot identical to the partner's. (One `type3` C2 cell read 137 ns;
+re-run, it is 80.3, `type2`'s 80.)
+
+**A recovery-grown subspace raises `h` less at n=60 than at n=20.** `--subspace recovery` grows the
+subspace as spinchain's `recover_configurations` does: from a `2^12` Hamming-shell core, each round solves
+`sqd`, scores H's one-hop reach by `|<c|H|v>|` and admits the top scorers, doubling it (scores checked
+against a dense `H` at n=8 to ≤ 9e-16). It picks better rows, as it should — at n=12 and 512 states it
+reaches −4.967 against the shells' −4.482 (exact −5.785) — and better rows are more coupled, so `h`
+rises. At n=20 (`2^13`) it reaches 0.354, where the CSR forms already exceed `(1, 0)`'s memory (368–400
+against 165 B/slot) and P0 still saves (101) at 1.57×. At n=60 it is only 1.3–1.8× the shells' `h`, at
+`2^21`, ns/state (speedup) and operator B/slot:
+
+| pattern | subspace | `h` | `(1, 0)` | P0 | P2 | C2R | B/slot `(1, 0)` / P0 / C2R |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `type1` | shells | 0.096 | 161 | 73 (2.2×) | 41 (3.9×) | 26 (6.2×) | 256 / 38 / 96 |
+| `type1` | recovery | 0.170 | 196 | 163 (1.20×) | 122 (1.61×) | 69 (2.85×) | 256 / 65 / 169 |
+| `type2` | shells | 0.121 | 265 | 168 (1.6×) | 125 (2.1×) | 79 (3.4×) | 488 / 89 / 236 |
+| `type2` | recovery | 0.161 | 266 | 177 (1.51×) | 126 (2.12×) | 103 (2.58×) | 488 / 118 / 321 |
+
+Within the cache (`2^17`) recovery still gives P0 2.40× / 2.75× and C2R 4.86× / 4.97× (`type1` /
+`type2`, `h` 0.133 / 0.118). So on the subspace spinchain would actually build the memory win holds —
+P0 −75%, C2R −34% of `(1, 0)`'s operator — while P0's speed past the cache thins to 1.20× on `type1`. Not
+modelled: spinchain also prunes rows the eigenvector drives below `weight_tol`, freeing budget for more
+coupled rows, which would push `h` further up, and its seed is Krylov samples in a Clifford frame, not
+Hamming shells. Shell `h` for `type1`/`type2` is read off `type4`/`type3`, which share their X signatures.
+
 ## 6. What it means
 
 - **For a memory-bound `(1, 0)` run** (spinchain at n ≥ 30, where `(1, 0)` already fills memory):
@@ -155,6 +185,8 @@ C2R stay faster (not compared against `(1, 2)` on these two rows). Sampled SQD s
   the speed. **C2R** is the speed choice — **3.4–6.2× past the cache, 4–5× whole solves** — with a peak
   about `(1, 0)`'s. C0i16 sits between them. At n=60 all beat `(1, 2)`, which buys its speed with 2.6–3.9× `(1, 0)`'s
   memory; at n=30 `type1` they only match it (C2R 1.48 s against 1.24 s), at a fraction of its memory.
+  On a recovery-grown subspace (§5) the memory win holds (P0 −75%, C2R −34% of `(1, 0)`'s operator at
+  `2^21`), but P0's speed past the cache falls to 1.20–1.51× and C2R's to 2.58–2.85×.
 - **The partial diagonal cache (item 3) cannot help such a run**: it adds memory on top of `(1, 0)`.
 - **CPU speedups at spinchain's sizes (N = 1.5M–20M) will be the `2^21` column or a little lower**, since
   past the cache the kernels are memory-bound. The GPU cannot be predicted from this: it has far more
@@ -167,7 +199,9 @@ C2R stay faster (not compared against `(1, 2)` on these two rows). Sampled SQD s
 3. **API.** Likely a new `cache_level[0] = 2` ("pairs"), with `cache_level[1]` choosing recomputed or
    cached diagonals; per-group construction, the counting sort, the id width and the real-diagonal split
    become implementation details.
-4. **Sampler subspaces.** Hit rates here come from Hamming-shell draws; `type3`/`type4` are unmeasured.
+4. **Pruned recovery and real samples.** §5's recovery subspace neither prunes nor starts from Krylov
+   samples. Pruning pushes `h` up, and n=20's 0.354 shows how far `h` can go; a replayed spinchain run
+   (`skqd/replay.py`) would give the true subspace.
 
 ## 8. The script
 
@@ -180,4 +214,6 @@ Everything above is `poc/sparse_pairs.py`, every arm built by one function (`ope
 | `peak` | setup-inclusive peak RSS, one fresh process per arm and size |
 | `general` | high hit rate: periodic Néel-Krylov XXZ and molecular-like JW |
 
-`--pattern type1`/`type2` and `--num-qubits` select the fixture.
+`--pattern type1`–`type4`, `--num-qubits` and `--subspace shells`/`recovery` select the fixture. A
+recovery subspace is cached as `/tmp/sparse_pairs_recovery_n<n>_<pattern>_d<delta>_<size>.npy`, since
+growing one to `2^21` runs `sqd` up to `2^20`.
