@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from conftest import (
     DENSE_MATVECS,
+    SPARSE_MATVECS,
     apply_h_inputs,
     apply_h_kwargs,
     eigval_of,
@@ -761,7 +762,7 @@ class TestSparseKernels:
 
     KINDS = ("real", "mixed", "none_real", "identity_only")
 
-    @pytest.mark.parametrize("matvec", ["pairs", "csr"])
+    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
     @pytest.mark.parametrize("kind", KINDS)
     @pytest.mark.parametrize("states_size", [20, 32])
     def test_product_matches_indices(self, kind, matvec, states_size):
@@ -802,7 +803,7 @@ class TestSparseKernels:
             assert got.shape == v.shape
             assert np.abs(np.asarray(got) - np.asarray(want)).max() < 1e-11
 
-    @pytest.mark.parametrize("matvec", ["pairs", "csr"])
+    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
     @pytest.mark.parametrize("kind", KINDS)
     def test_sqd_energy_matches_indices(self, kind, matvec):
         """Energies only: another summation order shifts the trajectory, so iteration counts differ."""
@@ -812,23 +813,15 @@ class TestSparseKernels:
 
     def test_size_class_rounding(self):
         """Exact below 16, then ``m * 2**k`` with ``8 <= m < 16``: waste under 12.5%, at least 1."""
-        assert [_size_class(c) for c in (0, 1, 8, 15, 16, 17, 18, 19, 33)] == [
-            1,
-            1,
-            8,
-            15,
-            16,
-            18,
-            18,
-            20,
-            36,
-        ]
+        counts = (0, 1, 8, 15, 16, 17, 18, 19, 33)
+        assert [_size_class(c) for c in counts] == [1, 1, 8, 15, 16, 18, 18, 20, 36]
         for chunks in range(1, 5000):
             size = _size_class(chunks)
             shift = max(size.bit_length() - 4, 0)
-            assert chunks <= size < chunks * 1.125 + 1 and 8 <= size >> shift < 16 or size < 16
+            assert chunks <= size < chunks * 1.125 + 1
+            assert size < 16 or 8 <= size >> shift < 16
 
-    @pytest.mark.parametrize("matvec", ["pairs", "csr"])
+    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
     def test_one_size_class_compiles_once(self, matvec, monkeypatch):
         """Two subspaces with different entry counts in one class share the jitted solve."""
         import rqutils.sqd as sqd_module
@@ -865,4 +858,4 @@ class TestSparseKernels:
     def test_entry_count_guard(self):
         """Raises before allocating: the passing side is every sparse solve in this file."""
         with pytest.raises(ValueError, match="2147483648 entries"):
-            _padded(2**31, 0, np.int32)
+            _padded(2**31, 0)

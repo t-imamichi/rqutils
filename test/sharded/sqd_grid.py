@@ -6,19 +6,20 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from common import emit, mesh
+from conftest import DENSE_MATVECS
 from jax.sharding import PartitionSpec
 
 import rqutils.sqd as sqd_module
 from rqutils.ground_locg import _chebyshev_prefilter
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import _MATVECS, _SPARSE_MATVECS, sqd
+from rqutils.sqd import sqd
 
 # 37 states, indivisible by every mesh size, pad to 64, which each divides.
 NUM_QUBITS, NUM_STATES, NUM_TERMS, STATES_SIZE = 8, 37, 5, 64
 PREFILTER = (16, 2)
 MESH_SIZES = (1, 2, 4)
 # pairs/csr are single-device and raise under a mesh (sparse_mesh.py), so they are excluded here.
-DENSE = [name for name in _MATVECS if name not in _SPARSE_MATVECS]
+DENSE = DENSE_MATVECS
 
 
 def main() -> None:

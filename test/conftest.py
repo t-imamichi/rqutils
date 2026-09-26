@@ -386,9 +386,11 @@ def assert_imports_without(module, blocked, extra_source=""):
 
 # Every `matvec` name, written out rather than read from `rqutils.sqd._MATVECS` so a kernel dropped
 # there fails here instead of vanishing from the sweep.
-MATVECS = ["onthefly", "indices", "tables", "pairs", "csr"]
 # The dense kernels: the only ones `apply_h` selects and the only ones a mesh accepts.
 DENSE_MATVECS = ["onthefly", "indices", "tables"]
+# Built host-side by `sqd`, single-device.
+SPARSE_MATVECS = ["pairs", "csr"]
+MATVECS = DENSE_MATVECS + SPARSE_MATVECS
 
 
 def pack_padded(states):

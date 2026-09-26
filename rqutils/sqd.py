@@ -175,7 +175,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from numbers import Number
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, overload
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, get_args, overload
 
 import jax
 import jax.core
@@ -253,8 +253,13 @@ def _check_array_role(name: str, array: Any) -> None:
         )
 
 
-type Matvec = Literal["onthefly", "indices", "tables", "pairs", "csr"]
-_MATVECS = ("onthefly", "indices", "tables", "pairs", "csr")
+type DenseMatvec = Literal["onthefly", "indices", "tables"]
+type SparseMatvec = Literal["pairs", "csr"]
+type Matvec = DenseMatvec | SparseMatvec
+_DENSE_MATVECS: tuple[DenseMatvec, ...] = get_args(DenseMatvec.__value__)
+#: The kernels whose operator arrays :func:`sqd` builds host-side; single-device for now.
+_SPARSE_MATVECS: tuple[SparseMatvec, ...] = get_args(SparseMatvec.__value__)
+_MATVECS = _DENSE_MATVECS + _SPARSE_MATVECS
 
 
 def _residual_floor_of(hamiltonian: PauliSumXZ) -> float:
@@ -991,7 +996,7 @@ def run_sqd(
     states_p: StateList,
     states_size: int,
     return_eigvec: bool,
-    matvec: Matvec = "indices",
+    matvec: DenseMatvec = "indices",
     maxiter: int = 1000,
     atol: float = 0.0,
     rtol: float | None = None,
@@ -1082,17 +1087,13 @@ def run_sqd(
             return diagonals[0]
         return get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u)
 
-    # Diagonals always recomputed, so no cached one vouches for itself; cached xsources are reused,
-    # since redoing the J-fold search was ~90% of the check (NOTES.md, "`EigenpairCheckError`").
-    check_ref = ("onthefly", hamiltonian.x) if matvec == "onthefly" else ("indices", xsources)
     return _solve(
         hamiltonian,
         states_u,
-        states_size,
         apply,
         args,
         diag0,
-        check_ref,
+        None if matvec == "onthefly" else xsources,
         sharding,
         return_eigvec=return_eigvec,
         maxiter=maxiter,
@@ -1107,11 +1108,10 @@ def run_sqd(
 def _solve(
     hamiltonian: PauliSumXZ,
     states_u: StateList,
-    states_size: int,
     apply: Callable[..., jax.Array],
     args: tuple,
     diag0: Callable[[], jax.Array],
-    check_ref: tuple[Matvec, NDArray],
+    xsources: jax.Array | None,
     sharding: PartitionSpec | None,
     *,
     return_eigvec: bool,
@@ -1124,9 +1124,10 @@ def _solve(
 ) -> SqdResult:
     """The solve every kernel shares, traced inside :func:`run_sqd` or :func:`_run_sparse`.
 
-    ``apply(vec, *args)`` is the operator, ``diag0()`` the identity-X group's diagonal, and
-    ``check_ref`` the ``(kernel, X groups)`` the residual check recomputes :math:`Hv` with.
+    ``apply(vec, *args)`` is the operator and ``diag0()`` the identity-X group's diagonal;
+    ``xsources`` is ``None`` unless cached source indices exist for the residual check to reuse.
     """
+    states_size = states_u.shape[0]
 
     def vinit_from_min_diag():
         # `.real`: `diagonals` is complex128 for odd-Y strings, and max/argmin reject complex
@@ -1177,7 +1178,9 @@ def _solve(
     )
     result = SqdResult(eigval, converged)
     if check_residual:
-        ref, xgroup = check_ref
+        # Diagonals always recomputed, so no cached one vouches for itself; cached xsources are reused,
+        # since redoing the J-fold search was ~90% of the check (NOTES.md, "`EigenpairCheckError`").
+        ref, xgroup = ("onthefly", hamiltonian.x) if xsources is None else ("indices", xsources)
         scanned_ref = _pack_scanned(ref, xgroup, hamiltonian.z, hamiltonian.c)
         ax = _apply_h_kernel(eigvec, scanned_ref, states_u, matvec=ref)
         result = result._replace(
@@ -1192,8 +1195,6 @@ def _solve(
     return result
 
 
-#: The kernels whose operator arrays :func:`sqd` builds host-side; single-device for now.
-_SPARSE_MATVECS = ("pairs", "csr")
 #: Entries per scanned chunk, so the sparse kernels' temporaries are ``O(chunk)`` (``poc/sparse-pairs.md``).
 _CHUNK = 1 << 15
 
@@ -1207,18 +1208,18 @@ def _size_class(chunks: int) -> int:
     return max(-(-chunks >> shift) << shift, 1)
 
 
-def _padded(count: int, fill: int, dtype: DTypeLike) -> np.ndarray:
-    """A flat array of ``count`` entries rounded up to whole chunks of a size class, all ``fill``.
+def _padded(count: int, fill: int) -> np.ndarray:
+    """A flat int32 array of ``count`` entries rounded up to whole chunks of a size class, all ``fill``.
 
     Raises:
         ValueError: If ``count`` reaches :math:`2^{31}`, past the int32 indices the entries are stored in.
     """
-    if count >= 2**31:
+    if count > _MAX_STATES:
         raise ValueError(
             f"the sparse operator has {count} entries, beyond the 2^31 - 1 addressable with int32 "
             'indices; use matvec="indices" or a smaller subspace'
         )
-    return np.full(_size_class(-(-count // _CHUNK)) * _CHUNK, fill, dtype=dtype)
+    return np.full(_size_class(-(-count // _CHUNK)) * _CHUNK, fill, dtype=np.int32)
 
 
 @functools.partial(jax.jit, static_argnames="kmax")
@@ -1243,7 +1244,7 @@ def _entry_factors(
 
 
 def _sparse_operator(
-    hamiltonian: PauliSumXZ, states_u: StateList, matvec: Matvec
+    hamiltonian: PauliSumXZ, states_u: StateList, matvec: SparseMatvec
 ) -> tuple[jax.Array, ...]:
     """Build the ``"pairs"`` or ``"csr"`` operator arrays on the host, one X group's search at a time.
 
@@ -1260,7 +1261,7 @@ def _sparse_operator(
     d0 = get_diagonal(z[0], c[0], states_u) if first else jnp.zeros(size, c.dtype)
     groups = range(first, hamiltonian.x.shape[0])
     coeffs = np.asarray(hamiltonian.c)
-    kmax = max([int(np.count_nonzero(coeffs[g])) for g in groups], default=1)
+    kmax = max((int(np.count_nonzero(coeffs[g])) for g in groups), default=1)
     rows = np.arange(size, dtype=np.int32)
     pairs = {}
     for g in groups:
@@ -1276,7 +1277,7 @@ def _sparse_operator(
 
     if matvec == "pairs":
         count = sum(len(i) for i, _ in pairs.values())
-        host = [_padded(count, 0, np.int32) for _ in range(3)]  # i, j, group
+        host = [_padded(count, fill) for fill in (size - 1, size - 1, 0)]  # i, j, group
         pos = 0
         for g in groups:
             i, j = pairs.pop(g)
@@ -1285,7 +1286,7 @@ def _sparse_operator(
             pos += len(i)
         return (d0, *on_device(host, c))
 
-    real = ~np.any(coeffs.imag != 0, axis=1)
+    real = np.isreal(coeffs).all(axis=1)
     arrays = [d0]
     for subset, c_set in (
         ([g for g in groups if real[g]], c.real),
@@ -1299,7 +1300,7 @@ def _sparse_operator(
             start[i + 1] += 1
             start[j + 1] += 1
         np.cumsum(start, out=start)
-        host = [_padded(int(start[-1]), fill, np.int32) for fill in (size - 1, size - 1, 0)]
+        host = [_padded(int(start[-1]), fill) for fill in (size - 1, size - 1, 0)]
         for g in subset:
             i, j = pairs.pop(g)
             for target, source in ((i, j), (j, i)):
@@ -1325,10 +1326,8 @@ def _apply_pairs(
     return jax.lax.scan(body, d0 * vec, (pi, pj, d))[0]
 
 
-def _sorted_scatter(
-    vec: jax.Array, out: jax.Array, t: jax.Array, s: jax.Array, d: jax.Array
-) -> jax.Array:
-    """``out[t] += d * vec[s]`` over target-sorted chunks."""
+def _apply_csr(vec: jax.Array, d0: jax.Array, *entries: jax.Array) -> jax.Array:
+    """``"csr"``: ``d0 * vec``, then ``out[t] += d * vec[s]`` over each target-sorted ``(t, s, d)`` set."""
     sharding = jax.typeof(vec).sharding
 
     def body(acc, chunk):
@@ -1336,14 +1335,9 @@ def _sorted_scatter(
         gathered = vec.at[..., si].get(out_sharding=sharding)
         return acc.at[..., ti].add(di * gathered, indices_are_sorted=True), None
 
-    return jax.lax.scan(body, out, (t, s, d))[0]
-
-
-def _apply_csr(vec: jax.Array, d0: jax.Array, *entries: jax.Array) -> jax.Array:
-    """``"csr"``: ``d0 * vec`` plus one sorted scatter per ``(t, s, d)`` entry set."""
     out = d0 * vec
-    for t, s, d in zip(entries[::3], entries[1::3], entries[2::3]):
-        out = _sorted_scatter(vec, out, t, s, d)
+    for k in range(0, len(entries), 3):
+        out = jax.lax.scan(body, out, entries[k : k + 3])[0]
     return out
 
 
@@ -1354,7 +1348,7 @@ def _run_sparse(
     operator: tuple[jax.Array, ...],
     states_size: int,
     return_eigvec: bool,
-    matvec: Matvec,
+    matvec: SparseMatvec,
     maxiter: int = 1000,
     atol: float = 0.0,
     rtol: float | None = None,
@@ -1370,11 +1364,10 @@ def _run_sparse(
     return _solve(
         hamiltonian,
         states_u,
-        states_size,
         apply,
         operator,
         lambda: operator[0],
-        ("onthefly", hamiltonian.x),
+        None,
         None,
         return_eigvec=return_eigvec,
         maxiter=maxiter,
@@ -1755,7 +1748,7 @@ def apply_xgrp(
 
 
 def _pack_scanned(
-    matvec: Matvec, xgroup: NDArray, diagonal_arg: NDArray, coeffs: NDArray | None
+    matvec: DenseMatvec, xgroup: NDArray, diagonal_arg: NDArray, coeffs: NDArray | None
 ) -> tuple[NDArray, ...]:
     """Lay out the tuple ``_apply_h_kernel`` scans over, for one resolved ``matvec``.
 
@@ -1943,7 +1936,7 @@ def _apply_h_kernel(
     vec: NDArray[np.inexact],
     scanned: tuple[NDArray, ...],
     states: StateList | None,
-    matvec: Matvec,
+    matvec: DenseMatvec,
 ) -> jax.Array:
     r"""Return :math:`Hv`, resolving the per-X-group inputs according to the ``matvec`` name.
 

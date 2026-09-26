@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 from conftest import (
     MATVECS,
+    SPARSE_MATVECS,
     assert_imports_without,
     assert_type_checks,
     collapsing_states,
@@ -266,7 +267,7 @@ class TestMatvecValidation:
         with pytest.raises(ValueError, match="matvec"):
             run_sqd(hamiltonian, pack_padded(states), 2, False, "indice")
         # pairs/csr are built host-side by sqd, so run_sqd must point there rather than trace them.
-        for name in ("pairs", "csr"):
+        for name in SPARSE_MATVECS:
             with pytest.raises(ValueError, match=r"Call sqd\(\.\.\., matvec=\.\.\.\)"):
                 run_sqd(hamiltonian, pack_padded(states), 2, False, name)
         with pytest.raises(TypeError, match="matvec"):
@@ -992,7 +993,7 @@ class TestEigenpairCheck:
 
         def calls(matvec):
             def count(check):
-                if matvec in ("pairs", "csr"):
+                if matvec in SPARSE_MATVECS:
                     operator = _sparse_operator(h, states_u, matvec)
                     solve = lambda a, b: _run_sparse(
                         a, b, operator, 16, False, matvec, check_residual=check
@@ -1008,10 +1009,10 @@ class TestEigenpairCheck:
             return search_on - search_off, diag_on - diag_off
 
         assert calls("tables") == (0, 1), "tables: (extra searches, extra diagonal builds)"
-        for matvec in ("pairs", "csr"):
+        for matvec in SPARSE_MATVECS:
             assert calls(matvec) == (1, 1), f"{matvec}: the check must run the onthefly kernel"
 
-    @pytest.mark.parametrize("matvec", ["pairs", "csr"])
+    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
     def test_a_sparse_solve_passes_the_check(self, matvec):
         """The check's onthefly product must agree with the solve's operator on a genuine pair."""
         from rqutils.paulis.symplectic import PauliSumXZ
