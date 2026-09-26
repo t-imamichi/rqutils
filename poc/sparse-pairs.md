@@ -131,6 +131,17 @@ ns/state for one `(2, N)` matvec, and operator B/slot at `2^21` (solver vectors 
 `type1` gains *more* past the cache than `type2` despite half the groups: with fewer groups the matvec is
 less memory-bound, so C2R holds 6.2× at `2^21` where `type2`'s falls to 3.4×.
 
+**Every figure above is batched, and batching never costs a pair arm** (`batch`: one `(2, N)` call against
+two `(N,)` in one program, n=60 shells). Per matvec at `2^17`/`2^21` it is worth 1.98–2.15× to C2R,
+1.54–1.77× to C0i16 and 1.55–1.75× to `(1, 0)`, but only 1.14–1.19× to P0 and 0.98–1.13× to P2: the pair
+kernels' cost is their random scatters, which batching does not share. Whole solves at `2^17`
+(`type1`/`type2`): C2R 1.27×/1.30×, C0i16 1.28×/1.34×, `(1, 0)` 1.27×/1.33×, `(1, 2)` 1.10×/1.09×, P0
+1.02×/1.11×, P2 0.96×/1.03×. P2's 0.96× is iteration count, not speed: on `type1` the batched pair arms take
+105 iterations against 96 unbatched (another summation order), and per iteration P2 is 1.04× and P0 1.11×
+batched. Energies agree to 5.3e-15. **An `(N, 2)` layout**, putting both vectors' entries in one cache
+line, measures 0.97–1.10× (best: P2 at `2^21`, 1.08–1.10×), so it does not recover the locality lost past
+the cache.
+
 ## 5. Beyond these fixtures: the win tracks the hit rate
 
 The pair form works for any Pauli Hamiltonian -- XOR is an involution for every X signature, `H_ji =
@@ -213,6 +224,7 @@ Everything above is `poc/sparse_pairs.py`, every arm built by one function (`ope
 | `solve` | whole `ground_locg` solves at one size, with XLA memory (inputs + temp) |
 | `peak` | setup-inclusive peak RSS, one fresh process per arm and size |
 | `general` | high hit rate: periodic Néel-Krylov XXZ and molecular-like JW |
+| `batch` | one `(2, N)` call against two `(N,)` and an `(N, 2)` layout, then solves with `batch_matvec` on/off |
 
 `--pattern type1`–`type4`, `--num-qubits` and `--subspace shells`/`recovery` select the fixture. A
 recovery subspace is cached as `/tmp/sparse_pairs_recovery_n<n>_<pattern>_d<delta>_<size>.npy`, since

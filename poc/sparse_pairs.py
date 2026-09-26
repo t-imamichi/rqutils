@@ -22,7 +22,9 @@ Hamming shells or ``recovery``, grown by spinchain-style ranked H-expansion from
 * ``matvec``  -- ns/state of one ``(2, N)`` matvec per arm over sizes, each checked against ``(1,0)``;
 * ``solve``   -- whole ``ground_locg`` solves at one size, with XLA memory (inputs + temp);
 * ``peak``    -- setup-inclusive peak RSS, one fresh process per arm and size;
-* ``general`` -- P0/P2/C2R at high hit rate: periodic Neel-Krylov XXZ, molecular-like JW.
+* ``general`` -- P0/P2/C2R at high hit rate: periodic Neel-Krylov XXZ, molecular-like JW;
+* ``batch``   -- one ``(2, N)`` application against two ``(N,)`` and an ``(N, 2)`` layout, then whole
+  solves with ``ground_locg``'s ``batch_matvec`` on and off.
 
 Run: uv run python poc/sparse_pairs.py matvec [--log2-sizes 15 17 19 21] [--arms ...]
      uv run python poc/sparse_pairs.py solve [--log2-size 17]
@@ -241,6 +243,48 @@ def matvec_seg(vec, t, s, d, d0):
         (d * vec[..., s]).T, t, num_segments=vec.shape[-1], indices_are_sorted=True
     )
     return d0 * vec + summed.T
+
+
+# (N, k) layout: row-indexed, so one random access fetches every vector's entry from one cache line.
+
+
+@functools.partial(jax.jit, static_argnames="kmax")
+def matvec_p0t(vec, pi, pj, pg, z, c, states, kmax):
+    def body(out, chunk):
+        i, j, g = chunk
+        d = jnp.where(i == j, 0.0, pair_diagonal(states[i], z[g][:, :kmax], c[g][:, :kmax]))[
+            :, None
+        ]
+        out = out.at[i].add(d * vec[j])
+        return out.at[j].add(jnp.conj(d) * vec[i]), None
+
+    return jax.lax.scan(body, get_diagonal(z[0], c[0], states)[:, None] * vec, (pi, pj, pg))[0]
+
+
+@jax.jit
+def matvec_p2t(vec, pi, pj, d, d0):
+    def body(out, chunk):
+        i, j, di = chunk
+        out = out.at[i].add(di[:, None] * vec[j])
+        return out.at[j].add(jnp.conj(di)[:, None] * vec[i]), None
+
+    return jax.lax.scan(body, d0[:, None] * vec, (pi, pj, d))[0]
+
+
+def _sorted_scatter_t(vec, out, t, s, d):
+    def body(acc, chunk):
+        ti, si, di = chunk
+        return acc.at[ti].add(di[:, None] * vec[si], indices_are_sorted=True), None
+
+    return jax.lax.scan(body, out, (t, s, d))[0]
+
+
+@jax.jit
+def matvec_c2rt(vec, rt, rs, rd, qt, qs, qd, d0):
+    return _sorted_scatter_t(vec, _sorted_scatter_t(vec, d0[:, None] * vec, rt, rs, rd), qt, qs, qd)
+
+
+TRANSPOSED = {"P0": None, "P2": matvec_p2t, "C2R": matvec_c2rt}  # P0's needs its kmax, bound below
 
 
 # ------------------------------------------------------------------------------------ operator assembly
@@ -492,12 +536,12 @@ def run_sqd_vinit(ham, states_u, size, d0):
     return seed + jnp.where(selected, jnp.where(sign == 0, 1.0, sign), 0.0)
 
 
-def solve_fn(fn, bound):
+def solve_fn(fn, bound, batch=True):
     """A ``ground_locg`` solve as ``run_sqd`` drives it: prefilter ``(32, 2)``, ``Σ|c|`` bound, batched."""
 
     def solve(vinit, *args):
         return ground_locg(
-            fn, vinit, args=args, prefilter=(32, 2), prefilter_hi=bound, batch_matvec=True
+            fn, vinit, args=args, prefilter=(32, 2), prefilter_hi=bound, batch_matvec=batch
         )
 
     return jax.jit(solve)
@@ -570,6 +614,79 @@ def cmd_solve(args) -> None:
         total = (mem.argument_size_in_bytes + mem.temp_size_in_bytes) / size
         print(
             f"{a:>7} {seconds:>8.2f} {int(result[2]):>5} {float(result[0]):>20.12f} {total:>7.0f}",
+            flush=True,
+        )
+
+
+def cmd_batch(args) -> None:
+    """One ``(2, N)`` application against two ``(N,)`` and an ``(N, 2)`` layout, then whole solves."""
+    arms = args.arms or ["(1,0)", "(1,2)", "P0", "P2", "C0i16", "C2R"]
+    print(
+        f"n={args.num_qubits} {args.pattern} {args.subspace} delta={args.delta}: ns/state for two "
+        "vectors; 'x' columns are speedups over the batched (2, N) call"
+    )
+    print(
+        f"{'size':>6} {'arm':>7} {'(2,N)':>8} {'2x(N,)':>8} {'unbat x':>8} {'(N,2)':>8} {'(N,2) x':>8}"
+    )
+    for log2 in args.log2_sizes:
+        size = 1 << log2
+        ham, states = spinchain_problem(
+            args.num_qubits, args.pattern, args.delta, size, args.subspace
+        )
+        ops, info = operators(ham, states, size, set(arms) | {"(1,0)"})
+        rng = np.random.default_rng(1)
+        vec = jnp.asarray(rng.normal(size=(2, size)) * (1 + 0.5j)).at[:, len(states) :].set(0)
+        vt = jnp.asarray(np.ascontiguousarray(np.asarray(vec).T))
+        check(ops, vec, len(states))
+        runs = {}
+        for a in arms:
+            fn, x, _ = ops[a]
+            pair = jax.jit(lambda v0, v1, *xs, fn=fn: (fn(v0, *xs), fn(v1, *xs)))
+            want = np.asarray(fn(vec, *x))
+            assert np.allclose(np.stack(pair(vec[0], vec[1], *x)), want, rtol=1e-12, atol=1e-12), a
+            runs[a] = {"b": (fn, (vec, *x)), "u": (pair, (vec[0], vec[1], *x))}
+            if a in TRANSPOSED:
+                ft = TRANSPOSED[a] or functools.partial(matvec_p0t, kmax=info["kmax"])
+                assert np.allclose(np.asarray(ft(vt, *x)).T, want, rtol=1e-12, atol=1e-12), a
+                runs[a]["t"] = (ft, (vt, *x))
+        times = {(a, k): [] for a in arms for k in runs[a]}
+        for _ in range(args.rounds):  # interleaved over arms and layouts
+            for a in arms:
+                for k, (f, fa) in runs[a].items():
+                    times[a, k].append(timed(f, fa, 1))
+        for a in arms:
+            ns = {k: 1e9 * np.median(times[a, k]) / size for k in runs[a]}
+            t_cols = (
+                f"{ns['t']:>8.1f} {ns['b'] / ns['t']:>7.2f}x" if "t" in ns else f"{'':>8} {'':>8}"
+            )
+            print(
+                f"  2^{log2} {a:>7} {ns['b']:>8.1f} {ns['u']:>8.1f} {ns['u'] / ns['b']:>7.2f}x {t_cols}"
+            )
+        print(f"{'':>8} hit {info['hit']:.3f}", flush=True)
+    if not args.solve_log2:
+        return
+    size = 1 << args.solve_log2
+    ham, states = spinchain_problem(args.num_qubits, args.pattern, args.delta, size, args.subspace)
+    ops, info = operators(ham, states, size, set(arms) | {"(1,0)"})
+    vinit = run_sqd_vinit(ham, info["su"], size, info["d0"])
+    bound = float(np.abs(np.asarray(ham.c)).sum())
+    print(f"whole solves at 2^{args.solve_log2}: batched vs unbatched ground_locg")
+    print(
+        f"{'arm':>7} {'batched s':>10} {'unbat s':>8} {'unbat x':>8} {'iters':>9} {'eigval diff':>12}"
+    )
+    for a in arms:
+        fn, x, _ = ops[a]
+        solves = {b: solve_fn(fn, bound, b) for b in (True, False)}
+        res = {b: jax.block_until_ready(f(vinit, *x)) for b, f in solves.items()}
+        secs = {True: [], False: []}
+        for _ in range(3):
+            for b, f in solves.items():
+                secs[b].append(timed(f, (vinit, *x), 1))
+        med = {b: float(np.median(v)) for b, v in secs.items()}
+        print(
+            f"{a:>7} {med[True]:>10.2f} {med[False]:>8.2f} {med[False] / med[True]:>7.2f}x "
+            f"{int(res[True][2]):>4}/{int(res[False][2]):<4} "
+            f"{float(res[False][0]) - float(res[True][0]):>12.1e}",
             flush=True,
         )
 
@@ -701,7 +818,7 @@ def cmd_general(args) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("matvec", "solve", "peak", "general"):
+    for name in ("matvec", "solve", "peak", "general", "batch"):
         p = sub.add_parser(name)
         p.add_argument("--num-qubits", type=int, default=60)
         p.add_argument("--pattern", default="type2")
@@ -709,7 +826,7 @@ def main() -> None:
         p.add_argument("--subspace", choices=("shells", "recovery"), default="shells")
         p.add_argument("--arms", nargs="+", choices=ARMS)
         p.add_argument("--rounds", type=int, default=7)
-        if name in ("matvec", "peak"):
+        if name in ("matvec", "peak", "batch"):
             p.add_argument(
                 "--log2-sizes",
                 type=int,
@@ -718,6 +835,8 @@ def main() -> None:
             )
         if name == "solve":
             p.add_argument("--log2-size", type=int, default=17)
+        if name == "batch":
+            p.add_argument("--solve-log2", type=int, default=17, help="0 skips the whole solves")
         if name == "peak":
             p.add_argument("--workdir", default="/tmp")
             p.add_argument("--child", choices=ARMS, help=argparse.SUPPRESS)
@@ -726,9 +845,13 @@ def main() -> None:
     if args.cmd == "peak" and args.child:
         print(json.dumps(peak_child(args)))
         return
-    {"matvec": cmd_matvec, "solve": cmd_solve, "peak": cmd_peak, "general": cmd_general}[args.cmd](
-        args
-    )
+    {
+        "matvec": cmd_matvec,
+        "solve": cmd_solve,
+        "peak": cmd_peak,
+        "general": cmd_general,
+        "batch": cmd_batch,
+    }[args.cmd](args)
 
 
 if __name__ == "__main__":
