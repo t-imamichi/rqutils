@@ -16,6 +16,10 @@ Arms (the identity-X group is always a plain ``d_0 * v``; every other arm scans 
 * ``C2R``          -- C2 with ``float64`` diagonals for real groups, ``complex128`` only for the rest;
 * ``seg``          -- C2 as one unchunked ``segment_sum``;
 * ``C2W``          -- C2R as row-window reductions: row-aligned chunks, a ``ROWS``-segment sum each;
+* ``P2F``/``C2RF``  -- P2/C2R with every gather and scatter declared ``promise_in_bounds``;
+* ``ELL``          -- rows bucketed by exact degree: scatter-free row sums, one write per row;
+* ``HYB``          -- one natural-order ELL block of width ``W`` (contiguous writes) + CSR overflow;
+* ``ELLC``         -- ELL with degrees rounded up to geometric classes: far fewer buckets and compiles;
 * ``...+RCM``      -- states relabelled by reverse Cuthill--McKee first.
 
 Subcommands (fixture: spinchain's open-XXZ ``xxz``, ``poc/eigenpair_check_scale``; ``--subspace`` picks
@@ -83,6 +87,11 @@ ARMS = (
     "C2R",
     "seg",
     "C2W",
+    "P2F",
+    "C2RF",
+    "ELL",
+    "HYB",
+    "ELLC",
     "C0i16+RCM",
     "C2+RCM",
     "C2R+RCM",
@@ -278,6 +287,234 @@ def matvec_seg(vec, t, s, d, d0):
         (d * vec[..., s]).T, t, num_segments=vec.shape[-1], indices_are_sorted=True
     )
     return d0 * vec + summed.T
+
+
+IB = "promise_in_bounds"  # every index is in bounds by construction: skip XLA's clamping
+
+
+@jax.jit
+def matvec_p2f(vec, pi, pj, d, d0):
+    """P2 with every gather and scatter declared in bounds."""
+
+    def body(acc, chunk):
+        i, j, di = chunk
+        acc = acc.at[..., i].add(di * vec.at[..., j].get(mode=IB), mode=IB)
+        return acc.at[..., j].add(jnp.conj(di) * vec.at[..., i].get(mode=IB), mode=IB), None
+
+    return jax.lax.scan(body, d0 * vec, (pi, pj, d))[0]
+
+
+def _sorted_scatter_f(vec, out, t, s, d):
+    def body(acc, chunk):
+        ti, si, di = chunk
+        gathered = vec.at[..., si].get(mode=IB)
+        return acc.at[..., ti].add(di * gathered, indices_are_sorted=True, mode=IB), None
+
+    return jax.lax.scan(body, out, (t, s, d))[0]
+
+
+@jax.jit
+def matvec_c2rf(vec, rt, rs, rd, qt, qs, qd, d0):
+    """C2R with every gather and scatter declared in bounds."""
+    return _sorted_scatter_f(vec, _sorted_scatter_f(vec, d0 * vec, rt, rs, rd), qt, qs, qd)
+
+
+@functools.partial(jax.jit, static_argnames="kmax")
+def bucket_factors(rows, grp, n, z, c, states, kmax):
+    """``d_g(row)`` for every ``(piece, R, k)`` bucket entry, zero on the padding rows past ``n``."""
+    per, k = grp.shape[1], grp.shape[2]
+
+    def one(args):
+        p, r, g = args
+        tt, gg = jnp.repeat(r, k), g.reshape(-1)
+        fac = pair_diagonal(states[tt], z[gg][:, :kmax], c[gg][:, :kmax]).reshape(per, k)
+        return jnp.where((p * per + jnp.arange(per) < n)[:, None], fac, jnp.zeros_like(fac))
+
+    return jax.lax.map(one, (jnp.arange(rows.shape[0]), rows, grp))
+
+
+def host_csr(pi, pj, pg, groups, num_groups, size):
+    """``(deg, indptr, src, grp)`` of the ``groups``' transitions, counting-sorted by target on the host.
+
+    The target is implied by ``indptr``; within one group every row occurs at most once per direction.
+    """
+    bounds = np.searchsorted(pg, np.arange(num_groups + 1))  # pairs are built group by group
+    deg = np.zeros(size, np.int64)
+    for g in groups:
+        deg[pi[bounds[g] : bounds[g + 1]]] += 1
+        deg[pj[bounds[g] : bounds[g + 1]]] += 1
+    indptr = np.zeros(size + 1, np.int64)
+    np.cumsum(deg, out=indptr[1:])
+    src = np.empty(int(indptr[-1]), np.int32)
+    grp = np.empty(int(indptr[-1]), np.int32)
+    pos = indptr[:-1].copy()
+    for g in groups:
+        a, b = bounds[g], bounds[g + 1]
+        for rows, srcs in ((pi[a:b], pj[a:b]), (pj[a:b], pi[a:b])):
+            p = pos[rows]
+            src[p], grp[p] = srcs, g
+            pos[rows] += 1
+    return deg, indptr, src, grp
+
+
+def hyb_width(deg, factor_bytes, size):
+    """The ELL width minimising bytes: ``size * W`` padded slots against the overflow's CSR entries."""
+    hist = np.bincount(deg)
+    ks = np.arange(len(hist))
+    above = np.cumsum(hist[::-1])[::-1]  # rows with degree >= k
+    mass = np.cumsum((hist * ks)[::-1])[::-1]  # entries in rows with degree >= k
+    over = np.array([mass[w + 1] - w * above[w + 1] if w + 1 < len(hist) else 0 for w in ks])
+    cost = size * ks * (4 + factor_bytes) + over * (8 + factor_bytes)
+    return int(np.argmin(cost))
+
+
+@functools.partial(jax.jit, static_argnames="kmax")
+def ell_block_factors(grp, deg, z, c, states, kmax):
+    """``d_g(row)`` over an ``(pieces, R, W)`` ELL block whose rows are ``p * R + r``; zero past ``deg``."""
+    _, rows, width = grp.shape
+
+    def one(args):
+        p, g, d = args
+        tt = jnp.repeat(p * rows + jnp.arange(rows), width)
+        gg = g.reshape(-1)
+        fac = pair_diagonal(states[tt], z[gg][:, :kmax], c[gg][:, :kmax]).reshape(rows, width)
+        return jnp.where(jnp.arange(width) < d[:, None], fac, jnp.zeros_like(fac))
+
+    return jax.lax.map(one, (jnp.arange(grp.shape[0]), grp, deg))
+
+
+def hyb_set(pi, pj, pg, groups, num_groups, size, z, c, states, kmax):
+    """One HYB set: an ELL block over every row in natural order, width ``W``, plus the overflow as
+    target-sorted CSR. Returns ``(ell_src, ell_fac, ovt, os, od)``; factors in one jitted call each."""
+    deg, indptr, src, grp = host_csr(pi, pj, pg, groups, num_groups, size)
+    width = hyb_width(deg, 8 if np.isrealobj(np.asarray(c)) else 16, size) if len(src) else 0
+    rows = 1 << max(0, int(np.log2(max(1, CHUNK // max(width, 1)))))  # a power of two divides size
+    rows = min(rows, size)
+    es = np.zeros((size, width), np.int32)
+    eg = np.zeros((size, width), np.int32)
+    for w in range(width):
+        r = np.flatnonzero(deg > w)
+        es[r, w], eg[r, w] = src[indptr[r] + w], grp[indptr[r] + w]
+    over = np.flatnonzero(deg > width)
+    counts = deg[over] - width
+    idx = np.repeat(indptr[over] + width - np.concatenate([[0], np.cumsum(counts)[:-1]]), counts)
+    idx = (idx + np.arange(len(idx))).astype(np.int64)
+    ovt, os_, og = np.repeat(over, counts).astype(np.int32), src[idx], grp[idx]
+    del src, grp, idx
+    shape = (size // rows, rows, width)
+    es_d, eg_d = jnp.asarray(es.reshape(shape)), jnp.asarray(eg.reshape(shape))
+    del es, eg
+    ef = ell_block_factors(eg_d, jnp.asarray(deg.reshape(shape[:2])), z, c, states, kmax)
+    del eg_d
+    ct, cs, cg = chunked((ovt, os_, og), pad=size - 1)
+    od = chunked_diagonals(ct, cs, cg, z, c, states, kmax)
+    return es_d, ef, ct, cs, od
+
+
+def ell_buckets(pi, pj, pg, groups, num_groups, size, z, c, states, kmax):
+    """The ``groups``' transitions bucketed by row degree, straight from the per-group pairs.
+
+    Per degree ``k``: ``(rows, src, fac)`` of shape ``(pieces, R)``, ``(pieces, R, k)``, ``(pieces, R, k)``,
+    ``R ~ CHUNK // k``. A counting sort by target builds host ``src``/``grp`` only (the target is implied
+    by the row offsets); padding rows repeat a real row with ``fac = 0``, so ``out`` needs no dummy slot.
+    """
+    deg, indptr, src, grp = host_csr(pi, pj, pg, groups, num_groups, size)
+    buckets = []
+    for k in np.unique(deg[deg > 0]):
+        k = int(k)
+        rows = np.flatnonzero(deg == k).astype(np.int32)
+        n = len(rows)
+        per = min(max(1, CHUNK // k), n)  # a small bucket is one unpadded piece
+        total = -(-n // per) * per
+        r = np.full(total, rows[0], np.int32)
+        r[:n] = rows
+        idx = indptr[rows].astype(np.int32)[:, None] + np.arange(k, dtype=np.int32)
+        sb, gb = np.zeros((total, k), np.int32), np.zeros((total, k), np.int32)
+        sb[:n], gb[:n] = src[idx], grp[idx]
+        del idx
+        rd, sd, gd = (jnp.asarray(x.reshape(-1, per, *x.shape[1:])) for x in (r, sb, gb))
+        del r, sb, gb
+        buckets += [rd, sd, bucket_factors(rd, gd, n, z, c, states, kmax)]
+        del gd
+    return buckets
+
+
+def ell_class_buckets(pi, pj, pg, groups, num_groups, size, z, c, states, kmax, ratio=1.25):
+    """ELL with each row's degree rounded up to a geometric class (``ratio`` apart), so there are
+    ~log_ratio(max degree) buckets rather than one per distinct degree; slots past a row's degree carry
+    a zero factor. Factors come from one ``chunked_diagonals`` pass over the flat entries."""
+    deg, indptr, src, grp = host_csr(pi, pj, pg, groups, num_groups, size)
+    if not len(src):
+        return []
+    t = np.repeat(np.arange(size, dtype=np.int32), deg)
+    ct, cs, cg = chunked((t, src, grp), pad=size - 1)  # padding has t == s, hence a zero factor
+    fac = np.asarray(chunked_diagonals(ct, cs, cg, z, c, states, kmax)).reshape(-1)[: len(src)]
+    del t, grp, ct, cs, cg
+    top = int(deg.max())
+    grid = np.unique(
+        np.ceil(ratio ** np.arange(int(np.log(top) / np.log(ratio)) + 2)).astype(np.int64)
+    )
+    grid = grid[: np.searchsorted(grid, top) + 1]
+    cls = np.where(deg > 0, grid[np.minimum(np.searchsorted(grid, deg), len(grid) - 1)], 0)
+    buckets = []
+    for w in np.unique(cls[cls > 0]):
+        w = int(w)
+        rows = np.flatnonzero(cls == w).astype(np.int32)
+        n = len(rows)
+        per = min(max(1, CHUNK // w), n)
+        total = -(-n // per) * per
+        r = np.full(total, rows[0], np.int32)
+        r[:n] = rows
+        valid = np.arange(w)[None, :] < deg[rows][:, None]
+        idx = np.where(valid, indptr[rows][:, None] + np.arange(w)[None, :], 0)
+        sb, fb = np.zeros((total, w), np.int32), np.zeros((total, w), fac.dtype)
+        sb[:n], fb[:n] = np.where(valid, src[idx], 0), np.where(valid, fac[idx], 0)
+        del valid, idx
+        buckets += [jnp.asarray(x.reshape(-1, per, *x.shape[1:])) for x in (r, sb, fb)]
+    return buckets
+
+
+def _bucket_scan(vec, out, rows, src, fac):
+    """Per piece: each row's sum ``fac . vec[src]`` along its own entries, written once per row."""
+
+    def body(acc, chunk):
+        r, sj, dj = chunk
+        val = jnp.sum(dj * vec.at[..., sj].get(mode=IB), axis=-1)
+        return acc.at[..., r].add(val, mode=IB), None
+
+    return jax.lax.scan(body, out, (rows, src, fac))[0]
+
+
+def _ell_block(vec, out, src, fac):
+    """Per piece of ``R`` consecutive rows: row sums ``fac . vec[src]``, added into ``out`` in place."""
+    rows = src.shape[1]
+
+    def body(acc, chunk):
+        p, sj, dj = chunk
+        val = jnp.sum(dj * vec[..., sj], axis=-1)
+        win = jax.lax.dynamic_slice_in_dim(acc, p * rows, rows, axis=-1)
+        return jax.lax.dynamic_update_slice_in_dim(acc, win + val, p * rows, axis=-1), None
+
+    return jax.lax.scan(body, out, (jnp.arange(src.shape[0]), src, fac))[0]
+
+
+@jax.jit
+def matvec_hyb(vec, d0, *parts):
+    """HYB: per set, a natural-order ELL block (contiguous writes) plus a sorted-scatter overflow."""
+    out = d0 * vec
+    for k in range(0, len(parts), 5):
+        es, ef, ovt, os_, od = parts[k : k + 5]
+        out = _sorted_scatter(vec, _ell_block(vec, out, es, ef), ovt, os_, od)
+    return out
+
+
+@jax.jit
+def matvec_ell(vec, d0, *buckets):
+    """Degree-bucketed ELL: scatter-free row sums, then one write per row."""
+    out = d0 * vec
+    for k in range(0, len(buckets), 3):
+        out = _bucket_scan(vec, out, *buckets[k : k + 3])
+    return out
 
 
 # C2W: rows one window may span, so its segment_sum emits O(window) segments, never N. 2^15 is the
@@ -509,7 +746,10 @@ def operators(ham, states, size, arms):
                 cdp = chunked_diagonals(cpi, cpj, cpg, z, c, su, kmax)
                 ops["P2"] = (matvec_p2, (cpi, cpj, cdp, d0), None)
             del cpi, cpj, cpg
-        needs_host = bool(({"C0", "C0i16", "C2", "C2R", "C2W", "seg"} | rcm_arms) & wanted)
+        needs_host = bool(
+            ({"C0", "C0i16", "C2", "C2R", "C2W", "C2RF", "ELL", "HYB", "ELLC", "seg"} | rcm_arms)
+            & wanted
+        )
         if (
             not needs_host
         ):  # nothing else reads the host pairs: free them before anything else is built
@@ -553,6 +793,57 @@ def operators(ham, states, size, arms):
                 del qg
                 parts += [qt, qs, qd]
             ops["C2R"] = (matvec_c2r, (*parts, d0), None)
+        if "P2F" in wanted:
+            fi, fj, fg = chunked((pi, pj, pg), pad=0)
+            ops["P2F"] = (
+                matvec_p2f,
+                (fi, fj, chunked_diagonals(fi, fj, fg, z, c, su, kmax), d0),
+                None,
+            )
+            del fg
+        if "C2RF" in wanted:
+            parts = []
+            for groups, real in (
+                ([g for g in every if real_group[g]], True),
+                ([g for g in every if not real_group[g]], False),
+            ):
+                qt, qs, qg = csr(groups, np.int32)
+                parts += [qt, qs, chunked_diagonals(qt, qs, qg, z, c.real if real else c, su, kmax)]
+                del qg
+            ops["C2RF"] = (matvec_c2rf, (*parts, d0), None)
+            del parts
+        if "ELL" in wanted:
+            buckets = []
+            for groups, real in (
+                ([g for g in every if real_group[g]], True),
+                ([g for g in every if not real_group[g]], False),
+            ):
+                c_set = c.real if real else c
+                buckets += ell_buckets(pi, pj, pg, groups, num_groups, size, z, c_set, su, kmax)
+            ops["ELL"] = (matvec_ell, (d0, *buckets), None)
+            del buckets
+        if "ELLC" in wanted:
+            buckets = []
+            for groups, real in (
+                ([g for g in every if real_group[g]], True),
+                ([g for g in every if not real_group[g]], False),
+            ):
+                c_set = c.real if real else c
+                buckets += ell_class_buckets(
+                    pi, pj, pg, groups, num_groups, size, z, c_set, su, kmax
+                )
+            ops["ELLC"] = (matvec_ell, (d0, *buckets), None)
+            del buckets
+        if "HYB" in wanted:
+            parts = []
+            for groups, real in (
+                ([g for g in every if real_group[g]], True),
+                ([g for g in every if not real_group[g]], False),
+            ):
+                c_set = c.real if real else c
+                parts += hyb_set(pi, pj, pg, groups, num_groups, size, z, c_set, su, kmax)
+            ops["HYB"] = (matvec_hyb, (d0, *parts), None)
+            del parts
         if "C2W" in wanted:
             windows = []
             for groups, real in (
