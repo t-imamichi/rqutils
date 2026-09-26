@@ -127,6 +127,14 @@ ns/state for one `(2, N)` matvec, and operator B/slot at `2^21` (solver vectors 
    complex coefficients (the end-site `Y` terms).
 4. **Reverse Cuthill–McKee: nothing.** A Hamming-shell transition graph is hypercube-like — each state's
    neighbours span the whole index range — so there is no small bandwidth to find; lex order is as good.
+5. **Real factors for pairs (P2R, 2026-09-27): −25–30% of P2's operator, but ≤ 9% of a solve.** C2R's
+   split applied to P2: `float64` factors for real groups, two scans. At `2^21` the operator falls 75 → 56
+   (`type1`) and 179 → 126 B/slot (`type2`) at equal matvec speed; at `2^17` the second scan costs 8–19%
+   per matvec and ~10% per solve (0.94 → 1.03 s, 1.58 → 1.72 s). The solver's ~150 B/slot of vectors
+   dominate, so whole-solve memory falls only 224 → 222 and 302 → 274 B/slot. The prototype's setup peak
+   *rose* (`type2`: 316 → 337 MiB at `2^19`, 832 → 941 at `2^21`) because it masks copies out of the full
+   host pair list; per-group filling as the library does caps the gain at the operator's ~106 MiB of 832
+   (−13%, unmeasured).
 
 `type1` gains *more* past the cache than `type2` despite half the groups: with fewer groups the matvec is
 less memory-bound, so C2R holds 6.2× at `2^21` where `type2`'s falls to 3.4×.

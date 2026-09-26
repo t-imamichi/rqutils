@@ -10,6 +10,7 @@ Arms (the identity-X group is always a plain ``d_0 * v``; every other arm scans 
 
 * ``(1,0)``, ``(1,2)`` -- today's kernels, the baselines;
 * ``P0`` / ``P2``  -- pairs ``(i, j, g)``, two scatters, diagonal recomputed / cached;
+* ``P2R``          -- P2 with ``float64`` factors for real groups, ``complex128`` only for the rest;
 * ``C0`` / ``C2``  -- both directions ``(t, s, g)`` sorted by target (CSR), one sorted scatter;
 * ``C0i16``        -- C0 with ``int16`` group ids (``int32`` if ``J > 32768``: ``astype`` would wrap);
 * ``C2R``          -- C2 with ``float64`` diagonals for real groups, ``complex128`` only for the rest;
@@ -74,6 +75,7 @@ ARMS = (
     "(1,2)",
     "P0",
     "P2",
+    "P2R",
     "C0",
     "C0i16",
     "C2",
@@ -199,12 +201,24 @@ def matvec_p0(vec, pi, pj, pg, z, c, states, kmax):
 
 @jax.jit
 def matvec_p2(vec, pi, pj, d, d0):
-    def body(out, chunk):
-        i, j, di = chunk
-        out = out.at[..., i].add(di * vec[..., j])
-        return out.at[..., j].add(jnp.conj(di) * vec[..., i]), None
+    return _pair_scan(vec, d0 * vec, pi, pj, d)
 
-    return jax.lax.scan(body, d0 * vec, (pi, pj, d))[0]
+
+def _pair_scan(vec, out, pi, pj, d):
+    """Per pair ``out[i] += d * vec[j]`` and ``out[j] += conj(d) * vec[i]``; conj is a no-op on real d."""
+
+    def body(acc, chunk):
+        i, j, di = chunk
+        acc = acc.at[..., i].add(di * vec[..., j])
+        return acc.at[..., j].add(jnp.conj(di) * vec[..., i]), None
+
+    return jax.lax.scan(body, out, (pi, pj, d))[0]
+
+
+@jax.jit
+def matvec_p2r(vec, ri, rj, rd, qi, qj, qd, d0):
+    """P2 over a ``float64``-factor set (real groups) and a ``complex128`` one (the rest), as C2R does."""
+    return _pair_scan(vec, _pair_scan(vec, d0 * vec, ri, rj, rd), qi, qj, qd)
 
 
 @functools.partial(jax.jit, static_argnames="kmax")
@@ -402,6 +416,13 @@ def operators(ham, states, size, arms):
     if wanted - {"(1,0)", "(1,2)"}:
         pi, pj, pg, info["hit"] = build_pairs(ham, su, dim)
         info["pairs_per_slot"] = len(pi) / size
+        if "P2R" in wanted:
+            parts = []
+            for mask, c_set in ((real_group[pg], c.real), (~real_group[pg], c)):
+                qi, qj, qg = chunked((pi[mask], pj[mask], pg[mask]), pad=0)
+                parts += [qi, qj, chunked_diagonals(qi, qj, qg, z, c_set, su, kmax)]
+                del qg
+            ops["P2R"] = (matvec_p2r, (*parts, d0), None)
         if {"P0", "P2"} & wanted:
             cpi, cpj, cpg = chunked((pi, pj, pg), pad=0)
             if "P0" in wanted:
