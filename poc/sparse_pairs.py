@@ -322,8 +322,11 @@ def to_codes(states):
     return (states.astype(np.uint64) << np.arange(states.shape[1], dtype=np.uint64)).sum(axis=1)
 
 
-def recovery_scores(masks, codes, v):
-    """``(c, |<c|H|v>|)`` for every ``c`` in H's one-hop reach of sorted ``codes`` and outside it."""
+def recovery_scores(masks, codes, v, signed=False):
+    """``(c, |<c|H|v>|)`` for every ``c`` in H's one-hop reach of sorted ``codes`` and outside it.
+
+    ``signed=True`` returns ``<c|H|v>`` itself, for a first-order start on the admitted states.
+    """
     x, z, coef = masks
     cand, amp = [], []
     for xg in np.unique(x[x != 0]):
@@ -341,7 +344,7 @@ def recovery_scores(masks, codes, v):
     uniq, inv = np.unique(np.concatenate(cand), return_inverse=True)
     score = np.zeros(len(uniq), complex)
     np.add.at(score, inv, np.concatenate(amp))
-    return uniq, np.abs(score)
+    return uniq, score if signed else np.abs(score)
 
 
 def recovery_subspace(op, n, size, seed_size=1 << 12):

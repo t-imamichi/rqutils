@@ -2256,6 +2256,14 @@ No verdict: warm beats cold 1.3–1.9× on iterations, but zero-padding, the sha
 withheld it. Cause: the ground state is concentrated (top-256 = 98.8%); a real retest needs relgap ≲
 1e-04, and this family saturates at 3.95e-02. `poc/warmstart.md` §1–§5.
 
+### Warm starts on a recovery-grown sequence: ~1.15×, and only with a lighter prefilter (2026-09-26)
+
+On a fixture where the answer moves every round (n=60 `type1`, recovery-grown `2^12` to `2^17`, 5–30%
+weight on new states), zero-padding finally loses at the shipped `(32, 2)` (4 of 5 rounds), and there the
+best warm start beats cold by only 1.02–1.10×. Warm start plus `(16, 1)` gives 1.13–1.26× in operator
+applications, shrinking as recovery converges (~1.15× per run); a first-order start is the worst warm arm.
+Every arm converged to the cold energy. `poc/warmstart-rounds.md` §1–§2.
+
 ### `body()`'s all-reduces are one chain; 13 -> 12 is the floor (2026-09-25)
 
 `test/sharded/allreduce_count.py`, 4 virtual CPU devices. The loop body compiled to 13 all-reduces
