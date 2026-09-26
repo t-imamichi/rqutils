@@ -230,6 +230,8 @@ Hamming shells. Shell `h` for `type1`/`type2` is read off `type4`/`type3`, which
 4. **Pruned recovery and real samples.** §5's recovery subspace neither prunes nor starts from Krylov
    samples. Pruning pushes `h` up, and n=20's 0.354 shows how far `h` can go; a replayed spinchain run
    (`skqd/replay.py`) would give the true subspace.
+5. **Replace the `"csr"` kernel with ELLC (§10).** It is 2.0–2.4× faster per whole solve than C2R with a
+   smaller operator; the name (`"ell"` or `"rows"`) is undecided.
 
 ## 8. The script
 
@@ -270,3 +272,67 @@ Real factors cut C2's operator 28–31% at no measured speed cost (§4, item 3),
 transition twice and so carries twice the factors; the same split on pairs (P2R, §4 item 5) halves as many
 bytes, moves the peak only 1–5% (within noise), and costs 9–10% of an in-cache solve. Revisit P2R only if
 a GPU run is bound by device memory, where the solve-memory row (up to −9%) is what counts.
+
+## 10. Rows bucketed by degree (ELL): faster than C2R, and the grid that makes it affordable
+
+2026-09-27, after the literature search (SELL-C-σ, Kreutzer et al. 2014; HYB, Bell & Garland 2009).
+Arms `ELL`, `ELLC`, `ELLD`, `HYB`, `P2F`, `C2RF`, all exact against `(1, 0)`; n=60 unless stated.
+
+**The idea.** C2R does one scatter-add per entry; ELL groups the rows of one degree `k` into a dense
+`(rows, k)` block, so a row's sum is a gather, a multiply and a reduction along the row, written once:
+E writes become N, the inner loop has a static length and vectorizes, and no per-entry target is
+stored (it is implied by the row). What it does not touch is the random `vec[src]` gather, the part that
+is memory-bound past the cache — so its lead narrows there, but holds.
+
+**Heavy-tailed degrees decide the format.** A Hamming-shell subspace fills its inner shells almost
+completely, so states there have nearly every neighbour inside, while outer-shell states keep a few: mean
+degree 3.69 / 10.19 / 11.58 against a maximum of 60 / 117 / 117 (`type1` `2^17`, `type2` `2^17`, `2^19`),
+with 17–68 distinct degrees per coefficient set. That is why exact-degree bucketing fits, and why **HYB
+(one ELL block of width W plus a CSR overflow) loses**: a byte-optimal W of 1–7 leaves 42–78% of the
+entries in the scatter overflow (64.1 against ELL's 23.9 ns/state at n=20 `2^14`).
+
+**Exact-degree ELL is fast but compiles one scan per bucket.** 1.31–1.34× over C2R at `2^21` (20.2 / 58.5
+against 26.4 / 78.6 ns/state), 1.7–2.0× at `2^17`, 1.73× on a recovery subspace (33.1 against 57.4), at
+a smaller operator (82 / 190 against 96 / 236 B/slot). But `type2` `2^19` has 70 buckets, and compiling
+their 70 scans costs **+477 MiB** (C2R +103), so its setup-inclusive peak was 918 MiB against C2R's
+389. That overhead is program size, roughly constant in N, and on a GPU it lands in host RAM, not on the
+device. Two construction faults were fixed on the way: a dummy output slot that cost two `(2, N)` copies
+(temp 35 / 49 → 4 / 19 B/slot), and building ELL from a live C2R operator.
+
+**Degree classes cut the buckets, and ×1.25 is the grid.** Rounding each degree up to a class trades
+padding for buckets; from the n=60 histograms (both sets):
+
+| grid | `type1` `2^19` | `type2` `2^19` | `type2` `2^21` |
+| --- | --- | --- | --- |
+| exact (ELL) | 34 buckets, 0.0% padding | 70, 0.0% | 50, 0.0% |
+| geometric ×1.25 (ELLC) | 14, 2.0% | 19, 7.7% | 16, 7.3% |
+| geometric ×1.5 | 11, 6.6% | 14, 15.0% | 12, 16.3% |
+| Fibonacci | 10, 14.3% | 12, 22.5% | 10, 22.9% |
+| powers of 2 | 7, 26.2% | 9, 41.5% | 8, 47.4% |
+
+Fibonacci is geometric with ratio φ and is coarse exactly where a heavy tail keeps its entries (55 → 89
+→ 144). A DP choosing classes from the histogram (ELLD: padding bytes + a per-bucket charge) picks
+irregular classes — exact where degrees are common, one jump across the rare tail (`type2` `2^21`: 6, 8,
+16, 19, 24, 73, 117) — and gives the lowest peak (532 MiB at 0.5 MiB/bucket, 13 buckets), but **its
+memory-only objective drives it wrong at large N**: it adds near-exact classes to shed padding, and every
+bucket also costs time, so it is 22% slower than ELLC on `type2` at `2^21` (52.2 against 42.7 ns/state);
+at 5.7 MiB/bucket it has too few buckets and pads its way to a 644 MiB peak. **ELLC's fixed ×1.25 grid
+is fastest or tied at every size**, with factors computed per bucket in fixed `2^15` chunks (padded slots
+get `s = t`, which the factor's `t == s` rule zeroes): construction then drops from +518 to +392 MiB.
+
+| n=60 | C2R | **ELLC** | ELLC vs C2R |
+| --- | --- | --- | --- |
+| matvec `type1` `2^17` / `2^21`, ns/state | 20.1 / 26.2 | 11.1 / 17.8 | 1.8× / 1.5× |
+| matvec `type2` `2^17` / `2^21` | 55.1 / 78.7 | 24.4 / 43.7 | 2.3× / 1.8× |
+| operator `type1` / `type2` at `2^21`, B/slot | 96 / 236 | 84 / 200 | −13% / −15% |
+| whole solve `type1` / `type2` at `2^17` | 1.20 s / 2.49 s | 0.61 s / 1.03 s | 2.0× / 2.4× |
+| solve memory `type1` / `type2`, B/slot | 244 / 348 | 246 / 338 | ≈ |
+| setup-inclusive peak, `type2` `2^19` | 461 MiB | 600 MiB | 1.3× |
+
+ELLC's remaining excess over C2R is its compile memory (+209 against +105 MiB, 19 scans), fixed in N.
+
+**Two things measured along the way.** `mode="promise_in_bounds"` on every gather and scatter changes
+nothing on CPU (P2F / C2RF within 0.1 ns/state of P2 / C2R). And whole-solve iteration counts (96 or 105
+on `type1`) are not a property of the kernel: two ELL builds with bit-identical products solved in 96
+and 105 iterations, because XLA fuses the surrounding solver differently and the last bits of its
+reductions pick one of two nearby trajectories — compare kernels by time per iteration.

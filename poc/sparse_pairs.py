@@ -20,6 +20,7 @@ Arms (the identity-X group is always a plain ``d_0 * v``; every other arm scans 
 * ``ELL``          -- rows bucketed by exact degree: scatter-free row sums, one write per row;
 * ``HYB``          -- one natural-order ELL block of width ``W`` (contiguous writes) + CSR overflow;
 * ``ELLC``         -- ELL with degrees rounded up to geometric classes: far fewer buckets and compiles;
+* ``ELLD``         -- ELL with classes chosen per histogram by a DP (padding bytes + per-bucket cost);
 * ``...+RCM``      -- states relabelled by reverse Cuthill--McKee first.
 
 Subcommands (fixture: spinchain's open-XXZ ``xxz``, ``poc/eigenpair_check_scale``; ``--subspace`` picks
@@ -92,6 +93,7 @@ ARMS = (
     "ELL",
     "HYB",
     "ELLC",
+    "ELLD",
     "C0i16+RCM",
     "C2+RCM",
     "C2R+RCM",
@@ -439,23 +441,55 @@ def ell_buckets(pi, pj, pg, groups, num_groups, size, z, c, states, kmax):
     return buckets
 
 
-def ell_class_buckets(pi, pj, pg, groups, num_groups, size, z, c, states, kmax, ratio=1.25):
-    """ELL with each row's degree rounded up to a geometric class (``ratio`` apart), so there are
-    ~log_ratio(max degree) buckets rather than one per distinct degree; slots past a row's degree carry
-    a zero factor. Factors come from one ``chunked_diagonals`` pass over the flat entries."""
+@functools.partial(jax.jit, static_argnames="kmax")
+def chunk_factors(t, s, g, z, c, states, kmax):
+    """``d_g(t)`` for one flat ``(CHUNK,)`` chunk, zero where ``t == s``: one compile per dtype."""
+    return jnp.where(t == s, 0.0, pair_diagonal(states[t], z[g][:, :kmax], c[g][:, :kmax]))
+
+
+def geometric_classes(deg, ratio=1.25):
+    """Class tops on a ``ratio``-geometric grid up to the largest degree (ELLC)."""
+    top = int(deg.max())
+    grid = np.ceil(ratio ** np.arange(int(np.log(max(top, 2)) / np.log(ratio)) + 2)).astype(
+        np.int64
+    )
+    grid = np.unique(grid)
+    return grid[: np.searchsorted(grid, top) + 1]
+
+
+def optimal_classes(deg, slot_bytes, bucket_bytes):
+    """Class tops minimising padding bytes + ``bucket_bytes`` per class (ELLD): an O(m^2) DP over the
+    sorted distinct degrees, each class a contiguous run padded to its largest degree."""
+    d, h = np.unique(deg[deg > 0], return_counts=True)
+    m = len(d)
+    best, cut = np.full(m + 1, np.inf), np.zeros(m + 1, np.int64)
+    best[0] = 0.0
+    hd, hc = np.concatenate([[0], np.cumsum(h * d)]), np.concatenate([[0], np.cumsum(h)])
+    for b in range(1, m + 1):  # class d[a:b], padded to d[b - 1]
+        a = np.arange(b)
+        pad = (d[b - 1] * (hc[b] - hc[a]) - (hd[b] - hd[a])) * slot_bytes
+        cost = best[a] + pad + bucket_bytes
+        k = int(np.argmin(cost))
+        best[b], cut[b] = cost[k], k
+    tops, b = [], m
+    while b:
+        tops.append(int(d[b - 1]))
+        b = int(cut[b])
+    return np.array(sorted(tops), np.int64)
+
+
+def ell_class_buckets(pi, pj, pg, groups, num_groups, size, z, c, states, kmax, classes):
+    """ELL with each row's degree rounded up to a class top from ``classes(deg, slot_bytes)``.
+
+    Factors are computed per bucket in fixed ``(CHUNK,)`` flat chunks: a padded or invalid slot gets
+    source = target, so ``chunk_factors``' ``t == s`` rule zeroes it with no mask and no flat round trip.
+    """
     deg, indptr, src, grp = host_csr(pi, pj, pg, groups, num_groups, size)
     if not len(src):
         return []
-    t = np.repeat(np.arange(size, dtype=np.int32), deg)
-    ct, cs, cg = chunked((t, src, grp), pad=size - 1)  # padding has t == s, hence a zero factor
-    fac = np.asarray(chunked_diagonals(ct, cs, cg, z, c, states, kmax)).reshape(-1)[: len(src)]
-    del t, grp, ct, cs, cg
-    top = int(deg.max())
-    grid = np.unique(
-        np.ceil(ratio ** np.arange(int(np.log(top) / np.log(ratio)) + 2)).astype(np.int64)
-    )
-    grid = grid[: np.searchsorted(grid, top) + 1]
-    cls = np.where(deg > 0, grid[np.minimum(np.searchsorted(grid, deg), len(grid) - 1)], 0)
+    slot = 4 + (8 if np.isrealobj(np.asarray(c)) else 16)
+    tops = classes(deg, slot)
+    cls = np.where(deg > 0, tops[np.minimum(np.searchsorted(tops, deg), len(tops) - 1)], 0)
     buckets = []
     for w in np.unique(cls[cls > 0]):
         w = int(w)
@@ -465,12 +499,29 @@ def ell_class_buckets(pi, pj, pg, groups, num_groups, size, z, c, states, kmax, 
         total = -(-n // per) * per
         r = np.full(total, rows[0], np.int32)
         r[:n] = rows
-        valid = np.arange(w)[None, :] < deg[rows][:, None]
-        idx = np.where(valid, indptr[rows][:, None] + np.arange(w)[None, :], 0)
-        sb, fb = np.zeros((total, w), np.int32), np.zeros((total, w), fac.dtype)
-        sb[:n], fb[:n] = np.where(valid, src[idx], 0), np.where(valid, fac[idx], 0)
-        del valid, idx
-        buckets += [jnp.asarray(x.reshape(-1, per, *x.shape[1:])) for x in (r, sb, fb)]
+        valid = np.zeros((total, w), bool)
+        valid[:n] = np.arange(w)[None, :] < deg[rows][:, None]
+        idx = np.zeros((total, w), np.int64)
+        idx[:n] = indptr[rows][:, None] + np.arange(w)[None, :]
+        sb = np.where(valid, src[np.where(valid, idx, 0)], 0).astype(np.int32)
+        gb = np.where(valid, grp[np.where(valid, idx, 0)], 0).astype(np.int32)
+        del idx
+        tt = np.repeat(r, w)
+        ss = np.where(valid.reshape(-1), sb.reshape(-1), tt)  # invalid slot: s == t, zero factor
+        pad = -len(tt) % CHUNK
+        flat = [
+            np.concatenate([x, np.zeros(pad, np.int32)]).reshape(-1, CHUNK)
+            for x in (tt, ss, gb.reshape(-1))
+        ]
+        del tt, ss, valid, gb
+        fac = jnp.concatenate(
+            [
+                chunk_factors(*(jnp.asarray(x[k]) for x in flat), z, c, states, kmax)
+                for k in range(len(flat[0]))
+            ]
+        )[: total * w].reshape(-1, per, w)
+        del flat
+        buckets += [jnp.asarray(r.reshape(-1, per)), jnp.asarray(sb.reshape(-1, per, w)), fac]
     return buckets
 
 
@@ -747,7 +798,10 @@ def operators(ham, states, size, arms):
                 ops["P2"] = (matvec_p2, (cpi, cpj, cdp, d0), None)
             del cpi, cpj, cpg
         needs_host = bool(
-            ({"C0", "C0i16", "C2", "C2R", "C2W", "C2RF", "ELL", "HYB", "ELLC", "seg"} | rcm_arms)
+            (
+                {"C0", "C0i16", "C2", "C2R", "C2W", "C2RF", "ELL", "HYB", "ELLC", "ELLD", "seg"}
+                | rcm_arms
+            )
             & wanted
         )
         if (
@@ -830,9 +884,42 @@ def operators(ham, states, size, arms):
             ):
                 c_set = c.real if real else c
                 buckets += ell_class_buckets(
-                    pi, pj, pg, groups, num_groups, size, z, c_set, su, kmax
+                    pi,
+                    pj,
+                    pg,
+                    groups,
+                    num_groups,
+                    size,
+                    z,
+                    c_set,
+                    su,
+                    kmax,
+                    lambda deg, slot: geometric_classes(deg),
                 )
             ops["ELLC"] = (matvec_ell, (d0, *buckets), None)
+            del buckets
+        if "ELLD" in wanted:
+            bucket_bytes = float(os.environ.get("ELLD_BUCKET_MIB", "5.7")) * 2**20
+            buckets = []
+            for groups, real in (
+                ([g for g in every if real_group[g]], True),
+                ([g for g in every if not real_group[g]], False),
+            ):
+                c_set = c.real if real else c
+                buckets += ell_class_buckets(
+                    pi,
+                    pj,
+                    pg,
+                    groups,
+                    num_groups,
+                    size,
+                    z,
+                    c_set,
+                    su,
+                    kmax,
+                    lambda deg, slot: optimal_classes(deg, slot, bucket_bytes),
+                )
+            ops["ELLD"] = (matvec_ell, (d0, *buckets), None)
             del buckets
         if "HYB" in wanted:
             parts = []

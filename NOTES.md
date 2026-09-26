@@ -1306,7 +1306,10 @@ the cache thins to 1.20--1.51×. Two measured lessons: the speedup shrinks with 
 not threads** (CSR order recovers it), and the setup peak needed a **counting sort** by target, per-group
 construction and no duplicate transients. **Shipped 2026-09-26 as `sqd(matvec="pairs"|"csr")`**,
 single-device: warm `sqd` at n=60 `type1` `2^17` takes 1.26 s / 1.63 s against `"indices"`' 6.25 s
-(`poc/sparse-pairs.md` §9). Open: GPU timing, sharding, a pruned recovery subspace.
+(`poc/sparse-pairs.md` §9). **Its successor is ELLC (2026-09-27):** rows bucketed by degree rounded to a
+×1.25 grid, a gather-reduce per row instead of a scatter per entry — 2.0–2.4× C2R per whole solve at a
+smaller operator, peak 1.3× C2R's from compiling 19 bucket scans (§10). Open: GPU timing, sharding, a
+pruned recovery subspace, and shipping ELLC as the csr kernel.
 
 ### Partial diagonal cache: *which* groups to cache barely matters, only how many (2026-09-25)
 
