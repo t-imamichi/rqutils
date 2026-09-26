@@ -7,7 +7,7 @@ import warnings
 import numpy as np
 import pytest
 from conftest import (
-    CACHE_LEVELS,
+    MATVECS,
     apply_h_inputs,
     apply_h_kwargs,
     pack_padded,
@@ -514,15 +514,15 @@ class TestApplyHArrayRoles:
         with pytest.raises(ValueError, match="diagonals"):
             apply_h(np.ones(2), xsources=xsources, diagonals=hamiltonian.z[0])
 
-    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
-    def test_every_valid_input_set_is_still_accepted(self, cache_level):
+    @pytest.mark.parametrize("matvec", MATVECS)
+    def test_every_valid_input_set_is_still_accepted(self, matvec):
         """The guard must not reject any of the three the kernel implements."""
         arrays = apply_h_inputs(np.random.default_rng(20260825))
         got = np.asarray(
             apply_h(
                 arrays["vector"],
                 states=arrays["states_u"],
-                **apply_h_kwargs(cache_level, arrays),
+                **apply_h_kwargs(matvec, arrays),
             )
         )
         expected = arrays["matrix"] @ arrays["vector"]
@@ -546,19 +546,19 @@ class TestMatvecKernels:
         ).real
         assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
 
-    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
-    def test_every_cache_level_matches_dense(self, cache_level):
+    @pytest.mark.parametrize("matvec", MATVECS)
+    def test_every_matvec_matches_dense(self, matvec):
         """Every resolution path of the unified kernel, each against the dense product.
 
-        The risk in one ``cache_level``-indexed kernel is a mis-wired argument slot -- feeding a Z
+        The risk in one ``matvec``-indexed kernel is a mis-wired argument slot -- feeding a Z
         signature where a coefficient belongs, say -- which would still produce a plausible finite
-        vector. Checking every level against ``project_dense`` (an independent Kronecker
+        vector. Checking every kernel against ``project_dense`` (an independent Kronecker
         construction) rather than against the other kernels is what catches it: cross-kernel
         agreement alone would pass if all of them broke identically.
         """
         p = apply_h_inputs(np.random.default_rng(20260805))
-        kwargs = apply_h_kwargs(cache_level, p)
-        needs_states = cache_level != (1, 2)
+        kwargs = apply_h_kwargs(matvec, p)
+        needs_states = matvec != "tables"
         got = np.asarray(
             apply_h(p["vector"], states=p["states_u"] if needs_states else None, **kwargs)
         ).real
@@ -576,9 +576,9 @@ class TestMatvecKernels:
         """The keyword form covers all three strategies and each still matches a dense reference.
 
         The keyword names are the only thing selecting the strategy here, so this is what pins the
-        keyword-to-digit pairing inside ``apply_h``. A transposed digit there would route a
+        keyword-to-kernel pairing inside ``apply_h``. A mis-resolved name there would route a
         call to the wrong branch and produce a plausible finite vector, exactly the failure mode
-        :meth:`test_every_cache_level_matches_dense` exists for -- so the reference is dense here too,
+        :meth:`test_every_matvec_matches_dense` exists for -- so the reference is dense here too,
         not the positional form (agreeing with a sibling that is wrong the same way proves nothing).
         """
         p = apply_h_inputs(np.random.default_rng(20260805))
@@ -637,26 +637,26 @@ class TestMatvecKernels:
         with pytest.raises(ValueError, match="exactly one of xsources= or xsignatures="):
             apply_h(np.zeros(4))
 
-    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
-    def test_pack_scanned_arity_matches_what_the_kernel_unpacks(self, cache_level):
+    @pytest.mark.parametrize("matvec", MATVECS)
+    def test_pack_scanned_arity_matches_what_the_kernel_unpacks(self, matvec):
         """The packer's arity is a contract with the kernel, and it is shared by two callers.
 
-        ``_apply_h_kernel``'s scan body reads ``val[2]`` only when ``cache_level[1] == 0``, so the
-        3-tuple/2-tuple split is a real contract: the two levels that *compute* a diagonal need
+        ``_apply_h_kernel``'s scan body reads ``val[2]`` only when ``matvec != "tables"``, so the
+        3-tuple/2-tuple split is a real contract: the two kernels that *compute* a diagonal need
         the coefficients, the one that reads a precomputed diagonal must not carry them.
 
         Asserted directly because the end-to-end tests do **not** catch a violation. Mutation-tested:
-        forcing the 3-tuple for every level leaves all of `test_sqd.py` green, because the extra
+        forcing the 3-tuple for every kernel leaves all of `test_sqd.py` green, because the extra
         element is scanned and then ignored -- wasted work per group rather than a wrong number. That
         makes it invisible to any value assertion, and it is exactly the kind of silent drift the
         shared packer exists to prevent now that ``run_sqd`` and ``apply_h`` both depend on it.
         """
         marker = np.zeros(1)
-        packed = _pack_scanned(cache_level, marker, marker, marker)
-        expected = 2 if cache_level[1] == 2 else 3
+        packed = _pack_scanned(matvec, marker, marker, marker)
+        expected = 2 if matvec == "tables" else 3
         assert len(packed) == expected, (
-            f"cache_level={cache_level} packed a {len(packed)}-tuple; the kernel expects {expected} "
-            "(coeffs are carried only by the levels that compute a diagonal)"
+            f"matvec={matvec!r} packed a {len(packed)}-tuple; the kernel expects {expected} "
+            "(coeffs are carried only by the kernels that compute a diagonal)"
         )
 
     def test_shape_assertion_would_not_have_closed_this(self):
@@ -690,26 +690,26 @@ class TestMatvecKernels:
         # of it (see TestApplyHArrayRoles).
         assert hamiltonian.x.dtype != xsources.dtype, (hamiltonian.x.dtype, xsources.dtype)
 
-    @pytest.mark.parametrize("cache_level", [(0, 0), (1, 0)])
-    def test_omitting_states_raises(self, cache_level):
-        """Only ``(1, 2)`` can run without the state list; the rest must say so.
+    @pytest.mark.parametrize("matvec", ["onthefly", "indices"])
+    def test_omitting_states_raises(self, matvec):
+        """Only ``"tables"`` can run without the state list; the rest must say so.
 
-        ``(1, 2)`` reads neither signature array, which is what lets a caller drop S after caching.
+        ``"tables"`` reads neither signature array, which is what lets a caller drop S after caching.
         For the other two, a missing S would otherwise surface as an opaque failure deep inside
         ``get_xsource``/``get_diagonal``.
         """
         # Shapes are irrelevant here -- the guard fires before any array is read -- so one dummy
-        # stands in for every name the level asks for.
+        # stands in for every name the kernel asks for.
         dummy = np.zeros((1, 1), dtype=np.uint8)
-        kwargs = apply_h_kwargs(cache_level, dict.fromkeys(_APPLY_H_ARRAY_KEYS, dummy))
+        kwargs = apply_h_kwargs(matvec, dict.fromkeys(_APPLY_H_ARRAY_KEYS, dummy))
         with pytest.raises(ValueError, match="states is required"):
             apply_h(np.zeros(4), states=None, **kwargs)
 
     def test_fully_cached_level_matches_dense(self):
-        """``cache_level=(1, 2)``, the fully-precomputed level, against a dense reference.
+        """``"tables"``, the fully-precomputed kernel, against a dense reference.
 
-        Overlaps :meth:`test_every_cache_level_matches_dense` by design, and is kept separate because
-        this level is the special case: with both the source indices and the diagonals precomputed it
+        Overlaps :meth:`test_every_matvec_matches_dense` by design, and is kept separate because
+        this kernel is the special case: with both the source indices and the diagonals precomputed it
         reads neither signature array, so it can run with ``states=None``. That makes it the positive
         control for the guard :meth:`test_omitting_states_raises` exercises from the other side --
         here passing None must *not* raise, and the answer must still match the dense projection.

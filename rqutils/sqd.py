@@ -115,18 +115,18 @@ the vector is real or complex (i.e., if there are terms in the Hamiltonian with 
 Caching both also frees :math:`S`, which is no longer read, so at small :math:`n` the full cache can
 be the cheaper option in memory too.
 
-``cache_level = (source_indices, diagonals)`` offers three combinations: ``(0, 0)`` caches nothing,
-``(1, 0)`` (the default) caches the source indices, and ``(1, 2)`` caches both. The other three
-pairs are rejected, being dominated on both memory and time: ``(0, 1)`` by ``(0, 0)``, ``(0, 2)`` by
-``(1, 0)`` and ``(1, 1)`` by ``(1, 2)`` (``NOTES.md``).
+``matvec`` names the kernel: ``"onthefly"`` stores nothing, searching the sources and computing
+the diagonals per matvec; ``"indices"`` (the default) caches the source indices; ``"tables"``
+caches both. The other storage combinations are not offered, being dominated on both memory and
+time (``NOTES.md``).
 
 **The source-index setup dominates the solve, so this is not a symmetric memory-for-speed dial.**
 Weighted by call count, the :math:`J`-fold :func:`get_xsource` precompute measured **66-97%** of an
 entire solve -- 97.5% at 10 iterations, 66.4% at 200 (3064 ms of setup against 8.35 ms per matvec
 iteration, N=200k, J=50; see ``markdown/scaling-pocs.md``). Turning source-index caching *off* pays
 that cost once per matvec rather than once per solve: measured end-to-end at N=3k, n=12, J=23,
-``(0, 0)`` is 7.2x slower than ``(1, 0)``, returning the same energy. Prefer ``(1, 0)`` or ``(1, 2)``
-unless the memory genuinely will not fit.
+``"onthefly"`` is 7.2x slower than ``"indices"``, returning the same energy. Prefer ``"indices"`` or
+``"tables"`` unless the memory genuinely will not fit.
 
 Distributed arrays and scaling limits
 =====================================
@@ -242,9 +242,9 @@ def _check_array_role(name: str, array: Any) -> None:
         )
 
 
-#: The supported ``(source_indices, diagonals)`` pairs, and each removed pair's dominating one.
-_CACHE_LEVELS = ((0, 0), (1, 0), (1, 2))
-_DOMINATED_CACHE_LEVELS = {(0, 1): (0, 0), (0, 2): (1, 0), (1, 1): (1, 2)}
+type Matvec = Literal["onthefly", "indices", "tables", "pairs", "csr"]
+#: The implemented :data:`Matvec` names; the rest are reserved for kernels not yet built.
+_MATVECS = ("onthefly", "indices", "tables")
 
 
 def _residual_floor_of(hamiltonian: PauliSumXZ) -> float:
@@ -252,45 +252,27 @@ def _residual_floor_of(hamiltonian: PauliSumXZ) -> float:
     return residual_floor(float(np.abs(hamiltonian.c).sum()), hamiltonian.c.dtype)
 
 
-def _check_cache_level(cache_level: Any) -> None:
-    """Raise unless ``cache_level`` is ``(0, 0)``, ``(1, 0)`` or ``(1, 2)``.
+def _check_matvec(matvec: Any) -> None:
+    """Raise unless ``matvec`` is one of the implemented kernel names in ``_MATVECS``.
 
-    Every branch on ``cache_level`` is an equality test with an implicit ``else``, so an unvalidated
-    value would be absorbed rather than reported. The three other in-range pairs are rejected because
-    each is dominated on both memory and time (``NOTES.md``), and the message names the dominating one.
-    Kept a tuple: it is bound static into the kernel via :func:`functools.partial`.
+    Every branch on ``matvec`` is an equality test with an implicit ``else``, so an unvalidated value
+    would be absorbed into some kernel rather than reported.
 
     Args:
-        cache_level: The caller's value, unvalidated.
+        matvec: The caller's value, unvalidated.
 
     Raises:
-        TypeError: If it is not a length-2 sequence of ints, ``bool`` being rejected as one.
-        ValueError: If it is not one of the three supported pairs.
+        TypeError: If it is not a ``str`` (the removed ``cache_level`` tuple included).
+        ValueError: If it is not an implemented name, including the reserved ``"pairs"``/``"csr"``.
     """
-    try:
-        source_indices, diagonals = cache_level
-    except (TypeError, ValueError) as exc:
-        raise TypeError(
-            f"`cache_level` must be a (source_indices, diagonals) pair of ints, got {cache_level!r}"
-        ) from exc
-    # `bool` is an `int` subclass, so (True, 0) would otherwise pass as (1, 0).
-    if not all(isinstance(d, int) and not isinstance(d, bool) for d in (source_indices, diagonals)):
-        raise TypeError(
-            f"`cache_level` must be a (source_indices, diagonals) pair of ints, got {cache_level!r}"
-        )
-    level = (source_indices, diagonals)
-    if level in _DOMINATED_CACHE_LEVELS:
-        better = _DOMINATED_CACHE_LEVELS[level]
+    if not isinstance(matvec, str):
+        raise TypeError(f"`matvec` must be a str, one of {_MATVECS}; got {matvec!r}")
+    if matvec in ("pairs", "csr"):
         raise ValueError(
-            f"`cache_level` {level} is removed: {better} is faster and uses no more memory. "
-            f"Pass cache_level={better}."
+            f"`matvec={matvec!r}` is reserved but not implemented yet; use one of {_MATVECS}"
         )
-    if level not in _CACHE_LEVELS:
-        raise ValueError(
-            f"`cache_level` is {cache_level!r}, but must be one of {_CACHE_LEVELS} as "
-            "(source_indices, diagonals): 0=recompute per matvec, 1=cache source indices, "
-            "2=cache diagonals. The axes are not interchangeable."
-        )
+    if matvec not in _MATVECS:
+        raise ValueError(f"`matvec` is {matvec!r}, but must be one of {_MATVECS}")
 
 
 def _check_zsignatures_rank(zsignatures: Any) -> None:
@@ -457,7 +439,7 @@ def sqd(
     states_size: int | None = ...,
     return_eigvec: Literal[True] = ...,
     packed: bool = ...,
-    cache_level: tuple[int, int] = ...,
+    matvec: Matvec = ...,
     maxiter: int = ...,
     atol: float = ...,
     rtol: float | None = ...,
@@ -473,7 +455,7 @@ def sqd(
     states_size: int | None = ...,
     return_eigvec: Literal[False],
     packed: bool = ...,
-    cache_level: tuple[int, int] = ...,
+    matvec: Matvec = ...,
     maxiter: int = ...,
     atol: float = ...,
     rtol: float | None = ...,
@@ -488,7 +470,7 @@ def sqd(
     states_size: int | None = None,
     return_eigvec: bool = True,
     packed: bool = False,
-    cache_level: tuple[int, int] = (1, 0),
+    matvec: Matvec = "indices",
     maxiter: int = 1000,
     atol: float = 0.0,
     rtol: float | None = None,
@@ -510,9 +492,8 @@ def sqd(
     spurious (fill-in) entries. ``PauliSumXZ`` reserves the same bit in its signatures
     unconditionally, so the two are aligned by construction.
 
-    Cache level is a 2-tuple where the first element specifies the caching of the source indices
-    (0=no caching, 1=cached) and the second specifies the caching of the diagonal elements (0=no
-    caching, 2=cache diagonals). Only ``(0, 0)``, ``(1, 0)`` and ``(1, 2)`` are accepted.
+    ``matvec`` names the matrix-vector kernel: ``"onthefly"`` caches nothing, ``"indices"`` caches
+    the per-group source indices, ``"tables"`` caches the source indices and the diagonals.
 
     Everything after ``states`` is **keyword-only**. It used to be positional-or-keyword, which made
     ``sqd(ham, states, True)`` a valid ``states_size`` of 1 (``True == 1``) rather than the
@@ -548,7 +529,7 @@ def sqd(
             fraction, so past N ~ 1e5 the trade inverts: rounding to a multiple of the largest power
             of two at or below ``N/8`` measured **one extra compilation and no measurable time**
             (5.09 s against 5.10 s over five growing dimensions at n=20) while cutting waste from
-            62.4% to 3.3%. At N=24M with the since-removed ``cache_level=(0, 2)`` that was **7.7 GB**.
+            62.4% to 3.3%. At N=24M with the since-removed sources-searched, diagonals-cached kernel that was **7.7 GB**.
             See ``NOTES.md``, "``states_size``'s power-of-two padding".
         return_eigvec: Whether to return the eigenvector (coefficients and unique state bitstrings).
         maxiter: Maximum LOBPCG iterations. **Non-convergence now raises** rather than returning
@@ -619,8 +600,9 @@ def sqd(
             different eigenvalue; every other qubit count is rejected on width. Pass the flag only for
             an array that came from ``pack_states``. Note the returned width is *also* wrong in that
             case, which gives a second chance to notice.
-        cache_level: ``(0, 0)``, ``(1, 0)`` or ``(1, 2)``: whether to cache the source indices and
-            the diagonals. See the module documentation for the resource tradeoff involved.
+        matvec: ``"onthefly"``, ``"indices"`` (default) or ``"tables"``: which of the source indices
+            and diagonals to cache. See the module documentation for the resource tradeoff involved.
+            ``"pairs"`` and ``"csr"`` are reserved names and raise until implemented.
         prefilter: ``(degree, cycles)`` Chebyshev prefilter, forwarded verbatim to
             :func:`rqutils.ground_locg.ground_locg` -- see its docstring for the semantics, the cost
             and the knob-choosing guidance. Validated by
@@ -683,11 +665,11 @@ def sqd(
             criterion; if ``atol`` is below the achievable eigen-residual floor
             :math:`4\,\varepsilon\sum_k|c_k|` **while** ``rtol`` is zero, so no arm can fire; or if
             ``rtol`` is at least 0.5, where its bound reaches :math:`\|H\|_2` and any vector would
-            report convergence; or if ``cache_level`` is not one of the three supported pairs.
-        TypeError: If ``cache_level`` is not a pair of ints, or ``prefilter`` is neither None nor a
+            report convergence; or if ``matvec`` is not an implemented kernel name.
+        TypeError: If ``matvec`` is not a ``str``, or ``prefilter`` is neither None nor a
             ``(degree, cycles)`` pair of ints.
     """
-    _check_cache_level(cache_level)
+    _check_matvec(matvec)
     _check_prefilter(prefilter)
     if states_size is None:
         # Next power of two: growing distinct sizes are the normal SQD pattern, so O(log N) retraces
@@ -727,7 +709,7 @@ def sqd(
         states_p,
         states_size,
         return_eigvec,
-        cache_level,
+        matvec,
         maxiter=maxiter,
         atol=atol,
         rtol=rtol,
@@ -935,7 +917,7 @@ def _spread_seed(
     mixed = mixed ^ (mixed >> 16)
     # Map to [-1, 1). The distribution does not matter, only that no entry is systematically zero.
     vec = mixed.astype(dtype) * (2.0 / float(2**32)) - 1.0
-    # Reshard the mask to `vec`: states_u arrives replicated at cache_level[0] == 0, and this
+    # Reshard the mask to `vec`: states_u arrives replicated under "onthefly", and this
     # function owns vec's sharding (NOTES.md, "sqd._spread_seed: reshard the filler mask").
     filler = _is_filler(states_u) == 1
     if sharding is not None:
@@ -972,7 +954,7 @@ class SqdResult(NamedTuple):
     static_argnames=[
         "states_size",
         "return_eigvec",
-        "cache_level",
+        "matvec",
         "maxiter",
         "prefilter",
         "log_level",
@@ -984,7 +966,7 @@ def run_sqd(
     states_p: StateList,
     states_size: int,
     return_eigvec: bool,
-    cache_level: tuple[int, int] = (1, 0),
+    matvec: Matvec = "indices",
     maxiter: int = 1000,
     atol: float = 0.0,
     rtol: float | None = None,
@@ -1002,6 +984,8 @@ def run_sqd(
     batch axis, so the stacked call is bit-identical to two separate ones.
 
     Args:
+        matvec: The kernel name, as in :func:`sqd`. Static, bound into the kernel via
+            :func:`functools.partial` because ``ground_locg`` splats ``args`` positionally.
         maxiter: Maximum LOBPCG iterations, forwarded to :func:`rqutils.ground_locg.ground_locg`.
             Static, as it is there.
         atol: Absolute bound on the eigen-residual ``||Hv - Ev||``. Validated in :func:`sqd`, which is
@@ -1010,14 +994,14 @@ def run_sqd(
             either suffices; see :func:`rqutils.ground_locg.ground_locg`, which both are forwarded to.
         prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter, forwarded to
             :func:`rqutils.ground_locg.ground_locg`. Static, as it is there -- passed by keyword, so
-            unlike ``cache_level`` it needs no :func:`functools.partial` binding. See :func:`sqd` on
+            unlike ``matvec`` it needs no :func:`functools.partial` binding. See :func:`sqd` on
             why this option's published speedups do not transfer to this path.
         check_residual: Recompute ``||Hv - Ev||`` and ``||Hv||`` after the solve, into ``residual``
             and ``ax_norm``, from recomputed diagonals (and a fresh search unless ``xsources`` are
             cached). :func:`sqd` turns it on and raises on the result.
     """
     # Static, so this runs once per trace; sqd validates too, and this covers direct poc/ callers.
-    _check_cache_level(cache_level)
+    _check_matvec(matvec)
     _check_prefilter(prefilter)
     sharding = None
     if not (mesh := get_abstract_mesh()).empty:
@@ -1028,7 +1012,7 @@ def run_sqd(
 
     states_u = uniquify_states(states_p, states_size)
 
-    if cache_level[0] == 1:
+    if matvec != "onthefly":
         if log_level <= logging.DEBUG:
             jax.debug.print("Precomputing xsources")
 
@@ -1042,7 +1026,7 @@ def run_sqd(
 
             states_u = jax.reshard(states_u, sharding)
 
-    if cache_level[1] == 2:
+    if matvec == "tables":
         if log_level <= logging.DEBUG:
             jax.debug.print("Precomputing diagonals")
 
@@ -1051,17 +1035,17 @@ def run_sqd(
             None,
             (hamiltonian.z, hamiltonian.c),
         )[1]
-        scanned = _pack_scanned(cache_level, xsources, diagonals, None)
+        scanned = _pack_scanned(matvec, xsources, diagonals, None)
     else:
-        xgroup = xsources if cache_level[0] == 1 else hamiltonian.x
-        scanned = _pack_scanned(cache_level, xgroup, hamiltonian.z, hamiltonian.c)
-    # Bind cache_level via partial, not static_argnames: ground_locg splats args positionally, so it
-    # would be traced and retrace the kernel every matvec. (1, 2) reads no states.
-    matvec = functools.partial(_apply_h_kernel, cache_level=cache_level)
-    args = (scanned, None if cache_level == (1, 2) else states_u)
+        xgroup = xsources if matvec == "indices" else hamiltonian.x
+        scanned = _pack_scanned(matvec, xgroup, hamiltonian.z, hamiltonian.c)
+    # Bind matvec via partial, not static_argnames: ground_locg splats args positionally, so it
+    # would be traced and retrace the kernel every matvec. "tables" reads no states.
+    apply = functools.partial(_apply_h_kernel, matvec=matvec)
+    args = (scanned, None if matvec == "tables" else states_u)
 
     def vinit_from_min_diag():
-        if cache_level[1] == 2:
+        if matvec == "tables":
             diagonal = diagonals[0]
         else:
             diagonal = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u)
@@ -1093,14 +1077,14 @@ def run_sqd(
     vinit = jax.lax.cond(jnp.all(hamiltonian.x[0] == 0), vinit_from_min_diag, vinit_nodiag)
 
     if log_level <= logging.DEBUG:
-        jax.debug.print(f"Starting minimization with cache_level {cache_level}")
+        jax.debug.print(f"Starting minimization with matvec {matvec}")
 
     # sum|c_k| rigorously bounds lambda_max (Pauli strings are unitary; projecting only shrinks it),
     # which a callable cannot supply (NOTES.md, "No matvec-only upper bound on `λ_max` exists").
     filter_runs = prefilter is not None and prefilter[0] > 1 and prefilter[1] > 0
     prefilter_hi = jnp.abs(hamiltonian.c).sum() if filter_runs else None
     eigval, eigvec, _, converged = ground_locg(
-        matvec,
+        apply,
         vinit,
         args=args,
         maxiter=maxiter,
@@ -1115,9 +1099,9 @@ def run_sqd(
     if check_residual:
         # Diagonals always recomputed, so no cached one vouches for itself; cached xsources are reused,
         # since redoing the J-fold search was ~90% of the check (NOTES.md, "`EigenpairCheckError`").
-        level, xgroup = ((1, 0), xsources) if cache_level[0] == 1 else ((0, 0), hamiltonian.x)
-        scanned_ref = _pack_scanned(level, xgroup, hamiltonian.z, hamiltonian.c)
-        ax = _apply_h_kernel(eigvec, scanned_ref, states_u, cache_level=level)
+        ref, xgroup = ("onthefly", hamiltonian.x) if matvec == "onthefly" else ("indices", xsources)
+        scanned_ref = _pack_scanned(ref, xgroup, hamiltonian.z, hamiltonian.c)
+        ax = _apply_h_kernel(eigvec, scanned_ref, states_u, matvec=ref)
         result = result._replace(
             residual=jnp.linalg.norm(ax - eigval * eigvec), ax_norm=jnp.linalg.norm(ax)
         )
@@ -1499,17 +1483,17 @@ def apply_xgrp(
 
 
 def _pack_scanned(
-    cache_level: tuple[int, int], xgroup: NDArray, diagonal_arg: NDArray, coeffs: NDArray | None
+    matvec: Matvec, xgroup: NDArray, diagonal_arg: NDArray, coeffs: NDArray | None
 ) -> tuple[NDArray, ...]:
-    """Lay out the tuple ``_apply_h_kernel`` scans over, for one resolved ``cache_level``.
+    """Lay out the tuple ``_apply_h_kernel`` scans over, for one resolved ``matvec``.
 
-    The kernel unpacks positionally (``val[0]``, ``val[1]``, and ``val[2]`` only when
-    ``cache_level[1] == 0``), so the arity rule is a contract between packer and kernel: a 3-tuple
-    carrying the coefficients for the two levels that *compute* a diagonal, a 2-tuple for ``(1, 2)``,
+    The kernel unpacks positionally (``val[0]``, ``val[1]``, and ``val[2]`` only when ``matvec`` is
+    not ``"tables"``), so the arity rule is a contract between packer and kernel: a 3-tuple carrying
+    the coefficients for the two kernels that *compute* a diagonal, a 2-tuple for ``"tables"``,
     which reads a precomputed one. Both callers -- ``run_sqd`` and ``apply_h``'s keyword resolution --
     go through here so that rule is stated once rather than once per caller.
     """
-    if cache_level[1] == 2:
+    if matvec == "tables":
         return (xgroup, diagonal_arg)
     return (xgroup, diagonal_arg, coeffs)
 
@@ -1526,23 +1510,23 @@ def apply_h(
 ) -> jax.Array:
     r"""Return :math:`Hv`, naming the per-X-group inputs so a mispairing cannot be expressed.
 
-    Name the per-X-group arrays you have and the caching strategy follows from them. Exactly three
-    input sets are accepted, one per supported ``cache_level``:
+    Name the per-X-group arrays you have and the kernel follows from them. Exactly three input sets
+    are accepted, one per implemented :func:`sqd` ``matvec``:
 
     .. code-block:: python
 
-        apply_h(vec, states=..., xsignatures=..., zsignatures=..., coeffs=...)  # (0, 0)
-        apply_h(vec, states=..., xsources=..., zsignatures=..., coeffs=...)     # (1, 0)
-        apply_h(vec, xsources=..., diagonals=...)                               # (1, 2)
+        apply_h(vec, states=..., xsignatures=..., zsignatures=..., coeffs=...)  # "onthefly"
+        apply_h(vec, states=..., xsources=..., zsignatures=..., coeffs=...)     # "indices"
+        apply_h(vec, xsources=..., diagonals=...)                               # "tables"
 
     Every array parameter is keyword-only. **This replaced a positional ``(scanned, cache_level)``
-    form, which is gone** -- a breaking change, because ``cache_level`` selected *positionally* how
+    form, which is gone** -- a breaking change, because that tuple selected *positionally* how
     the members of ``scanned`` were interpreted and nothing checked that they matched: raw X
-    signatures under a level promising X *sources* silently computed a different operator (measured
+    signatures under a tuple promising X *sources* silently computed a different operator (measured
     max abs error 0.44 on a 5-state n=4 subspace).
 
     :func:`sqd` and :mod:`ground_locg` do not go through here: they call the private
-    ``_apply_h_kernel`` with an assembled tuple and a static ``cache_level`` bound via
+    ``_apply_h_kernel`` with an assembled tuple and a static ``matvec`` name bound via
     ``functools.partial``, because the solver splats ``matvec(vec, *args)`` positionally.
 
     A shape check cannot separate the roles -- at ``n = 15`` with a 2-state subspace X sources and X
@@ -1550,7 +1534,7 @@ def apply_h(
     (:func:`_check_array_role`). What remains open is a swap between two roles of the **same** kind,
     ``xsignatures`` for ``zsignatures``, both ``uint8``.
 
-    Each level is one ``jax.lax.scan`` over the X groups accumulating
+    Each kernel is one ``jax.lax.scan`` over the X groups accumulating
     ``out + apply_xgrp(xsource, diagonal, vec)``, with ``xsource`` either ``get_xsource(x, states)``
     or ``xsources`` as given, and ``diagonal`` either ``get_diagonal(z, c, states)`` or ``diagonals``
     as given.
@@ -1566,10 +1550,11 @@ def apply_h(
         vec: Vector to multiply. Placed on the live mesh unless already there.
         states: Uniquified state list. Required except with ``diagonals=``, which reads neither
             signature array.
-        xsignatures: Packed X signatures per group; selects ``(0, 0)``.
-        xsources: Precomputed X source indices per group; selects ``(1, 0)`` or ``(1, 2)``.
-        zsignatures: Packed Z signatures per group; selects ``(*, 0)``. Needs ``coeffs``.
-        diagonals: Fully precomputed diagonals per group; selects ``(1, 2)``, so requires
+        xsignatures: Packed X signatures per group; selects ``"onthefly"``.
+        xsources: Precomputed X source indices per group; selects ``"indices"`` or ``"tables"``.
+        zsignatures: Packed Z signatures per group; selects ``"onthefly"`` or ``"indices"``. Needs
+            ``coeffs``.
+        diagonals: Fully precomputed diagonals per group; selects ``"tables"``, so requires
             ``xsources=``. Must not be combined with ``coeffs``, which it makes redundant.
         coeffs: Pauli coefficients per group. Required by ``zsignatures``.
 
@@ -1585,56 +1570,53 @@ def apply_h(
             the device count.
     """
     xgiven = [
-        opt
-        for opt in (("xsources", 1, xsources), ("xsignatures", 0, xsignatures))
-        if opt[2] is not None
+        opt for opt in (("xsources", xsources), ("xsignatures", xsignatures)) if opt[1] is not None
     ]
     dgiven = [
         opt
-        for opt in (("diagonals", 2, diagonals), ("zsignatures", 0, zsignatures))
-        if opt[2] is not None
+        for opt in (("diagonals", diagonals), ("zsignatures", zsignatures))
+        if opt[1] is not None
     ]
     if len(xgiven) != 1:
         raise ValueError(
             "apply_h: pass exactly one of xsources= or xsignatures= "
-            f"(got {sorted(name for name, _, _ in xgiven) or 'neither'})"
+            f"(got {sorted(name for name, _ in xgiven) or 'neither'})"
         )
     if len(dgiven) != 1:
         raise ValueError(
             "apply_h: pass exactly one of diagonals= or zsignatures= "
-            f"(got {sorted(name for name, _, _ in dgiven) or 'neither'})"
+            f"(got {sorted(name for name, _ in dgiven) or 'neither'})"
         )
-    (xname, xaxis, xarray), (dname, daxis, darray) = xgiven[0], dgiven[0]
-    cache_level = (xaxis, daxis)
-    if cache_level == (0, 2):
+    (xname, xarray), (dname, darray) = xgiven[0], dgiven[0]
+    precomputed = dname == "diagonals"
+    if precomputed and xname == "xsignatures":
         raise ValueError(
-            "apply_h: diagonals= requires xsources=, not xsignatures= -- that pairing was "
-            "cache_level (0, 2), removed as dominated by (1, 0); pass xsources= from get_xsource"
+            "apply_h: diagonals= requires xsources=, not xsignatures= -- that pairing was removed as "
+            'dominated by matvec="indices"; pass xsources= from get_xsource'
         )
+    matvec = "tables" if precomputed else "indices" if xname == "xsources" else "onthefly"
 
     # coeffs is required by the computed diagonal and meaningless beside a precomputed one, so a stray
     # one is rejected rather than ignored.
-    if daxis == 2 and coeffs is not None:
+    if precomputed and coeffs is not None:
         raise ValueError("apply_h: diagonals= already folds in coeffs=; do not pass both")
-    if daxis != 2 and coeffs is None:
+    if not precomputed and coeffs is None:
         raise ValueError(f"apply_h: {dname}= requires coeffs=")
 
     # Not redundant with the kernel's check: the missing-input-set error must precede the role check
     # below (TestMatvecKernels::test_omitting_states_raises); keep the messages in step.
-    if cache_level != (1, 2) and states is None:
-        raise ValueError(f"states is required for cache_level={cache_level}")
+    if matvec != "tables" and states is None:
+        raise ValueError(f"states is required for matvec={matvec!r}")
 
     # Dtype separates what shape cannot (uint8 signatures vs int32 sources, both (2, 2) at n=15);
     # last, so it only adds errors and never displaces an input-set error raised above.
     _check_array_role(xname, xarray)
     _check_array_role(dname, darray)
 
-    # `states`, not `vec`: `get_xsource` reshards one entry per state, and only `xaxis == 0` gets there.
-    vec = _place_vec(vec, states if xaxis == 0 else None)
+    # `states`, not `vec`: `get_xsource` reshards one entry per state, and only "onthefly" gets there.
+    vec = _place_vec(vec, states if matvec == "onthefly" else None)
 
-    return _apply_h_kernel(
-        vec, _pack_scanned(cache_level, xarray, darray, coeffs), states, cache_level
-    )
+    return _apply_h_kernel(vec, _pack_scanned(matvec, xarray, darray, coeffs), states, matvec)
 
 
 def _check_mesh_divisible(num_states: int) -> None:
@@ -1684,33 +1666,33 @@ def _place_vec(vec: NDArray[np.inexact], divisible: StateList | None) -> NDArray
     return jax.device_put(vec, jax.sharding.NamedSharding(mesh, PartitionSpec()))
 
 
-@jax.jit(static_argnames=["cache_level"])
+@jax.jit(static_argnames=["matvec"])
 def _apply_h_kernel(
     vec: NDArray[np.inexact],
     scanned: tuple[NDArray, ...],
     states: StateList | None,
-    cache_level: tuple[int, int],
+    matvec: Matvec,
 ) -> jax.Array:
-    r"""Return :math:`Hv`, resolving the per-X-group inputs according to ``cache_level``.
+    r"""Return :math:`Hv`, resolving the per-X-group inputs according to the ``matvec`` name.
 
-    The jitted kernel behind :func:`apply_h`. Kept positional with a static ``cache_level`` because
+    The jitted kernel behind :func:`apply_h`. Kept positional with a static ``matvec`` because
     :mod:`ground_locg` splats ``matvec(vec, *args)``: a ``static_argnames`` entry would never see a
-    keyword, and a traced ``cache_level`` tuple would retrace on every matvec call in the solver loop.
+    keyword, so it is bound via :func:`functools.partial` rather than passed through ``args``.
     The name resolution lives in the wrapper, in plain Python, so it costs nothing per call.
 
     See :func:`apply_h` for the input sets and argument semantics.
 
     Raises:
-        ValueError: If ``states`` is None at a level other than ``(1, 2)``.
+        ValueError: If ``states`` is None for a kernel other than ``"tables"``.
     """
-    if cache_level != (1, 2) and states is None:
-        raise ValueError(f"states is required for cache_level={cache_level}")
+    if matvec != "tables" and states is None:
+        raise ValueError(f"states is required for matvec={matvec!r}")
 
     def fn(out, val):
         # val[0] is the X source for this group: either the precomputed index array or the X
         # signature it is derived from.
-        xsource = val[0] if cache_level[0] == 1 else get_xsource(val[0], states)
-        diagonal = get_diagonal(val[1], val[2], states) if cache_level[1] == 0 else val[1]
+        xsource = get_xsource(val[0], states) if matvec == "onthefly" else val[0]
+        diagonal = val[1] if matvec == "tables" else get_diagonal(val[1], val[2], states)
         return out + apply_xgrp(xsource, diagonal, vec), None
 
     return jax.lax.scan(fn, jnp.zeros_like(vec), scanned)[0]

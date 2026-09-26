@@ -10,7 +10,7 @@ import jax
 import numpy as np
 import pytest
 from conftest import (
-    CACHE_LEVELS,
+    MATVECS,
     run_sharded_child,
 )
 
@@ -20,16 +20,16 @@ from rqutils.sqd import (
 
 
 class TestShardedSqd:
-    """``sqd`` must agree sharded and single-device at every ``cache_level`` and mesh size.
+    """``sqd`` must agree sharded and single-device at every ``matvec`` and mesh size.
 
-    **Swept over every level, not sampled**, because two sharding defects lived in the
-    ``cache_level[0] == 0`` cells that nothing covered, and the first masked the second:
+    **Swept over every kernel, not sampled**, because two sharding defects lived in the
+    source-searching cells (now ``"onthefly"``) that nothing covered, and the first masked the second:
 
     * ``_accumulate_diagonal`` carried its template's rank-2 spec onto a rank-1 accumulator ("Length
-      of sharding.spec (2) must be equal to aval's ndim (1)"), failing **every** level.
+      of sharding.spec (2) must be equal to aval's ndim (1)"), failing **every** kernel.
     * ``_spread_seed``'s ``jnp.where`` mixed a replicated predicate with a partitioned ``vec``, because
-      ``run_sqd`` reshards ``states_u`` only when ``cache_level[0] == 1``: ``ShardingTypeError`` on the
-      uncached levels. Fixing the first bug halved the failures, not cleared them.
+      ``run_sqd`` reshards ``states_u`` only when the source indices are cached: ``ShardingTypeError`` on the
+      uncached kernels. Fixing the first bug halved the failures, not cleared them.
 
     Runs with ``prefilter=(16, 2)`` on a **padded** subspace (37 states to 64), the one prefilter
     configuration only ``sqd`` reaches: filler masked to zero, partitioned, through ``apply_h``'s
@@ -40,13 +40,13 @@ class TestShardedSqd:
     partitioning survives, since a replicated run matches single-device exactly.
     """
 
-    def test_every_cache_level_agrees_sharded_and_single_device(self):
+    def test_every_matvec_agrees_sharded_and_single_device(self):
         got = run_sharded_child("sqd_grid")
         for devices in ("1", "2", "4"):
-            for level in map(str, CACHE_LEVELS):
-                single, sharded = got["single"][level], got["sharded"][devices][level]
+            for matvec in MATVECS:
+                single, sharded = got["single"][matvec], got["sharded"][devices][matvec]
                 assert single == pytest.approx(sharded, abs=1e-12), (
-                    f"devices={devices} cache_level={level}: sharded {sharded} vs single {single}"
+                    f"devices={devices} matvec={matvec}: sharded {sharded} vs single {single}"
                 )
             for label in ("part", "repl"):
                 vinit_spec, filtered_spec = got["specs"][devices][label]
@@ -69,7 +69,7 @@ class TestShardedBatchMatvec:
 
     **The spec assertion is the half values cannot make**: a stack partitioning the batch axis
     (``P('x', None)``) or replicating everything both agree with single-device to exactly 0.0. Drives
-    ``ground_locg`` directly with ``run_sqd``'s ``(1, 0)`` operator, since ``run_sqd`` always batches.
+    ``ground_locg`` directly with ``run_sqd``'s ``"indices"`` operator, since ``run_sqd`` always batches.
     """
 
     def test_batched_and_unbatched_agree_sharded(self):

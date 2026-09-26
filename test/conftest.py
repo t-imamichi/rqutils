@@ -384,9 +384,9 @@ def assert_imports_without(module, blocked, extra_source=""):
     )
 
 
-# Every supported (source_indices, diagonals) pair, written out rather than read from
-# `rqutils.sqd._CACHE_LEVELS` so a level dropped there fails here instead of vanishing from the sweep.
-CACHE_LEVELS = [(0, 0), (1, 0), (1, 2)]
+# Every implemented `matvec` name, written out rather than read from `rqutils.sqd._MATVECS` so a
+# kernel dropped there fails here instead of vanishing from the sweep.
+MATVECS = ["onthefly", "indices", "tables"]
 
 
 def pack_padded(states):
@@ -409,25 +409,25 @@ def eigval_of(pauli_strings, coeffs, states, **kwargs):
     return float(np.asarray(result).ravel()[0])
 
 
-def apply_h_kwargs(cache_level, arrays):
-    """Map a ``cache_level`` back to the ``apply_h`` keywords that select it.
+def apply_h_kwargs(matvec, arrays):
+    """Map a ``matvec`` name back to the ``apply_h`` keywords that select it.
 
-    The positional form is gone, so a level is requested by *naming* the arrays it implies. That
+    The positional form is gone, so a kernel is requested by *naming* the arrays it implies. That
     mapping is the thing under test in several places here, so it lives in one function: written out
     per test it was copy-paste-with-variation, which is the hazard the keyword API exists to reduce.
 
     Args:
-        cache_level: The ``(source_indices, diagonals)`` pair to express.
+        matvec: The kernel name to express.
         arrays: Anything indexable by keyword name -- :func:`apply_h_inputs`' dict keys are already
             spelled as the keywords, so it can be passed directly.
 
     Returns:
         The keyword dict, including ``coeffs`` for the two strategies that compute a diagonal.
     """
-    xname = "xsources" if cache_level[0] == 1 else "xsignatures"
-    dname = {0: "zsignatures", 2: "diagonals"}[cache_level[1]]
+    xname = "xsignatures" if matvec == "onthefly" else "xsources"
+    dname = "diagonals" if matvec == "tables" else "zsignatures"
     kwargs = {xname: arrays[xname], dname: arrays[dname]}
-    if cache_level[1] != 2:
+    if matvec != "tables":
         kwargs["coeffs"] = arrays["coeffs"]
     return kwargs
 

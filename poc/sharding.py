@@ -61,7 +61,7 @@ jax.config.update("jax_enable_x64", True)
 import numpy as np
 from _scaling_common import header, init_devices, make_1d_mesh, make_problem
 
-from rqutils.sqd import _CACHE_LEVELS, hproj, sqd
+from rqutils.sqd import _MATVECS, hproj, sqd
 
 
 def check_single_vs_sharded():
@@ -103,13 +103,15 @@ def check_single_vs_sharded():
     return results, reused
 
 
-def check_all_cache_levels(problem, eig_dense):
-    header("POC 7d: every cache_level, sharded vs single-device vs dense")
-    print("Two sharding bugs lived in the three cache_level[0] == 0 cells, uncovered because this")
-    print("script and the pytest arm both ran only sqd's default (1, 0):")
+def check_all_matvecs(problem, eig_dense):
+    header("POC 7d: every matvec, sharded vs single-device vs dense")
+    print("Two sharding bugs lived in the then-three cache_level[0] == 0 cells, uncovered because")
+    print("this script and the pytest arm both ran only sqd's default, now matvec='indices':")
     print("  * _accumulate_diagonal put a rank-2 PartitionSpec on a rank-1 accumulator (all six).")
     print("  * _spread_seed's jnp.where mixed a replicated predicate with a partitioned vec, since")
-    print("    run_sqd reshards states_u only inside `if cache_level[0] == 1` ((0,*) only).")
+    print(
+        "    run_sqd reshards states_u only when the source indices are cached ('onthefly' only)."
+    )
     print(
         "The FIRST masked the SECOND -- fixing it turned 6 failures into 3, not 0. So the grid is"
     )
@@ -122,20 +124,15 @@ def check_all_cache_levels(problem, eig_dense):
 
     worst = 0.0
     print(
-        f"  {'cache_level':>12s}  {'single':>16s}  {'sharded':>16s}  {'|s-1dev|':>10s}  {'|s-dense|':>10s}"
+        f"  {'matvec':>12s}  {'single':>16s}  {'sharded':>16s}  {'|s-1dev|':>10s}  {'|s-dense|':>10s}"
     )
-    for cache_level in _CACHE_LEVELS:
-        single = float(sqd(p.hamiltonian, p.states, return_eigvec=False, cache_level=cache_level))
+    for matvec in _MATVECS:
+        single = float(sqd(p.hamiltonian, p.states, return_eigvec=False, matvec=matvec))
         with jax.set_mesh(mesh):
-            sharded = float(
-                sqd(p.hamiltonian, p.states, return_eigvec=False, cache_level=cache_level)
-            )
+            sharded = float(sqd(p.hamiltonian, p.states, return_eigvec=False, matvec=matvec))
         d_ss, d_ref = abs(sharded - single), abs(sharded - eig_dense)
         worst = max(worst, d_ss)
-        print(
-            f"  {cache_level!s:>12s}  {single:+16.10f}  {sharded:+16.10f}  "
-            f"{d_ss:10.3e}  {d_ref:10.3e}"
-        )
+        print(f"  {matvec:>12s}  {single:+16.10f}  {sharded:+16.10f}  {d_ss:10.3e}  {d_ref:10.3e}")
     print(f"\n  dense reference: {eig_dense:+.10f}")
     return worst
 
@@ -241,7 +238,7 @@ def main():
         print("interconnect. Still correctness only -- this script reports no timings.")
 
     res, (problem, eig_dense) = check_single_vs_sharded()
-    worst_cache = check_all_cache_levels(problem, eig_dense)
+    worst_cache = check_all_matvecs(problem, eig_dense)
     check_mesh_padding()
     check_eigvec_path()
 

@@ -26,18 +26,18 @@ from rqutils.sqd import (
 
 # 37 draws collapse to ~34 unique rows; `_pad_states` raises if that ever exceeds STATES_SIZE.
 NUM_QUBITS, NUM_STATES, NUM_TERMS, STATES_SIZE = 8, 37, 6, 64
-CACHE_LEVEL = (1, 0)  # run_sqd's default
+MATVEC = "indices"  # run_sqd's default
 
 
 @jax.jit
 def operator(hamiltonian, states_p):
-    """``run_sqd``'s ``(1, 0)`` matvec args and spread seed, built as it builds them."""
+    """``run_sqd``'s ``"indices"`` matvec args and spread seed, built as it builds them."""
     sharding = None if (m := get_abstract_mesh()).empty else PartitionSpec(m.axis_names)
     states_u = uniquify_states(states_p, STATES_SIZE)
     xsources = jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, hamiltonian.x)[1]
     if sharding:
         states_u = jax.reshard(states_u, sharding)
-    scanned = _pack_scanned(CACHE_LEVEL, xsources, hamiltonian.z, hamiltonian.c)
+    scanned = _pack_scanned(MATVEC, xsources, hamiltonian.z, hamiltonian.c)
     return (scanned, states_u), _spread_seed(STATES_SIZE, states_u, hamiltonian.c.dtype, sharding)
 
 
@@ -45,7 +45,7 @@ def operator(hamiltonian, states_p):
 # runs enough iterations for the iteration-count comparison to have teeth.
 @functools.partial(jax.jit, static_argnames="batch")
 def solve(vinit, args, batch):
-    matvec = functools.partial(_apply_h_kernel, cache_level=CACHE_LEVEL)
+    matvec = functools.partial(_apply_h_kernel, matvec=MATVEC)
     return ground_locg(matvec, vinit, args=args, batch_matvec=batch)
 
 

@@ -18,14 +18,12 @@ initial-vector bugs affected every kernel identically, so a consistency-only sui
 passed while every kernel returned the same wrong number.
 """
 
-import re
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from conftest import (
-    CACHE_LEVELS,
+    MATVECS,
     assert_imports_without,
     assert_type_checks,
     collapsing_states,
@@ -67,7 +65,7 @@ def run_sqd_jaxpr(rng, **kwargs):
     hamiltonian = PauliSumXZ.from_paulisum((strings, list(rng.normal(size=len(strings)))))
     states_p = pack_padded(unique_states(12, 4, rng))
     return str(
-        jax.make_jaxpr(lambda h, s: run_sqd(h, s, 16, False, (1, 0), maxiter=50, **kwargs))(
+        jax.make_jaxpr(lambda h, s: run_sqd(h, s, 16, False, "indices", maxiter=50, **kwargs))(
             hamiltonian, states_p
         )
     )
@@ -213,55 +211,56 @@ class TestPackedStatesInput:
             hproj(hamiltonian, packed)
 
 
-class TestCacheLevelValidation:
-    """``cache_level`` is validated instead of falling through an implicit ``else``.
+class TestMatvecValidation:
+    """``matvec`` is validated instead of falling through an implicit ``else``.
 
-    Every branch on ``cache_level`` is an equality test with no ``else``, so before this an
-    out-of-range **first** digit was silently ignored -- ``(2, 0)`` behaved exactly as ``(0, 0)`` at
-    7.2x the cost -- and an out-of-range **second** digit surfaced as ``UnboundLocalError``, an
-    internal error from a public entry point. The three dominated levels are rejected too, naming
-    the level that beats them.
+    Every branch on the kernel choice is an equality test with no ``else``, so an unvalidated value
+    is absorbed into some kernel: under the tuple ``cache_level`` this replaced, ``(2, 0)`` behaved
+    exactly as ``(0, 0)`` at 7.2x the cost, and ``(1, 5)`` surfaced as ``UnboundLocalError``.
     """
 
-    @pytest.mark.parametrize(
-        "bad",
-        [
-            # First digit out of range: was silently equivalent to (0, 0) -- same answer, 7.2x cost.
-            (2, 0),
-            (-1, 0),
-            (3, 1),
-            # Second digit out of range: was `UnboundLocalError`, an internal error leaking from a
-            # public entry point.
-            (1, 5),
-            (1, 3),
-            (0, -1),
-            # Malformed altogether -- wrong arity, wrong type.
-            (1,),
-            (1, 0, 0),
-            1,
-            "10",
-        ],
-    )
-    def test_invalid_cache_level_raises(self, bad):
-        """Every rejected shape must name ``cache_level`` rather than fall through the implicit else."""
+    @pytest.mark.parametrize("bad", ["indice", "Indices", "on-the-fly", "", "table"])
+    def test_unknown_name_raises_listing_every_valid_name(self, bad):
+        """A typo must be reported, and the message must list what to pass instead."""
         states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
-        with pytest.raises((ValueError, TypeError), match="cache_level"):
-            sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=bad)
+        with pytest.raises(ValueError, match="matvec") as excinfo:
+            sqd((["ZI"], [1.0]), states, return_eigvec=False, matvec=bad)
+        for name in MATVECS:
+            assert repr(name) in str(excinfo.value)
 
-    def test_the_message_names_both_axes(self):
-        """A transposed tuple is legal, so the message has to make the axes readable."""
+    @pytest.mark.parametrize("reserved", ["pairs", "csr"])
+    def test_reserved_names_raise_not_implemented(self, reserved):
+        """Reserved for follow-up kernels: named in the type, rejected until built."""
         states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
-        with pytest.raises(ValueError) as excinfo:
-            sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=(2, 0))
-        message = str(excinfo.value)
-        assert "source" in message.lower() and "diagonal" in message.lower()
+        with pytest.raises(ValueError, match="not implemented yet") as excinfo:
+            sqd((["ZI"], [1.0]), states, return_eigvec=False, matvec=reserved)
+        for name in MATVECS:
+            assert repr(name) in str(excinfo.value)
 
-    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
-    def test_every_valid_level_is_still_accepted(self, cache_level):
+    @pytest.mark.parametrize("bad", [(1, 0), (0, 0), (1, 2), 1, True, None, ["indices"]])
+    def test_non_str_raises_type_error(self, bad):
+        """The old tuple form, and ``bool``/``int``/``None``, are type errors rather than names."""
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises(TypeError, match="matvec"):
+            sqd((["ZI"], [1.0]), states, return_eigvec=False, matvec=bad)
+
+    def test_cache_level_keyword_is_gone(self):
+        """A hard break with no alias: the removed keyword raises the natural ``TypeError``."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        with pytest.raises(TypeError, match="cache_level"):
+            sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=(1, 0))
+        hamiltonian = PauliSumXZ.from_paulisum((["ZI"], [1.0]))
+        with pytest.raises(TypeError, match="cache_level"):
+            run_sqd(hamiltonian, pack_padded(states), 2, False, cache_level=(1, 0))
+
+    @pytest.mark.parametrize("matvec", MATVECS)
+    def test_every_valid_name_is_still_accepted(self, matvec):
         """The guard must accept exactly the three the kernel implements."""
         states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
         assert isinstance(
-            float(sqd((["ZI"], [1.0]), states, return_eigvec=False, cache_level=cache_level)), float
+            float(sqd((["ZI"], [1.0]), states, return_eigvec=False, matvec=matvec)), float
         )
 
     def test_run_sqd_validates_too(self):
@@ -270,23 +269,12 @@ class TestCacheLevelValidation:
 
         states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
         hamiltonian = PauliSumXZ.from_paulisum((["ZI"], [1.0]))
-        with pytest.raises(ValueError, match="cache_level"):
-            run_sqd(hamiltonian, pack_padded(states), 2, False, (2, 0))
-
-    @pytest.mark.parametrize(
-        ("removed", "better"), [((0, 1), (0, 0)), ((0, 2), (1, 0)), ((1, 1), (1, 2))]
-    )
-    def test_dominated_levels_raise_naming_the_dominating_one(self, removed, better):
-        """Each removed level is beaten on memory and time by one kept level; the message names it."""
-        from rqutils.paulis.symplectic import PauliSumXZ
-
-        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
-        hamiltonian = PauliSumXZ.from_paulisum((["ZI"], [1.0]))
-        match = re.escape(f"{removed} is removed: {better}")
-        with pytest.raises(ValueError, match=match):
-            sqd(hamiltonian, states, return_eigvec=False, cache_level=removed)
-        with pytest.raises(ValueError, match=match):
-            run_sqd(hamiltonian, pack_padded(states), 2, False, removed)
+        with pytest.raises(ValueError, match="matvec"):
+            run_sqd(hamiltonian, pack_padded(states), 2, False, "indice")
+        with pytest.raises(ValueError, match="not implemented yet"):
+            run_sqd(hamiltonian, pack_padded(states), 2, False, "pairs")
+        with pytest.raises(TypeError, match="matvec"):
+            run_sqd(hamiltonian, pack_padded(states), 2, False, (1, 0))
 
 
 class TestStatesWidthCheck:
@@ -349,7 +337,7 @@ class TestKeywordOnlyEntryPoints:
 
     The slip this closes is ``sqd(ham, states, True)``. Every parameter after ``states`` used to be
     positional-or-keyword, and the three are semantically unrelated (``states_size: int | None``,
-    ``return_eigvec: bool``, ``cache_level: tuple``). Since ``True == 1``, that call was a *valid*
+    ``return_eigvec: bool``, then ``cache_level: tuple``). Since ``True == 1``, that call was a *valid*
     ``states_size`` and did not raise -- it pinned the array to size 1. ``hproj(ham, states, True)``
     is the same shape one function over, where the third parameter is ``unique_states``.
 
@@ -564,9 +552,9 @@ class TestSqdMinDiagWeightCancellation:
 class TestSqdEndToEnd:
     """``sqd`` against an independent dense reference, over every matvec kernel."""
 
-    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
-    def test_all_kernels_agree_with_reference(self, cache_level):
-        """The ``cache_level`` kernels are several routes to one number.
+    @pytest.mark.parametrize("matvec", MATVECS)
+    def test_all_kernels_agree_with_reference(self, matvec):
+        """The ``matvec`` kernels are several routes to one number.
 
         They trade memory for speed and must be numerically interchangeable. Asserting each against
         the external reference (rather than only against each other) is what catches an error common
@@ -578,15 +566,15 @@ class TestSqdEndToEnd:
         coeffs = rng.normal(size=len(strings))
         states = rng.integers(0, 2, size=(24, num_qubits)).astype(np.uint8)
         reference = lowest_projected(strings, coeffs, states)
-        assert eigval_of(strings, coeffs, states, cache_level=cache_level) == pytest.approx(
+        assert eigval_of(strings, coeffs, states, matvec=matvec) == pytest.approx(
             reference, rel=1e-10
         )
 
-    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
-    def test_many_z_terms_per_x_group(self, cache_level):
+    @pytest.mark.parametrize("matvec", MATVECS)
+    def test_many_z_terms_per_x_group(self, matvec):
         """Pure-Z input puts every term in one X group, exercising the byte-boundary path.
 
-        With 13 Z terms the since-removed ``cache_level[1] == 1`` kernels returned -6.520 against a
+        With 13 Z terms the since-removed cached-sign-bit kernels returned -6.520 against a
         true -8.699 -- a 25% error in a physical eigenvalue, silently.
         """
         rng = np.random.default_rng(2)
@@ -599,7 +587,7 @@ class TestSqdEndToEnd:
         coeffs = rng.normal(size=len(strings))
         states = rng.integers(0, 2, size=(40, num_qubits)).astype(np.uint8)
         reference = lowest_projected(strings, coeffs, states)
-        assert eigval_of(strings, coeffs, states, cache_level=cache_level) == pytest.approx(
+        assert eigval_of(strings, coeffs, states, matvec=matvec) == pytest.approx(
             reference, rel=1e-10
         )
 
@@ -991,10 +979,10 @@ class TestEigenpairCheck:
     def test_the_check_reuses_cached_xsources_but_never_a_cached_diagonal(self):
         """The check must rebuild every diagonal, and must not redo the search when xsources are cached.
 
-        Redoing the J-fold search was ~90% of the check (3.2% of a (1, 0) solve, against 0.3% reusing
+        Redoing the J-fold search was ~90% of the check (3.2% of an "indices" solve, against 0.3% reusing
         the cache), while a cached diagonal is what it exists to cross-check. Counted as named call
-        sites in the jaxpr; (0, 0) and (1, 0) are skipped, where the check's kernel is the solve's and
-        JAX prints the shared jaxpr once -- which leaves (1, 2) as the one countable level.
+        sites in the jaxpr; "onthefly" and "indices" are skipped, where the check's kernel is the
+        solve's and JAX prints the shared jaxpr once -- which leaves "tables" as the one countable one.
         """
         from rqutils.paulis.symplectic import PauliSumXZ
 
@@ -1002,17 +990,17 @@ class TestEigenpairCheck:
         h = PauliSumXZ.from_paulisum((real_pauli_strings(4, 6, rng), rng.normal(size=6).tolist()))
         states_p = pack_padded(unique_states(12, 4, rng))
 
-        def calls(level):
+        def calls(matvec):
             def count(check):
                 traced = jax.make_jaxpr(
-                    lambda a, b: run_sqd(a, b, 16, False, level, check_residual=check)
+                    lambda a, b: run_sqd(a, b, 16, False, matvec, check_residual=check)
                 )(h, states_p)
                 return str(traced).count("name=get_xsource"), str(traced).count("name=get_diagonal")
 
             (search_off, diag_off), (search_on, diag_on) = count(False), count(True)
             return search_on - search_off, diag_on - diag_off
 
-        assert calls((1, 2)) == (0, 1), "(1, 2): (extra searches, extra diagonal builds)"
+        assert calls("tables") == (0, 1), "tables: (extra searches, extra diagonal builds)"
 
 
 class TestAtolAndRtol:
@@ -1172,7 +1160,7 @@ class TestAtolAndRtol:
         eigval_of(strings, coeffs, states, atol=sumabs * 0.5, rtol=0.0, maxiter=8000)
 
     def test_a_non_numeric_tolerance_raises_typeerror(self):
-        """``bool`` is rejected for the reason ``_check_cache_level`` gives: it is an int subclass."""
+        """``bool`` is rejected: it is an ``int`` subclass, so ``True`` would pass as ``1``."""
         strings, coeffs, states = self._problem()
         for bad in ("1e-6", (1e-6,), True):
             with pytest.raises(TypeError, match="must be a real number"):
@@ -1270,7 +1258,7 @@ class TestAtolAndRtol:
 
         hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_p = PauliSumXZ.pack_states(states)
-        result = run_sqd(hamiltonian, states_p, states_p.shape[0], False, (1, 0), maxiter=1)
+        result = run_sqd(hamiltonian, states_p, states_p.shape[0], False, "indices", maxiter=1)
         theta, converged = float(result.eigval), bool(result.converged)
         assert not converged
         assert np.isfinite(theta) and theta > reference, (theta, reference)
@@ -1310,7 +1298,7 @@ class TestPublicHelperPreconditions:
         """It indexes ``zsignatures``' leading axis, so a 1-D array is read as scalars.
 
         Measured before the guard: ``get_diagonal`` returned ``(4,)`` of ``[2., 2., 2., 2.]``
-        from a 1-D input -- a plausible finite diagonal. It is public and is ``cache_level=(*, 0)``'s
+        from a 1-D input -- a plausible finite diagonal. It is public and is ``"onthefly"``/``"indices"``'s
         diagonal source, so it is in exactly the bypass population item 10 is about.
         """
         with pytest.raises(ValueError, match="zsignatures|rank|2-D|dimension"):
@@ -1348,24 +1336,24 @@ class TestPublicHelperPreconditions:
         )
 
 
-class TestComplexCoefficientsAcrossCacheLevels:
-    """Every ``cache_level`` must handle a complex-coefficient Hamiltonian.
+class TestComplexCoefficientsAcrossMatvecs:
+    """Every ``matvec`` kernel must handle a complex-coefficient Hamiltonian.
 
     ``.c`` is complex128 whenever any Pauli string has an **odd Y count** -- the folded
     ``(-i)^{x.z}`` phase makes it so by construction, not by mistake (see
     ``paulis/symplectic.py``). ``run_sqd``'s ``vinit_from_min_diag`` took ``.real`` on the uncached
     diagonal branch but used ``diagonals[0]`` raw on the cached one, and the ``jnp.max``/``argmin``
-    below reject complex input outright. So ``cache_level[1] == 2`` raised
+    below reject complex input outright. So ``"tables"`` raised
     ``TypeError: lt does not accept dtype complex128`` for every odd-Y Hamiltonian -- **single
     device, no mesh involved**.
 
     Uncovered because the whole suite's fixtures draw from ``real_pauli_strings``, which keeps the Y
-    count even so ``.c`` stays float64. A grid sweep over ``cache_level`` with a real fixture reports
+    count even so ``.c`` stays float64. A sweep over ``matvec`` with a real fixture reports
     all passes; the defect needs the *fixture* varied, not the parameter. That is the lesson worth
     keeping: parametrizing over a strategy axis proves nothing about dtype axes the fixture pins.
     """
 
-    def test_odd_y_hamiltonian_works_at_every_cache_level(self):
+    def test_odd_y_hamiltonian_works_at_every_matvec(self):
         from rqutils.paulis.symplectic import PauliSumXZ
 
         # "YZII" and "IIYY": the first has an odd Y count, so the folded phase leaves .c complex.
@@ -1383,10 +1371,10 @@ class TestComplexCoefficientsAcrossCacheLevels:
         # agreeing with a sibling that could be wrong the same way proves nothing.
         reference = lowest_projected(strings, coeffs, states)
 
-        for cache_level in CACHE_LEVELS:
-            got = float(sqd(hamiltonian, states, return_eigvec=False, cache_level=cache_level))
+        for matvec in MATVECS:
+            got = float(sqd(hamiltonian, states, return_eigvec=False, matvec=matvec))
             assert got == pytest.approx(reference, abs=1e-9), (
-                f"cache_level={cache_level}: sqd gave {got}, dense reference is {reference}"
+                f"matvec={matvec!r}: sqd gave {got}, dense reference is {reference}"
             )
 
 
@@ -1415,7 +1403,7 @@ class TestSqdPrefilter:
       minimum. A filter is a spectral transformation applied to exactly that vector, so it is capable
       of depleting the very overlap the spread seed exists to provide.
     * **The static-argument plumbing.** ``prefilter`` reaches ``run_sqd``'s ``static_argnames`` while
-      ``cache_level`` deliberately cannot (``ground_locg`` splats ``args`` positionally), so the two
+      ``matvec`` deliberately cannot (``ground_locg`` splats ``args`` positionally), so the two
       travel by different routes and the new one needs its own pin.
 
     Every value assertion is against :func:`lowest_projected`, the dense reference -- not against the
@@ -1476,12 +1464,12 @@ class TestSqdPrefilter:
             np.random.default_rng(20260828), prefilter=(32, 2)
         ), "omitting `prefilter` did not trace as the documented (32, 2) default"
 
-    @pytest.mark.parametrize("cache_level", CACHE_LEVELS)
-    def test_agrees_with_reference_across_every_kernel(self, cache_level):
-        """Swept over ``cache_level``, not sampled at the default.
+    @pytest.mark.parametrize("matvec", MATVECS)
+    def test_agrees_with_reference_across_every_kernel(self, matvec):
+        """Swept over ``matvec``, not sampled at the default.
 
-        Per ``CLAUDE.md`` three bugs have hidden behind the default ``(1, 0)``, each masked by the one
-        before. The axes are not independent here: ``cache_level`` selects which of the matvec
+        Per ``CLAUDE.md`` three bugs have hidden behind the default ``"indices"``, each masked by the one
+        before. The axes are not independent here: ``matvec`` selects which of the matvec
         kernels the Chebyshev recurrence calls, and the recurrence calls it ``cycles * (degree + 1)``
         times rather than once per iteration, so a kernel-specific defect gets a different amount of
         exposure in the filtered arm than in the unfiltered one.
@@ -1492,9 +1480,9 @@ class TestSqdPrefilter:
         coeffs = rng.normal(size=len(strings))
         states = unique_states(24, num_qubits, rng)
         reference = lowest_projected(strings, coeffs, states)
-        got = eigval_of(strings, coeffs, states, cache_level=cache_level, prefilter=(16, 2))
+        got = eigval_of(strings, coeffs, states, matvec=matvec, prefilter=(16, 2))
         assert got == pytest.approx(reference, rel=1e-10), (
-            f"cache_level={cache_level} with a prefilter gave {got}, expected {reference}"
+            f"matvec={matvec!r} with a prefilter gave {got}, expected {reference}"
         )
 
     def test_filler_slots_do_not_contaminate_the_filtered_vector(self):
@@ -1614,7 +1602,7 @@ class TestSqdPrefilter:
         problem", which is the one misdiagnosis this option cannot afford given its docstring tells
         callers to A/B it themselves. The malformed *types* were worse: they surfaced
         ``ground_locg``'s own tuple-unpack ``ValueError``/``TypeError`` from inside a public entry
-        point. ``(True, 2)`` is the ``bool``-is-an-``int`` hole ``_check_cache_level`` also closes.
+        point. ``(True, 2)`` is the ``bool``-is-an-``int`` hole.
         """
         rng = np.random.default_rng(20260828)
         strings = real_pauli_strings(4, 6, rng)

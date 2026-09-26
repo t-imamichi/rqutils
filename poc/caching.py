@@ -1,6 +1,6 @@
 """POC 2: the caching axis -- a partial-J source-index dial.
 
-``cache_level`` is all-or-nothing across the J X-groups: either every group's source indices are
+``matvec`` is all-or-nothing across the J X-groups: either every group's source indices are
 cached or none are. A partial dial -- cache the first ``J'`` groups, recompute the rest -- turns the
 discrete choice into a continuous memory/time curve. Whether that is *useful* depends entirely on the
 shape of the curve, which is the thing to measure: if time is flat in ``J'`` until it collapses at the

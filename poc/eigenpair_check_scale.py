@@ -9,7 +9,7 @@ The Hamiltonians are the request's own: its ``xxz`` builder verbatim (open chain
 ``-f_i/2``) over its four field patterns at ``delta`` 0.5 and 2.0. Subspaces are a Hamming-shell draw
 around the two Neel states -- whole shells of increasing distance, then a random subset of the last to hit
 N -- the shape the request names for synthetic ones (spinchain's own ``draw`` is not reproduced exactly).
-``sqd`` runs as spinchain calls it: default ``atol``/``rtol`` and prefilter, at both of its cache levels,
+``sqd`` runs as spinchain calls it: default ``atol``/``rtol`` and prefilter, at both of its ``matvec`` kernels,
 reading the check's own INFO line back.
 
 Run: uv run python poc/eigenpair_check_scale.py [--num-qubits 30] [--sizes 100000 1000000]
@@ -105,14 +105,13 @@ def main() -> None:
     parser.add_argument("--num-qubits", type=int, default=30)
     parser.add_argument("--sizes", type=int, nargs="+", default=[100_000, 1_000_000])
     parser.add_argument("--patterns", nargs="+", default=["type1", "type2", "type3", "type4"])
-    parser.add_argument("--levels", nargs="+", default=["1,0", "1,2"])
+    parser.add_argument("--matvecs", nargs="+", default=["indices", "tables"])
     parser.add_argument("--deltas", type=float, nargs="+", default=list(DELTAS))
     parser.add_argument(
         "--dense-check", type=int, default=0, help="N for a dense cross-check instead"
     )
     args = parser.parse_args()
     n = args.num_qubits
-    levels = [tuple(int(v) for v in s.split(",")) for s in args.levels]
     handler = CheckLine()
     log = logging.getLogger("rqutils.sqd")
     log.addHandler(handler)
@@ -135,7 +134,7 @@ def main() -> None:
         return
 
     print(
-        f"{'case':16} {'N':>9} {'level':>7} {'sum|c|':>7} {'eigval':>18} {'residual':>10} "
+        f"{'case':16} {'N':>9} {'matvec':>8} {'sum|c|':>7} {'eigval':>18} {'residual':>10} "
         f"{'threshold':>10} {'res/thr':>8} {'s':>6}"
     )
     for size in args.sizes:
@@ -144,13 +143,13 @@ def main() -> None:
             for delta in args.deltas:
                 ham = xxz(n, delta, *patterns(n)[name])
                 sum_c = float(np.abs(ham.coeffs).sum())
-                for level in levels:
+                for matvec in args.matvecs:
                     t0 = time.perf_counter()
-                    eigval = sqd(ham, states, return_eigvec=False, cache_level=level)
+                    eigval = sqd(ham, states, return_eigvec=False, matvec=matvec)
                     seconds = time.perf_counter() - t0
                     residual, threshold = handler.take()
                     print(
-                        f"{name + ' d=' + str(delta):16} {len(states):>9} {level!s:>7} "
+                        f"{name + ' d=' + str(delta):16} {len(states):>9} {matvec:>8} "
                         f"{sum_c:>7.2f} {eigval:>18.12f} {residual:>10.3e} {threshold:>10.3e} "
                         f"{residual / threshold:>8.4f} {seconds:>6.1f}",
                         flush=True,

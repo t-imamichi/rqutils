@@ -147,7 +147,7 @@ def recover_configurations(states, vec, num_draws, rng, hamming=None):
 
 
 def build_round(strings, coeffs, states):
-    """Assemble the cache_level (1,2) matvec for one subspace, plus its dense oracle.
+    """Assemble the "tables" matvec for one subspace, plus its dense oracle.
 
     Returns the packed states too: the warm start needs them as join keys, because `uniquify_states`
     lex-sorts and a state's index therefore MOVES between rounds. Slicing by position would silently

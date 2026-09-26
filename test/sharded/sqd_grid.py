@@ -1,4 +1,4 @@
-"""``sqd`` sharded against single-device over every cache level and mesh size; see ``TestShardedSqd``."""
+"""``sqd`` sharded against single-device over every ``matvec`` and mesh size; see ``TestShardedSqd``."""
 
 import functools
 
@@ -11,13 +11,12 @@ from jax.sharding import PartitionSpec
 import rqutils.sqd as sqd_module
 from rqutils.ground_locg import _chebyshev_prefilter
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import _CACHE_LEVELS, sqd
+from rqutils.sqd import _MATVECS, sqd
 
 # 37 states, indivisible by every mesh size, pad to 64, which each divides.
 NUM_QUBITS, NUM_STATES, NUM_TERMS, STATES_SIZE = 8, 37, 5, 64
 PREFILTER = (16, 2)
 MESH_SIZES = (1, 2, 4)
-CACHE_LEVELS = _CACHE_LEVELS
 
 
 def main() -> None:
@@ -27,22 +26,22 @@ def main() -> None:
     coeffs = rng.normal(size=NUM_TERMS).tolist()
     states = rng.integers(0, 2, size=(NUM_STATES, NUM_QUBITS)).astype(np.uint8)
 
-    def solve(cache_level):
+    def solve(matvec):
         return float(
             sqd(
                 (strings, coeffs),
                 states,
                 return_eigvec=False,
-                cache_level=cache_level,
+                matvec=matvec,
                 prefilter=PREFILTER,
             )
         )
 
-    single = {str(level): solve(level) for level in CACHE_LEVELS}
+    single = {name: solve(name) for name in _MATVECS}
     sharded = {}
     for num_devices in MESH_SIZES:
         with jax.set_mesh(mesh(num_devices)):
-            sharded[num_devices] = {str(level): solve(level) for level in CACHE_LEVELS}
+            sharded[num_devices] = {name: solve(name) for name in _MATVECS}
     emit({"single": single, "sharded": sharded, "specs": prefilter_specs(strings, coeffs, states)})
 
 
@@ -50,7 +49,7 @@ def prefilter_specs(strings, coeffs, states):
     """``{devices: {label: [vinit spec, filtered spec]}}``, with the matvec assembled as ``run_sqd`` does.
 
     Not through ``sqd``: it reshards the eigenvector to ``P(None)`` on return, which hides the
-    partitioning the filter must preserve. Mirrors ``cache_level == (1, 0)``.
+    partitioning the filter must preserve. Mirrors ``matvec="indices"``.
     """
     hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs))
     states_p = PauliSumXZ.pack_states(states)

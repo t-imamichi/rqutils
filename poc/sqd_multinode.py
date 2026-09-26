@@ -111,9 +111,10 @@ parser.add_argument(
 )
 parser.add_argument("--jz", type=float, default=0.8, help="XXZ anisotropy.")
 parser.add_argument(
-    "--cache-level",
-    default="1,0",
-    help="cache_level as 'a,b'. Default (1,0) is sqd's own default.",
+    "--matvec",
+    default="indices",
+    choices=["onthefly", "indices", "tables"],
+    help="sqd's matvec kernel. Default 'indices' is sqd's own default.",
 )
 parser.add_argument(
     "--reference-energy",
@@ -139,7 +140,7 @@ from qiskit.quantum_info import SparsePauliOp
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import _host_scalar, _pad_states, run_sqd, sqd
 
-CACHE_LEVEL = tuple(int(x) for x in options.cache_level.split(","))
+MATVEC = options.matvec
 
 
 def xxz_hamiltonian(num_qubits: float, jz: float) -> PauliSumXZ:
@@ -251,7 +252,7 @@ def peak_temp_bytes(hamiltonian, states, mesh=None) -> int | None:
     if mesh is not None and (resid := states_size % mesh.size) != 0:
         states_size += mesh.size - resid
     states_p = _pad_states(states_p, states_size)
-    fn = jax.jit(lambda h, s: run_sqd(h, s, states_size, True, cache_level=CACHE_LEVEL))
+    fn = jax.jit(lambda h, s: run_sqd(h, s, states_size, True, matvec=MATVEC))
     try:
         if mesh is None:
             return int(
@@ -289,9 +290,9 @@ def solve(hamiltonian, states, mesh=None, retain=False):
     """
     if not retain:
         if mesh is None:
-            return float(sqd(hamiltonian, states, return_eigvec=False, cache_level=CACHE_LEVEL))
+            return float(sqd(hamiltonian, states, return_eigvec=False, matvec=MATVEC))
         with jax.sharding.set_mesh(mesh):
-            return float(sqd(hamiltonian, states, return_eigvec=False, cache_level=CACHE_LEVEL))
+            return float(sqd(hamiltonian, states, return_eigvec=False, matvec=MATVEC))
 
     # `run_sqd` takes packed states and a static size, which `sqd` would otherwise derive. Mirrors
     # `sqd`'s own defaulting (power-of-two bucketing, then the mesh round-up) so the measured arm is
@@ -303,7 +304,7 @@ def solve(hamiltonian, states, mesh=None, retain=False):
     states_p = _pad_states(states_p, states_size)
 
     def run():
-        out = run_sqd(hamiltonian, states_p, states_size, True, cache_level=CACHE_LEVEL)
+        out = run_sqd(hamiltonian, states_p, states_size, True, matvec=MATVEC)
         assert bool(_host_scalar(out.converged)), "run_sqd did not converge"
         return float(_host_scalar(out.eigval)), out.eigvec, out.states
 
@@ -362,7 +363,7 @@ def main():
     hamiltonian = xxz_hamiltonian(options.num_qubits, options.jz)
     states = xxz_krylov_states(options.num_qubits, options.max_states)
     coeff_sum = float(np.abs(hamiltonian.c).sum())
-    section(f"fixture: 1D XXZ n={options.num_qubits} Jz={options.jz} cache_level={CACHE_LEVEL}")
+    section(f"fixture: 1D XXZ n={options.num_qubits} Jz={options.jz} matvec={MATVEC}")
     emit(
         f"  N={len(states)} states (unpacked, unsorted -- sqd uniquifies internally)\n"
         f"  J={hamiltonian.x.shape[0]} X-groups, maxK={hamiltonian.z.shape[1]}, "

@@ -84,8 +84,8 @@ CYCLES = tuple(int(x) for x in options.cycles.split(","))
 def assemble(problem):
     """Build the cached matvec the prefilter will be measured against.
 
-    ``cache_level=(1, 2)`` equivalent: X sources and diagonals both precomputed, which is
-    ``DiagCache.SPEED`` and the level a real SKQD run uses. Assembled by hand rather than through
+    ``matvec="tables"`` equivalent: X sources and diagonals both precomputed, which is
+    ``DiagCache.SPEED`` and the kernel a real SKQD run uses. Assembled by hand rather than through
     ``sqd()`` so the solve can be timed without the setup, since the prefilter only affects the solve.
     """
     hamiltonian, states = problem.hamiltonian, problem.states_p

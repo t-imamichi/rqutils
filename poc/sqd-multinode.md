@@ -207,7 +207,7 @@ for n in 2 4; do
 done
 ```
 
-Its other flags: `--num-qubits` (default 26), `--max-states` (400000), `--jz` (0.8), `--cache-level`
-(`1,0`), `--host-devices` (4, virtual devices when no `--devices`). `prefilter_gpu.py` takes
+Its other flags: `--num-qubits` (default 26), `--max-states` (400000), `--jz` (0.8), `--matvec`
+(`indices`), `--host-devices` (4, virtual devices when no `--devices`). `prefilter_gpu.py` takes
 `--num-qubits` (26), `--num-states` (1000000), `--num-xgroups` (30), `--degrees` (`8,16,32`) and
 `--cycles` (`2,4,8`); `uniquify_sharded.py` takes `--num-qubits` (100) and `--host-devices` (4).

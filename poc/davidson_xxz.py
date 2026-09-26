@@ -2,7 +2,7 @@
 
 Closes the caveat in NOTES.md's "Davidson vs ground_locg" entry: the matvec ratios there are from
 synthetic dense fixtures at n=512, unfiltered. Here the operator is a real 1D XXZ Hamiltonian
-projected onto a Krylov subspace reachable from |Neel>, applied via `apply_h` at cache_level (1,2),
+projected onto a Krylov subspace reachable from |Neel>, applied via `apply_h` as matvec="tables",
 and the *identical* Chebyshev filter is given to both arms -- the filter is an operator-agnostic
 start-vector transform, so giving it to only one arm measures the filter, not the algorithm.
 """
@@ -92,7 +92,7 @@ def xxz_krylov(nq, rungs, cap, rng):
 
 
 def build(nq, rungs, cap, delta, bx, seed):
-    """Assemble the apply_h matvec at cache_level (1,2), plus a sparse reference for the diagonal."""
+    """Assemble the apply_h matvec as "tables", plus a sparse reference for the diagonal."""
     rng = np.random.default_rng(seed)
     strings, coeffs = xxz_strings(nq, delta, bx)
     states = xxz_krylov(nq, rungs, cap, rng)

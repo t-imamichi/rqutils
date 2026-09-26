@@ -1,7 +1,7 @@
 """Partial diagonal cache: which groups to cache at equal bytes -- a prefix, or the largest ``K_g`` first.
 
-Item 3 of ``markdown/improvement-ideas-2026-09-25.md``. A partial diagonal cache runs ``(1, 2)`` over the
-cached groups and ``(1, 0)`` over the rest, summed (the 2026-08-30 prototype in ``NOTES.md``). Every
+Item 3 of ``markdown/improvement-ideas-2026-09-25.md``. A partial diagonal cache runs ``"tables"`` over the
+cached groups and ``"indices"`` over the rest, summed (the 2026-08-30 prototype in ``NOTES.md``). Every
 cached group costs the same bytes (one diagonal per state), but recomputing group ``g`` costs ``K_g``
 iterations -- ``_accumulate_diagonal`` stops at the first zero-padded term -- so at equal bytes, caching
 the largest ``K_g`` first removes the most work. This measures whether that shows up in time.
@@ -101,21 +101,21 @@ def main() -> None:
 
     two_arm = jax.jit(
         lambda v, cached, rest, st: (
-            _apply_h_kernel(v, cached, None, cache_level=(1, 2))
-            + _apply_h_kernel(v, rest, st, cache_level=(1, 0))
+            _apply_h_kernel(v, cached, None, matvec="tables")
+            + _apply_h_kernel(v, rest, st, matvec="indices")
         )
     )
 
     def arm(order: np.ndarray, num_cached: int) -> tuple:
         sel, rest = np.sort(order[:num_cached]), np.sort(order[num_cached:])
-        cached = _pack_scanned((1, 2), xs[sel], dg[sel], ham.c[sel])
-        uncached = _pack_scanned((1, 0), xs[rest], ham.z[rest], ham.c[rest])
+        cached = _pack_scanned("tables", xs[sel], dg[sel], ham.c[sel])
+        uncached = _pack_scanned("indices", xs[rest], ham.z[rest], ham.c[rest])
         return cached, uncached, int(k[rest].sum())
 
     prefix = np.arange(num_groups)
     largest = np.argsort(-k, kind="stable")
     reference = np.asarray(
-        _apply_h_kernel(vec, _pack_scanned((1, 2), xs, dg, ham.c), None, cache_level=(1, 2))
+        _apply_h_kernel(vec, _pack_scanned("tables", xs, dg, ham.c), None, matvec="tables")
     )
 
     arms = {}

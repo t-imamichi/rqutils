@@ -494,8 +494,8 @@ def _check_prefilter(prefilter: Any) -> None:
     reached ``ground_locg``'s tuple unpack and surfaced its ``ValueError``/``TypeError`` from inside a
     public entry point.
 
-    ``bool`` is rejected for the reason :func:`rqutils.sqd._check_cache_level` gives -- it is an
-    ``int`` subclass, so ``(True, 2)`` would otherwise pass as ``(1, 2)``, i.e. as a documented no-op.
+    ``bool`` is rejected because it is an ``int`` subclass, so ``(True, 2)`` would otherwise pass as
+    ``(1, 2)``, i.e. as a documented no-op.
 
     The **intentional** no-ops stay legal: ``degree <= 1`` or ``cycles == 0`` is how a caller disables
     the filter without restructuring a sweep, and ``TestChebyshevPrefilter`` pins that contract. Only

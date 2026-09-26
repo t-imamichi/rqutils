@@ -1,7 +1,7 @@
 """Sparse transition pairs instead of dense source indices -- every prototype and measurement in one script.
 
 Item 8 of ``markdown/improvement-ideas-2026-09-25.md``; the write-up with every result is
-``poc/sparse-pairs.md``. At ``cache_level=(1, *)`` ``sqd`` stores one ``int32`` source per
+``poc/sparse-pairs.md``. At ``matvec="indices"``/``"tables"`` ``sqd`` stores one ``int32`` source per
 ``(X group, state)`` (``4*J`` B/slot) though on sampled subspaces most are ``-1``. XOR is an involution, so
 each real transition of a group ``g != 0`` is a pair; storing it once, and computing its diagonal once since
 ``H_ji = conj(H_ij)`` exactly for one X signature, removes the placeholders and half the diagonal work.
@@ -488,14 +488,14 @@ def operators(ham, states, size, arms):
     if {"(1,0)", "(1,2)"} & set(arms):
         xs = jax.lax.scan(lambda _, x: (None, get_xsource(x, su)), None, ham.x)[1]
         if "(1,0)" in arms:
-            k10 = functools.partial(_apply_h_kernel, cache_level=(1, 0))
-            ops["(1,0)"] = (jax.jit(k10), (_pack_scanned((1, 0), xs, ham.z, ham.c), su), None)
+            k10 = functools.partial(_apply_h_kernel, matvec="indices")
+            ops["(1,0)"] = (jax.jit(k10), (_pack_scanned("indices", xs, ham.z, ham.c), su), None)
         if "(1,2)" in arms:
             dg = jax.lax.scan(
                 lambda _, v: (None, get_diagonal(v[0], v[1], su)), None, (ham.z, ham.c)
             )[1]
-            k12 = functools.partial(_apply_h_kernel, cache_level=(1, 2))
-            ops["(1,2)"] = (jax.jit(k12), (_pack_scanned((1, 2), xs, dg, ham.c), None), None)
+            k12 = functools.partial(_apply_h_kernel, matvec="tables")
+            ops["(1,2)"] = (jax.jit(k12), (_pack_scanned("tables", xs, dg, ham.c), None), None)
     k0 = functools.partial(matvec_c0, kmax=kmax)
     if rcm_arms:
         t0 = time.perf_counter()
@@ -707,7 +707,7 @@ def peak_child(args) -> dict:
     baseline = peak()
     t0 = time.perf_counter()
     if args.child == "(1,0)":  # production: run_sqd precomputes its own (J, N) source array
-        solve, x, setup = (lambda: run_sqd(ham, states_p, size, False, (1, 0))), (), 0.0
+        solve, x, setup = (lambda: run_sqd(ham, states_p, size, False, "indices")), (), 0.0
     else:
         ops, info = operators(ham, states, size, [args.child])
         fn, xargs, _ = ops[args.child]

@@ -34,7 +34,7 @@ from _scaling_common import header, make_problem, timeit
 from rqutils.sqd import apply_h, get_diagonal, get_xsource, uniquify_states
 
 
-def component_costs(problem, cache_level=(1, 2)):
+def component_costs(problem):
     """Time each component of one SQD solve at a fixed problem size."""
     ham = problem.hamiltonian
     size = problem.states_p.shape[0]
@@ -54,7 +54,7 @@ def component_costs(problem, cache_level=(1, 2)):
         lambda: get_diagonal(ham.z[0], ham.c[0], states_u), "get_diagonal (1 group)", trials=5
     )
 
-    # Full precomputation of all J source indices, as run_sqd does under cache_level[0]==1.
+    # Full precomputation of all J source indices, as run_sqd does for matvec="indices"/"tables".
     def all_xsources():
         return jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, ham.x)[1]
 
@@ -69,7 +69,7 @@ def component_costs(problem, cache_level=(1, 2)):
     )
     vec = jnp.asarray(np.random.default_rng(0).normal(size=size).astype(ham.c.dtype))
     mv = functools.partial(apply_h, xsources=xsources, diagonals=diagonals)
-    out["matvec"] = timeit(lambda: mv(vec), "apply_h (1,2) matvec", trials=5)
+    out["matvec"] = timeit(lambda: mv(vec), "apply_h tables matvec", trials=5)
     return out
 
 

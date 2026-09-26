@@ -155,7 +155,7 @@ child that dies partway fails rather than passing on a partial grid. The scratch
   moving draws into fixtures makes RNG stream position depend on fixture ordering. Keep new generators
   as plain functions taking `rng` **last**: `real_pauli_strings(num_qubits, count, rng)` (strings only —
   draw coefficients separately), `unique_states(num_draws, num_qubits, rng)`.
-- **Sweep `cache_level`, don't sample it** — bugs hide behind the default `(1, 0)`, and one needed a
+- **Sweep `matvec`, don't sample it** — bugs hide behind the default `"indices"`, and one needed a
   *complex* fixture rather than just the parameter varied.
 - **A physically-motivated fixture can invert a conclusion a synthetic one reaches.** Build it from the
   Hamiltonian's own structure; `poc/hash_partition`'s `xxz_krylov` is the pattern. And **check the
@@ -314,26 +314,30 @@ and fills `residual`/`ax_norm` only under `check_residual=True`; pad its input w
   on width (`uint64` keys for `B ≤ 8` bytes, explicit lexicographic beyond) — a **correctness** boundary,
   not a performance one.
 
-**`cache_level=(source_indices, diagonals)`** selects one of three matvec strategies: `(0, 0)`, the memory
-floor, `(1, 0)` and `(1, 2)`. The other three combinations raise: each is dominated on memory *and* time
-by one of these (`NOTES.md`'s n=100 memory and n=22 six-level timing tables).
+**`matvec=` names the kernel by what it stores**: `"onthefly"` (nothing; sources searched and factors
+computed every matvec — the memory floor), `"indices"` (per-group source-index tables; the default) and
+`"tables"` (indices *and* factors). `"pairs"` and `"csr"` are reserved for the sparse kernels. Before
+2026-09-26 this was `cache_level=(source_indices, diagonals)`, the three being `(0, 0)`, `(1, 0)` and
+`(1, 2)`; `NOTES.md` and older docs still use the tuples. The other three tuples were dominated on memory
+*and* time (`NOTES.md`'s n=100 memory and n=22 six-level timing tables), which is why no name exists for them.
 
-- **Prefer `cache_level[0] = 1`.** `get_xsource` setup is 66–97% of a solve — a figure **weighted by call
-  count** (the `J`-fold search per matvec against once), *not* headroom for accelerating the precompute,
-  which is only 4.5–8.4% of a `(1,*)` solve. Misreading it as the latter is a recorded trap.
+- **Prefer a stored-index kernel to `"onthefly"`.** `get_xsource` setup is 66–97% of a solve — a figure
+  **weighted by call count** (the `J`-fold search per matvec against once), *not* headroom for
+  accelerating the precompute, which is only 4.5–8.4% of an `"indices"`/`"tables"` solve. Misreading it as
+  the latter is a recorded trap.
 - **Which axis dominates is set by `K`**, the Z signatures per X group — a property of the Hamiltonian,
   not the subspace. **Quote `K` with any memory figure and never size from `4 * J * N` alone.**
   `states_size` also rounds **up to a power of two**.
 
 **The public `apply_h` is keyword-only**: name the arrays you have and the strategy follows. Internally
-`run_sqd` calls the private `_apply_h_kernel` with an assembled tuple and `cache_level` bound via
+`run_sqd` calls the private `_apply_h_kernel` with an assembled tuple and `matvec` bound via
 `functools.partial` — it **must** stay static there, since `ground_locg` splats `args` positionally and
 `static_argnames` would never see it. `states_size` exists solely to pin array shapes against JIT
 recompilation.
 
 **Rule for a new solver option on `run_sqd`:** forwarded to `ground_locg` by *keyword* → `static_argnames`;
-riding inside the positionally-splatted `args` → bind with `functools.partial`. `cache_level` is the
-second case, `prefilter` the first — so the `static_argnames` list is not evidence that `cache_level`
+riding inside the positionally-splatted `args` → bind with `functools.partial`. `matvec` is the
+second case, `prefilter` the first — so the `static_argnames` list is not evidence that `matvec`
 could join it.
 
 **`sqd` forwards `prefilter` but not `precond`** — that gap is deliberate (see Closed investigations).
@@ -350,7 +354,7 @@ so treat it as off-by-default plumbing rather than a recommended setting.
   whenever the coefficients are.
 
 **`states` must be replicated today, but that is not fundamental.** The `13 * N` per-device cost is the
-one term the `(0,0)` floor cannot shed. Only `searchsorted` fails on a partitioned `[N, B]`; a
+one term the `"onthefly"` floor cannot shed. Only `searchsorted` fails on a partitioned `[N, B]`; a
 hash-ownership-plus-local-search design is verified bit-identical at 16× less per-device memory, and the
 popcount diagonal path already shards with zero collectives. **Hash the whole key, not a prefix, and not
 a range split.** `uniquify_states` is the exception — its output feeds a binary search so it must stay
@@ -421,16 +425,16 @@ derive a bound from a callable.
 **`batch_matvec` stacks each group of independent applications into one `(k, n)` call** — the
 steady-state iteration's pair, and `debug=True`'s three diagnostics. Needs no kernel change: `sqd`'s
 `apply_xgrp` indexes `vec.at[..., xsource]` and scales elementwise, both width-agnostic. 1.15–1.21×
-end-to-end at `cache_level=(1, 0)` (1.61–1.81× on the pair alone), and it **cuts the sharded
-all-gathers** in the compiled loop body **3 → 2** (4 devices, `(1, 0)`; `test/sharded/batch_matvec.py`
+end-to-end at `matvec="indices"` (1.61–1.81× on the pair alone), and it **cuts the sharded
+all-gathers** in the compiled loop body **3 → 2** (4 devices, `"indices"`; `test/sharded/batch_matvec.py`
 asserts it — the once-recorded 6 → 3 does not reproduce), because the operator's gather is paid once
 per group — `jnp.stack` on a `P('x')`
 vector gives `P(None, 'x')`, so the data axis keeps its partitioning. `run_sqd` always batches;
 `ground_locg` defaults to `False`, since an arbitrary callable need not accept a batch, and an **array** `mat`
-raises — its matvec is a `jax.lax.dot`, which rejects a rank-2 rhs. **`(1, 2)` is the one level that can
-lose**: both axes cached leaves no per-matvec setup to share, so only the stack cost remains — 0.93× at
-N=2k, recovering to 1.04–1.09× by N=8k–30k as it amortizes. Every other level measured 1.20–1.24×.
-`run_sqd` batches it regardless: spinchain's `(1, 2)` solves run at N ≥ 1.5M, far past the crossover. The
+raises — its matvec is a `jax.lax.dot`, which rejects a rank-2 rhs. **`"tables"` is the one kernel that can
+lose**: everything cached leaves no per-matvec setup to share, so only the stack cost remains — 0.93× at
+N=2k, recovering to 1.04–1.09× by N=8k–30k as it amortizes. Every other kernel measured 1.20–1.24×.
+`run_sqd` batches it regardless: spinchain's `"tables"` solves run at N ≥ 1.5M, far past the crossover. The
 contract is "broadcasts over a leading axis of *any* size", not just 2 — so **any new length check on `vec` must read `shape[-1]`**; a
 `shape[0]` check rejected a valid `(2, N)` call as "vec length 2". **Memory depends on the operator and the two regimes have
 opposite signs** — measured, not reasoned: against `sqd`'s matvec, whole-`run_sqd` temp *falls* a flat
@@ -574,8 +578,8 @@ in it.
   opt-in path only. Pass `np.unique(states, axis=0)` or leave `unique_states=False`.
 - **`apply_h` is keyword-only**; the positional `(scanned, cache_level)` form raises `TypeError`. A hard
   break rather than a shim, so the three valid input sets become the only constructible ones. Bind the
-  *arrays* for a matvec thunk (`functools.partial(apply_h, xsources=xs, diagonals=dg)`), not the
-  `cache_level`.
+  *arrays* for a matvec thunk (`functools.partial(apply_h, xsources=xs, diagonals=dg)`), not a
+  kernel name.
 - **`apply_h` places a host `vec` on the live mesh but will not round its length.** With `xsignatures=`
   the *`states`* count must divide `mesh.size` (`get_xsource` reshards per state); `xsources=` takes any
   length. Rounding is **declined, not unimplemented** — the two precomputed diagonals put the state axis
@@ -585,11 +589,11 @@ in it.
   needs no re-pack — which also removes a hazard, `pack_states` not being idempotent. A caller comparing
   the result against an unpacked array breaks loudly on the shape mismatch. Both overloads annotate
   `StateList`, which cannot express the width, so **`ty` will not catch a caller assuming the wrong one**.
-- **Three `cache_level`s, `xcache_groups` and `run_sqd(batch_matvec=)` are gone (2026-09-26).** `(0, 1)`,
-  `(0, 2)` and `(1, 1)` raise `ValueError` naming what dominates each — `(0, 0)`, `(1, 0)`, `(1, 2)` — and
-  level 1 took `apply_h(diag_signs=)`, `get_diag_signs` and `compute_diagonal` with it. `xcache_groups=`
-  raises `TypeError`: until sparse pairs ship, a solve `(1, 0)` cannot fit falls back to `(0, 0)`, 7–8×
-  slower. `run_sqd` always batches; `ground_locg` keeps its flag. Evidence: `NOTES.md`, "`cache_level[1] = 1`
+- **`cache_level` is gone, replaced by `matvec=` (2026-09-26)**: `(0, 0)` → `"onthefly"`, `(1, 0)` →
+  `"indices"`, `(1, 2)` → `"tables"`; `cache_level=` raises `TypeError`, as does a tuple for `matvec`. The
+  same day removed the dominated `(0, 1)`, `(0, 2)` and `(1, 1)` — and with them `apply_h(diag_signs=)`,
+  `get_diag_signs` and `compute_diagonal` — and `xcache_groups` (`TypeError`): until sparse pairs ship, a
+  solve `"indices"` cannot fit falls back to `"onthefly"`, 7–8× slower. `run_sqd` always batches; `ground_locg` keeps its flag. Evidence: `NOTES.md`, "`cache_level[1] = 1`
   is dominated on both axes" and "`xcache_groups`: an intermediate count can *raise* peak memory".
 - **`tol` is gone**, replaced by `atol`/`rtol` (see `ground_locg.py` above). `tol=` raises `TypeError`
   with no alias, deliberately: it meant *relative* in one revision and *absolute* in the next, so
@@ -621,7 +625,7 @@ in it.
 - **Reduced precision in `ground_locg`, both variants.** f32 arithmetic with f64 storage is 0.42×
   end-to-end. f32 *storage* of a carried vector is closed by one measurement: rounding `ax` to f32 raises
   the residual floor 3.1e6× above tolerance, from catastrophic cancellation in `r = Ax - θx`, not a
-  tunable tolerance. **The `(0,0)` floor is 120 B/slot and that is the honest single-device ceiling** —
+  tunable tolerance. **The `"onthefly"` floor is 120 B/slot and that is the honest single-device ceiling** —
   lowering it needs a solver with fewer carried `O(N)` vectors, not a dtype change.
 - **The Bloom pre-filter for `get_xsource`.** Every mechanic was settled and it is still not worth
   building: it can only attach to the precompute, which is 4.5–8.4% of a solve, so Amdahl caps it at
