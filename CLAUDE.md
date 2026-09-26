@@ -316,7 +316,12 @@ and fills `residual`/`ax_norm` only under `check_residual=True`; pad its input w
 
 **`matvec=` names the kernel by what it stores**: `"onthefly"` (nothing; sources searched and factors
 computed every matvec — the memory floor), `"indices"` (per-group source-index tables; the default) and
-`"tables"` (indices *and* factors). `"pairs"` and `"csr"` are reserved for the sparse kernels. Before
+`"tables"` (indices *and* factors), plus the two sparse kernels: `"pairs"` (each transition once, with its
+factor) and `"csr"` (both directions by target row, `float64` factors where a group is real). Their entry
+counts depend on the data, so `sqd()` builds them **host-side before the jitted solve**, rounding the chunk
+count to `m·2^k` (8 ≤ m < 16) so the solve recompiles per size class. They are `sqd`-only (`run_sqd` and
+`apply_h` reject them), **single-device** (they raise under a mesh), and their residual check runs
+`"onthefly"`, so it reads none of their cached data. Measurements: `poc/sparse-pairs.md`. Before
 2026-09-26 this was `cache_level=(source_indices, diagonals)`, the three being `(0, 0)`, `(1, 0)` and
 `(1, 2)`; `NOTES.md` and older docs still use the tuples. The other three tuples were dominated on memory
 *and* time (`NOTES.md`'s n=100 memory and n=22 six-level timing tables), which is why no name exists for them.
@@ -592,8 +597,8 @@ in it.
 - **`cache_level` is gone, replaced by `matvec=` (2026-09-26)**: `(0, 0)` → `"onthefly"`, `(1, 0)` →
   `"indices"`, `(1, 2)` → `"tables"`; `cache_level=` raises `TypeError`, as does a tuple for `matvec`. The
   same day removed the dominated `(0, 1)`, `(0, 2)` and `(1, 1)` — and with them `apply_h(diag_signs=)`,
-  `get_diag_signs` and `compute_diagonal` — and `xcache_groups` (`TypeError`): until sparse pairs ship, a
-  solve `"indices"` cannot fit falls back to `"onthefly"`, 7–8× slower. `run_sqd` always batches; `ground_locg` keeps its flag. Evidence: `NOTES.md`, "`cache_level[1] = 1`
+  `get_diag_signs` and `compute_diagonal` — and `xcache_groups` (`TypeError`): a solve `"indices"` cannot
+  fit now falls back to `"pairs"`, not `"onthefly"`. `run_sqd` always batches; `ground_locg` keeps its flag. Evidence: `NOTES.md`, "`cache_level[1] = 1`
   is dominated on both axes" and "`xcache_groups`: an intermediate count can *raise* peak memory".
 - **`tol` is gone**, replaced by `atol`/`rtol` (see `ground_locg.py` above). `tol=` raises `TypeError`
   with no alias, deliberately: it meant *relative* in one revision and *absolute* in the next, so

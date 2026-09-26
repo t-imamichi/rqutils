@@ -1304,7 +1304,9 @@ diagonal computed once (`H_ji = conj(H_ij)` exactly per X signature), measured o
 n=20) the memory win holds at `2^21` -- P0 −75%, C2R −34% of `(1, 0)`'s operator -- but P0's speed past
 the cache thins to 1.20--1.51×. Two measured lessons: the speedup shrinks with N from **cache locality,
 not threads** (CSR order recovers it), and the setup peak needed a **counting sort** by target, per-group
-construction and no duplicate transients. Open: GPU timing, sharding, a pruned recovery subspace.
+construction and no duplicate transients. **Shipped 2026-09-26 as `sqd(matvec="pairs"|"csr")`**,
+single-device: warm `sqd` at n=60 `type1` `2^17` takes 1.26 s / 1.63 s against `"indices"`' 6.25 s
+(`poc/sparse-pairs.md` §9). Open: GPU timing, sharding, a pruned recovery subspace.
 
 ### Partial diagonal cache: *which* groups to cache barely matters, only how many (2026-09-25)
 

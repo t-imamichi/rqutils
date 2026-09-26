@@ -10,7 +10,7 @@ import jax
 import numpy as np
 import pytest
 from conftest import (
-    MATVECS,
+    DENSE_MATVECS,
     run_sharded_child,
 )
 
@@ -43,7 +43,7 @@ class TestShardedSqd:
     def test_every_matvec_agrees_sharded_and_single_device(self):
         got = run_sharded_child("sqd_grid")
         for devices in ("1", "2", "4"):
-            for matvec in MATVECS:
+            for matvec in DENSE_MATVECS:  # pairs/csr reject a mesh: TestShardedSparseRejects
                 single, sharded = got["single"][matvec], got["sharded"][devices][matvec]
                 assert single == pytest.approx(sharded, abs=1e-12), (
                     f"devices={devices} matvec={matvec}: sharded {sharded} vs single {single}"
@@ -308,3 +308,18 @@ class TestShardedDiagonals:
                 assert groups > 1, f"{case}: only {groups} X groups, fixture is degenerate"
                 assert bad_spec == 0, f"{case}: {bad_spec} outputs lost their 'x' spec"
                 assert bad_value == 0, f"{case}: {bad_value} outputs differ from single-device"
+
+
+class TestShardedSparseRejects:
+    """``"pairs"``/``"csr"`` are single-device for now, so a live mesh must raise, not half-work.
+
+    A pair's endpoints can sit on different devices and CSR needs its sources gathered
+    (``poc/sparse-pairs.md``, section 7); until that is built the dense kernels are the sharded path.
+    """
+
+    def test_a_scoped_mesh_raises_and_leaving_it_works(self):
+        got = run_sharded_child("sparse_mesh")
+        for name, message in got["scoped"].items():
+            assert "single-device" in message, f"{name} under a mesh: {message!r}"
+        for name, eigval in got["after"].items():
+            assert eigval == pytest.approx(got["dense"], abs=1e-12), (name, eigval, got["dense"])

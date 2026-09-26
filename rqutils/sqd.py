@@ -115,10 +115,21 @@ the vector is real or complex (i.e., if there are terms in the Hamiltonian with 
 Caching both also frees :math:`S`, which is no longer read, so at small :math:`n` the full cache can
 be the cheaper option in memory too.
 
-``matvec`` names the kernel: ``"onthefly"`` stores nothing, searching the sources and computing
-the diagonals per matvec; ``"indices"`` (the default) caches the source indices; ``"tables"``
-caches both. The other storage combinations are not offered, being dominated on both memory and
-time (``NOTES.md``).
+``matvec`` names the kernel by what it stores:
+
+- ``"onthefly"``: nothing; the sources are searched and the diagonals computed per matvec.
+- ``"indices"`` (the default): the source indices :math:`[j^{i}]` of every X group.
+- ``"tables"``: the source indices and the composed diagonals :math:`C^{(j)}`.
+- ``"pairs"``: each transition :math:`(a, b)`, :math:`a < b`, of a non-identity X group once, with
+  :math:`d = C^{(j)}_a`, applied as :math:`v'_a \mathrel{+}= d v_b` and
+  :math:`v'_b \mathrel{+}= \bar{d} v_a` -- exact, since :math:`H_{ba} = \overline{H_{ab}}` per X signature.
+- ``"csr"``: both directions of every transition, sorted by target, with ``float64`` factors for
+  the all-real groups and ``complex128`` for the rest.
+
+The other dense storage combinations are dominated on both memory and time (``NOTES.md``). The last
+two store only the transitions that land inside the subspace, where the source indices mostly hold
+the ``-1`` absent marker; :func:`sqd` builds them host-side before the solve, they are single-device
+for now, and ``poc/sparse-pairs.md`` has the measurements.
 
 **The source-index setup dominates the solve, so this is not a symmetric memory-for-speed dial.**
 Weighted by call count, the :math:`J`-fold :func:`get_xsource` precompute measured **66-97%** of an
@@ -243,8 +254,7 @@ def _check_array_role(name: str, array: Any) -> None:
 
 
 type Matvec = Literal["onthefly", "indices", "tables", "pairs", "csr"]
-#: The implemented :data:`Matvec` names; the rest are reserved for kernels not yet built.
-_MATVECS = ("onthefly", "indices", "tables")
+_MATVECS = ("onthefly", "indices", "tables", "pairs", "csr")
 
 
 def _residual_floor_of(hamiltonian: PauliSumXZ) -> float:
@@ -253,7 +263,7 @@ def _residual_floor_of(hamiltonian: PauliSumXZ) -> float:
 
 
 def _check_matvec(matvec: Any) -> None:
-    """Raise unless ``matvec`` is one of the implemented kernel names in ``_MATVECS``.
+    """Raise unless ``matvec`` is one of the kernel names in ``_MATVECS``.
 
     Every branch on ``matvec`` is an equality test with an implicit ``else``, so an unvalidated value
     would be absorbed into some kernel rather than reported.
@@ -263,14 +273,10 @@ def _check_matvec(matvec: Any) -> None:
 
     Raises:
         TypeError: If it is not a ``str`` (the removed ``cache_level`` tuple included).
-        ValueError: If it is not an implemented name, including the reserved ``"pairs"``/``"csr"``.
+        ValueError: If it is not one of those names.
     """
     if not isinstance(matvec, str):
         raise TypeError(f"`matvec` must be a str, one of {_MATVECS}; got {matvec!r}")
-    if matvec in ("pairs", "csr"):
-        raise ValueError(
-            f"`matvec={matvec!r}` is reserved but not implemented yet; use one of {_MATVECS}"
-        )
     if matvec not in _MATVECS:
         raise ValueError(f"`matvec` is {matvec!r}, but must be one of {_MATVECS}")
 
@@ -493,7 +499,8 @@ def sqd(
     unconditionally, so the two are aligned by construction.
 
     ``matvec`` names the matrix-vector kernel: ``"onthefly"`` caches nothing, ``"indices"`` caches
-    the per-group source indices, ``"tables"`` caches the source indices and the diagonals.
+    the per-group source indices, ``"tables"`` caches the source indices and the diagonals, and
+    ``"pairs"``/``"csr"`` store only the transitions inside the subspace.
 
     Everything after ``states`` is **keyword-only**. It used to be positional-or-keyword, which made
     ``sqd(ham, states, True)`` a valid ``states_size`` of 1 (``True == 1``) rather than the
@@ -601,8 +608,12 @@ def sqd(
             an array that came from ``pack_states``. Note the returned width is *also* wrong in that
             case, which gives a second chance to notice.
         matvec: ``"onthefly"``, ``"indices"`` (default) or ``"tables"``: which of the source indices
-            and diagonals to cache. See the module documentation for the resource tradeoff involved.
-            ``"pairs"`` and ``"csr"`` are reserved names and raise until implemented.
+            and diagonals to cache; or ``"pairs"``/``"csr"``, which store the in-subspace transitions
+            instead. See the module documentation for the resource tradeoff involved.
+
+            ``"pairs"`` and ``"csr"`` are built on the host before the solve (logged as their own
+            phase), with the entry count rounded up to a size class so the solve recompiles per
+            class rather than per subspace. Single-device only for now.
         prefilter: ``(degree, cycles)`` Chebyshev prefilter, forwarded verbatim to
             :func:`rqutils.ground_locg.ground_locg` -- see its docstring for the semantics, the cost
             and the knob-choosing guidance. Validated by
@@ -665,11 +676,17 @@ def sqd(
             criterion; if ``atol`` is below the achievable eigen-residual floor
             :math:`4\,\varepsilon\sum_k|c_k|` **while** ``rtol`` is zero, so no arm can fire; or if
             ``rtol`` is at least 0.5, where its bound reaches :math:`\|H\|_2` and any vector would
-            report convergence; or if ``matvec`` is not an implemented kernel name.
+            report convergence; if ``matvec`` is not a kernel name; if ``matvec`` is ``"pairs"`` or
+            ``"csr"`` under a mesh, or their operator reaches :math:`2^{31}` entries.
         TypeError: If ``matvec`` is not a ``str``, or ``prefilter`` is neither None nor a
             ``(degree, cycles)`` pair of ints.
     """
     _check_matvec(matvec)
+    if matvec in _SPARSE_MATVECS and not get_abstract_mesh().empty:
+        raise ValueError(
+            f"matvec={matvec!r} is single-device for now; call sqd outside the mesh context, or use "
+            "a dense kernel (onthefly, indices, tables) for a sharded solve"
+        )
     _check_prefilter(prefilter)
     if states_size is None:
         # Next power of two: growing distinct sizes are the normal SQD pattern, so O(log N) retraces
@@ -704,9 +721,15 @@ def sqd(
 
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
-    result = run_sqd(
-        hamiltonian,
-        states_p,
+    if matvec in _SPARSE_MATVECS:
+        # run_sqd is jitted and the entry counts are data-dependent, so the operator is built here.
+        states_u = uniquify_states(states_p, states_size)
+        operator = _sparse_operator(hamiltonian, states_u, matvec)
+        LOG.info("Built the %s operator in %f seconds.", matvec, time.time() - start)
+        solve = functools.partial(_run_sparse, hamiltonian, states_u, operator)
+    else:
+        solve = functools.partial(run_sqd, hamiltonian, states_p)
+    result = solve(
         states_size,
         return_eigvec,
         matvec,
@@ -999,9 +1022,17 @@ def run_sqd(
         check_residual: Recompute ``||Hv - Ev||`` and ``||Hv||`` after the solve, into ``residual``
             and ``ax_norm``, from recomputed diagonals (and a fresh search unless ``xsources`` are
             cached). :func:`sqd` turns it on and raises on the result.
+
+    Raises:
+        ValueError: If ``matvec`` is ``"pairs"`` or ``"csr"``, which only :func:`sqd` can build.
     """
     # Static, so this runs once per trace; sqd validates too, and this covers direct poc/ callers.
     _check_matvec(matvec)
+    if matvec in _SPARSE_MATVECS:
+        raise ValueError(
+            f"run_sqd cannot build matvec={matvec!r}: its entry counts are data-dependent, so the "
+            "operator is built host-side before the solve. Call sqd(..., matvec=...) instead."
+        )
     _check_prefilter(prefilter)
     sharding = None
     if not (mesh := get_abstract_mesh()).empty:
@@ -1044,14 +1075,63 @@ def run_sqd(
     apply = functools.partial(_apply_h_kernel, matvec=matvec)
     args = (scanned, None if matvec == "tables" else states_u)
 
-    def vinit_from_min_diag():
+    def diag0():
         if matvec == "tables":
-            diagonal = diagonals[0]
-        else:
-            diagonal = get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u)
-        # `.real` on both branches: `diagonals` is complex128 for odd-Y strings, and max/argmin
-        # reject complex (NOTES.md, "sqd.vinit_from_min_diag: `.real` on both branches").
-        diagonal = diagonal.real
+            return diagonals[0]
+        return get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u)
+
+    # Diagonals always recomputed, so no cached one vouches for itself; cached xsources are reused,
+    # since redoing the J-fold search was ~90% of the check (NOTES.md, "`EigenpairCheckError`").
+    check_ref = ("onthefly", hamiltonian.x) if matvec == "onthefly" else ("indices", xsources)
+    return _solve(
+        hamiltonian,
+        states_u,
+        states_size,
+        apply,
+        args,
+        diag0,
+        check_ref,
+        matvec,
+        sharding,
+        return_eigvec=return_eigvec,
+        maxiter=maxiter,
+        atol=atol,
+        rtol=rtol,
+        prefilter=prefilter,
+        log_level=log_level,
+        check_residual=check_residual,
+    )
+
+
+def _solve(
+    hamiltonian: PauliSumXZ,
+    states_u: StateList,
+    states_size: int,
+    apply: Callable[..., jax.Array],
+    args: tuple,
+    diag0: Callable[[], jax.Array],
+    check_ref: tuple[Matvec, NDArray],
+    matvec: Matvec,
+    sharding: PartitionSpec | None,
+    *,
+    return_eigvec: bool,
+    maxiter: int,
+    atol: float,
+    rtol: float | None,
+    prefilter: tuple[int, int] | None,
+    log_level: int,
+    check_residual: bool,
+) -> SqdResult:
+    """The solve every kernel shares, traced inside :func:`run_sqd` or :func:`_run_sparse`.
+
+    ``apply(vec, *args)`` is the operator, ``diag0()`` the identity-X group's diagonal, and
+    ``check_ref`` the ``(kernel, X groups)`` the residual check recomputes :math:`Hv` with.
+    """
+
+    def vinit_from_min_diag():
+        # `.real`: `diagonals` is complex128 for odd-Y strings, and max/argmin reject complex
+        # (NOTES.md, "sqd.vinit_from_min_diag: `.real` on both branches").
+        diagonal = diag0().real
         # Filler slots get the max so argmin sees only genuine entries; no reshard, unlike
         # _spread_seed, since `diagonal` derives from states_u (verified P(None) and P('x')).
         diagonal = jnp.where(_is_filler(states_u) == 1, jnp.max(diagonal), diagonal)
@@ -1097,9 +1177,7 @@ def run_sqd(
     )
     result = SqdResult(eigval, converged)
     if check_residual:
-        # Diagonals always recomputed, so no cached one vouches for itself; cached xsources are reused,
-        # since redoing the J-fold search was ~90% of the check (NOTES.md, "`EigenpairCheckError`").
-        ref, xgroup = ("onthefly", hamiltonian.x) if matvec == "onthefly" else ("indices", xsources)
+        ref, xgroup = check_ref
         scanned_ref = _pack_scanned(ref, xgroup, hamiltonian.z, hamiltonian.c)
         ax = _apply_h_kernel(eigvec, scanned_ref, states_u, matvec=ref)
         result = result._replace(
@@ -1112,6 +1190,216 @@ def run_sqd(
         subspace_dim = jnp.searchsorted(_is_filler(states_u), 1)
         result = result._replace(eigvec=eigvec, states=states_u, subspace_dim=subspace_dim)
     return result
+
+
+#: The kernels whose operator arrays :func:`sqd` builds host-side; single-device for now.
+_SPARSE_MATVECS = ("pairs", "csr")
+#: Entries per scanned chunk, so the sparse kernels' temporaries are ``O(chunk)`` (``poc/sparse-pairs.md``).
+_CHUNK = 1 << 15
+
+
+def _size_class(chunks: int) -> int:
+    """Round a chunk count up to ``m * 2**k`` with ``8 <= m < 16`` (exact below 16), at least 1.
+
+    The jitted solve recompiles per class rather than per subspace, wasting at most 12.5%.
+    """
+    shift = max(chunks.bit_length() - 4, 0)
+    return max(-(-chunks >> shift) << shift, 1)
+
+
+def _check_entry_count(count: int) -> None:
+    """Raise unless ``count`` sparse entries are addressable by the int32 indices they are stored in.
+
+    Raises:
+        ValueError: If ``count`` is at least :math:`2^{31}`.
+    """
+    if count >= 2**31:
+        raise ValueError(
+            f"the sparse operator has {count} entries, beyond the 2^31 - 1 addressable with int32 "
+            'indices; use matvec="indices" or a smaller subspace'
+        )
+
+
+def _padded(count: int, fill: int, dtype: DTypeLike) -> np.ndarray:
+    """A flat array of ``count`` entries rounded up to whole chunks of a size class, all ``fill``."""
+    _check_entry_count(count)
+    return np.full(_size_class(-(-count // _CHUNK)) * _CHUNK, fill, dtype=dtype)
+
+
+@functools.partial(jax.jit, static_argnames="kmax")
+def _entry_factors(
+    target: jax.Array,
+    source: jax.Array,
+    group: jax.Array,
+    z: jax.Array,
+    c: jax.Array,
+    states: StateList,
+    kmax: int,
+) -> jax.Array:
+    """``H[target, source] = d_group(target)`` per chunked entry, zero where the endpoints coincide."""
+
+    def one(chunk):
+        t, s, g = chunk
+        parity = jax.vmap(_z_parity, in_axes=(None, 1), out_axes=1)(states[t], z[g][:, :kmax])
+        factor = jnp.sum(c[g][:, :kmax] * (1.0 - 2.0 * parity), axis=-1)
+        return jnp.where(t == s, jnp.zeros_like(factor), factor)
+
+    return jax.lax.map(one, (target, source, group))
+
+
+def _sparse_operator(
+    hamiltonian: PauliSumXZ, states_u: StateList, matvec: Matvec
+) -> tuple[jax.Array, ...]:
+    """Build the ``"pairs"`` or ``"csr"`` operator arrays on the host, one X group's search at a time.
+
+    Returns ``(d0, i, j, d)`` for ``"pairs"`` and ``(d0, rt, rs, rd, qt, qs, qd)`` for ``"csr"``, each
+    entry array ``(chunks, _CHUNK)``; ``r``/``q`` are the real-coefficient groups (float64 factors)
+    and the rest. Padding entries have equal endpoints and a zero factor.
+
+    Raises:
+        ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_check_entry_count`.
+    """
+    size = states_u.shape[0]
+    z, c = jnp.asarray(hamiltonian.z), jnp.asarray(hamiltonian.c)
+    first = int(np.all(np.asarray(hamiltonian.x[0]) == 0))
+    d0 = get_diagonal(z[0], c[0], states_u) if first else jnp.zeros(size, c.dtype)
+    groups = range(first, hamiltonian.x.shape[0])
+    coeffs = np.asarray(hamiltonian.c)
+    kmax = max([int(np.count_nonzero(coeffs[g])) for g in groups], default=1)
+    rows = np.arange(size, dtype=np.int32)
+    pairs = {}
+    for g in groups:
+        j = np.asarray(get_xsource(hamiltonian.x[g], states_u))
+        keep = j > rows  # each pair once; absent sources (-1) and filler rows (always absent) drop
+        pairs[g] = (rows[keep], j[keep])
+    del rows
+
+    def on_device(host, c_set):
+        # Pops each host array as it is copied, so no host entry array outlives its device copy.
+        t, s, g = (jnp.asarray(host.pop(0).reshape(-1, _CHUNK)) for _ in range(3))
+        return t, s, _entry_factors(t, s, g, z, c_set, states_u, kmax)
+
+    if matvec == "pairs":
+        count = sum(len(i) for i, _ in pairs.values())
+        host = [_padded(count, 0, np.int32) for _ in range(3)]  # i, j, group
+        pos = 0
+        for g in groups:
+            i, j = pairs.pop(g)
+            for array, value in zip(host, (i, j, g)):
+                array[pos : pos + len(i)] = value
+            pos += len(i)
+        return (d0, *on_device(host, c))
+
+    real = ~np.any(coeffs.imag != 0, axis=1)
+    arrays = [d0]
+    for subset, c_set in (
+        ([g for g in groups if real[g]], c.real),
+        ([g for g in groups if not real[g]], c),
+    ):
+        # Counting sort by target straight into padded chunks: a row occurs at most once per group,
+        # so each group's fill is conflict-free (poc/sparse-pairs.md, section 2).
+        start = np.zeros(size + 1, np.int64)
+        for g in subset:
+            i, j = pairs[g]
+            start[i + 1] += 1
+            start[j + 1] += 1
+        np.cumsum(start, out=start)
+        host = [_padded(int(start[-1]), fill, np.int32) for fill in (size - 1, size - 1, 0)]
+        for g in subset:
+            i, j = pairs.pop(g)
+            for target, source in ((i, j), (j, i)):
+                pos = start[target]
+                host[0][pos], host[1][pos], host[2][pos] = target, source, g
+                start[target] += 1
+        del start
+        arrays += on_device(host, c_set)
+    return tuple(arrays)
+
+
+def _apply_pairs(
+    vec: jax.Array, d0: jax.Array, pi: jax.Array, pj: jax.Array, d: jax.Array
+) -> jax.Array:
+    """``"pairs"``: ``d0 * vec``, then per pair ``out[i] += d * vec[j]`` and ``out[j] += conj(d) * vec[i]``."""
+    sharding = jax.typeof(vec).sharding
+
+    def body(out, chunk):
+        i, j, di = chunk
+        out = out.at[..., i].add(di * vec.at[..., j].get(out_sharding=sharding))
+        return out.at[..., j].add(jnp.conj(di) * vec.at[..., i].get(out_sharding=sharding)), None
+
+    return jax.lax.scan(body, d0 * vec, (pi, pj, d))[0]
+
+
+def _sorted_scatter(
+    vec: jax.Array, out: jax.Array, t: jax.Array, s: jax.Array, d: jax.Array
+) -> jax.Array:
+    """``out[t] += d * vec[s]`` over target-sorted chunks."""
+    sharding = jax.typeof(vec).sharding
+
+    def body(acc, chunk):
+        ti, si, di = chunk
+        gathered = vec.at[..., si].get(out_sharding=sharding)
+        return acc.at[..., ti].add(di * gathered, indices_are_sorted=True), None
+
+    return jax.lax.scan(body, out, (t, s, d))[0]
+
+
+def _apply_csr(vec: jax.Array, d0: jax.Array, *entries: jax.Array) -> jax.Array:
+    """``"csr"``: ``d0 * vec`` plus one sorted scatter per ``(t, s, d)`` entry set."""
+    out = d0 * vec
+    for t, s, d in zip(entries[::3], entries[1::3], entries[2::3]):
+        out = _sorted_scatter(vec, out, t, s, d)
+    return out
+
+
+@jax.jit(
+    static_argnames=[
+        "states_size",
+        "return_eigvec",
+        "matvec",
+        "maxiter",
+        "prefilter",
+        "log_level",
+        "check_residual",
+    ]
+)
+def _run_sparse(
+    hamiltonian: PauliSumXZ,
+    states_u: StateList,
+    operator: tuple[jax.Array, ...],
+    states_size: int,
+    return_eigvec: bool,
+    matvec: Matvec,
+    maxiter: int = 1000,
+    atol: float = 0.0,
+    rtol: float | None = None,
+    prefilter: tuple[int, int] | None = (32, 2),
+    log_level: int = logging.INFO,
+    check_residual: bool = False,
+) -> SqdResult:
+    """:func:`run_sqd` for ``"pairs"``/``"csr"``, given :func:`_sparse_operator`'s arrays.
+
+    The residual check runs the ``"onthefly"`` kernel, so it reads none of ``operator``.
+    """
+    apply = _apply_pairs if matvec == "pairs" else _apply_csr
+    return _solve(
+        hamiltonian,
+        states_u,
+        states_size,
+        apply,
+        operator,
+        lambda: operator[0],
+        ("onthefly", hamiltonian.x),
+        matvec,
+        None,
+        return_eigvec=return_eigvec,
+        maxiter=maxiter,
+        atol=atol,
+        rtol=rtol,
+        prefilter=prefilter,
+        log_level=log_level,
+        check_residual=check_residual,
+    )
 
 
 @jax.jit(static_argnames=["states_size"])
@@ -1511,7 +1799,7 @@ def apply_h(
     r"""Return :math:`Hv`, naming the per-X-group inputs so a mispairing cannot be expressed.
 
     Name the per-X-group arrays you have and the kernel follows from them. Exactly three input sets
-    are accepted, one per implemented :func:`sqd` ``matvec``:
+    are accepted, one per dense :func:`sqd` ``matvec``; ``"pairs"``/``"csr"`` are ``sqd``-only:
 
     .. code-block:: python
 

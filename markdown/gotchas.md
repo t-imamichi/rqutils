@@ -514,6 +514,28 @@ From `CLAUDE.md`, `NOTES.md`, `markdown/spinchain/rqutils-requests.md`, `markdow
 * **`paulis(dim)` multi-subsystem einsum cap** at ~17 subsystems; `sparse=True` for products raises.
 * **`cz` correct only up to a uniform `exp(iπ/4)`**, and decomposed only on the `QuantumCircuit` path.
 
+## JAX pitfalls -- not `rqutils` API, but the same silent wrong answer
+
+Not counted in the summary: nothing here is an `rqutils` signature. Recorded because each one returns a
+plausible value inside code that looks correct, and this library's data reaches them routinely.
+
+* **`jnp.any` and `jnp.all` read only the real part of a complex array** (measured, JAX 0.11.2):
+
+  | input | `jnp.any` | `np.any` | `jnp.all` | `np.all` |
+  | --- | --- | --- | --- | --- |
+  | `[0, 0.3j]` | **False** | True | False | False |
+  | `[0.3j]` | **False** | True | **False** | True |
+  | `[0.1+0.3j]` | True | True | True | True |
+
+  The same array's `.astype(bool)` is right (`[0.3j]` gives `[True]`), and so is an explicit comparison,
+  `jnp.any(a != 0)`. The trap is real here because **a purely imaginary coefficient is normal**: an X
+  group holding one Y string with a real coefficient folds `(-i)^1` into it, so a "does this group have a
+  nonzero coefficient?" or "is it complex?" test written as `jnp.any(c)` reads that group as empty or
+  real. `sqd(matvec="csr")`'s real/complex split avoids it by testing `np.any(coeffs.imag != 0)`, and
+  `test/test_sqd_kernels.py`'s `none_real` fixture (single-Y strings, purely imaginary groups) pins it —
+  dropping the complex set fails 8 tests. **Rule: never reduce a complex array to a truth value; compare
+  first (`!= 0`, `.imag != 0`), or reduce on the host with numpy.**
+
 ---
 
 ## Suggested order

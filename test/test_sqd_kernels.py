@@ -1,25 +1,38 @@
 """Tests for :mod:`rqutils.sqd`'s building blocks: diagonals, source-index search, uniquification
-and the three matvec kernels. Organized by defect, like ``test_sqd.py``.
+and the matvec kernels. Organized by defect, like ``test_sqd.py``.
 """
 
 import warnings
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from conftest import (
-    MATVECS,
+    DENSE_MATVECS,
     apply_h_inputs,
     apply_h_kwargs,
+    eigval_of,
     pack_padded,
+    real_pauli_strings,
+    unique_states,
 )
 
+from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import (
+    _CHUNK,
+    _apply_csr,
+    _apply_pairs,
+    _check_entry_count,
     _is_lex_sorted,
     _pack_scanned,
     _pack_state_keys,
+    _pad_states,
+    _size_class,
+    _sparse_operator,
     apply_h,
     get_xsource,
     hproj,
+    sqd,
     uniquify_states,
 )
 
@@ -514,7 +527,7 @@ class TestApplyHArrayRoles:
         with pytest.raises(ValueError, match="diagonals"):
             apply_h(np.ones(2), xsources=xsources, diagonals=hamiltonian.z[0])
 
-    @pytest.mark.parametrize("matvec", MATVECS)
+    @pytest.mark.parametrize("matvec", DENSE_MATVECS)
     def test_every_valid_input_set_is_still_accepted(self, matvec):
         """The guard must not reject any of the three the kernel implements."""
         arrays = apply_h_inputs(np.random.default_rng(20260825))
@@ -546,7 +559,7 @@ class TestMatvecKernels:
         ).real
         assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
 
-    @pytest.mark.parametrize("matvec", MATVECS)
+    @pytest.mark.parametrize("matvec", DENSE_MATVECS)
     def test_every_matvec_matches_dense(self, matvec):
         """Every resolution path of the unified kernel, each against the dense product.
 
@@ -637,7 +650,7 @@ class TestMatvecKernels:
         with pytest.raises(ValueError, match="exactly one of xsources= or xsignatures="):
             apply_h(np.zeros(4))
 
-    @pytest.mark.parametrize("matvec", MATVECS)
+    @pytest.mark.parametrize("matvec", DENSE_MATVECS)
     def test_pack_scanned_arity_matches_what_the_kernel_unpacks(self, matvec):
         """The packer's arity is a contract with the kernel, and it is shared by two callers.
 
@@ -721,3 +734,135 @@ class TestMatvecKernels:
             apply_h(p["vector"], xsources=p["xsources"], diagonals=p["diagonals"], states=None)
         ).real
         assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
+
+
+def sparse_fixture(kind, rng):
+    """``(strings, coeffs, states)`` for one coefficient layout of :class:`TestSparseKernels`."""
+    strings = {
+        "real": real_pauli_strings(5, 8, rng),
+        # Odd-Y strings make their groups complex; "XXIII" and "IIZZI" stay real.
+        "mixed": ["ZIIII", "XXIII", "YZIII", "IXYII", "IIZZI", "IIIYY"],
+        "none_real": ["ZIIII", "YIIII", "IYZII", "XYIII", "IIIYX"],
+        "identity_only": ["ZIIII", "IZZII", "IIIZZ"],
+    }[kind]
+    states = unique_states(60, 5, rng)
+    assert len(states) >= 20, "fixture needs 20 distinct states"
+    return strings, rng.normal(size=len(strings)), states[:20]
+
+
+class TestSparseKernels:
+    """``"pairs"`` and ``"csr"`` against ``"indices"``'s product, per coefficient layout.
+
+    ``"pairs"`` applies ``conj(d)`` for the reverse direction, and ``"csr"`` splits its entries into a
+    ``float64`` real-group set and a ``complex128`` rest, so each layout reaches a different half:
+    all real (the complex set is padding), mixed, none real (the real set is padding), and only the
+    identity group (zero entries, one padding chunk).
+    """
+
+    KINDS = ("real", "mixed", "none_real", "identity_only")
+
+    @pytest.mark.parametrize("matvec", ["pairs", "csr"])
+    @pytest.mark.parametrize("kind", KINDS)
+    @pytest.mark.parametrize("states_size", [20, 32])
+    def test_product_matches_indices(self, kind, matvec, states_size):
+        rng = np.random.default_rng(20260926)
+        strings, coeffs, states = sparse_fixture(kind, rng)
+        assert len(states) == 20, (
+            "fixture must be exactly states_size=20 so that arm is filler-free"
+        )
+        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_u = uniquify_states(_pad_states(pack_padded(states), states_size), states_size)
+        operator = _sparse_operator(h, states_u, matvec)
+
+        real = ~np.any(np.asarray(h.c).imag != 0, axis=1)[1:]
+        expect = {
+            "real": real.all(),
+            "none_real": not real.any(),
+            "mixed": 0 < real.sum() < len(real),
+        }
+        assert expect.get(kind, h.x.shape[0] == 1), f"{kind} fixture lost its layout: {real}"
+        if matvec == "csr":
+            # np.asarray first: jnp.any reads a purely imaginary complex array as all-False.
+            rd, qd = np.asarray(operator[3]), np.asarray(operator[6])
+            assert rd.dtype == np.float64, rd.dtype
+            assert np.any(rd) == (kind in ("real", "mixed")), "real set populated wrongly"
+            assert np.any(qd) == (kind in ("mixed", "none_real")), "complex set populated wrongly"
+        if kind == "identity_only":
+            assert all(a.shape == (1, _CHUNK) for a in operator[1:]), "zero entries is one chunk"
+
+        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in h.x])
+        apply = _apply_pairs if matvec == "pairs" else _apply_csr
+        vec = rng.normal(size=(2, states_size)) + 1j * rng.normal(size=(2, states_size))
+        # Zero on fillers, as every solver vector is: there the dense identity group gathers the
+        # first filler's entry rather than its own, a difference nothing can observe.
+        vec[:, len(states) :] = 0.0
+        for v in (vec[0], vec):  # width-agnostic: (N,) and (k, N)
+            want = apply_h(v, states=states_u, xsources=xsources, zsignatures=h.z, coeffs=h.c)
+            got = apply(jnp.asarray(v), *operator)  # private: the solver passes jax arrays
+            assert got.shape == v.shape
+            assert np.abs(np.asarray(got) - np.asarray(want)).max() < 1e-11
+
+    @pytest.mark.parametrize("matvec", ["pairs", "csr"])
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_sqd_energy_matches_indices(self, kind, matvec):
+        """Energies only: another summation order shifts the trajectory, so iteration counts differ."""
+        strings, coeffs, states = sparse_fixture(kind, np.random.default_rng(20260926))
+        want = eigval_of(strings, coeffs, states, matvec="indices")
+        assert eigval_of(strings, coeffs, states, matvec=matvec) == pytest.approx(want, abs=1e-10)
+
+    def test_size_class_rounding(self):
+        """Exact below 16, then ``m * 2**k`` with ``8 <= m < 16``: waste under 12.5%, at least 1."""
+        assert [_size_class(c) for c in (0, 1, 8, 15, 16, 17, 18, 19, 33)] == [
+            1,
+            1,
+            8,
+            15,
+            16,
+            18,
+            18,
+            20,
+            36,
+        ]
+        for chunks in range(1, 5000):
+            size = _size_class(chunks)
+            shift = max(size.bit_length() - 4, 0)
+            assert chunks <= size < chunks * 1.125 + 1 and 8 <= size >> shift < 16 or size < 16
+
+    @pytest.mark.parametrize("matvec", ["pairs", "csr"])
+    def test_one_size_class_compiles_once(self, matvec, monkeypatch):
+        """Two subspaces with different entry counts in one class share the jitted solve."""
+        import rqutils.sqd as sqd_module
+
+        monkeypatch.setattr(sqd_module, "_CHUNK", 1)  # one entry per chunk: counts are chunk counts
+        rng = np.random.default_rng(5)
+        strings = real_pauli_strings(6, 10, rng)
+        h = PauliSumXZ.from_paulisum((strings, rng.normal(size=len(strings)).tolist()))
+        states = unique_states(40, 6, rng)[:32]
+
+        def entries(rows):
+            states_u = uniquify_states(_pad_states(pack_padded(rows), 32), 32)
+            operator = _sparse_operator(h, states_u, matvec)
+            return int(np.count_nonzero(np.asarray(operator[1]) != np.asarray(operator[2]))), rows
+
+        by_class = {}
+        for keep in range(16, 33):
+            count, rows = entries(states[:keep])
+            by_class.setdefault(_size_class(count), {}).setdefault(count, rows)
+        # Two distinct counts in one class, and a subspace from any other class as the control.
+        shared = next(size for size, rows in by_class.items() if len(rows) >= 2)
+        first, second = list(by_class[shared].values())[:2]
+        other = next(next(iter(rows.values())) for size, rows in by_class.items() if size != shared)
+
+        def compiles(rows):
+            before = sqd_module._run_sparse._cache_size()
+            sqd(h, rows, states_size=32, return_eigvec=False, matvec=matvec)
+            return sqd_module._run_sparse._cache_size() - before
+
+        compiles(first)
+        assert compiles(second) == 0, "a second subspace in the same size class recompiled"
+        assert compiles(other) == 1, "control: a different size class must compile afresh"
+
+    def test_entry_count_guard(self):
+        _check_entry_count(2**31 - 1)
+        with pytest.raises(ValueError, match="2147483648 entries"):
+            _check_entry_count(2**31)

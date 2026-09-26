@@ -207,9 +207,8 @@ Hamming shells. Shell `h` for `type1`/`type2` is read off `type4`/`type3`, which
 
 1. **GPU timing** of P0 and C2R against `(1, 0)` and `(1, 2)` — the deciding measurement.
 2. **Sharding.** A pair's endpoints can sit on different devices; CSR needs its sources gathered.
-3. **API.** Likely a new `cache_level[0] = 2` ("pairs"), with `cache_level[1]` choosing recomputed or
-   cached diagonals; per-group construction, the counting sort, the id width and the real-diagonal split
-   become implementation details.
+3. **API — done.** P2 and C2R ship as `sqd(matvec="pairs")` and `sqd(matvec="csr")` (§9); P0 and C0i16
+   were not shipped.
 4. **Pruned recovery and real samples.** §5's recovery subspace neither prunes nor starts from Krylov
    samples. Pruning pushes `h` up, and n=20's 0.354 shows how far `h` can go; a replayed spinchain run
    (`skqd/replay.py`) would give the true subspace.
@@ -229,3 +228,21 @@ Everything above is `poc/sparse_pairs.py`, every arm built by one function (`ope
 `--pattern type1`–`type4`, `--num-qubits` and `--subspace shells`/`recovery` select the fixture. A
 recovery subspace is cached as `/tmp/sparse_pairs_recovery_n<n>_<pattern>_d<delta>_<size>.npy`, since
 growing one to `2^21` runs `sqd` up to `2^20`.
+
+## 9. In the library
+
+`sqd(matvec="pairs"|"csr")`, 2026-09-26: built host-side in `sqd()` (per-group construction, the counting
+sort, chunked factors, host arrays freed as they reach the device), chunk counts rounded to `m·2^k` with
+8 ≤ m < 16 so the solve recompiles per size class, residual check on the `"onthefly"` kernel, single-device.
+Warm `sqd` at n=60 `type1`, `2^17` (all −11.676532550657):
+
+| `matvec` | `sqd` | construction | solve alone | POC solve |
+| --- | --- | --- | --- | --- |
+| `"indices"` | 6.25 s | — | — | 6.15 s |
+| `"tables"` | 2.22 s | — | — | 2.08 s |
+| `"pairs"` | 1.26 s | 0.17 s | 0.93 s | 0.92 s |
+| `"csr"` | 1.63 s | 0.18 s | 1.27 s | 1.19 s |
+
+The difference between `sqd` and the solve alone is construction plus the residual check (~0.15 s).
+Peak RSS at `2^19`, n=60 `type2`, fresh processes: packed input 454 / 336 / 393 MiB for `"indices"` /
+`"pairs"` / `"csr"` (POC: 461 / 313 / 404); unpacked input, which `sqd` packs itself, 627 / 451 / 469 MiB.

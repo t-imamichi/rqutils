@@ -38,6 +38,9 @@ from conftest import (
 from rqutils.sqd import (
     _MAX_STATES,
     EigenpairCheckError,
+    _pad_states,
+    _run_sparse,
+    _sparse_operator,
     _spread_seed,
     get_diagonal,
     get_xsource,
@@ -228,15 +231,6 @@ class TestMatvecValidation:
         for name in MATVECS:
             assert repr(name) in str(excinfo.value)
 
-    @pytest.mark.parametrize("reserved", ["pairs", "csr"])
-    def test_reserved_names_raise_not_implemented(self, reserved):
-        """Reserved for follow-up kernels: named in the type, rejected until built."""
-        states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
-        with pytest.raises(ValueError, match="not implemented yet") as excinfo:
-            sqd((["ZI"], [1.0]), states, return_eigvec=False, matvec=reserved)
-        for name in MATVECS:
-            assert repr(name) in str(excinfo.value)
-
     @pytest.mark.parametrize("bad", [(1, 0), (0, 0), (1, 2), 1, True, None, ["indices"]])
     def test_non_str_raises_type_error(self, bad):
         """The old tuple form, and ``bool``/``int``/``None``, are type errors rather than names."""
@@ -257,7 +251,7 @@ class TestMatvecValidation:
 
     @pytest.mark.parametrize("matvec", MATVECS)
     def test_every_valid_name_is_still_accepted(self, matvec):
-        """The guard must accept exactly the three the kernel implements."""
+        """The guard must accept every kernel name, the host-built ``"pairs"``/``"csr"`` included."""
         states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
         assert isinstance(
             float(sqd((["ZI"], [1.0]), states, return_eigvec=False, matvec=matvec)), float
@@ -271,8 +265,10 @@ class TestMatvecValidation:
         hamiltonian = PauliSumXZ.from_paulisum((["ZI"], [1.0]))
         with pytest.raises(ValueError, match="matvec"):
             run_sqd(hamiltonian, pack_padded(states), 2, False, "indice")
-        with pytest.raises(ValueError, match="not implemented yet"):
-            run_sqd(hamiltonian, pack_padded(states), 2, False, "pairs")
+        # pairs/csr are built host-side by sqd, so run_sqd must point there rather than trace them.
+        for name in ("pairs", "csr"):
+            with pytest.raises(ValueError, match=r"Call sqd\(\.\.\., matvec=\.\.\.\)"):
+                run_sqd(hamiltonian, pack_padded(states), 2, False, name)
         with pytest.raises(TypeError, match="matvec"):
             run_sqd(hamiltonian, pack_padded(states), 2, False, (1, 0))
 
@@ -983,24 +979,50 @@ class TestEigenpairCheck:
         the cache), while a cached diagonal is what it exists to cross-check. Counted as named call
         sites in the jaxpr; "onthefly" and "indices" are skipped, where the check's kernel is the
         solve's and JAX prints the shared jaxpr once -- which leaves "tables" as the one countable one.
+
+        ``"pairs"``/``"csr"`` cache every factor and no source index, so their check must run
+        ``"onthefly"``: one search and one diagonal build, where reusing the solve's operator is (0, 0).
         """
         from rqutils.paulis.symplectic import PauliSumXZ
 
         rng = np.random.default_rng(3)
         h = PauliSumXZ.from_paulisum((real_pauli_strings(4, 6, rng), rng.normal(size=6).tolist()))
         states_p = pack_padded(unique_states(12, 4, rng))
+        states_u = uniquify_states(_pad_states(states_p, 16), 16)
 
         def calls(matvec):
             def count(check):
-                traced = jax.make_jaxpr(
-                    lambda a, b: run_sqd(a, b, 16, False, matvec, check_residual=check)
-                )(h, states_p)
+                if matvec in ("pairs", "csr"):
+                    operator = _sparse_operator(h, states_u, matvec)
+                    solve = lambda a, b: _run_sparse(
+                        a, b, operator, 16, False, matvec, check_residual=check
+                    )
+                    traced = jax.make_jaxpr(solve)(h, states_u)
+                else:
+                    traced = jax.make_jaxpr(
+                        lambda a, b: run_sqd(a, b, 16, False, matvec, check_residual=check)
+                    )(h, states_p)
                 return str(traced).count("name=get_xsource"), str(traced).count("name=get_diagonal")
 
             (search_off, diag_off), (search_on, diag_on) = count(False), count(True)
             return search_on - search_off, diag_on - diag_off
 
         assert calls("tables") == (0, 1), "tables: (extra searches, extra diagonal builds)"
+        for matvec in ("pairs", "csr"):
+            assert calls(matvec) == (1, 1), f"{matvec}: the check must run the onthefly kernel"
+
+    @pytest.mark.parametrize("matvec", ["pairs", "csr"])
+    def test_a_sparse_solve_passes_the_check(self, matvec):
+        """The check's onthefly product must agree with the solve's operator on a genuine pair."""
+        from rqutils.paulis.symplectic import PauliSumXZ
+
+        rng = np.random.default_rng(3)
+        h = PauliSumXZ.from_paulisum((["YZII", "XXII", "IZZI", "IIYY"], [0.5, -0.3, 0.7, 0.2]))
+        states_u = uniquify_states(_pad_states(pack_padded(unique_states(12, 4, rng)), 16), 16)
+        operator = _sparse_operator(h, states_u, matvec)
+        result = _run_sparse(h, states_u, operator, 16, False, matvec, check_residual=True)
+        assert bool(result.converged)
+        assert float(result.residual) < 1e-12 * float(result.ax_norm), float(result.residual)
 
 
 class TestAtolAndRtol:

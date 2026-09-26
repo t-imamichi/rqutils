@@ -384,9 +384,11 @@ def assert_imports_without(module, blocked, extra_source=""):
     )
 
 
-# Every implemented `matvec` name, written out rather than read from `rqutils.sqd._MATVECS` so a
-# kernel dropped there fails here instead of vanishing from the sweep.
-MATVECS = ["onthefly", "indices", "tables"]
+# Every `matvec` name, written out rather than read from `rqutils.sqd._MATVECS` so a kernel dropped
+# there fails here instead of vanishing from the sweep.
+MATVECS = ["onthefly", "indices", "tables", "pairs", "csr"]
+# The dense kernels: the only ones `apply_h` selects and the only ones a mesh accepts.
+DENSE_MATVECS = ["onthefly", "indices", "tables"]
 
 
 def pack_padded(states):
