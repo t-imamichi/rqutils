@@ -15,6 +15,7 @@ Arms (the identity-X group is always a plain ``d_0 * v``; every other arm scans 
 * ``C0i16``        -- C0 with ``int16`` group ids (``int32`` if ``J > 32768``: ``astype`` would wrap);
 * ``C2R``          -- C2 with ``float64`` diagonals for real groups, ``complex128`` only for the rest;
 * ``seg``          -- C2 as one unchunked ``segment_sum``;
+* ``C2W``          -- C2R as row-window reductions: row-aligned chunks, a ``ROWS``-segment sum each;
 * ``...+RCM``      -- states relabelled by reverse Cuthill--McKee first.
 
 Subcommands (fixture: spinchain's open-XXZ ``xxz``, ``poc/eigenpair_check_scale``; ``--subspace`` picks
@@ -81,6 +82,7 @@ ARMS = (
     "C2",
     "C2R",
     "seg",
+    "C2W",
     "C0i16+RCM",
     "C2+RCM",
     "C2R+RCM",
@@ -278,6 +280,60 @@ def matvec_seg(vec, t, s, d, d0):
     return d0 * vec + summed.T
 
 
+# C2W: rows one window may span, so its segment_sum emits O(window) segments, never N. 2^15 is the
+# best of 2^11..2^15 measured, and still slower than C2R.
+ROWS = int(os.environ.get("C2W_ROWS", str(1 << 15)))
+
+
+def row_windows(t, s, d):
+    """Target-sorted entries re-chunked on row boundaries: ``(base, local, s, d)``, ``(chunks, CHUNK)``.
+
+    Each window holds whole rows, at most ``CHUNK`` entries and ``ROWS`` consecutive rows from ``base``,
+    so ``local = t - base < ROWS``. Padding has ``d = 0``. Built on the host from C2R's chunks.
+    """
+    keep = t != s  # padding entries have equal endpoints; genuine ones never do
+    t, s, d = t[keep], s[keep], d[keep]
+    cuts, e0 = [], 0
+    while e0 < len(t):
+        e1 = min(e0 + CHUNK, int(np.searchsorted(t, t[e0] + ROWS)))
+        if e1 < len(t) and t[e1 - 1] == t[e1]:  # never split a row across windows
+            e1 = int(np.searchsorted(t, t[e1]))
+        cuts.append((e0, e1))
+        e0 = e1
+    n = max(len(cuts), 1)
+    base = np.zeros(n, np.int32)
+    local, src = np.zeros((n, CHUNK), np.int32), np.zeros((n, CHUNK), np.int32)
+    fac = np.zeros((n, CHUNK), d.dtype)
+    for k, (a, b) in enumerate(cuts):
+        base[k] = t[a]
+        local[k, : b - a], src[k, : b - a], fac[k, : b - a] = t[a:b] - t[a], s[a:b], d[a:b]
+    return tuple(jnp.asarray(x) for x in (base, local, src, fac))
+
+
+def _window_scan(vec, out, base, local, src, fac):
+    """Per window: ``segment_sum`` of ``fac * vec[src]`` over ``ROWS`` local rows, added at ``base``."""
+
+    def body(acc, chunk):
+        b, lt, sj, dj = chunk
+        msg = jnp.moveaxis(dj * vec[..., sj], -1, 0)  # segment axis first
+        seg = jnp.moveaxis(
+            jax.ops.segment_sum(msg, lt, num_segments=ROWS, indices_are_sorted=True), 0, -1
+        )
+        win = jax.lax.dynamic_slice_in_dim(acc, b, ROWS, axis=-1)
+        return jax.lax.dynamic_update_slice_in_dim(acc, win + seg, b, axis=-1), None
+
+    return jax.lax.scan(body, out, (base, local, src, fac))[0]
+
+
+@jax.jit
+def matvec_c2w(vec, rb, rl, rs, rd, qb, ql, qs, qd, d0):
+    """C2R as row-window reductions instead of per-entry scatters; ``out`` is padded by ``ROWS``."""
+    pad = [(0, 0)] * (vec.ndim - 1) + [(0, ROWS)]
+    out = jnp.pad(d0 * vec, pad)
+    out = _window_scan(vec, _window_scan(vec, out, rb, rl, rs, rd), qb, ql, qs, qd)
+    return out[..., : vec.shape[-1]]
+
+
 # (N, k) layout: row-indexed, so one random access fetches every vector's entry from one cache line.
 
 
@@ -453,7 +509,7 @@ def operators(ham, states, size, arms):
                 cdp = chunked_diagonals(cpi, cpj, cpg, z, c, su, kmax)
                 ops["P2"] = (matvec_p2, (cpi, cpj, cdp, d0), None)
             del cpi, cpj, cpg
-        needs_host = bool(({"C0", "C0i16", "C2", "C2R", "seg"} | rcm_arms) & wanted)
+        needs_host = bool(({"C0", "C0i16", "C2", "C2R", "C2W", "seg"} | rcm_arms) & wanted)
         if (
             not needs_host
         ):  # nothing else reads the host pairs: free them before anything else is built
@@ -497,6 +553,19 @@ def operators(ham, states, size, arms):
                 del qg
                 parts += [qt, qs, qd]
             ops["C2R"] = (matvec_c2r, (*parts, d0), None)
+        if "C2W" in wanted:
+            windows = []
+            for groups, real in (
+                ([g for g in every if real_group[g]], True),
+                ([g for g in every if not real_group[g]], False),
+            ):
+                qt, qs, qg = csr(groups, np.int32)
+                qd = chunked_diagonals(qt, qs, qg, z, c.real if real else c, su, kmax)
+                del qg
+                flat = (np.asarray(x).reshape(-1) for x in (qt, qs, qd))
+                del qt, qs, qd
+                windows += row_windows(*flat)
+            ops["C2W"] = (matvec_c2w, (*windows, d0), None)
         if rcm_arms:
             t, s, g = directed_by_target(pi, pj, pg)
             ct, cs, cg = chunked((t, s, g), pad=size - 1)

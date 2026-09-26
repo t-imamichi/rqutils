@@ -136,6 +136,15 @@ ns/state for one `(2, N)` matvec, and operator B/slot at `2^21` (solver vectors 
    **when each set is filled group by group**; masking the two sets out of the full host pair list instead
    raised it to 934 MiB (+12%). Sharing one `(i, j)` array and slicing it inside the jit is worse still:
    XLA copies the slices, +18.5 / +48 B/slot of temp per matvec, so the whole solve rises to 238 / 316.
+6. **Windowed row reduction (C2W, 2026-09-27): 1.7–1.9× *slower* than C2R — closed.** C2R's entries
+   re-chunked on row boundaries (`row_windows`), each window a `segment_sum` over `ROWS` local rows added
+   into `out` as one contiguous slice, so temporaries stay O(window) rather than `seg`'s 411 B/slot. The
+   best window (`ROWS = 2^15`) measures 38.8 / 46.2 ns/state (`type1`, `2^17` / `2^21`) against C2R's
+   20.2 / 25.4, and 101.1 / 129.4 against 55.6 / 77.3 (`type2`), with 32–36 B/slot of temp against 2.3;
+   smaller windows are worse (117–236 ns/state at `2^11`–`2^12`), their fixed per-window cost dominating.
+   C2R's sorted scatter already is an efficient row reduction on CPU. Caveat: XLA has a ~3× `segment_sum`
+   regression across JAX 0.9.2–0.11.0 under a strided layout (openxla/xla#47203); this ran on 0.11.2, and
+   C2W's `moveaxis` around the segment axis is that shape, so `seg` and C2W may read pessimistic.
 
 `type1` gains *more* past the cache than `type2` despite half the groups: with fewer groups the matvec is
 less memory-bound, so C2R holds 6.2× at `2^21` where `type2`'s falls to 3.4×.
