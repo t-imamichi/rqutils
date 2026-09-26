@@ -1,7 +1,7 @@
 """POC 15: ``sqd`` at scale on a real multi-node GPU mesh -- memory and speed, not correctness.
 
 ``sharding.py`` already settles multi-node **correctness**: it passed on 4 GPUs across 4 nodes at
-all six ``cache_level`` cells, every ``N mod mesh.size``, and the ``return_eigvec`` round trip, worst
+all six ``cache_level`` cells then existing (three since 2026-09-26), every ``N mod mesh.size``, and the ``return_eigvec`` round trip, worst
 ``|sharded - single|`` = 4.441e-16. It does so at ``n <= 18``, ``N <= 5000`` -- fixtures small enough
 that every arm fits on one device, which is what makes them safe to compare against a single-device
 reference. This script exists for the two questions that *cannot* be asked there:
