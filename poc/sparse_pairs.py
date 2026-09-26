@@ -221,6 +221,25 @@ def matvec_p2r(vec, ri, rj, rd, qi, qj, qd, d0):
     return _pair_scan(vec, _pair_scan(vec, d0 * vec, ri, rj, rd), qi, qj, qd)
 
 
+def real_split(pi, pj, pg, real_group):
+    """Chunked ``(i, j, g)`` for the real groups' pairs and for the rest, each filled group by group
+    into its final padded arrays: masking copies out of the full list measured +12% peak at ``2^21``."""
+    bounds = np.searchsorted(pg, np.arange(len(real_group) + 1))  # pairs are built group by group
+    sets = []
+    for want in (True, False):
+        gs = [g for g in range(1, len(real_group)) if real_group[g] == want]
+        total = -(-int(sum(bounds[g + 1] - bounds[g] for g in gs)) // CHUNK) * CHUNK
+        out = [np.zeros(total, np.int32) for _ in range(3)]
+        pos = 0
+        for g in gs:
+            a, b = bounds[g], bounds[g + 1]
+            for dst, src in zip(out, (pi, pj, pg)):
+                dst[pos : pos + b - a] = src[a:b]
+            pos += b - a
+        sets.append([jnp.asarray(a.reshape(-1, CHUNK)) for a in out])
+    return sets
+
+
 @functools.partial(jax.jit, static_argnames="kmax")
 def matvec_c0(vec, t, s, g, z, c, states, kmax):
     def body(out, chunk):
@@ -417,12 +436,11 @@ def operators(ham, states, size, arms):
         pi, pj, pg, info["hit"] = build_pairs(ham, su, dim)
         info["pairs_per_slot"] = len(pi) / size
         if "P2R" in wanted:
-            parts = []
-            for mask, c_set in ((real_group[pg], c.real), (~real_group[pg], c)):
-                qi, qj, qg = chunked((pi[mask], pj[mask], pg[mask]), pad=0)
-                parts += [qi, qj, chunked_diagonals(qi, qj, qg, z, c_set, su, kmax)]
-                del qg
-            ops["P2R"] = (matvec_p2r, (*parts, d0), None)
+            (ri, rj, rg), (qi, qj, qg) = real_split(pi, pj, pg, real_group)
+            rd = chunked_diagonals(ri, rj, rg, z, c.real, su, kmax)
+            qd = chunked_diagonals(qi, qj, qg, z, c, su, kmax)
+            del rg, qg
+            ops["P2R"] = (matvec_p2r, (ri, rj, rd, qi, qj, qd, d0), None)
         if {"P0", "P2"} & wanted:
             cpi, cpj, cpg = chunked((pi, pj, pg), pad=0)
             if "P0" in wanted:

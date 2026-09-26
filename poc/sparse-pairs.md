@@ -127,14 +127,15 @@ ns/state for one `(2, N)` matvec, and operator B/slot at `2^21` (solver vectors 
    complex coefficients (the end-site `Y` terms).
 4. **Reverse Cuthill–McKee: nothing.** A Hamming-shell transition graph is hypercube-like — each state's
    neighbours span the whole index range — so there is no small bandwidth to find; lex order is as good.
-5. **Real factors for pairs (P2R, 2026-09-27): −25–30% of P2's operator, but ≤ 9% of a solve.** C2R's
-   split applied to P2: `float64` factors for real groups, two scans. At `2^21` the operator falls 75 → 56
-   (`type1`) and 179 → 126 B/slot (`type2`) at equal matvec speed; at `2^17` the second scan costs 8–19%
-   per matvec and ~10% per solve (0.94 → 1.03 s, 1.58 → 1.72 s). The solver's ~150 B/slot of vectors
-   dominate, so whole-solve memory falls only 224 → 222 and 302 → 274 B/slot. The prototype's setup peak
-   *rose* (`type2`: 316 → 337 MiB at `2^19`, 832 → 941 at `2^21`) because it masks copies out of the full
-   host pair list; per-group filling as the library does caps the gain at the operator's ~106 MiB of 832
-   (−13%, unmeasured).
+5. **Real factors for pairs (P2R, 2026-09-27): −25–30% of the operator, ≤ 5% of the peak, ~10% slower in
+   cache — not shipped.** C2R's split applied to P2: `float64` factors for real groups, two scans. At `2^21`
+   the operator falls 75 → 56 (`type1`) and 179 → 126 B/slot (`type2`) at equal matvec speed; at `2^17` the
+   second scan costs 10–17% per matvec and 9–10% per solve (0.93 → 1.02 s, 1.61 → 1.76 s). Whole-solve
+   memory falls only 224 → 222 and 302 → 274 B/slot, since the solver's vectors dominate. Setup-inclusive
+   peak (`type2`) is 326 → 310 MiB at `2^19` and 834 → 824 at `2^21` (−5% / −1%, within run-to-run noise)
+   **when each set is filled group by group**; masking the two sets out of the full host pair list instead
+   raised it to 934 MiB (+12%). Sharing one `(i, j)` array and slicing it inside the jit is worse still:
+   XLA copies the slices, +18.5 / +48 B/slot of temp per matvec, so the whole solve rises to 238 / 316.
 
 `type1` gains *more* past the cache than `type2` despite half the groups: with fewer groups the matvec is
 less memory-bound, so C2R holds 6.2× at `2^21` where `type2`'s falls to 3.4×.
@@ -254,3 +255,9 @@ Warm `sqd` at n=60 `type1`, `2^17` (all −11.676532550657):
 The difference between `sqd` and the solve alone is construction plus the residual check (~0.15 s).
 Peak RSS at `2^19`, n=60 `type2`, fresh processes: packed input 454 / 336 / 393 MiB for `"indices"` /
 `"pairs"` / `"csr"` (POC: 461 / 313 / 404); unpacked input, which `sqd` packs itself, 627 / 451 / 469 MiB.
+
+**Which split ships, and why the same trick gets opposite verdicts.** `"pairs"` is P2 and `"csr"` is C2R.
+Real factors cut C2's operator 28–31% at no measured speed cost (§4, item 3), because CSR stores every
+transition twice and so carries twice the factors; the same split on pairs (P2R, §4 item 5) halves as many
+bytes, moves the peak only 1–5% (within noise), and costs 9–10% of an in-cache solve. Revisit P2R only if
+a GPU run is bound by device memory, where the solve-memory row (up to −9%) is what counts.
