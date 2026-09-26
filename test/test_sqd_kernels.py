@@ -22,11 +22,11 @@ from rqutils.sqd import (
     _CHUNK,
     _apply_csr,
     _apply_pairs,
-    _check_entry_count,
     _is_lex_sorted,
     _pack_scanned,
     _pack_state_keys,
     _pad_states,
+    _padded,
     _size_class,
     _sparse_operator,
     apply_h,
@@ -863,6 +863,6 @@ class TestSparseKernels:
         assert compiles(other) == 1, "control: a different size class must compile afresh"
 
     def test_entry_count_guard(self):
-        _check_entry_count(2**31 - 1)
+        """Raises before allocating: the passing side is every sparse solve in this file."""
         with pytest.raises(ValueError, match="2147483648 entries"):
-            _check_entry_count(2**31)
+            _padded(2**31, 0, np.int32)

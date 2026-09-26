@@ -973,17 +973,19 @@ class SqdResult(NamedTuple):
     ax_norm: jax.Array | None = None
 
 
-@jax.jit(
-    static_argnames=[
-        "states_size",
-        "return_eigvec",
-        "matvec",
-        "maxiter",
-        "prefilter",
-        "log_level",
-        "check_residual",
-    ]
-)
+#: Static arguments of both jitted solve entry points, :func:`run_sqd` and :func:`_run_sparse`.
+_SOLVE_STATIC = [
+    "states_size",
+    "return_eigvec",
+    "matvec",
+    "maxiter",
+    "prefilter",
+    "log_level",
+    "check_residual",
+]
+
+
+@jax.jit(static_argnames=_SOLVE_STATIC)
 def run_sqd(
     hamiltonian: PauliSumXZ,
     states_p: StateList,
@@ -1091,7 +1093,6 @@ def run_sqd(
         args,
         diag0,
         check_ref,
-        matvec,
         sharding,
         return_eigvec=return_eigvec,
         maxiter=maxiter,
@@ -1111,7 +1112,6 @@ def _solve(
     args: tuple,
     diag0: Callable[[], jax.Array],
     check_ref: tuple[Matvec, NDArray],
-    matvec: Matvec,
     sharding: PartitionSpec | None,
     *,
     return_eigvec: bool,
@@ -1157,7 +1157,7 @@ def _solve(
     vinit = jax.lax.cond(jnp.all(hamiltonian.x[0] == 0), vinit_from_min_diag, vinit_nodiag)
 
     if log_level <= logging.DEBUG:
-        jax.debug.print(f"Starting minimization with matvec {matvec}")
+        jax.debug.print("Starting minimization")
 
     # sum|c_k| rigorously bounds lambda_max (Pauli strings are unitary; projecting only shrinks it),
     # which a callable cannot supply (NOTES.md, "No matvec-only upper bound on `λ_max` exists").
@@ -1207,22 +1207,17 @@ def _size_class(chunks: int) -> int:
     return max(-(-chunks >> shift) << shift, 1)
 
 
-def _check_entry_count(count: int) -> None:
-    """Raise unless ``count`` sparse entries are addressable by the int32 indices they are stored in.
+def _padded(count: int, fill: int, dtype: DTypeLike) -> np.ndarray:
+    """A flat array of ``count`` entries rounded up to whole chunks of a size class, all ``fill``.
 
     Raises:
-        ValueError: If ``count`` is at least :math:`2^{31}`.
+        ValueError: If ``count`` reaches :math:`2^{31}`, past the int32 indices the entries are stored in.
     """
     if count >= 2**31:
         raise ValueError(
             f"the sparse operator has {count} entries, beyond the 2^31 - 1 addressable with int32 "
             'indices; use matvec="indices" or a smaller subspace'
         )
-
-
-def _padded(count: int, fill: int, dtype: DTypeLike) -> np.ndarray:
-    """A flat array of ``count`` entries rounded up to whole chunks of a size class, all ``fill``."""
-    _check_entry_count(count)
     return np.full(_size_class(-(-count // _CHUNK)) * _CHUNK, fill, dtype=dtype)
 
 
@@ -1257,7 +1252,7 @@ def _sparse_operator(
     and the rest. Padding entries have equal endpoints and a zero factor.
 
     Raises:
-        ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_check_entry_count`.
+        ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_padded`.
     """
     size = states_u.shape[0]
     z, c = jnp.asarray(hamiltonian.z), jnp.asarray(hamiltonian.c)
@@ -1352,17 +1347,7 @@ def _apply_csr(vec: jax.Array, d0: jax.Array, *entries: jax.Array) -> jax.Array:
     return out
 
 
-@jax.jit(
-    static_argnames=[
-        "states_size",
-        "return_eigvec",
-        "matvec",
-        "maxiter",
-        "prefilter",
-        "log_level",
-        "check_residual",
-    ]
-)
+@jax.jit(static_argnames=_SOLVE_STATIC)
 def _run_sparse(
     hamiltonian: PauliSumXZ,
     states_u: StateList,
@@ -1390,7 +1375,6 @@ def _run_sparse(
         operator,
         lambda: operator[0],
         ("onthefly", hamiltonian.x),
-        matvec,
         None,
         return_eigvec=return_eigvec,
         maxiter=maxiter,
