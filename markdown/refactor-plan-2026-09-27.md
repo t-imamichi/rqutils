@@ -1,7 +1,13 @@
 # Refactor plan for `rqutils/` (2026-09-27)
 
-Why: several files and functions have grown long. Measured on branch `matvec-names` (AST line counts),
-excluding `qprint` and `svsim`, which were earlier ruled out of scope for refactoring.
+Why: several files and functions have grown long. Measured on branch `matvec-names` (AST line counts).
+
+**Scope.** `qprint` and `svsim` are not modified: spinchain uses neither. The priority is the
+spinchain-facing surface — exactly four names, `sqd`, `apply_h` and `uniquify_states` from `rqutils.sqd`,
+and `PauliSumXZ` from `rqutils.paulis.symplectic` — **which must stay importable from those paths,
+with unchanged behaviour, through every step.** Spinchain never calls `ground_locg` directly, but every
+`sqd` solve runs through `_ground_locg_callable` (`sqd` → `run_sqd` / `_run_sparse` → `_solve` →
+`ground_locg` → its callable branch).
 
 ## Where the length is
 
@@ -29,9 +35,23 @@ The longest functions:
 | `sqd.get_xsource` | 98 | 59 | ~39 |
 | `sqd._solve` | 88 | 4 | 84 |
 
-## The steps, highest value first
+## The steps, in order
 
-### 1. Split `sqd.py` into a package, with no API change
+### 1. Trim docstrings to CLAUDE.md's own ceiling
+
+3–5 lines per docstring paragraph; evidence belongs in NOTES.md and the `poc/*.md` write-ups. Targets:
+`sqd`'s 198-line docstring, `ground_locg`'s 185, `ground_locg`'s 289-line module docstring. `Args`,
+`Returns` and `Raises` stay complete: they feed the published reference. A paragraph holding evidence
+found nowhere else moves to NOTES rather than being cut. Likely the largest saving (several hundred
+lines). Acceptance: a clean docs build and a read-through; the suite cannot see docstrings.
+
+### 2. Break up `sqd()`'s ~116 lines of code
+
+It validates, packs and pads the states, dispatches dense against sparse, runs the residual check and
+formats the result inline. Named steps (`_prepare_states`, `_check_eigenpair`, ...) make it a short
+sequence. Host-side Python only, no traced code: low risk.
+
+### 3. Split `sqd.py` into a package, with no API change
 
 `rqutils/sqd/`, keeping `from rqutils.sqd import X` working for every public and currently imported
 private name:
@@ -56,20 +76,6 @@ Risks to check first:
 - **Path references** to `rqutils/sqd.py` in CLAUDE.md, NOTES.md, `markdown/` and `poc/` need updating;
   NOTES headings name functions (`sqd._host_scalar`), which stay valid.
 
-### 2. Trim docstrings to CLAUDE.md's own ceiling
-
-3–5 lines per docstring paragraph; evidence belongs in NOTES.md and the `poc/*.md` write-ups. Targets:
-`sqd`'s 198-line docstring, `ground_locg`'s 185, `ground_locg`'s 289-line module docstring. `Args`,
-`Returns` and `Raises` stay complete: they feed the published reference. A paragraph holding evidence
-found nowhere else moves to NOTES rather than being cut. Likely the largest saving (several hundred
-lines). Acceptance: a clean docs build and a read-through; the suite cannot see docstrings.
-
-### 3. Break up `sqd()`'s ~116 lines of code
-
-It validates, packs and pads the states, dispatches dense against sparse, runs the residual check and
-formats the result inline. Named steps (`_prepare_states`, `_check_eigenpair`, ...) make it a short
-sequence. Host-side Python only, no traced code: low risk.
-
 ### 4. Lift `_ground_locg_callable`'s nested functions to module level
 
 239 lines of code: the seed steps, `body`, `compute_sas` and `diagnostics`, all closures inside one
@@ -80,5 +86,9 @@ and the sharded all-reduce-count tests.
 
 ## Order and bar
 
-1 → 3 → 2 → 4, one commit each. Steps 1 and 3 must prove identical traced graphs and bit-identical
-operators; step 2 a clean docs build. The `"ell"` simplify fixes land first, since they touch `sqd.py`.
+1 → 2 → 3 → 4, one commit each. Shrink `sqd.py` in place first (docstrings, then `sqd()`'s code), so the
+split moves final code and is a *pure* move whose proof — identical traced graphs and bit-identical sparse
+operators — means any difference is a bug; splitting first would move everything once and edit it again.
+Steps 2–4 must prove identical traced graphs and bit-identical operators; step 1 a clean docs build and a
+read-through. `ground_locg` stays last: every solve runs through it. (The `"ell"` simplify fixes it was
+waiting on landed in `357ce39`.)
