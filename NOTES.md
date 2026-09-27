@@ -2754,3 +2754,269 @@ every `cache_level`. `NamedSharding`, since a bare `PartitionSpec` is rejected w
 
 With `& 255` rather than `& 7` the shift `7 - ibit` goes negative from `iterm=8`, i.e. past 8 Z terms in an
 X group: **0.71 absolute error on 9 terms, and a 25% error in the end-to-end eigenvalue**.
+
+## Moved from docstrings (2026-09-27)
+
+Rationale, measurements and history cut from `rqutils/sqd.py` and `rqutils/ground_locg.py` docstrings to
+meet the 3–5-line paragraph ceiling; each docstring points to its subsection.
+
+### ground_locg module: the polish repairs the eigenvalue, not the eigenvector
+
+Being second order in the eigenvector *angle* error, the Rayleigh-quotient polish repairs θ and leaves
+the eigenvector as computed. For a near-degenerate lowest pair the returned `v` can be nearly orthogonal
+to the true eigenvector while θ is still accurate to ten digits (measured `|⟨v_true|v⟩| = 0.447` against
+a θ error of 1.2e-10). `_nullvec_3x3`'s cross products are the fragile step; once they lose the
+eigenvector the polish has nothing to recover from. So audit the eigenvector, not only θ — κ becomes the
+next iteration's search direction. It has *not* been shown that the iteration ever builds such a
+projected matrix, since `_project_out` keeps the basis orthonormal by construction.
+
+The module's measurements were first recorded in `markdown/locg.md`, which describes the pre-rewrite
+module: its line numbers, "no pytest suite exists" note and several severity claims no longer hold, and
+at least one failure mode it measured is no longer reachable now that the defects it compounded with are
+fixed (see "ground_locg._reorthogonalize: the measured drift").
+
+### ground_locg module: Chebyshev prefilter provenance
+
+The technique is Chebyshev-filtered subspace iteration (ChFSI), standard in large-scale
+electronic-structure codes (Banerjee et al. 2016; Zhou et al. 2006; Banerjee et al. 2018, used in
+production in DFT-FE and the provenance `markdown/locg-chebyshev-prefilter.md` cites). Those papers
+filter a whole subspace inside a self-consistent loop. The two-level complementary-subspace method of
+the 2018 paper is **not** implemented and would not fit: it filters a subspace and solves its
+complement, against the module's three-vector memory budget. A two-level *preconditioner* was
+separately measured and rejected (0.68-0.98x, `markdown/deflation-preconditioner.md`): it improved
+conditioning without opening the gap, which is what the iteration count tracks. Neither load-bearing
+property (the Rayleigh-quotient lower edge, the true upper bound) is inherited from the references.
+
+### ground_locg module: sharding verification
+
+The re-orthogonalization adds two inner products per iteration, following the same reduction pattern as
+the existing ones. `poc/sharding.py` exercises the solver on a four-device mesh (virtual CPU devices via
+`XLA_FLAGS=--xla_force_host_platform_device_count=4`), agreeing with the single-device result to
+8.9e-16; real multi-GPU behaviour remains unverified.
+
+### ground_locg.residual_floor: the measured constant
+
+The floor `ε·‖A‖₂` is dimension-independent, measured over n = 70 to 32768 and six decades of `‖A‖₂`,
+dense and matrix-free, both coefficient dtypes: 27 samples, the constant spanning 0.49-1.26 (median
+0.84, a 2.6x spread) while the n-scaled form spans 306x and so is not the mechanism. The factor 4 is a 3.2x margin
+over the worst constant. `Σ|c_k|`, which `sqd` passes as the bound, measured a 1.56-1.90x over-estimate
+of `‖H‖₂` on 1D XXZ fixtures. Full record: "The eigen-residual floor is `eps·‖H‖` with no dimension
+dependence, and `tol` is now absolute (2026-08-31)".
+
+### ground_locg._check_tols: why only rtol takes None
+
+`rtol`'s default is the *promoted operator dtype's* epsilon, which no literal in the signature can
+express: a hardcoded `8.88e-16` is right for float64 and unsatisfiable by 1.3e8x on a float32 problem,
+which `test/test_ground_locg.py` exercises. `atol` has no dtype-derived absolute residual a caller would
+want, so it takes a plain 0.0 and `None` is an error rather than a synonym. The below-floor check is
+conditioned on `rtol == 0` because this repo already paid for a guard that fired on correct input (an
+overflow count that included discarded padding, reported 763,677 beside a bit-exact result).
+
+### ground_locg._check_prefilter: what the gate absorbed
+
+`_chebyshev_prefilter` runs only `if degree > 1 and cycles > 0`, a branch with an implicit `else`, so an
+out-of-range value was absorbed into a silent no-op: `(2, -1)`, `(-4, 2)` and `(True, 2)` all returned
+the exact unfiltered energy at zero speedup, which reads as "the prefilter does not help on my problem"
+— the one misdiagnosis this option cannot afford, since callers are told to A/B it. Malformed *types*
+were no better: `(2,)`, `"32,2"` and `32` reached `ground_locg`'s tuple unpack and surfaced its
+`ValueError`/`TypeError` from inside a public entry point. The legal-no-op versus error distinction is
+only expressible here, since the single gate cannot make it. See also "Validation belongs to the module
+that owns the gate".
+
+### ground_locg._gershgorin_bound: cost
+
+One `O(N²)` reduction, measured 1.1-2.7x a single matvec at N=512-4096, against the 11 matvecs the
+power iteration it replaced spent on an estimate that was not a bound at all. Sharding-preserving: an
+elementwise `abs` and two reductions.
+
+### ground_locg._chebyshev_prefilter: the measurements
+
+- **The upper bound.** It came from 10 power-iteration steps, wrong twice over: power iteration converges
+  to the largest-*magnitude* eigenvalue, so on a negative-leaning spectrum the interval **inverts**, and
+  even sign-repaired a fixed step count under-estimates. Measured: the n=2 Heisenberg chain returned
+  +0.25 for a true -0.75; the bound was invalid in 16 of 25 XXZ configurations, with wrong answers in 2
+  (`markdown/spinchain/rqutils-prefilter-bug.md`). The impossibility is Kuczynski & Wozniakowski, SIAM J.
+  Matrix Anal. Appl. 13(4):1094-1122, 1992; the candidate table and the adversarial construction are in
+  "No matvec-only upper bound on `λ_max` exists, so the prefilter takes one from structure".
+- **The lower edge.** An accurate `lambda_1` instead of the running Rayleigh quotient measured 8.1x at
+  relgap 1.3e-2 but an energy off by 15, silently, at relgap 4.0e-05: the interval then begins at
+  `lambda_0` and damps the ground state with the rest.
+- **Filtering alone** plateaus around 1e-5 to 1e-7, the lower edge following θ onto its own target
+  (`markdown/locg-chebyshev-prefilter.md`).
+- **No depleted residual.** A power-iteration start is *worse* than a random one (measured 177 LOBPCG
+  iterations against 77): it collapses onto the dominant direction, leaving a residual with nothing to
+  expose. A polynomial filter suppresses the unwanted band multiplicatively and leaves the residual rich
+  in the directions block-size-1 LOBPCG can search.
+
+### ground_locg.ground_locg: prefilter tuning
+
+- **Correctness with a valid bound**: the returned eigenpair is the one the solver was going to reach
+  (eigenvector overlap 1.0000000 against the unfiltered result, energies agreeing with `eigsh(tol=0)` to
+  2.8e-14). The ~11 matvecs of a `λ_max` estimate are gone, since `prefilter_hi` needs no iteration.
+- **`(32, 2)`**: across 27 connected-subspace configurations (3 sizes x 3 seeds x 3 anisotropies, every
+  arm converged and correct to <1e-9) a median **1.88x** wall-clock reduction, range 1.25-3.95x, at
+  *fewer* matvecs than the alternatives.
+- **The knobs**: amplification outside the band grows like `cosh(degree · arccosh|x|)`, roughly
+  exponentially, for `degree` matvecs. Cycle 1 does most of the work (growth factor 1e8-1e12), cycle 2
+  refines once, past that θ is near `λ_0`.
+- **Medians**: `(16, 4)` 1.41x, `(32, 2)` 1.88x, `(48, 2)` 1.79x; on a narrower sweep `(64, 2)` 2.29x and
+  `(128, 2)` 1.68x with a 1.01x floor. An independent `spinchain` sweep measured `degree=64` as the
+  *weakest* arm on every path (median 1.35x through `sqd`, 0.74-0.80x dense), so only `(32, 2)` is
+  recommended without qualification. Longer solves favour the higher end: the 249- and 573-iteration
+  cases measured 3.6-5.1x at `degree` 48-96.
+- All single-device CPU; `poc/prefilter_gpu.py` sweeps the grid on a GPU ("The GPU prefilter sweep: the
+  peak transfers, its location does not (2026-09-04)").
+
+### ground_locg.ground_locg: the out-of-range one-hot
+
+The one-hot is built as `iota == xinit`, so an out-of-range (or negative) index matches nothing and
+yields the **zero vector**, from which the solver returned `0.0` with `converged=True`: measured
+`xinit=16` on a dimension-16 operator whose true minimum was -1.5. Without the `vspace` check, the
+callable path failed with an opaque "NoneType is not subscriptable".
+
+### ground_locg.ground_locg: the rtol_scale key
+
+`rtol_scale` (named `reltol` before 2026-09-01) holds `‖Ax‖ + |θ|`. Once converged `x` is the ground
+eigenvector, so this is ~`2|λ_min|` (verified 3.9990 against `|λ_min| = 2`), **not** `2‖A‖₂`; the two
+coincide only when the ground state is also the largest-magnitude one. See "ground_locg debug
+diagnostics: `reltol` became `rtol_scale`".
+
+### ground_locg._reorthogonalize: the measured drift
+
+Measured `|⟨x|y⟩| = 1.0` at shift 1e9 without it. Removing it degrades the worst `|⟨x|y⟩|` over 60
+iterations from ~5e-17 to 2.5e-12 at shift 1e6 and **1.0e-08 at shift 1e9** — eight orders of
+magnitude — and `TestBasisOrthogonality` fails 3 of its 4 arms. θ still matches `eigvalsh` throughout,
+so nothing else in the suite notices: the drift is underway but has not collapsed the basis. The audit's
+`|⟨x|y⟩| = 1.0` needed the 2000-iteration runs that the `reltol` sign error (item I4) used to force, where
+the fixed solver converges in 8-46 — hence the direct assertion off the `debug=True` diagnostics. Both
+callers are `@jax.jit`-decorated, so reassigning it in a live session reuses the compiled kernel and
+both arms return bit-identical numbers that look like "no effect".
+
+### ground_locg._subtract_projections: why not a matmul
+
+Reassociating the summation order into a matmul measured consistently worse in the near-degenerate
+regime: over 4000 adversarial cases with `r` almost entirely inside `span(x, y)` plus an orthogonal part
+of 1e-14..1e-6, both forms hold residual orthogonality at machine epsilon, but the matmul's worst
+`|⟨b|p⟩|` is 8.3e-17 against 6.2e-17. Neither is broken, so this is a judgement call: a few ops are not
+worth a 33% erosion of the quantity these guards protect.
+
+### sqd.sqd: why keyword-only
+
+Everything after `states` used to be positional-or-keyword, which made `sqd(ham, states, True)` a valid
+`states_size` of 1 (`True == 1`) rather than the `return_eigvec` the caller meant — no error, the array
+pinned to one slot. The parameters are unrelated, so no bare positional was worth preserving; `hproj`'s
+`unique_states` is keyword-only for the same reason.
+
+### sqd.sqd: states_size on a mesh
+
+Rounding up to a multiple of `mesh.size` widens the coalescing `states_size` exists for rather than
+defeating it: on a 4-device mesh `states_size` 33 through 36 all share one compiled kernel (707 ms to
+compile, then ~16 ms) while 37 rounds to 40 and compiles afresh. The large-`N` case (4.9% at N=1M, 39.8%
+at N=24M, 82.0% at N=144k; 97% of a cold solve compiling at N=2000; `N/8` buckets at 5.09 s against 5.10
+s; 7.7 GB at N=24M) is "`states_size`'s power-of-two padding".
+
+### sqd.sqd: one packed flag for both directions
+
+Before 2026-08-30 the returned basis was unpacked either way, so a caller passing `packed=True` and
+comparing against an unpacked array now gets a shape mismatch. That fails loudly (`np.array_equal` is
+`False` on differing shapes), which is why one flag governs both directions instead of a second
+`return_packed`: two flags make four combinations, two of them format conversions, and `sqd` is not a
+converter — `pack_states` and `unpack_states` are.
+
+### sqd.sqd: the prefilter default
+
+1.49x median end-to-end (range 1.15-1.70x, 6 sampled XXZ subspaces at n=14-18, dim 978-3982, every arm
+correct to <1e-9 against `eigsh(tol=0)`). That is **below** the 1.88x median of dense `ground_locg`, and
+the gap is the point: the filter spends `cycles * (degree + 1)` matvecs up front, and `apply_h`'s
+gather-heavy kernel is cheap enough that they cost proportionally more. Counting *iterations* would
+report 5.02x, the wrong unit for a caller. `None` restores the pre-2026-08-28 graph exactly. See
+"`precond` was removed; `sqd` defaults to `prefilter=(32, 2)`" and "Prefilter vs precond".
+
+### sqd.sqd: degenerate ground states
+
+Anything not basis-independent (per-site occupancies from `|v_i|²`, say) gets an arbitrary member's
+value rather than the eigenspace average. The solver cannot report the case: the Rayleigh-Ritz 3x3
+spans the search basis `{x, y, p}`, whose spacing reflects that basis, not the multiplicity — measured
+2.0, not 0, on a 2-fold degenerate operator. Deflate-and-resolve is the other second opinion. The
+returned member moves with the seed, the prefilter default or the iteration, none treated as breaking.
+
+### sqd.sqd: non-convergence raises
+
+The convergence flag used to be discarded and the non-converged `state.theta` returned — a valid
+variational **upper bound**, so finite, real and above the true minimum, indistinguishable from a
+correct result. `markdown/locg.md` records that this absence "is the reason I4 could hide", a sign error
+that made the convergence test unsatisfiable so the solver silently never converged. `run_sqd` is
+jitted, so `converged` is traced there and `sqd` raises on it once concrete.
+
+### sqd._check_states_shape: three mistakes, and the packed declaration
+
+- **Re-feeding packed states.** `sqd` takes *unpacked* states while the intermediate a caller keeps
+  (from `uniquify_states`, or `pack_states` directly) is *packed*; re-packing it is `astype(uint8)` (a
+  no-op) then `packbits` reading each byte as one bit, so the subspace silently changes. Realistic loop:
+  `sqd`, configuration recovery, `sqd` again. At `num_qubits <= 7` a packed row is one byte, so a 1-qubit
+  Hamiltonian's shape genuinely matches; `pack_states`' binary check catches it, packed bytes exceeding 1.
+- **A transposed array** `(num_qubits, subspace_dim)`, and **a mismatched Hamiltonian**.
+- **`packed=True` is a declaration** because at `num_qubits == 1` the shapes are undecidable:
+  `sqd(unpacked, packed=True)` returns `+1.0` where the truth is `-1.0`, since `[[0], [1]]` is a legal
+  *packed* array meaning something else. The flag closes the one direction nothing else can.
+- **Coercion**: both entry points document `states` "as an array of integers or booleans" and `hproj`
+  accepted a list of lists; reading `.ndim` off the raw argument would narrow that with an
+  `AttributeError`. It also made the entry points agree, where `sqd` used to require an array.
+
+### sqd._hproj_cols_elems: module scope
+
+Defined inside `hproj`, a fresh cache key per call meant a full retrace and XLA compile every call:
+0.098 s against 0.0001 s warm, essentially `hproj`'s whole steady-state cost. Nothing else there is worth
+hoisting (`PauliSumXZ.from_paulisum` 0.4 ms, `packbits` noise): compile cost versus host work. A captured
+`states_p` is part of the function object too, so as an argument it is traced and keyed on shape and
+dtype, which repeat.
+
+### sqd._pack_state_keys: why B > 8 raises
+
+The limit was previously only *described*, and the failure is worse than truncation: byte 0 is most
+significant, so at `B = 9` its shift is `8 * (9 - 1) = 64` bits on a `uint64` and it vanishes. Measured,
+two 9-byte rows differing only in byte 0 both pack to key `0`, aliasing distinct states and destroying
+the lex-order equivalence the search depends on. `B = ceil((n + 1) / 8)`, so `n >= 64` reaches it.
+
+### sqd._is_lex_sorted: cost
+
+One vectorized pass with no early exit, so unsorted input costs the same as sorted: 12-14% of `hproj`
+(A/B'd end-to-end; both `O(N)`, so the ratio is flat in N) and ~20 ms standalone at N=1M, flat in `B`.
+Cheap enough to be unconditional on a reference path; `sqd` never reaches it. Two or more fillers fail
+the strictness test as duplicates; the high-bit test is for the single one.
+
+### sqd._pack_state_words: either padding end
+
+Trailing-padding is also order-preserving: appending a constant number of zero bytes is a left-shift by
+`8 * pad`, and a constant left-shift is monotonic. Verified exhaustively at `B = 3` and over 20000 random
+pairs at `B = 9`; a mutation to the other end leaves the whole suite green.
+
+### sqd._word_less_than: no cumprod prefix
+
+Word-wise comparison measured 3.6-7.7x on the whole search across n=64..200, bit-identical to the
+byte-wise form it replaced. That predecessor used a `jnp.cumprod` prefix and had to pin
+`dtype=jnp.uint8`: `cumprod` rejects a bool accumulator and promotes to int64, materializing the
+`[N, B]` mask at 8 bytes per element — 192 MB of transients against 23 MB at N=1M, B=12, and 1.53x on
+the J-fold precompute. Two or four scalar comparisons need no prefix.
+
+### sqd.get_xsource: why a search, not a sort
+
+- Lex-sortedness was always required — the sort-based implementation also returned a wrong answer
+  otherwise — but was never stated. `hproj(unique_states=True)` skipped its `np.unique` and returned a
+  wrong, non-symmetric matrix on unsorted input; it now raises
+  (`test_sqd_hproj.py::TestHproj::test_unsorted_input_with_unique_states_raises`).
+- The former implementation sorted a concatenated `[2N, B]` array of `S` and `S ^ X`: the `2N`
+  allocation capped `N` at `2^31` (the sort runs on one device), and it dominated runtime at 66-97% of a
+  solve. A `searchsorted` is a pure gather, so it also shards. Measured on CPU at 12-25x per signature
+  and 12-17x on the J-fold precompute, and **5.15x at N=64M on an NVIDIA GH200** (a GPU sort is well
+  optimized relative to its gather, so the ratio compresses while the direction holds);
+  `markdown/scaling-pocs.md`.
+- `lax.sort` was observed to leak GPU memory (up to 5 GB at `(5M, 9)`); re-measured on that GH200 against
+  a pinned copy of the old sort it **did not reproduce** (~0.95 GB of transients at `(5M, 4)` reclaimed
+  every repetition). The removal never depended on it.
+- The wide path first compared rows one **byte** at a time, ~8x per state across the boundary (15
+  ns/state at n=60 against 189 at n=100, N=300k). Words make a level `ceil((n+1)/64)` comparisons,
+  3.6-7.7x on the whole search across n=64..200; the `B <= 8` path was untouched (0.83-1.18x, noise).
+- The previous implementation returned *assorted* negative values for absent sources (`I[k+1] - N`,
+  computed unconditionally) rather than exactly `-1`; consumers could not tell, since `apply_xgrp`
+  gathers with `mode="fill", wrap_negative_indices=False`.

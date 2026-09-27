@@ -57,14 +57,10 @@ of :math:`\rho (x_{i})`. Note that :math:`r_{i}` is orthogonal to :math:`x_{i}`:
                           & = 0.
 
 
-In practice, instead of finding the optimal step size :math:`\alpha_{i}`, we can directly minimize
-:math:`\rho` in the space spanned by :math:`\{x_{i}, r_{i}\}` via the Rayleigh-Ritz method and
-identify the minimizing vector as :math:`x_{i+1}`. Furthermore, it is known that convergence of the
-algorithm is drastically improved if we search :math:`x_{i+1}` in the extended space spanned by
-:math:`\{x_{i}, x_{i-1}, r_{i}\}`. Thus, one iteration of gradient descent is given by the following
-steps, with orthogonal :math:`\{x_{i}, y_{i}, r_{i}\}` (:math:`x_{i}, y_{i}` normal) as the
-carryover from the previous iteration and :math:`R_A` indicating the Rayleigh-Ritz routine over
-matrix :math:`A`:
+Instead of an optimal step size :math:`\alpha_{i}`, Rayleigh-Ritz minimizes :math:`\rho` directly,
+and over the extended space :math:`\{x_{i}, x_{i-1}, r_{i}\}`, which converges drastically faster
+than :math:`\{x_{i}, r_{i}\}`. With orthogonal :math:`\{x_{i}, y_{i}, r_{i}\}` (:math:`x_{i}, y_{i}`
+normal) carried over and :math:`R_A` the Rayleigh-Ritz routine over :math:`A`, one iteration is:
 
 .. math::
 
@@ -110,27 +106,20 @@ Numerical considerations
 Naive transcriptions of the steps above are numerically fragile in ways that fail *silently*: they
 return a plausible number that is simply wrong, rather than raising or producing ``NaN``.
 
-The measurements behind each item below were originally recorded in ``markdown/locg.md``. **That
-document describes the pre-rewrite module and is now stale** -- its line numbers, its "no pytest
-suite exists" scope note, and several of its severity claims no longer hold, and at least one
-failure mode it measured is no longer reachable now that the defects it compounded with are fixed
-(see :func:`_reorthogonalize`). Read it as history; the invariant that is actually binding is the
-one stated here next to the code, and ``test/test_ground_locg.py`` is what enforces it.
+The measurements behind each item below are in ``markdown/locg.md``, which audits the pre-rewrite
+module and is stale; the binding invariant is the one stated here, enforced by
+``test/test_ground_locg.py`` (``NOTES.md``, "``ground_locg``: every guard is load-bearing").
 
 Analytic eigenpair kernels
 --------------------------
 
-:func:`eigenpair_2x2` and :func:`eigenpair_3x3` must not build the characteristic-polynomial
-coefficients from the *unshifted, unscaled* matrix. For :math:`H = A + sI` the leading coefficients
-grow as powers of :math:`s` while the quantities of interest stay :math:`O(\mathrm{spread})`, so a
-large trace destroys the result -- for the 3x3 kernel the radicand of a square root goes negative
-and produces ``NaN``. Since a physical Hamiltonian is rarely traceless, this is the ordinary case
-rather than an edge case.
+:func:`eigenpair_2x2` and :func:`eigenpair_3x3` must not build the characteristic polynomial from the
+*unshifted, unscaled* matrix: for :math:`H = A + sI` its coefficients grow as powers of :math:`s`, so
+the large trace of an ordinary physical Hamiltonian destroys the result (``NaN`` for the 3x3 kernel).
 
 Both kernels therefore **balance** first: subtract :math:`\mathrm{tr}/3` (2x2: :math:`\mathrm{tr}/2`)
-to work with the traceless part, and divide by :math:`\max_{ij} |A_{ij}|` so the intermediates stay
-:math:`O(1)`. The eigenvector is invariant under both operations; only the eigenvalue is mapped
-back at the end.
+and divide by :math:`\max_{ij} |A_{ij}|` so the intermediates stay :math:`O(1)`. The eigenvector is
+invariant under both; only the eigenvalue is mapped back.
 
 .. math::
 
@@ -140,28 +129,16 @@ back at the end.
 
 
 The eigenvector extraction is rank-aware. :func:`eigenpair_3x3` takes the largest of all three
-column cross products rather than one fixed pair (any single pair can be rank deficient, in which
-case its cross product points nowhere useful), and falls back to the orthogonal complement of the
-largest column when the lowest eigenvalue is degenerate (rank 1), or to an arbitrary unit vector
-when the input is a multiple of the identity (rank 0). :func:`eigenpair_2x2` selects between the two
-rows of the singular shifted matrix on the sign of :math:`\delta = (d_0 - d_1)/2`, so :math:`\delta`
-is never cancelled against a nearly equal radius.
+column cross products (any one pair can be rank deficient), falling back to the orthogonal complement
+of the largest column at rank 1 (degenerate lowest eigenvalue) and to an arbitrary unit vector at
+rank 0 (a multiple of the identity). :func:`eigenpair_2x2` selects between the two rows of the
+singular shifted matrix on the sign of :math:`\delta = (d_0 - d_1)/2`, so :math:`\delta` never cancels.
 
 Finally both kernels close with a Rayleigh-quotient polish, :math:`\theta \leftarrow v^{\dagger} B
 v` on the balanced matrix. This is second order in the eigenvector error and recovers full
 precision where the closed form alone reaches only :math:`\sqrt{\epsilon}` (a near-degenerate lowest
-pair).
-
-Being second order in the eigenvector *angle* error, the polish repairs the eigenvalue and leaves
-the eigenvector as computed. Those are not equally good: for a near-degenerate lowest pair the
-returned :math:`v` can be nearly orthogonal to the true eigenvector while :math:`\theta` is still
-accurate to ten digits (measured :math:`|\langle v_{\mathrm{true}} | v \rangle| = 0.447` against a
-:math:`\theta` error of 1.2e-10). :func:`_nullvec_3x3`'s cross products are the fragile step, and
-once they lose the eigenvector the polish has nothing to recover from. So when auditing this module,
-check the eigenvector and not only :math:`\theta` -- the caller propagates the vector, since
-:math:`\kappa` becomes the next iteration's search direction. It has *not* been shown that the
-iteration ever builds such a projected matrix, since :func:`_project_out` keeps the basis
-orthonormal by construction.
+pair). It repairs :math:`\theta`, not :math:`v`, so audit the eigenvector too (``NOTES.md``,
+"ground_locg module: the polish repairs the eigenvalue, not the eigenvector").
 
 Iteration
 ---------
@@ -170,46 +147,20 @@ Iteration
 
   .. math:: \|r\| < \max\bigl(\mathrm{atol},\ \mathrm{rtol}\,(\|Ax\| + |\theta|)\bigr)
 
-  ``atol`` is an absolute bound on :math:`\|Ax - \theta x\|_2`, so a caller whose consumer checks a
-  fixed residual can name it and have it hold at every :math:`n`. ``rtol`` is a *fraction of the
-  operator magnitude* -- the conventional meaning, as in :func:`numpy.allclose` -- and since
-  :math:`\|Ax\| \approx |\theta|` at convergence its bound is :math:`\approx 2\,\mathrm{rtol}\|A\|_2`,
-  independent of the dimension. The ``max`` is what makes the pair strictly more expressive than either
-  alone: a purely relative test cannot name a residual, and a purely absolute one cannot track an
-  operator whose scale the caller does not know.
-
-  The achievable floor is
+  ``atol`` is an absolute bound on :math:`\|Ax - \theta x\|_2`, holding at every :math:`n`. ``rtol``
+  is a fraction of the operator magnitude, as in :func:`numpy.allclose`: its bound is
+  :math:`\approx 2\,\mathrm{rtol}\|A\|_2`, independent of the dimension. The achievable floor is
 
   .. math:: \mathrm{floor}(\|r\|) \approx \varepsilon(\mathrm{dtype}) \cdot \|A\|_2
 
-  with **no** dependence on :math:`n` -- measured over :math:`n = 70` to :math:`32768` and
-  :math:`\|A\|_2` over six decades, on both the dense and matrix-free paths and both real and complex
-  coefficients (27 samples: the constant spans 0.49-1.26 with median 0.84, while the :math:`n`-scaled
-  form :math:`\varepsilon\|A\|n` spans 306x). ``rtol=None`` targets :math:`8\varepsilon\|A\|_2`, 8x that
-  floor.
-
-  **Two earlier forms, both superseded, and the reasons matter.** A relative test
-  :math:`\|r\| < \mathrm{tol}\,(\|Ax\| + |\theta|)\,n \cdot 10` carried an :math:`n \cdot 10` factor that
-  was 700x-94600x looser than the floor -- slack, not a rounding budget -- so one ``tol`` meant a
-  different absolute residual at every :math:`n` and no single value could be both fast and admissible
-  for a caller with a fixed requirement. Replacing it with a *purely* absolute ``tol`` then removed the
-  ability of one value to track the operator at all, and made the default 1.18-1.49x slower. Neither
-  factor of that :math:`n \cdot 10` survives here: folding a dimension count into a "relative"
-  tolerance made it unpredictable and, at large :math:`n`, dangerous -- ``rtol=1e-8`` at
-  :math:`n = 2^{20}` gave a bound of 4.2 against :math:`\|A\| = 20`, so the first iterate reported
-  convergence and returned a wrong answer. :func:`rqutils.sqd.sqd` now rejects ``rtol >= 0.5``.
-
-  Two traps the relative form recorded, still worth keeping visible because they constrain any future
-  change to the scale: the natural-looking ``norm(Ax) - theta`` is a difference of two nearly equal
-  large positive numbers for a positive-definite operator and was measured going *negative*, making the
-  test unsatisfiable; and :math:`|\theta|` rather than :math:`+\theta` is needed because for the
-  negative-definite operators typical of a ground-state search :math:`+\theta` cancels in turn. The
-  second still applies -- the scale here is that same sum.
+  with **no** dependence on :math:`n`; ``rtol=None`` targets :math:`8\varepsilon\|A\|_2`, 8x that
+  floor (``NOTES.md``, "The eigen-residual floor is ``eps·‖H‖`` with no dimension dependence"). Two
+  earlier forms, an :math:`n \cdot 10`-scaled relative ``tol`` and a purely absolute one, are
+  superseded (``NOTES.md``, "``atol``/``rtol``: the pair is right").
 
 - **Basis orthogonality.** :math:`t` is re-orthogonalized against the new :math:`x` before
   normalization, or :math:`y` drifts into :math:`x` and the standard Rayleigh-Ritz step returns a
-  :math:`\theta` below the true minimum. See :func:`_reorthogonalize`, whose docstring records the
-  measured drift and how to A/B it correctly.
+  :math:`\theta` below the true minimum. See :func:`_reorthogonalize`.
 
 - **Search direction normalization.** :func:`_project_out` guarantees only
   :math:`\|p\| \ge 0.99`, and a short :math:`p` scales :math:`\mathrm{sas}_{22}` by :math:`|p|^2`,
@@ -217,12 +168,10 @@ Iteration
   :math:`p` is renormalized before the projected eigensolve, using the norm :func:`_project_out`
   returns alongside it rather than a second reduction over a vector of up to :math:`10^8` elements.
 
-- **Exhausted search space.** When :func:`_project_out` returns exactly zero, row and column 2 of
-  the projected matrix vanish; for a positive-definite :math:`A` that zero diagonal is the
-  *smallest* eigenvalue, so Rayleigh-Ritz would select the null direction and the subsequent
-  normalization would divide by zero. That diagonal is masked out of contention, and the condition
-  is reported as convergence: :math:`\{x, y\}` already spans the residual, so no new search
-  direction exists and no further iteration can lower :math:`\theta`.
+- **Exhausted search space.** When :func:`_project_out` returns exactly zero, the zero diagonal it
+  leaves would be the *smallest* eigenvalue of a positive-definite projected matrix, and normalizing
+  the null direction would divide by zero. It is masked out of contention and reported as
+  convergence: :math:`\{x, y\}` already spans the residual, so :math:`\theta` cannot fall further.
 
 Every division by a norm in this module is guarded, so a zero or degenerate input yields a
 well-defined result instead of ``NaN``.
@@ -231,34 +180,22 @@ Chebyshev prefilter
 ===================
 
 :func:`ground_locg` takes an optional ``prefilter=(degree, cycles)`` that applies a Chebyshev
-polynomial filter to the initial vector before the iteration starts, damping the band
-:math:`[\theta, \lambda_{\max}]` by :math:`1/T_{\mathrm{degree}}` so the ground direction comes out
-amplified relative to everything else. The technique is Chebyshev-filtered subspace iteration
-(ChFSI), standard in large-scale electronic-structure codes[3][4][5]; what is used here is the
-single-vector, prefilter-then-LOBPCG specialization rather than a construction from those papers,
-which filter a whole subspace inside a self-consistent loop. In particular the two-level
-complementary-subspace method of [5] is **not** implemented here and would not fit: it filters a
-subspace and solves its complement, against this module's three-vector memory budget. A two-level
-*preconditioner* was separately measured and rejected (0.68-0.98x, ``markdown/deflation-preconditioner.md``)
--- it improved conditioning without opening the gap, which is what the iteration count tracks.
+polynomial filter to the initial vector, damping the band :math:`[\theta, \lambda_{\max}]` by
+:math:`1/T_{\mathrm{degree}}` so the ground direction comes out amplified. It is the single-vector,
+prefilter-then-LOBPCG specialization of Chebyshev-filtered subspace iteration[3][4][5], not the
+two-level method of [5] (``NOTES.md``, "ground_locg module: Chebyshev prefilter provenance").
 
-Two properties are load-bearing and neither is inherited from the references. The filter's lower edge
-is the *current Rayleigh quotient*, re-read each cycle, not an estimate of :math:`\lambda_1` -- an
-accurate :math:`\lambda_1` measured faster on a comfortable gap and silently wrong on a tight one.
-And the upper edge ``prefilter_hi`` must be a true bound on :math:`\lambda_{\max}`, which no
-matvec-based iteration can supply; a power-iteration estimate returned an *excited* eigenpair with
-``converged=True``. :func:`_chebyshev_prefilter` records both measurements, and
-``markdown/locg-chebyshev-prefilter.md`` has the tuning tables.
+Two properties are load-bearing: the filter's lower edge is the *current Rayleigh quotient*, re-read
+each cycle, not an estimate of :math:`\lambda_1`; and ``prefilter_hi`` must be a true upper bound on
+:math:`\lambda_{\max}`, which no matvec-based iteration can supply. :func:`_chebyshev_prefilter` has
+both; ``markdown/locg-chebyshev-prefilter.md`` has the tuning tables.
 
 Distributed arrays
 ==================
 
 This function works transparently over distributed (sharded) input :math:`v_0` if the callable
-passed as the ``mat`` argument preserves the sharding in the output. The re-orthogonalization
-described above introduces two additional inner products per iteration, following the same reduction
-pattern as the existing ones. ``poc/sharding.py`` exercises this on a four-device
-mesh (virtual CPU devices via ``XLA_FLAGS=--xla_force_host_platform_device_count=4``), agreeing with
-the single-device result to 8.9e-16; real multi-GPU behaviour remains unverified.
+passed as the ``mat`` argument preserves the sharding in the output (``NOTES.md``, "ground_locg
+module: sharding verification").
 
 References
 ==========
@@ -276,9 +213,7 @@ J. Chem. Phys. **145**, 154101 (2016).
 Chebyshev-filtered subspace iteration*, J. Comput. Phys. **219**, 172 (2006).
 
 [5]: A. S. Banerjee, L. Lin, P. Suryanarayana, C. Yang, J. E. Pask, *Two-level Chebyshev filter based
-complementary subspace method*, J. Chem. Theory Comput. **14**, 2930 (2018). The provenance
-``markdown/locg-chebyshev-prefilter.md`` cites; used in production in DFT-FE. Its two-level
-complementary-subspace split is **not** what this module does -- see the note below.
+complementary subspace method*, J. Chem. Theory Comput. **14**, 2930 (2018).
 
 Single-vector LOBPCG API
 ========================
@@ -355,16 +290,11 @@ def residual_floor(opnorm_bound: float, dtype: DTypeLike) -> float:
     r"""Return the smallest eigen-residual a solve on this operator can reach.
 
     The achievable floor of :math:`\|Ax - \theta x\|_2` is :math:`\varepsilon \cdot \|A\|_2`,
-    **independent of the dimension** -- measured over :math:`n = 70` to :math:`32768` and six decades
-    of :math:`\|A\|_2`, on the dense and matrix-free paths and both coefficient dtypes (27 samples:
-    the constant spans 0.49-1.26, median 0.84; the :math:`n`-scaled form spans 306x and is therefore
-    not the mechanism). The returned value multiplies that by **4**, a 3.2x margin over the worst
-    constant observed.
+    **independent of the dimension**; this returns **4** times that, a 3.2x margin over the worst
+    measured constant (``NOTES.md``, "ground_locg.residual_floor: the measured constant").
 
     ``opnorm_bound`` may be any upper bound on :math:`\|A\|_2`; :func:`rqutils.sqd.sqd` passes
-    :math:`\sum_k |c_k|`, measured a 1.56-1.90x over-estimate on 1D XXZ fixtures. Over-estimating is
-    the safe direction -- it raises the reported floor, so a ``tol`` this function admits is
-    comfortably reachable.
+    :math:`\sum_k |c_k|`. Over-estimating is the safe direction: it raises the reported floor.
 
     Args:
         opnorm_bound: An upper bound on the spectral norm of the operator.
@@ -389,26 +319,17 @@ def _check_tols(atol: Any, rtol: Any, opnorm_bound: float, dtype: DTypeLike) -> 
       and resolves to ``4 * eps`` (see :func:`ground_locg`). Negative is rejected, 0.0 disables the arm,
       and ``>= 0.5`` is rejected because the bound would then reach ``||A||`` and any vector would pass.
 
-    **Why only one of them takes ``None``**, since the asymmetry invites the question. ``rtol``'s default
-    is the *promoted operator dtype's* epsilon, which cannot be written as a literal in the signature: a
-    hardcoded ``8.88e-16`` is right for float64 and unsatisfiable by 1.3e8x on a float32 problem, which
-    ``test/test_ground_locg.py`` exercises. ``None`` is the only way to defer that to runtime. ``atol``
-    has no such excuse -- there is no dtype-derived absolute residual a caller would want -- so it takes
-    a plain 0.0 and ``None`` is an error rather than a synonym for it.
+    Only ``rtol`` takes ``None`` because its default is the promoted dtype's epsilon, which no literal
+    can express; ``atol`` has no dtype-derived value (``NOTES.md``, "ground_locg._check_tols: why only
+    rtol takes None").
 
-    **The floor check fires only when ``atol`` is the sole arm.** The achievable residual floor is
-    ``eps * ||H||_2``, so a below-floor ``atol`` cannot be met -- but with ``rtol > 0`` the relative arm
-    still can, and rejecting that configuration would fail a *working* call. This repo has already paid
-    for a guard that fired on correct input (an overflow count that included discarded padding, reported
-    763,677 beside a bit-exact result); the condition is `rtol == 0`, not `atol < floor` alone.
+    The below-floor check fires only when ``rtol == 0``: with a live relative arm a below-floor ``atol``
+    is harmless, and rejecting it would fail a working call. Both arms zero is rejected outright, since
+    no residual satisfies ``||r|| < 0``.
 
-    Both arms zero is rejected outright: no residual satisfies ``|| r || < 0``, so the solve would run to
-    ``maxiter`` and raise. That is diagnosable here and only a symptom there.
-
-    Sited in this module, beside the test it guards, for the reason :func:`_check_prefilter` gives. It
-    cannot be enforced *at* that test: ``converged`` is a traced boolean inside a ``jax.lax.while_loop``,
-    so nothing there can raise. :func:`rqutils.sqd.sqd` is the outermost point where
-    :math:`\sum_k |c_k|` is concrete, which is why it is the caller.
+    Sited here beside the test it guards (``NOTES.md``, "Validation belongs to the module that owns the
+    gate"), but called by :func:`rqutils.sqd.sqd`, the outermost point where :math:`\sum_k |c_k|` is
+    concrete: ``converged`` is traced inside a ``while_loop``, so nothing there can raise.
 
     Args:
         atol: The caller's absolute tolerance, unvalidated.
@@ -483,24 +404,16 @@ def _check_tols(atol: Any, rtol: Any, opnorm_bound: float, dtype: DTypeLike) -> 
 def _check_prefilter(prefilter: Any) -> None:
     """Raise unless ``prefilter`` is None or a ``(degree, cycles)`` pair of non-negative ints.
 
-    Lives here rather than in :mod:`rqutils.sqd` because this module owns the gate the check exists
-    to compensate for: :func:`_chebyshev_prefilter` runs only ``if degree > 1 and cycles > 0``, an
-    equality-style
-    branch with an implicit ``else``, so an out-of-range value is **absorbed into a silent no-op**
-    rather than reported: measured, ``(2, -1)``, ``(-4, 2)`` and ``(True, 2)`` all returned the exact
-    unfiltered energy at zero speedup, which reads as "the prefilter does not help on my problem".
-    That misdiagnosis is the one thing this option cannot afford, because its docstring tells callers
-    to A/B it on their own subspaces. Malformed *types* were no better: ``(2,)``, ``"32,2"`` and ``32``
-    reached ``ground_locg``'s tuple unpack and surfaced its ``ValueError``/``TypeError`` from inside a
-    public entry point.
+    Lives here because this module owns the ``degree > 1 and cycles > 0`` gate, which absorbs an
+    out-of-range value into a silent no-op rather than reporting it (``NOTES.md``,
+    "ground_locg._check_prefilter: what the gate absorbed").
 
     ``bool`` is rejected because it is an ``int`` subclass, so ``(True, 2)`` would otherwise pass as
     ``(1, 2)``, i.e. as a documented no-op.
 
-    The **intentional** no-ops stay legal: ``degree <= 1`` or ``cycles == 0`` is how a caller disables
-    the filter without restructuring a sweep, and ``TestChebyshevPrefilter`` pins that contract. Only
-    negative values, non-ints and wrong shapes are errors -- a distinction only expressible here,
-    since that single ``degree > 1 and cycles > 0`` test cannot make it.
+    The **intentional** no-ops stay legal: ``degree <= 1`` or ``cycles == 0`` disables the filter
+    without restructuring a sweep (pinned by ``TestChebyshevPrefilter``). Only negative values,
+    non-ints and wrong shapes are errors.
 
     Args:
         prefilter: The caller's value, unvalidated.
@@ -534,10 +447,8 @@ def _gershgorin_bound(mat: jax.Array) -> jax.Array:
     r"""Rigorous upper bound on :math:`\lambda_{\max}` of a Hermitian array: ``max_i sum_j |A_ij|``.
 
     Gershgorin: every eigenvalue lies within :math:`\sum_j |A_{ij}|` of some :math:`A_{ii}`, so this
-    row-magnitude maximum bounds the spectral radius and therefore :math:`\lambda_{\max}`. **Rigorous
-    for every Hermitian input**, needs no iteration, and costs one :math:`O(N^2)` reduction -- measured
-    1.1-2.7x a single matvec at N=512-4096, against the 11 matvecs the power iteration this replaced
-    spent on an estimate that was not a bound at all.
+    bounds the spectral radius. **Rigorous for every Hermitian input**, with no iteration: one
+    :math:`O(N^2)` reduction (``NOTES.md``, "ground_locg._gershgorin_bound: cost").
 
     Preserves sharding: an elementwise ``abs`` and two reductions, so the scalar result carries no
     partitioning to conflict with the caller's vector.
@@ -555,22 +466,11 @@ def _chebyshev_prefilter(
 ) -> jax.Array:
     r"""Damp the unwanted band of the spectrum before the LOBPCG iteration starts.
 
-    ``hi`` MUST BE A TRUE UPPER BOUND ON :math:`\lambda_{\max}`, and is now a required argument
-    because nothing computable from ``matvec`` can guarantee that. It previously came from 10 steps of
-    power iteration, which is wrong twice over: power iteration converges to the eigenvalue of largest
-    *magnitude*, so on a negative-leaning spectrum it returns something near :math:`\lambda_{\min}`
-    and the interval **inverts**; and even with the sign repaired a fixed step count merely
-    under-estimates. The consequence was a silent wrong answer -- the filter damps its own target and
-    the solver returns an *excited* eigenpair with ``converged=True`` (measured: the n=2 Heisenberg
-    chain returned +0.25 for a true -0.75; the bound was invalid in 16 of 25 XXZ configurations, with
-    wrong answers in 2). ``markdown/spinchain/rqutils-prefilter-bug.md`` has the report and the reproduction.
-
-    **No cheap matvec-only upper bound exists** -- a theorem, not a tuning problem (Kuczynski &
-    Wozniakowski, SIAM J. Matrix Anal. Appl. 13(4):1094-1122, 1992). So rigour has to come from the
-    operator's structure: Gershgorin for an array (:func:`_gershgorin_bound`),
-    :math:`\sum_k |c_k|` for a Pauli sum, which is what :mod:`rqutils.sqd` passes. ``NOTES.md`` has
-    the measured candidate table, the adversarial construction, and why the Ritz-plus-residual forms
-    production libraries use are estimates rather than bounds.
+    ``hi`` MUST BE A TRUE UPPER BOUND ON :math:`\lambda_{\max}`; an under-estimate makes the filter
+    damp its own target, returning an *excited* eigenpair with ``converged=True``. No matvec-only upper
+    bound exists (a theorem), so it comes from structure: Gershgorin for an array
+    (:func:`_gershgorin_bound`), :math:`\sum_k |c_k|` for a Pauli sum (``NOTES.md``, "No matvec-only
+    upper bound on ``λ_max`` exists"; "ground_locg._chebyshev_prefilter: the measurements").
 
     Prefer a loose bound to a tight estimate: over-estimating costs resolution smoothly, while
     under-estimating flips which eigenvector is amplified most and returns the wrong answer.
@@ -581,23 +481,11 @@ def _chebyshev_prefilter(
     :math:`\cosh`, so the ground state comes out amplified relative to everything else. Cost is
     ``cycles * (degree + 1)`` matrix-vector products and three live vectors, independent of ``degree``.
 
-    THE LOWER EDGE IS THE CURRENT RAYLEIGH QUOTIENT, RE-READ EACH CYCLE, AND THAT CHOICE IS LOAD-BEARING
-    -- not an approximation to a better bound. Using an accurate ``lambda_1`` instead is faster where the
-    gap is comfortable and **returns a wrong answer** where it is not: measured 8.1x at relgap 1.3e-2 but
-    an energy off by 15, silently, at relgap 4.0e-05, because the filter interval then begins at
-    ``lambda_0`` and damps the ground state along with the rest. A Rayleigh quotient starts *above*
-    ``lambda_0`` and descends toward it, so it can never bracket the target out.
-
-    Filtering alone does not converge: as ``theta`` approaches ``lambda_0`` the lower edge does too, so
-    the filter begins attacking its own target and accuracy plateaus around 1e-5 to 1e-7. That is why
-    this is a *prefilter* handing off to the full iteration rather than a solver -- see
-    ``markdown/locg-chebyshev-prefilter.md`` for both measurements.
-
-    Note this does **not** reproduce the depleted-residual failure that makes a power-iteration start
-    *worse* than a random one (measured 177 LOBPCG iterations against 77). Power iteration collapses onto
-    the dominant direction, leaving a residual with nothing left to expose; a polynomial filter
-    suppresses the unwanted band multiplicatively and leaves the residual rich in the directions
-    block-size-1 LOBPCG can actually search.
+    THE LOWER EDGE IS THE CURRENT RAYLEIGH QUOTIENT, RE-READ EACH CYCLE, AND THAT IS LOAD-BEARING: it
+    starts above ``lambda_0`` and descends, so it never brackets the target out, where an accurate
+    ``lambda_1`` returned a wrong answer on a tight gap. Filtering alone plateaus as ``theta`` nears
+    ``lambda_0``, hence a *prefilter* handing off to the iteration. Unlike a power-iteration start it
+    leaves the residual rich in searchable directions (``markdown/locg-chebyshev-prefilter.md``).
     """
 
     def cycle(vec, _):
@@ -712,183 +600,106 @@ def ground_locg(
             sharding-transparent only through that contract, which is why every ``apply_*`` in
             :mod:`rqutils.sqd` passes ``out_sharding=jax.typeof(vec).sharding``.
         xinit: Initial vector, or an integer index selecting a one-hot vector (which requires
-            ``vspace`` if ``mat`` is callable). A plain Python ``int`` is accepted -- the
-            implementations inspect ``xinit.dtype``, but both are ``jax.jit``-wrapped, so an ``int``
-            arrives as a 0-d traced array. Must have a non-vanishing overlap with :math:`v_0`.
+            ``vspace`` if ``mat`` is callable). A plain Python ``int`` is accepted. Must have a
+            non-vanishing overlap with :math:`v_0`.
         args: Additional arguments to callable ``mat``.
         maxiter: Maximum number of gradient descent iterations.
-        atol: **Absolute** bound on the eigen-residual :math:`\|Ax - \theta x\|_2`. Default ``0.0``,
-            which disables this arm and leaves ``rtol`` to decide. Set it when a downstream consumer has
-            a fixed residual requirement: ``atol=1e-6`` means :math:`\|r\| < 10^{-6}` at **every**
-            :math:`n`, which no relative tolerance can express.
+        atol: **Absolute** bound on the eigen-residual :math:`\|Ax - \theta x\|_2`, holding at
+            **every** :math:`n`: ``atol=1e-6`` means :math:`\|r\| < 10^{-6}`. Default ``0.0``, which
+            disables this arm. **``None`` is rejected**; pass ``0.0`` to disable the arm.
 
-            **``None`` is rejected** -- pass ``0.0`` to disable the arm. A *derived* absolute bound is
-            the unintuitive construct this pair replaced: an absolute residual is either a number the
-            caller wants or it is not wanted at all.
-
-            The achievable floor is :math:`\mathrm{eps} \cdot \|A\|_2` with **no** :math:`n` dependence
-            (measured over :math:`n = 70..32768` and six decades of :math:`\|A\|`, dense and
-            matrix-free, both dtypes: the constant spans 0.49-1.26 while the :math:`n`-scaled form
-            spans 306x). An ``atol`` below that floor is unreachable **when ``rtol`` is zero**;
-            :func:`rqutils.sqd.sqd` rejects that combination. With a non-zero ``rtol`` it is harmless,
-            because the relative arm can still fire.
+            The achievable floor is :math:`\mathrm{eps} \cdot \|A\|_2` with **no** :math:`n`
+            dependence. A below-floor ``atol`` is unreachable **when ``rtol`` is zero**, and
+            :func:`rqutils.sqd.sqd` rejects that combination; with a non-zero ``rtol`` it is harmless.
         rtol: **Relative** tolerance -- a fraction of the operator magnitude:
 
             .. math:: \|r\| < \mathrm{rtol}\,(\|Ax\| + |\theta|)
 
-            This is the conventional meaning, as in :func:`numpy.allclose` and :mod:`scipy`: ``rtol`` is
-            dimensionless, and :math:`(\|Ax\| + |\theta|)` supplies the units, since :math:`\|r\|` scales
-            with :math:`\|A\|`. Since :math:`\|Ax\| \approx |\theta|` at convergence the bound is
-            :math:`\approx 2\,\mathrm{rtol}\|A\|_2` -- **independent of the dimension**, so one value
-            means the same thing at every :math:`n`.
+            Dimensionless, as in :func:`numpy.allclose`: the bound is
+            :math:`\approx 2\,\mathrm{rtol}\|A\|_2`, **independent of the dimension**. If ``None``
+            (the default), :math:`4\varepsilon` of the promoted dtype, targeting
+            :math:`8\varepsilon\|A\|_2`, 8x the floor. Pass ``0.0`` to disable the arm.
 
-            If ``None`` (the default), :math:`4\varepsilon` is used, targeting :math:`8\varepsilon\|A\|_2`
-            -- 8x the measured floor of :math:`\varepsilon\|A\|_2`, the same 3.2x margin over the worst
-            observed floor constant that :func:`residual_floor` applies. Pass ``0.0`` to disable the arm.
-
-            :math:`|\theta|` rather than :math:`+\theta` because the sum must not cancel for either sign,
-            and a ground-state search is typically negative-definite; the natural-looking
-            ``norm(Ax) - theta`` was measured going *negative* for a positive-definite operator, which
-            makes the test unsatisfiable.
-
-            **An earlier form multiplied this by** :math:`n \cdot 10`, **and that is gone.** Neither
-            factor was a rounding budget -- the floor has no :math:`n` term (measured over
-            :math:`n = 70..32768`: the :math:`\varepsilon\|A\|` constant spans 2.6x where the
-            :math:`n`-scaled form spans 306x) -- and folding a dimension count and a bare 10 into a
-            "relative" tolerance made it unpredictable and, at large :math:`n`, dangerous: ``rtol=1e-8``
-            at :math:`n = 2^{20}` produced a bound of 4.2 against :math:`\|A\| = 20`, so the solve
-            converged on the first iterate and returned a wrong answer with ``converged=True``. The dial
-            also saturated, ``rtol=1e-6`` and ``1e-4`` giving bit-identical results.
-
-            The cost is real and worth stating: **one ``rtol`` no longer scales itself across
-            dimensions.** A caller that needs a different bound per subspace size sets ``atol`` per call
-            instead. :func:`rqutils.sqd.sqd` rejects ``rtol >= 0.5``, where the bound would reach
-            :math:`\|A\|` and every vector would "converge".
+            :math:`|\theta|`, not :math:`+\theta`, so the scale cannot cancel for either sign
+            (``NOTES.md``, "ground_locg.body: the convergence test's scale").
 
             **Convergence is** ``||r|| < max(atol, rtol * scale)`` **-- either arm suffices**, so
             ``atol=x, rtol=0.0`` is absolute-only, ``atol=0.0`` with a non-zero ``rtol`` is
-            relative-only, and setting both takes whichever is looser.
+            relative-only, and setting both takes whichever is looser. One ``rtol`` does not scale
+            itself across dimensions; set ``atol`` per call for that. :func:`rqutils.sqd.sqd`
+            rejects ``rtol >= 0.5``, where the bound reaches :math:`\|A\|`.
 
             .. warning::
 
                **``tol`` is gone, and it had two meanings.** Relative (against an
-               :math:`n`-scaled bound) until 2026-08-31, absolute after. There is no alias:
-               ``tol=`` raises ``TypeError`` rather than silently resolving to one of the pair.
-               From the absolute form, ``tol=x`` becomes ``atol=x``. From the relative form there is
-               **no exact equivalent**, because the :math:`n \cdot 10` factor is not reproduced;
-               ``rtol`` gives per-operator scaling only.
+               :math:`n \cdot 10`-scaled bound) until 2026-08-31, absolute after. ``tol=`` raises
+               ``TypeError``. From the absolute form, ``tol=x`` becomes ``atol=x``; from the
+               relative form there is **no exact equivalent** (``NOTES.md``, "``atol``/``rtol``: the
+               pair is right").
         vspace: Specification (dimension, dtype) of the vector space. Required only when ``mat`` is
             a callable and ``xinit`` is an integer.
-        prefilter_hi: Upper bound on :math:`\lambda_{\max}`, used as the filter's upper interval
-            edge. Ignored unless ``prefilter`` is set. **Required when ``mat`` is a callable** -- there
-            is no fallback, because no matvec-only estimate can be rigorous and the estimate this
-            replaced silently returned excited eigenpairs. When ``mat`` is an array the Gershgorin
-            bound ``max_i sum_j |A_ij|`` is derived automatically, so no caller of the array path is
-            affected. :mod:`rqutils.sqd` passes ``sum|c_k|``, valid because every Pauli string is
-            unitary. Prefer a loose bound: over-estimating costs resolution smoothly, while
-            *under*-estimating changes the answer. See :func:`_chebyshev_prefilter`.
         prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter applied to ``xinit`` before the
-            iteration starts, damping the unwanted band of the spectrum so the LOBPCG loop begins
-            closer to :math:`v_0`. ``None`` (the default) leaves the traced graph unchanged, so no
-            existing caller is affected; it is a static argument, so the branch resolves at trace
-            time. Costs ``cycles * (degree + 1)`` extra matrix-vector products -- the ~11 for a
-            :math:`\lambda_{\max}` estimate are gone, since ``prefilter_hi`` needs no iteration --
-            and three live vectors: **no growing basis**, which is
-            what makes it compatible with this module's single-vector memory budget. Like ``mat`` and
-            ``mat`` it is sharding-transparent, since it only calls ``mat`` and scales
-            elementwise. **It cannot change the answer, only the path -- provided ``prefilter_hi``
-            is a true upper bound.** That caveat is load-bearing and was originally missing: the
-            residual test every convergence check reads certifies that *an* eigenpair was found, not
-            that it is the lowest, so a filter that removed the target from the iterate's span
-            returned an excited eigenpair with ``converged=True``
-            (``markdown/spinchain/rqutils-prefilter-bug.md``). With a valid bound the returned eigenpair is the same
-            one to the tolerance the solver was going to reach anyway (measured: eigenvector overlap 1.0000000 against the
-            unfiltered result, energies agreeing with ``eigsh(tol=0)`` to 2.8e-14).
+            iteration, damping the unwanted band of the spectrum. Static; ``None`` (the default)
+            leaves the traced graph unchanged. Costs ``cycles * (degree + 1)`` matvecs and three live
+            vectors, with no growing basis, and is sharding-transparent. ``degree <= 1`` or
+            ``cycles == 0`` is a legal no-op.
 
-            **Start with ``(32, 2)``.** Across 27 connected-subspace configurations (3 sizes x 3
-            seeds x 3 anisotropies, every arm converged and correct to <1e-9) it measured a median
-            **1.88x** wall-clock reduction, range 1.25-3.95x, at *fewer* matvecs than the
-            alternatives below. The two knobs are not interchangeable:
+            **It changes only the path, not the answer -- provided ``prefilter_hi`` is a true upper
+            bound.** An under-estimate removes the target from the iterate's span and returns an
+            excited eigenpair with ``converged=True``, since the residual test certifies *an*
+            eigenpair, not the lowest (``markdown/spinchain/rqutils-prefilter-bug.md``).
 
-            - ``degree`` sets how sharply **one** cycle separates. Amplification outside the damped
-              band grows like :math:`\cosh(\mathrm{degree} \cdot \mathrm{arccosh}|x|)`, i.e.
-              roughly exponentially, while costing only ``degree`` matrix-vector products. This is
-              the high-leverage knob.
-            - ``cycles`` sets how many times the interval re-tightens around the descending Rayleigh
-              quotient. Cycle 1 does most of the work (measured growth factor 1e8-1e12), cycle 2
-              refines once, and past that :math:`\theta` is already near :math:`\lambda_0` so
-              further cycles pay full cost for little separation.
-
-            So **raise ``degree``, keep ``cycles`` at 2**. Measured medians: ``(16, 4)`` 1.41x,
-            ``(32, 2)`` **1.88x**, ``(48, 2)`` 1.79x; on a narrower sweep ``(64, 2)`` reached 2.29x
-            and ``(128, 2)`` fell to 1.68x with a 1.01x floor. **Treat the upper half of that range with
-            suspicion**: an independent sweep from the ``spinchain`` side measured ``degree=64`` as
-            the *weakest* arm on every path it tried (median 1.35x through ``sqd``, 0.74-0.80x dense),
-            so ``(32, 2)`` is the only value recommended without qualification. Longer solves favour the higher end:
-            the 249- and 573-iteration cases measured 3.6-5.1x at ``degree`` 48-96.
-
-            All figures are single-device CPU; the ordering may differ on a GPU, where the
-            matvec-to-bookkeeping cost ratio differs -- ``poc/prefilter_gpu.py``
-            sweeps this grid to settle it. See ``markdown/locg-chebyshev-prefilter.md`` for the tables,
-            why the filter's lower edge must be the running Rayleigh quotient rather than an
-            accurate :math:`\lambda_1`, and why filtering alone does not converge.
+            **Start with ``(32, 2)``**, and raise ``degree`` rather than ``cycles``: ``degree`` sets
+            how sharply one cycle separates, while cycle 1 does most of the work and cycle 2 refines
+            once. All figures are single-device CPU (``NOTES.md``, "ground_locg.ground_locg:
+            prefilter tuning"; ``markdown/locg-chebyshev-prefilter.md``).
+        prefilter_hi: Upper bound on :math:`\lambda_{\max}`, the filter's upper interval edge;
+            ignored unless ``prefilter`` runs. **Required when ``mat`` is a callable**, with no
+            fallback, since no matvec-only estimate is rigorous; derived by Gershgorin when ``mat``
+            is an array. :mod:`rqutils.sqd` passes ``sum|c_k|``. A loose bound only costs resolution,
+            while an *under*-estimate changes the answer. See :func:`_chebyshev_prefilter`.
         debug: If True, additionally return per-iteration diagnostics. Note that the diagnostic
             path uses ``jax.lax.scan`` to collect fixed-size output, and therefore always runs the
             full ``maxiter`` iterations with no early exit; rows past convergence are
             post-convergence noise.
         log_level: Verbosity level.
         batch_matvec: Send each group of *independent* operator applications as one stacked
-            ``(k, n)`` array instead of ``k`` separate ``(n,)`` calls, so ``mat`` is invoked once per
-            group. Requires ``mat`` to broadcast over a leading axis of **any** size and to return a
-            matching ``(k, n)`` -- not just ``k = 2``: the steady-state iteration sends a pair, and
-            ``debug=True``'s diagnostics send three, so an operator that hardcodes 2 breaks on the
-            debug path. :mod:`rqutils.sqd`'s matvecs satisfy this, since they index with
-            ``vec.at[..., xsource]`` and scale elementwise, both of which are width-agnostic.
-            Ignored -- and rejected with a ``ValueError`` -- when ``mat`` is an array, whose matvec
-            this function builds itself. Default ``False``, because an arbitrary callable need not
-            accept a batch. Measured 1.61-1.81x on the pair with bit-identical results, and on a
-            4-device mesh it halves the all-gathers (6 to 3) by paying the operator's gather once for
-            both vectors. The eigen*value* is unaffected, but the returned eigen*vector* need
-            not be bit-identical to the unbatched arm, and the cause is ``mat`` rather than this
-            function: XLA may contract a ``(k, n)`` operand in a different order than an ``(n,)`` one,
-            so a batched call is not obliged to round identically. Measured at ``dim=32`` with
-            ``debug=True``: an elementwise operator gives exactly 0.0 on every diagnostic, while a
-            dense ``einsum`` moves ``y`` by 1.1e-9. The size of that difference carries no
-            information -- on a near-degenerate subspace ``y`` moved 0.56 while ``theta`` still agreed
-            to 2.2e-15, the eigenvector being free to rotate within an invariant subspace -- so
-            compare eigenvalues, not vector norms, when A/B-ing this flag.
+            ``(k, n)`` array, so ``mat`` is invoked once per group. ``mat`` must broadcast over a
+            leading axis of **any** size and return a matching ``(k, n)``: the iteration sends 2,
+            ``debug=True``'s diagnostics 3. Default ``False``, since an arbitrary callable need not
+            accept a batch; rejected when ``mat`` is an array.
+
+            The eigen*value* is unaffected, but the eigen*vector* need not be bit-identical to the
+            unbatched arm, since XLA may contract a ``(k, n)`` operand in a different order; compare
+            eigenvalues, not vectors (``NOTES.md``, "ground_locg.body: the batched matvec pair").
 
     Returns:
         ``(eigval, eigvec, niter, converged)`` -- the smallest eigenvalue, its eigenvector, the
         number of gradient descent iterations performed, and whether the convergence criterion was
-        met. Check the fourth value rather than comparing the third against ``maxiter``, which is
-        ambiguous. With ``debug=True`` a fifth element is appended, a dict of stacked per-iteration
-        diagnostics keyed ``x``, ``y``, ``r``, ``theta``, ``rho``, ``kappa``, ``sas``,
-        ``rtol_scale`` and ``converged``; narrow on ``len(result) == 5`` before reading it, since
-        ``debug`` is a static flag that a type checker cannot follow into the return arity.
+        met. Check the fourth value rather than comparing the third against ``maxiter``.
 
-        **The ``rtol_scale`` key was named ``reltol`` before 2026-09-01.** It holds
-        :math:`\|Ax\| + |\theta|`, the quantity ``rtol`` multiplies -- never a tolerance, and never
-        the residual floor the old name suggested. Once converged :math:`x` is the ground eigenvector,
-        so this is :math:`\approx 2|\lambda_{\min}|` (verified 3.9990 against
-        :math:`|\lambda_{\min}| = 2`), **not** :math:`2\|A\|_2` -- those coincide only when the
-        ground state is also the largest-magnitude one. A caller reading ``diag["reltol"]`` now gets a
-        ``KeyError``, which is the intended failure: the old name was off by roughly
-        :math:`1/\varepsilon` against what it implied.
+        With ``debug=True`` a fifth element is appended, a dict of stacked per-iteration diagnostics
+        keyed ``x``, ``y``, ``r``, ``theta``, ``rho``, ``kappa``, ``sas``, ``rtol_scale`` and
+        ``converged``; narrow on ``len(result) == 5``, since a type checker cannot follow the static
+        ``debug`` flag into the return arity.
+
+        ``rtol_scale`` holds :math:`\|Ax\| + |\theta|`, the quantity ``rtol`` multiplies
+        (:math:`\approx 2|\lambda_{\min}|` once converged, not :math:`2\|A\|_2`). It was ``reltol``
+        before 2026-09-01; ``diag["reltol"]`` raises ``KeyError`` (``NOTES.md``,
+        "ground_locg.ground_locg: the rtol_scale key").
 
     Raises:
-        ValueError: If ``xinit`` is an integer and ``mat`` is a callable but ``vspace`` is None. The
-            vector space cannot be inferred from a callable, and without this the one-hot
-            construction would fail with an opaque "NoneType is not subscriptable".
+        ValueError: If ``xinit`` is an integer and ``mat`` is a callable but ``vspace`` is None,
+            since the vector space cannot be inferred from a callable.
 
-            Also if an integer ``xinit`` is out of range (negative included). The one-hot is built as
-            ``iota == xinit``, so such an index matches nothing and yields the **zero vector**, from
-            which the solver returns ``0.0`` with ``converged=True`` -- measured ``xinit=16`` on a
-            dimension-16 operator whose true minimum was -1.5.
+            Also if an integer ``xinit`` is out of range (negative included), which would otherwise
+            yield the zero vector and a converged ``0.0`` (``NOTES.md``, "ground_locg.ground_locg:
+            the out-of-range one-hot").
 
-            Also if ``batch_matvec`` is set while ``mat`` is an array. There is no caller-supplied
-            matvec to batch on that path, and silently ignoring the flag would make an unchanged
-            timing read as "batching does not help" rather than "batching never happened".
+            Also if ``batch_matvec`` is set while ``mat`` is an array, rather than silently ignoring
+            the flag; if ``prefilter`` runs on a callable ``mat`` with no ``prefilter_hi``; or if a
+            ``prefilter`` entry is negative.
+        TypeError: If ``prefilter`` is neither None nor a ``(degree, cycles)`` pair of ints.
     """
     _check_prefilter(prefilter)
     # Host-side: inside jit the index is traced and cannot raise. Negative is equally wrong -- iota is
@@ -1229,30 +1040,15 @@ def _ground_locg_callable(
 def _reorthogonalize(vector, against, passes=2):
     """Re-orthogonalize ``vector`` against a single unit vector, repeatedly.
 
-    :math:`t = \\kappa_0 s / |s| - |s| x` is a difference of two quantities both nearly parallel to
-    :math:`x` as :math:`|s| \\to 0`, so catastrophic cancellation lets :math:`y` drift into
-    :math:`x`. Once :math:`\\langle x | y \\rangle` is :math:`O(1)` the basis is no longer
-    orthonormal, and because the Rayleigh-Ritz step solves a *standard* eigenproblem it then returns
-    a :math:`\\theta` **below** the true minimum eigenvalue -- a silent wrong answer rather than a
-    visible failure. Measured :math:`|\\langle x | y \\rangle| = 1.0` at shift 1e9 without this.
+    :math:`t = \\kappa_0 s / |s| - |s| x` cancels catastrophically as :math:`|s| \\to 0`, letting
+    :math:`y` drift into :math:`x`; the *standard* Rayleigh-Ritz step on the non-orthonormal basis then
+    returns a :math:`\\theta` **below** the true minimum. One pass is not enough, for the same reason
+    :func:`_project_out` runs twice: the second removes what the first's rounding reintroduced.
 
-    One pass is not enough for the same reason :func:`_project_out` runs twice; the second removes
-    what the first pass's own rounding reintroduced.
-
-    **Measurably load-bearing, and pinned by**
-    ``test/test_ground_locg.py::TestBasisOrthogonality``. Removing it degrades the worst
-    :math:`|\\langle x | y \\rangle|` over 60 iterations from ~5e-17 to 2.5e-12 at shift 1e6 and
-    **1.0e-08 at shift 1e9** -- eight orders of magnitude -- and that test fails 3 of its 4 arms as a
-    result. Note theta still matches ``eigvalsh`` throughout, so *nothing else* in the suite notices:
-    the drift is underway but has not yet collapsed the basis, and the audit's
-    :math:`|\\langle x|y\\rangle| = 1.0` needed the 2000-iteration runs that the ``reltol`` sign
-    error (item I4) used to force, where the fixed solver converges in 8-46. That is why the
-    invariant is asserted directly off the ``debug=True`` per-iteration diagnostics rather than by
-    waiting for a wrong eigenvalue.
-
-    When A/B-ing this function, patch it in a **fresh subprocess before any tracing**. Both callers
-    are ``@jax.jit``-decorated, so reassigning it in a live session silently reuses the compiled
-    kernel and both arms return bit-identical numbers that look like "no effect".
+    Pinned by ``test/test_ground_locg.py::TestBasisOrthogonality`` off the ``debug=True``
+    diagnostics, since ``theta`` stays correct while the drift builds. A/B it in a **fresh subprocess
+    before any tracing**, or the jitted callers reuse one kernel (``NOTES.md``,
+    "ground_locg._reorthogonalize: the measured drift").
     """
     for _ in range(passes):
         vector = vector - against * jnp.sum(against.conjugate() * vector)
@@ -1263,14 +1059,9 @@ def _subtract_projections(basis, vector):
     """Subtract the projection of ``vector`` onto each basis element.
 
     All inner products are taken before any subtraction, so a multi-element basis is projected out
-    in one pass rather than sequentially. Deliberately *not* batched into a matmul: reassociating the
-    summation order measured consistently worse in the near-degenerate regime this exists for. Over
-    4000 adversarial cases with ``r`` placed almost entirely inside ``span(x, y)`` plus an orthogonal
-    part of size 1e-14..1e-6, both forms hold residual orthogonality at machine epsilon, but the
-    matmul is consistently worse -- worst ``|<b|p>|`` of 8.3e-17 against 6.2e-17. Neither form is
-    broken, so this is a judgement call rather than a measured failure: a few ops are not worth a
-    33% erosion of the quantity these guards exist to protect. Re-run that comparison before
-    "optimizing" this.
+    in one pass. Deliberately *not* batched into a matmul, whose summation order measured
+    consistently worse near degeneracy; re-run that comparison before "optimizing" this (``NOTES.md``,
+    "ground_locg._subtract_projections: why not a matmul").
     """
     ips = [jnp.sum(vb.conjugate() * vector) for vb in basis]
     for vb, ip in zip(basis, ips):
@@ -1335,9 +1126,7 @@ def _nullvec_3x3(mat: jax.Array) -> jax.Array:
     """Return a unit null vector of a singular 3x3 Hermitian matrix, robust to any rank.
 
     Seven candidates are generated and the one with the smallest residual :math:`|Mv|` is returned.
-    Selecting on the measured residual rather than on a magnitude threshold matters because the
-    rank-2 and rank-1 constructions below fail in ways that a threshold cannot cleanly separate: for
-    a degenerate eigenvalue the cross products do not vanish but decay only to
+    Not a magnitude threshold: at a degenerate eigenvalue the cross products decay only to
     :math:`O(\\epsilon \\|M\\|^2)`, close enough to a genuinely small rank-2 cross product that any
     fixed cutoff misclassifies one case or the other.
     """

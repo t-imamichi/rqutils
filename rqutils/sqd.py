@@ -57,12 +57,10 @@ the X/Z signatures, and sorted. The resulting array :math:`S = [s^{0}, \dots, s^
 on which the Hamiltonian is projected. We then define the initial vector of length :math:`N` as the
 input to the LOBPCG function.
 
-That initial vector is a deterministic pseudo-random spread over the subspace, with the
-minimum-diagonal state weighted heavily on top of it when the Hamiltonian has a diagonal part. It is
-deliberately *not* a one-hot vector: LOBPCG requires a non-vanishing overlap with the ground state,
-and a one-hot cannot leave the connected component of the projected Hamiltonian that contains it, so
-a subspace whose Hamiltonian splits into disconnected blocks would silently yield that block's
-minimum instead of the global one. See :func:`_spread_seed`.
+That initial vector is a deterministic pseudo-random spread over the subspace (:func:`_spread_seed`),
+with the minimum-diagonal state weighted heavily on top when the Hamiltonian has a diagonal part --
+not a one-hot, which cannot leave its connected component of the projected Hamiltonian (``NOTES.md``,
+"``sqd``: why the initial vector is a spread, not a one-hot").
 
 Let :math:`J` be the number of distinct X signatures in the Hamiltonian, and :math:`K^{(j)}` be the
 number of Z signatures and coefficients associated with the :math:`j` th X signature. The
@@ -107,13 +105,11 @@ is entirely static in the same way. It is therefore possible to consider caching
 reusing them in the repeated call to the matrix-vector function. There is however a tradeoff between
 the compute time and memory footprint, as is always the case with caching.
 
-Concretely, caching the source indices :math:`[j^{i}]` requires :math:`4 J N` bytes of memory,
-assuming :math:`N \leq 2^{31}` (which is actually the hard limit set by other constraints; see the
-next section) and therefore 32-bit (4-byte) integers are used for vector indexing. Caching the
-composed diagonals :math:`C^{(j)}` takes :math:`8 J N` or :math:`16 J N` bytes, depending on whether
-the vector is real or complex (i.e., if there are terms in the Hamiltonian with odd numbers of Ys).
-Caching both also frees :math:`S`, which is no longer read, so at small :math:`n` the full cache can
-be the cheaper option in memory too.
+Caching the source indices :math:`[j^{i}]` takes :math:`4 J N` bytes (int32 indices, since
+:math:`N < 2^{31}`; see the next section). Caching the composed diagonals :math:`C^{(j)}` takes
+:math:`8 J N` or :math:`16 J N` bytes, real or complex (terms with odd numbers of Ys). Caching both
+also frees :math:`S`, which is no longer read, so at small :math:`n` the full cache can be the cheaper
+option in memory too.
 
 ``matvec`` names the kernel by what it stores:
 
@@ -134,13 +130,10 @@ three store only the transitions that land inside the subspace, where the source
 the ``-1`` absent marker; :func:`sqd` builds them host-side before the solve, they are single-device
 for now, and ``poc/sparse-pairs.md`` has the measurements.
 
-**The source-index setup dominates the solve, so this is not a symmetric memory-for-speed dial.**
-Weighted by call count, the :math:`J`-fold :func:`get_xsource` precompute measured **66-97%** of an
-entire solve -- 97.5% at 10 iterations, 66.4% at 200 (3064 ms of setup against 8.35 ms per matvec
-iteration, N=200k, J=50; see ``markdown/scaling-pocs.md``). Turning source-index caching *off* pays
-that cost once per matvec rather than once per solve: measured end-to-end at N=3k, n=12, J=23,
-``"onthefly"`` is 7.2x slower than ``"indices"``, returning the same energy. Prefer ``"indices"`` or
-``"tables"`` unless the memory genuinely will not fit.
+**The source-index setup dominates the solve, so this is not a symmetric memory-for-speed dial:**
+``"onthefly"`` pays the :math:`J`-fold :func:`get_xsource` search once per matvec rather than once per
+solve. Prefer ``"indices"`` or ``"tables"`` unless the memory genuinely will not fit (``NOTES.md``,
+"``sqd``: ``get_xsource`` setup dominates a solve"; ``markdown/scaling-pocs.md``).
 
 Distributed arrays and scaling limits
 =====================================
@@ -150,14 +143,11 @@ When the SQD function is called within a context where the global mesh is set vi
 and accordingly all arrays with an axis with size :math:`N` follow the same sharding. Even the most
 aggressive caching strategy described above will be possible this way.
 
-However, there is a limit to scaling in :math:`N` (SQD subspace dimension) imposed by the need to
-sort the states list during the initial uniquification. That sort must take place within a single
-device, with at most :math:`2^{32}` elements involved, so it caps the achievable :math:`N` at
-:math:`2^{31}`. Source index identification no longer contributes: it is a binary search into the
-already-sorted state list rather than a sort of a stacked :math:`2N` array, which is why the cap
-comes from :func:`uniquify_states` alone -- see :func:`get_xsource` for that change and what it was
-measured to be worth. A comparable limit is set by the GPU memory, which is at most O(100)GB per
-device as of mid-2026.
+However, :math:`N` (the SQD subspace dimension) is capped at :math:`2^{31} - 1`: subspace positions
+are int32, and :func:`uniquify_states`' sort runs on a single device over at most :math:`2^{32}`
+elements (:func:`get_xsource` is a binary search and does not contribute). GPU memory, at most
+O(100)GB per device as of mid-2026, sets a comparable limit (``NOTES.md``, "The ``N ≤ 2^31 - 1``
+ceiling").
 
 When the source indices are cached, the state list :math:`S` is also sharded once they are computed.
 
@@ -315,37 +305,18 @@ def _check_zsignatures_rank(zsignatures: Any) -> None:
 def _check_states_shape(states: Any, num_qubits: int, packed: bool = False) -> StateList:
     """Raise unless ``states`` is ``(subspace_dim, num_qubits)``, or packed-width when ``packed``.
 
-    One ``O(1)`` look at a shape, shared by :func:`sqd` and :func:`hproj` so the two cannot drift.
-    It closes three distinct mistakes that all used to produce a plausible finite answer:
+    One ``O(1)`` look at a shape, shared by :func:`sqd` and :func:`hproj` so the two cannot drift. It
+    catches re-fed *packed* states (``pack_states`` is not idempotent), a transposed array, and a
+    mismatched Hamiltonian, all of which used to return a plausible finite answer (``NOTES.md``,
+    "sqd._check_states_shape: three mistakes, and the packed declaration").
 
-    * **Re-feeding packed states.** :meth:`PauliSumXZ.pack_states` is not idempotent, and ``sqd``
-      takes *unpacked* states while the natural intermediate a caller keeps -- from
-      :func:`uniquify_states`, or from ``pack_states`` called directly -- is *packed*. Feeding that
-      back re-packs it: ``astype(uint8)`` is a no-op and ``packbits`` then reads each byte as one bit
-      via nonzero-to-1, so the subspace silently changes. Realistic loop: run ``sqd``, do
-      configuration recovery, run ``sqd`` again.
-    * **A transposed array**, ``(num_qubits, subspace_dim)``.
-    * **A mismatched Hamiltonian**, right shape family and wrong qubit count.
+    ``packed=True`` expects ``ceil((num_qubits + 1) / 8)`` columns instead. It is a **declaration, not
+    an inference**: at ``num_qubits == 1`` both widths are 1, so unpacked states under the flag
+    silently return a different eigenvalue. The reverse (packed, flag omitted) and a 1-byte re-feed
+    are caught by :meth:`PauliSumXZ.pack_states`' binary check.
 
-    Note it does not close *every* re-feed on its own: at ``num_qubits <= 7`` a packed row is one
-    byte wide, so a 1-qubit Hamiltonian would accept it -- the shape genuinely matches. What catches
-    that is :meth:`PauliSumXZ.pack_states`' binary check, since packed bytes exceed 1.
-
-    ``packed=True`` expects ``ceil((num_qubits + 1) / 8)`` columns instead, for a caller handing over
-    :meth:`PauliSumXZ.pack_states`' own output. It is a **declaration, not a shape inference**, and
-    that is not merely stylistic: at ``num_qubits == 1`` both widths are 1, so the shapes are
-    genuinely undecidable and the flag is the only discriminator. Measured there --
-    ``sqd(unpacked, packed=True)`` returns ``+1.0`` where the truth is ``-1.0``, silently, because an
-    unpacked ``[[0], [1]]`` is a legal *packed* array meaning something else. The reverse direction
-    (packed array, flag omitted) is caught by :meth:`PauliSumXZ.pack_states`' binary check, since
-    packed bytes exceed 1. So the flag closes the one direction nothing else can.
-
-    Coerces with :func:`numpy.asarray` and returns the result, rather than only inspecting: both
-    entry points document ``states`` as passable "as an array of integers or booleans", and
-    :func:`hproj` accepted a list of lists. Reading ``.ndim`` off the raw argument would narrow that
-    to arrays only, and would do so with an ``AttributeError`` rather than this function's documented
-    ``ValueError``. Coercing here also makes the two entry points agree, where ``sqd`` previously
-    required an array and ``hproj`` did not.
+    Coerces with :func:`numpy.asarray` and returns the result, so both entry points accept a list of
+    lists, and a malformed one gets the documented ``ValueError`` rather than an ``AttributeError``.
 
     Args:
         states: The caller's states, as anything :func:`numpy.asarray` accepts.
@@ -405,24 +376,14 @@ class EigenpairCheckError(RuntimeError):
 def _host_scalar(value: jax.Array | float | bool) -> jax.Array | float | bool:
     """Return a replicated scalar in a form the host can read, on any process topology.
 
-    ``float()``/``bool()`` on a ``jax.Array`` fetch its value, which **raises across processes**:
-    "Fetching value for `jax.Array` that spans non-addressable (non process local) devices". A
-    reduction over a partitioned vector produces exactly that -- a rank-0 array whose sharding still
-    names the whole mesh -- so on a multi-process mesh ``sqd`` could not return its own eigenvalue,
-    nor read its own convergence flag, on the *default* ``return_eigvec=False`` path.
+    ``float()``/``bool()`` **raise across processes** on a rank-0 reduction over a partitioned vector,
+    whose sharding still names the whole mesh ("spans non-addressable devices"). ``jax.reshard`` does
+    not help (the spec is already ``P()``), so multi-process goes through
+    :func:`jax.experimental.multihost_utils.process_allgather`.
 
-    ``jax.reshard`` does not help: the spec is already ``P()``, so the problem is addressability rather
-    than layout. Multi-process therefore goes through
-    :func:`jax.experimental.multihost_utils.process_allgather`, which puts the value on every process
-    irrespective of the mesh in context or the mesh the array came from -- both of which broke
-    hand-rolled ``jit(out_shardings=...)`` attempts (see the comments in the body).
-
-    **The branch is on ``jax.process_count()``, deliberately, not on this rank's view of the array.**
-    Whether a given rank can see the value is a per-rank property -- measured on 4 nodes, two ranks read
-    it successfully while two raised from the same call -- and branching on that would send some ranks
-    into the collective and let others return early, hanging the job at the barrier. ``process_count()``
-    is identical on every rank, so every rank takes the same path. Single process short-circuits, since
-    it addresses every device and no communication is required.
+    **The branch is on ``jax.process_count()``, not on this rank's view of the array**: that is
+    identical on every rank, so no rank enters the collective alone and hangs the job. Single process
+    short-circuits (``NOTES.md``, "sqd._host_scalar: one path on every rank").
 
     Args:
         value: A rank-0 ``jax.Array``, or an already-host scalar (returned unchanged).
@@ -510,10 +471,7 @@ def sqd(
     the per-group source indices, ``"tables"`` caches the source indices and the diagonals, and the
     sparse kernels (see the module documentation) store only the transitions inside the subspace.
 
-    Everything after ``states`` is **keyword-only**. It used to be positional-or-keyword, which made
-    ``sqd(ham, states, True)`` a valid ``states_size`` of 1 (``True == 1``) rather than the
-    ``return_eigvec`` the caller meant -- no error, the array pinned to one slot. The three
-    parameters are semantically unrelated, so no reading of a bare positional was worth preserving.
+    Everything after ``states`` is **keyword-only** (``NOTES.md``, "sqd.sqd: why keyword-only").
 
     Args:
         hamiltonian: Hamiltonian to be projected and diagonalized.
@@ -521,100 +479,61 @@ def sqd(
             (subspace_dim, num_qubits). Entries must be 0 or 1 --
             :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states` raises otherwise, since a
             :math:`\{-1, +1\}` spin encoding would silently collapse the subspace.
-        states_size: Fix the size of the states array used in computation to the specified value so
-            that compilation is not triggered at each call with slightly different array sizes. Must
-            be at least ``states.shape[0]``. Defaults to the next power of two at or above
-            ``states.shape[0]``, which is the rule a caller feeding growing, all-distinct subspace
-            dimensions needs (the normal SQD access pattern -- one dimension per Krylov rung plus
-            one per configuration-recovery round, so no two calls share a size). Pass
-            ``states.shape[0]`` for no padding at all. On a non-empty mesh this is rounded **up**
-            to the next multiple of ``mesh.size``, so the value used internally may exceed the one
-            passed; that widens the coalescing this argument exists for rather than defeating it
-            (measured on a 4-device mesh, ``states_size`` 33 through 36 all share one compiled
-            kernel -- 707 ms to compile, then ~16 ms -- while 37 rounds to 40 and compiles afresh).
-            The padding is not observable in the result: filler slots are excluded from the
-            projection and trimmed from the returned basis.
+        states_size: Pad the states array to this size, so calls with slightly different sizes share
+            one compilation. Must be at least ``states.shape[0]`` and at most :math:`2^{31} - 1`.
+            Defaults to the next power of two at or above ``states.shape[0]``, suiting growing,
+            all-distinct subspace dimensions; pass ``states.shape[0]`` for no padding. The padding
+            is not observable in the result.
+
+            On a non-empty mesh it is rounded **up** to a multiple of ``mesh.size``, so the value
+            used may exceed the one passed (``NOTES.md``, "sqd.sqd: states_size on a mesh").
 
             **At large subspace dimensions, size this by hand.** The power-of-two default inflates
-            *every* per-slot term at once -- states, the solver's vectors and every cache -- by up to
-            2x, and how much depends on where ``states.shape[0]`` falls: 4.9% at N=1M, 39.8% at
-            N=24M, 82.0% at N=144k. The default is right at small dimensions, where a compilation is
-            most of a solve (97% of a cold solve at N=2000), and a finer bucket there measured **57%
-            slower** over a growing sweep. But compile time is roughly fixed while the waste is a
-            fraction, so past N ~ 1e5 the trade inverts: rounding to a multiple of the largest power
-            of two at or below ``N/8`` measured **one extra compilation and no measurable time**
-            (5.09 s against 5.10 s over five growing dimensions at n=20) while cutting waste from
-            62.4% to 3.3%. At N=24M with the since-removed sources-searched, diagonals-cached kernel that was **7.7 GB**.
-            See ``NOTES.md``, "``states_size``'s power-of-two padding".
+            every per-slot term -- states, the solver's vectors and every cache -- by up to 2x, and
+            past N ~ 1e5 a finer bucket costs no measurable time (``NOTES.md``, "``states_size``'s
+            power-of-two padding").
         return_eigvec: Whether to return the eigenvector (coefficients and unique state bitstrings).
-        maxiter: Maximum LOBPCG iterations. **Non-convergence now raises** rather than returning
-            the iteration cap's best guess -- see ``Raises``.
+        maxiter: Maximum LOBPCG iterations. **Non-convergence raises** -- see ``Raises``.
         atol: **Absolute** bound on the eigen-residual :math:`\|Hv - Ev\|_2`, forwarded to
-            :func:`rqutils.ground_locg.ground_locg`. Default ``0.0``, which disables this arm.
-
-            Set it when a downstream consumer has a fixed residual requirement: ``atol=1e-6`` means
-            :math:`\|Hv - Ev\| < 10^{-6}` at **every** :math:`N`, which no relative tolerance can
-            express. ``None`` is **rejected** -- pass ``0.0`` to disable the arm, since a *derived*
-            absolute bound is the unintuitive construct this pair replaced.
+            :func:`rqutils.ground_locg.ground_locg`, holding at **every** :math:`N`: ``atol=1e-6``
+            means :math:`\|Hv - Ev\| < 10^{-6}`. Default ``0.0``, which disables this arm. ``None``
+            is **rejected**; pass ``0.0``.
         rtol: **Relative** tolerance -- a fraction of the operator magnitude,
             :math:`\|r\| < \mathrm{rtol}\,(\|Hv\| + |E|)`. The conventional meaning, as in
-            :func:`numpy.allclose`: dimensionless, with the bracket supplying the units. Since
-            :math:`\|Hv\| \approx |E|` at convergence the bound is :math:`\approx 2\,\mathrm{rtol}\|H\|_2`
-            -- **independent of** :math:`N`, so one value means the same thing at every subspace size.
-
-            ``None`` (the default) uses :math:`4\varepsilon`, targeting :math:`8\varepsilon\|H\|_2`, 8x
-            the measured achievable floor. Pass ``0.0`` to disable the arm.
+            :func:`numpy.allclose`: dimensionless, with the bound
+            :math:`\approx 2\,\mathrm{rtol}\|H\|_2` **independent of** :math:`N`. ``None`` (the
+            default) uses :math:`4\varepsilon`, 8x the achievable floor; ``0.0`` disables the arm.
 
             **Convergence is** ``||r|| < max(atol, rtol * scale)`` **-- either arm suffices.** So
             ``atol=x, rtol=0.0`` is absolute-only, ``atol=0.0`` with a non-zero ``rtol`` is
             relative-only, and setting both takes whichever is looser -- usually what a caller wants.
+            A caller needing a different bound per subspace size sets ``atol`` per call.
 
             .. warning::
 
                **``tol`` is removed, and it had two different meanings.** It was *relative* against an
-               :math:`N`-scaled bound up to 2026-08-31, and *absolute* after. There is no alias:
-               ``tol=`` raises ``TypeError`` rather than silently resolving to one of the pair.
-               From the absolute form, ``tol=x`` becomes ``atol=x``. From the relative form there is
-               **no exact equivalent** -- see below.
+               :math:`N`-scaled bound up to 2026-08-31, and *absolute* after. ``tol=`` raises
+               ``TypeError``. From the absolute form, ``tol=x`` becomes ``atol=x``; from the
+               relative form there is **no exact equivalent** (``NOTES.md``, "``atol``/``rtol``: the
+               pair is right").
 
-            The pre-2026-08-31 relative form multiplied the scale by a further :math:`N \cdot 10`, and
-            that is **not** reproduced. Neither factor was a rounding budget (the floor has no :math:`N`
-            term, measured), and folding a dimension count into a "relative" tolerance made it
-            unpredictable and, at large :math:`N`, dangerous -- ``rtol=1e-8`` at :math:`N = 2^{20}` gave
-            a bound of 4.2 against :math:`\|H\| = 20`, so the solve converged on the first iterate and
-            returned a wrong answer with ``converged=True``. **A caller needing a different bound per
-            subspace size sets ``atol`` per call.** ``rtol >= 0.5`` is rejected, being the range where
-            the bound reaches :math:`\|H\|`.
-
-            An ``atol`` below the achievable floor :math:`4\,\varepsilon\sum_k|c_k|` is rejected **only
-            when ``rtol`` is zero**, since otherwise the relative arm can still fire. See ``Raises`` and
-            :func:`rqutils.ground_locg.residual_floor`.
+            ``rtol >= 0.5`` is rejected, and so is an ``atol`` below the floor
+            :math:`4\,\varepsilon\sum_k|c_k|` **when ``rtol`` is zero** (otherwise the relative arm
+            can still fire). See ``Raises`` and :func:`rqutils.ground_locg.residual_floor`.
         packed: Whether ``states`` is already bit-packed, i.e. the output of
             :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states`. Default ``False``, which takes
-            the unpacked ``(subspace_dim, num_qubits)`` form and packs it internally.
-
-            Set it when you already hold the packed array, to skip an 8x round trip: unpacked states
-            are one byte per qubit against ``ceil((num_qubits + 1) / 8)`` bytes packed -- 2.40 GB
-            against 0.31 GB at ``num_qubits=100``, ``subspace_dim=24M`` -- and both arrays are live
-            at once during the pack, so the transient peak is their sum. The packed form is what the
-            solver has always used internally.
+            the unpacked ``(subspace_dim, num_qubits)`` form and packs it internally. Set it when you
+            hold the packed array, to skip an ~8x round trip (``NOTES.md``, "sqd.sqd: ``packed=True``
+            skips the pack").
 
             **It governs the returned basis too**, so a round trip needs no re-pack: ``packed=True``
-            returns the ``ceil((num_qubits + 1) / 8)``-wide rows the solver searched, ``packed=False``
-            unpacks them to ``num_qubits``. **This is a behavioural change** -- before 2026-08-30 the
-            return was unpacked either way, so a caller passing ``packed=True`` and comparing the
-            result against an unpacked array now gets a shape mismatch. That comparison fails loudly
-            (``np.array_equal`` is ``False`` on differing shapes) rather than silently, which is why
-            the flag governs both directions instead of a second ``return_packed``: two flags make
-            four combinations, two of which are format conversions, and ``sqd`` is not a conversion
-            utility -- :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states` and
-            :meth:`~rqutils.paulis.symplectic.PauliSumXZ.unpack_states` are.
+            returns ``ceil((num_qubits + 1) / 8)``-wide rows, ``packed=False`` unpacks them to
+            ``num_qubits``. Before 2026-08-30 the return was unpacked either way (``NOTES.md``,
+            "sqd.sqd: one packed flag for both directions").
 
-            It is a declaration, and a wrong one is not always caught. At ``num_qubits == 1`` the two
-            widths coincide, so passing unpacked states with ``packed=True`` silently returns a
-            different eigenvalue; every other qubit count is rejected on width. Pass the flag only for
-            an array that came from ``pack_states``. Note the returned width is *also* wrong in that
-            case, which gives a second chance to notice.
+            It is a declaration, and a wrong one is not always caught: at ``num_qubits == 1`` the two
+            widths coincide, so unpacked states with ``packed=True`` silently return a different
+            eigenvalue (and a wrong-width basis). Every other qubit count is rejected on width.
         matvec: ``"onthefly"``, ``"indices"`` (default) or ``"tables"``: which of the source indices
             and diagonals to cache; or a sparse kernel, which stores the in-subspace transitions
             instead. See the module documentation for the kernels and their resource tradeoff.
@@ -623,71 +542,56 @@ def sqd(
             its array shapes rounded up to size classes so the solve recompiles per class rather
             than per subspace. Single-device only for now.
         prefilter: ``(degree, cycles)`` Chebyshev prefilter, forwarded verbatim to
-            :func:`rqutils.ground_locg.ground_locg` -- see its docstring for the semantics, the cost
-            and the knob-choosing guidance. Validated by
-            :func:`rqutils.ground_locg._check_prefilter`, which rejects the malformed values the
-            filter's own gate would absorb as a silent no-op. Static, so the branch resolves at trace
-            time; ``None`` disables it and restores the pre-2026-08-28 graph exactly.
+            :func:`rqutils.ground_locg.ground_locg` (see there) and validated by
+            :func:`rqutils.ground_locg._check_prefilter`. Static; ``None`` disables it and restores
+            the unfiltered graph exactly. ``sqd`` supplies the filter's upper bound itself as
+            :math:`\sum_k |c_k|`, so there is no bound to get wrong.
 
-            **``(32, 2)`` is the default**, measured end-to-end through ``sqd`` at a **1.49x median**
-            wall-clock reduction (range 1.15-1.70x, 6 sampled XXZ subspaces at n=14-18, dim
-            978-3982, every arm correct to <1e-9 against ``eigsh(tol=0)``). ``sqd`` supplies the
-            filter's required upper bound itself as :math:`\sum_k |c_k|`, so the option costs the
-            caller nothing to use and there is no bound to get wrong.
-
-            That 1.49x is **below** the 1.88x median ``markdown/locg-chebyshev-prefilter.md`` measured on
-            dense ``ground_locg``, and the gap is the point: the filter spends
-            ``cycles * (degree + 1)`` matvecs up front, and :func:`apply_h`'s sparse gather-heavy
-            kernel is cheap enough that those cost proportionally more here. Counting *iterations*
-            instead would report 5.02x -- the wrong unit for a caller. Pass ``None`` if your subspaces
-            do not benefit; A/B rather than assuming, since all figures are single-device CPU.
+            **``(32, 2)`` is the default**, measured at a 1.49x median end-to-end, below the dense
+            ``ground_locg`` figures (``NOTES.md``, "sqd.sqd: the prefilter default"). Pass ``None`` if
+            your subspaces do not benefit; A/B rather than assuming, since all figures are
+            single-device CPU.
 
     Returns:
         Calculated ground state energy, or a tuple of energy, ground state vector, and sorted
         uniquified states (if return_eigvec=True). The returned states are the genuine unique rows
         only, never the filler slots, so their count can be below ``states_size``. Their **width
         follows** ``packed``: ``num_qubits`` columns by default, ``ceil((num_qubits + 1) / 8)`` when
-        ``packed=True``. Both overloads annotate this as ``StateList``, which cannot express the
-        difference, so a type checker will not catch a caller that assumes the wrong width.
+        ``packed=True``; a type checker will not catch a caller assuming the wrong width.
 
         **On a degenerate ground eigenvalue the eigenvector is one arbitrary member of the eigenspace,
-        and nothing in the return marks that case.** The eigenvalue is still correct. Anything not
-        basis-independent -- per-site occupancies from :math:`|v_i|^2`, say -- therefore gets an
-        arbitrary member's value rather than the eigenspace average. Detection needs a second opinion
-        (``eigvalsh`` on :func:`hproj`, or a deflate-and-resolve); the solver cannot report it, since
-        the Rayleigh-Ritz 3x3 spans the search basis :math:`\{x, y, p\}` and its spacing reflects that
-        basis, not the multiplicity -- measured 2.0, not 0, on a 2-fold degenerate operator.
+        and nothing in the return marks that case.** The eigenvalue is still correct; detection needs
+        a second opinion such as ``eigvalsh`` on :func:`hproj` (``NOTES.md``, "sqd.sqd: degenerate
+        ground states").
 
-        **Which member is returned is deterministic in the arguments** and may be relied on across
-        runs and processes at a fixed rqutils version: the start vector is a fixed hash of the subspace
-        index (:func:`_spread_seed`), with no PRNG key and no host-order dependence. It is **not**
-        stable across versions -- a change to the seed, the prefilter default or the iteration moves
-        it, and none of those is treated as breaking. Pin the version rather than fingerprinting the
-        vector.
+        **Which member is returned is deterministic in the arguments** at a fixed rqutils version: the
+        start vector is a fixed hash of the subspace index (:func:`_spread_seed`). It is **not** stable
+        across versions; pin the version rather than fingerprinting the vector.
 
     Raises:
-        RuntimeError: If LOBPCG does not converge within ``maxiter``. Previously the convergence flag
-            was discarded and the non-converged value was returned as the answer: it is
-            ``state.theta``, a valid variational **upper bound**, so finite, real and above the true
-            minimum -- indistinguishable from a correct result by inspection. ``markdown/locg.md`` records
-            that this absence "is the reason I4 could hide", a sign error that made the convergence
-            test unsatisfiable so the solver silently never converged. Raise ``maxiter``, or loosen
+        RuntimeError: If LOBPCG does not converge within ``maxiter``. The unconverged value is a
+            finite variational upper bound, indistinguishable from a correct result, so it is never
+            returned (``NOTES.md``, "sqd.sqd: non-convergence raises"). Raise ``maxiter``, or loosen
             ``atol`` / ``rtol``, to proceed.
         EigenpairCheckError: If the solve converged but ``||Hv - Ev||``, recomputed after it without
             any cached diagonal, exceeds 10x the convergence bound (or the residual floor).
-        ValueError: If ``states_size`` is smaller than ``states.shape[0]``, or if it exceeds
-            :math:`2^{31} - 1`, the ceiling imposed by the int32 indices used for subspace positions
-            (beyond it an index wraps negative and the subspace is silently permuted); or if either
-            ``prefilter`` entry is negative -- see :func:`rqutils.ground_locg._check_prefilter`, which explains why a
-            negative value would otherwise be absorbed as a silent no-op; if ``atol`` is ``None`` or
-            either tolerance is negative; if **both** tolerances are zero, leaving no satisfiable
-            criterion; if ``atol`` is below the achievable eigen-residual floor
-            :math:`4\,\varepsilon\sum_k|c_k|` **while** ``rtol`` is zero, so no arm can fire; or if
-            ``rtol`` is at least 0.5, where its bound reaches :math:`\|H\|_2` and any vector would
-            report convergence; if ``matvec`` is not a kernel name; if a sparse ``matvec`` is used
-            under a mesh, or its operator reaches :math:`2^{31}` entries.
-        TypeError: If ``matvec`` is not a ``str``, or ``prefilter`` is neither None nor a
-            ``(degree, cycles)`` pair of ints.
+        ValueError: If ``states_size`` is smaller than ``states.shape[0]``, or exceeds
+            :math:`2^{31} - 1`, the int32 ceiling (beyond it the subspace is silently permuted); or
+            if ``states`` has the wrong shape (see ``packed``) or non-binary entries.
+
+            If either ``prefilter`` entry is negative, which the filter's own gate would absorb as a
+            silent no-op (:func:`rqutils.ground_locg._check_prefilter`).
+
+            If ``atol`` is ``None`` or either tolerance is negative; if **both** are zero; if ``atol``
+            is at or above :math:`\sum_k|c_k|`, or below the floor :math:`4\,\varepsilon\sum_k|c_k|`
+            **while** ``rtol`` is zero; or if ``rtol`` is at least 0.5, where any vector would report
+            convergence.
+
+            If ``matvec`` is not a kernel name; if a sparse ``matvec`` is used under a mesh, or its
+            operator reaches :math:`2^{31}` entries.
+        TypeError: If ``matvec`` is not a ``str``; if ``prefilter`` is neither None nor a
+            ``(degree, cycles)`` pair of ints; or if ``atol`` is not a real number, or ``rtol``
+            neither None nor one.
     """
     _check_matvec(matvec)
     if matvec in _SPARSE_MATVECS and not get_abstract_mesh().empty:
@@ -815,23 +719,20 @@ def hproj(
         states: Binary array of computational basis states to project the Hamiltonian onto. Shape
             (subspace_dim, num_qubits). Entries must be 0 or 1 --
             :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states` raises otherwise.
-        unique_states: Whether ``states`` can be assumed to be already uniquified **and
-            lex-sorted**, skipping the internal ``np.unique(..., axis=0)``. Both halves are
-            required, because :func:`get_xsource` binary-searches into ``states``; violating either
-            raises :class:`ValueError`. Sortedness is validated on this path (host-side numpy,
-            measured 12-14% of the call), so an unsorted subspace is rejected rather than silently
-            projected into a wrong, non-symmetric matrix as it was before. Leave this ``False`` to
-            skip the check and have ``hproj`` sort for you.
+        unique_states: Whether ``states`` is already uniquified **and lex-sorted**, skipping the
+            internal ``np.unique(..., axis=0)``; :func:`get_xsource` binary-searches it, so both are
+            required. Validated on this path at 12-14% of the call, raising rather than returning a
+            wrong, non-symmetric matrix. Leave it ``False`` to have ``hproj`` sort for you.
 
     Returns:
         The projected Hamiltonian as a sparse matrix.
 
     Raises:
         ValueError: If a mesh is set -- ``hproj`` is single-device only; if ``unique_states=True`` and
-            ``states`` is not strictly increasing in
-            lexicographic order (unsorted, or containing duplicate rows); or if the subspace exceeds
-            :math:`2^{31} - 1` states, the ceiling imposed by the int32 indices
-            :func:`get_xsource` returns.
+            ``states`` is not strictly increasing in lexicographic order (unsorted, or containing
+            duplicate rows); if ``states`` is not 2-D with ``num_qubits`` columns, or has non-binary
+            entries; or if the subspace exceeds :math:`2^{31} - 1` states, the ceiling imposed by
+            the int32 indices :func:`get_xsource` returns.
     """
     if not isinstance(hamiltonian, PauliSumXZ):
         hamiltonian = PauliSumXZ.from_paulisum(hamiltonian)
@@ -880,17 +781,9 @@ def hproj(
 def _hproj_cols_elems(hamiltonian: PauliSumXZ, states_p: StateList) -> tuple[jax.Array, jax.Array]:
     """Scan every Pauli term, returning its column indices and matrix elements.
 
-    Module scope is load-bearing, not style. ``jax.jit`` keys its trace cache on the wrapped
-    function *object*, so defining this inside ``hproj`` -- as it used to be -- made a fresh key on
-    every call and the cache never hit: each ``hproj`` call paid a full retrace and XLA compile,
-    measured at 0.098 s versus 0.0001 s once the cache is warm, i.e. essentially the entire
-    steady-state cost of ``hproj``. Nothing else in ``hproj`` is worth hoisting for speed, and not
-    because of where it sits: ``PauliSumXZ.from_paulisum`` is 0.4 ms and the ``packbits`` below
-    noise. The distinction is compile cost versus host work, and only this closure was compile cost.
-
-    ``states_p`` must stay an argument rather than a captured closure variable, or the retrace
-    returns -- a capture is part of the function object, so a new array means a new key again. As an
-    argument it is traced, and the cache keys on shape and dtype, which repeat across calls.
+    Module scope is load-bearing: ``jax.jit`` keys its cache on the function *object*, so a closure
+    inside ``hproj`` retraced and recompiled on every call. For the same reason ``states_p`` must stay
+    an argument, not a capture (``NOTES.md``, "sqd._hproj_cols_elems: module scope").
     ``PauliSumXZ`` is a registered dataclass pytree, so it passes through as a jit argument.
     """
 
@@ -1009,12 +902,9 @@ def run_sqd(
 ) -> SqdResult:
     """JIT-compiled part of the SQD function; returns a :class:`SqdResult`.
 
-    ``converged`` is returned rather than checked because this function is ``@jax.jit``-wrapped, so it
-    is a traced boolean here; :func:`sqd` raises on it once concrete. It used to be discarded, which
-    let a non-converged ``theta`` -- a valid variational upper bound, so plausible -- pass as the answer.
-
-    The solver always runs with ``batch_matvec=True``: every kernel here broadcasts over a leading
-    batch axis, so the stacked call is bit-identical to two separate ones.
+    ``converged`` is returned rather than checked, being traced here; :func:`sqd` raises on it once
+    concrete. The solver always runs with ``batch_matvec=True``, since every kernel here broadcasts
+    over a leading batch axis, bit-identically to separate calls.
 
     Args:
         matvec: The kernel name, as in :func:`sqd`. Static, bound into the kernel via
@@ -1025,10 +915,8 @@ def run_sqd(
             where ``sum|c_k|`` is concrete -- this function is jitted, so it cannot raise.
         rtol: Relative tolerance on ``||Hv|| + |E|``. Convergence is the ``max`` of the two arms, so
             either suffices; see :func:`rqutils.ground_locg.ground_locg`, which both are forwarded to.
-        prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter, forwarded to
-            :func:`rqutils.ground_locg.ground_locg`. Static, as it is there -- passed by keyword, so
-            unlike ``matvec`` it needs no :func:`functools.partial` binding. See :func:`sqd` on
-            why this option's published speedups do not transfer to this path.
+        prefilter: Optional ``(degree, cycles)`` Chebyshev prefilter, forwarded by keyword to
+            :func:`rqutils.ground_locg.ground_locg`, and static as it is there.
         check_residual: Recompute ``||Hv - Ev||`` and ``||Hv||`` after the solve, into ``residual``
             and ``ax_norm``, from recomputed diagonals (and a fresh search unless ``xsources`` are
             cached). :func:`sqd` turns it on and raises on the result.
@@ -1561,14 +1449,9 @@ def _pack_state_keys(states: StateList) -> jax.Array:
         One ``uint64`` key per row, ordered identically to the rows.
 
     Raises:
-        ValueError: If ``B > 8``. :func:`get_xsource` already routes wide input to the lexicographic
-            path, so this is defence-in-depth for anyone reaching past it -- but the limit was
-            previously only *described* here, and the failure is worse than truncation: byte 0 is the
-            most significant, so at ``B = 9`` its shift is ``8 * (9 - 1) = 64`` bits on a ``uint64``
-            and the byte vanishes outright rather than being coarsened. Measured, two 9-byte rows
-            differing only in byte 0 both pack to key ``0``, aliasing distinct states and destroying
-            the lex-order equivalence the search depends on. ``B = ceil((n + 1) / 8)``, so ``n >= 64``
-            reaches it.
+        ValueError: If ``B > 8`` (``n >= 64``), where byte 0's shift reaches 64 bits and distinct
+            states alias onto one key. Defence-in-depth: :func:`get_xsource` routes wide input to the
+            lexicographic path (``NOTES.md``, "sqd._pack_state_keys: why B > 8 raises").
     """
     nbytes = states.shape[1]
     if nbytes > 8:
@@ -1585,30 +1468,14 @@ def _is_lex_sorted(states: NDArray[np.uint8]) -> bool:
     """Return whether `[N, B]` uint8 rows are in strictly increasing lexicographic order.
 
     Host-side numpy, deliberately: the one caller (:func:`hproj`) is eager, and the point is to
-    ``raise`` before any tracing, which a traced predicate cannot do. Compares adjacent rows at their
-    first differing byte -- equal rows count as *unsorted*, since `get_xsource`'s precondition is
-    uniquified-and-sorted and a duplicate row makes the projection ambiguous either way.
+    ``raise`` before any tracing. Compares adjacent rows at their first differing byte; equal rows
+    count as *unsorted*, since a duplicate row makes the projection ambiguous. One vectorized pass,
+    12-14% of `hproj` (``NOTES.md``, "sqd._is_lex_sorted: cost").
 
-    One vectorized pass, no early exit, so unsorted input costs the same as sorted. Measured at 12-14%
-    of `hproj` (A/B'd end-to-end; both are `O(N)`, so the ratio is flat in N) and ~20 ms standalone at
-    N=1M, flat in `B`. Cheap enough to be unconditional on a debug/reference path, in exchange for
-    turning a silent wrong answer into a raise. :func:`sqd` never reaches `hproj`, so it is unaffected.
-
-    **Rejects a padded :func:`uniquify_states` result, by design** -- and now for *any* number of
-    filler slots. Fillers are all-``255`` rows, so two or more are duplicates and fail the strictness
-    test; that is what this paragraph used to rest on, but a **single** filler row is strictly
-    increasing and passed. `hproj` builds a dense `[N, N]` operator with no filler-masking step, so
-    that row became a spurious basis state: one row and column too large, still symmetric, plausible
-    wrong eigenvalue (measured **-1.118034 against a true -1.0**). There is now an explicit high-bit
-    test, independent of sortedness.
-
-    It reads the *packed* byte deliberately. :meth:`PauliSumXZ.pack_states` makes byte 0 of every
-    genuine state ``< 128``, so ``255`` is unambiguous there -- whereas unpacking a filler at
-    ``n = 2`` yields ``[1, 1]``, a perfectly legitimate state, so no check on the unpacked form could
-    distinguish them.
-
-    Slice to the real rows first (`~_is_filler(states)`) if you hold a padded array; `sqd` already
-    trims before returning its basis.
+    **Rejects a padded :func:`uniquify_states` result, by design**, for any number of filler slots:
+    an explicit high-bit test on the *packed* byte 0, since a lone filler is strictly increasing and
+    `hproj` does not mask fillers (``NOTES.md``, "sqd._is_lex_sorted: the filler test"). Slice to the
+    real rows first (`~_is_filler(states)`) if you hold a padded array.
     """
     # Any filler disqualifies, tested apart from sortedness (a lone filler is strictly increasing);
     # fillers sort last, so the last row decides (NOTES.md, "sqd._is_lex_sorted: the filler test").
@@ -1633,12 +1500,9 @@ def _pack_state_words(states: StateList) -> jax.Array:
     big-endian, MSW-first, and the most significant word is left-padded with zero bytes, so word-wise
     lexicographic order matches byte-wise row order exactly.
 
-    Leading-padding is chosen so that ``nwords == 1`` reproduces :func:`_pack_state_keys` bit for bit,
-    which is what lets the two paths be compared directly. It is *not* required for correctness:
-    trailing-padding is also order-preserving, since appending a constant number of zero bytes is a
-    left-shift by ``8 * pad`` and a constant left-shift is monotonic. Verified exhaustively at
-    ``B = 3`` and over 20000 random pairs at ``B = 9``; a mutation to the other end leaves the whole
-    suite green, so do not read the choice as load-bearing.
+    Leading-padding makes ``nwords == 1`` reproduce :func:`_pack_state_keys` bit for bit, so the two
+    paths compare directly. It is *not* load-bearing: trailing-padding also preserves order
+    (``NOTES.md``, "sqd._pack_state_words: either padding end").
 
     Returns:
         Shape ``[N, ceil(B/8)]`` uint64. ``B <= 8`` yields one column, identical in value to
@@ -1664,18 +1528,12 @@ def _word_less_than(rows: jax.Array, targets: jax.Array) -> jax.Array:
     """Elementwise lexicographic `rows[i] < targets[i]` over uint64 words, MSW-first.
 
     Lexicographic row order, but on packed words: a search level costs ``ceil(B/8)`` comparisons
-    instead of ``B``. At n=100 (``B = 13``) that is 2 rather than 13, measured 3.6-7.7x on the whole
-    search across n=64..200 and bit-identical to the byte-wise form it replaced.
+    instead of ``B`` -- 2 rather than 13 at n=100 (``NOTES.md``, "sqd.get_xsource: search on uint64
+    words").
 
     The unrolled Python loop is deliberate: ``nwords`` is static, and a `lax` loop would need a
-    traced index into a static shape.
-
-    Accumulating ``lt``/``eq`` in bool is safe here, but do not reintroduce a ``jnp.cumprod`` prefix
-    over the word axis to "vectorize" it. The byte-wise predecessor this replaced did exactly that and
-    had to pin ``dtype=jnp.uint8``: `cumprod` rejects a bool accumulator and promotes to int64,
-    materializing the ``[N, B]`` mask at 8 bytes per element where 1 suffices -- measured 192 MB of
-    transients against 23 MB at N=1M, B=12, and 1.53x on the J-fold precompute this path feeds. Two
-    or four scalar comparisons need no prefix at all.
+    traced index into a static shape. Do not "vectorize" it with a ``jnp.cumprod`` prefix, which
+    promotes the mask to int64 (``NOTES.md``, "sqd._word_less_than: no cumprod prefix").
     """
     lt = jnp.zeros(targets.shape[0], dtype=bool)
     eq = jnp.ones(targets.shape[0], dtype=bool)
@@ -1696,57 +1554,24 @@ def get_xsource(xsignature: NDArray[np.uint8], states: StateList) -> jax.Array:
     being applied to the states in `S`; X (I) is applied to qubit `q` if `Q-q-1`th bit is 1 (0). Let
     `P` be the projector of the shape `[2 ** Q]` state vector `W` onto `V`.
 
-    We want to find a vector of indices `A` where `(PXW)[i] = V[A[i]]`. This is trivial if `P` is
-    the identity (or equivalently if `S` contains all bitstrings from `0` to `2^Q-1`), because then
-    we know that `S[i] = i` and therefore `A[i] = i ^ X`. In the presence of a nontrivial
-    projection, we must take care of not only the source location but also the existence of the
-    source itself, since it is not guaranteed that `S[i] ^ X` is in `S`. When it is not, we set
-    `A[i] = -1` so that `V[A[i]]` can default to a `fill_value` of 0.0 through `at[].get()` applied
-    to `V`.
+    We want a vector of indices `A` where `(PXW)[i] = V[A[i]]`. Without a projection (`S` holding
+    every bitstring) `A[i] = i ^ X`. With one, the source `S[i] ^ X` need not be in `S`; then
+    `A[i] = -1`, so that `V[A[i]]` defaults to a `fill_value` of 0.0 through `at[].get()`.
 
-    **`states` must be lex-sorted.** This has always been required -- the previous sort-based
-    implementation also silently returned a wrong answer otherwise -- but was never stated. Both
+    **`states` must be lex-sorted**, since finding `A` is a binary search of `S ^ X` into `S`. Both
     in-tree callers satisfy it: `run_sqd` passes `uniquify_states`' output, and `hproj` passes
-    `np.unique(..., axis=0)`'s. Note `hproj`'s `unique_states=True` shortcut skips that `np.unique`,
-    so a caller passing unsorted-but-unique states gets a wrong (and non-symmetric) matrix; that
-    predates this implementation and is pinned by
-    `test/test_sqd_hproj.py::TestHproj::test_unsorted_input_with_unique_states_is_wrong` -- named for the
-    behaviour, since nothing is rejected: the result is silently wrong.
-
-    Since `S` is sorted, finding `A` is a **binary search** of `S ^ X` into `S` -- not a reason to
-    sort anything. The former implementation concatenated `S` and `S ^ X` into a `[2N, B]` array and
-    sorted that, which cost three things: the `2N` allocation is what caps `N` at `2^31` (the sort
-    must run on one device), `lax.sort` was observed to leak GPU memory (up to 5 GB at shape
-    `(5M, 9)`), and it dominated runtime -- measured 66-97% of an entire solve. A `searchsorted` is a
-    pure gather, so it also shards, where a sort does not. Measured on CPU at 12-25x per signature and
-    12-17x on the J-fold precompute, and **5.15x at N=64M on an NVIDIA GH200** (a GPU sort is
-    well optimized relative to its gather, so the ratio compresses while the direction holds); see
-    `markdown/scaling-pocs.md`.
-
-    The memory leak, re-measured on that GH200 against a pinned copy of the old sort, **did not
-    reproduce**: ~0.95 GB of transients at `(5M, 4)` were fully reclaimed after every repetition. That
-    note was therefore stale or version-specific. It is recorded here as history because the removal
-    never depended on it -- the `2N` ceiling, shardability and runtime each justify it alone.
+    `np.unique`'s or validates `unique_states=True` input. It replaced a `[2N, B]` sort (``NOTES.md``,
+    "sqd.get_xsource: why a search, not a sort"; ``markdown/scaling-pocs.md``).
 
     Two paths, selected statically on width. `B <= 8` packs each row into a `uint64` and uses
     `jnp.searchsorted` directly; wider inputs fall back to an explicit binary search over the rows
     packed into `ceil(B/8)` `uint64` words (:func:`_pack_state_words`), MSW-first. The boundary is a
-    correctness limit, not a tuning parameter: at `B > 8` a *single* `uint64` key would silently
-    truncate the row and alias distinct states onto one key.
+    correctness limit, not a tuning parameter: at `B > 8` a *single* `uint64` key would alias
+    distinct states (``NOTES.md``, "sqd.get_xsource: search on uint64 words").
 
-    The wide path used to compare rows one **byte** at a time, which cost `O(B)` comparisons per
-    search level and made this path scale poorly in `n`: measured **~8x per state** across the
-    boundary (15 ns/state at n=60 against 189 at n=100, N=300k). Comparing words instead makes a
-    level cost `ceil((n+1)/64)` comparisons -- 2 rather than 13 at n=100 -- so cost is logarithmic in
-    packed width. Measured **3.6-7.7x** on the whole search across n=64..200, bit-identical to the
-    byte-wise form at every width, and the `B <= 8` path is untouched (0.83-1.18x, i.e. noise).
-
-    Returns `-1` at every position whose source is absent. Note the previous implementation returned
-    *assorted* negative values there (it computed `I[k+1] - N` unconditionally) rather than exactly
-    `-1`; consumers cannot tell, because `apply_xgrp` gathers with
-    `mode="fill", wrap_negative_indices=False` and any negative index yields 0.0. Tests comparing
-    against a stored index array must therefore compare only valid rows, or compare the gathered
-    result.
+    Returns `-1` at every position whose source is absent. Tests comparing against a stored index
+    array should compare only valid rows, or the gathered result, since `apply_xgrp` treats any
+    negative index as absent.
     """
     size, nbytes = states.shape
     targets = jnp.bitwise_xor(states, xsignature)  # S^X
@@ -1911,32 +1736,25 @@ def apply_h(
         apply_h(vec, states=..., xsources=..., zsignatures=..., coeffs=...)     # "indices"
         apply_h(vec, xsources=..., diagonals=...)                               # "tables"
 
-    Every array parameter is keyword-only. **This replaced a positional ``(scanned, cache_level)``
-    form, which is gone** -- a breaking change, because that tuple selected *positionally* how
-    the members of ``scanned`` were interpreted and nothing checked that they matched: raw X
-    signatures under a tuple promising X *sources* silently computed a different operator (measured
-    max abs error 0.44 on a 5-state n=4 subspace).
+    Every array parameter is keyword-only; the positional ``(scanned, cache_level)`` form is gone
+    (``NOTES.md``, "``sqd``: why ``apply_h``'s positional form was deleted rather than deprecated").
+    :func:`sqd` does not go through here: it binds a static ``matvec`` name to the private
+    ``_apply_h_kernel`` via ``functools.partial``, since the solver splats ``matvec(vec, *args)``.
 
-    :func:`sqd` and :mod:`ground_locg` do not go through here: they call the private
-    ``_apply_h_kernel`` with an assembled tuple and a static ``matvec`` name bound via
-    ``functools.partial``, because the solver splats ``matvec(vec, *args)`` positionally.
-
-    A shape check cannot separate the roles -- at ``n = 15`` with a 2-state subspace X sources and X
-    signatures are both ``(2, 2)`` -- but a dtype check can, and is applied
-    (:func:`_check_array_role`). What remains open is a swap between two roles of the **same** kind,
-    ``xsignatures`` for ``zsignatures``, both ``uint8``.
+    A dtype check (:func:`_check_array_role`) separates roles a shape cannot -- at ``n = 15`` with 2
+    states X sources and X signatures are both ``(2, 2)`` -- but not a swap between roles of the
+    **same** kind, ``xsignatures`` for ``zsignatures``, both ``uint8``.
 
     Each kernel is one ``jax.lax.scan`` over the X groups accumulating
     ``out + apply_xgrp(xsource, diagonal, vec)``, with ``xsource`` either ``get_xsource(x, states)``
     or ``xsources`` as given, and ``diagonal`` either ``get_diagonal(z, c, states)`` or ``diagonals``
     as given.
 
-    **Under a mesh** ``vec`` is placed on the live mesh automatically, batch axis and all. Two
-    constraints stay the caller's: with ``xsignatures=`` the state count must divide the device
-    count, since ``get_xsource`` partitions per state -- build the subspace with
-    ``uniquify_states(states, states_size)`` at a divisible ``states_size``, **not** from ``sqd``'s
-    return, which is trimmed to the genuine uniques and so is the one input guaranteed to fail -- and
-    a ``states`` passed already sharded must be replicated, its ``255`` filler being load-bearing.
+    **Under a mesh** ``vec`` is placed on the live mesh automatically, batch axis and all. With
+    ``xsignatures=`` the state count must divide the device count: build the subspace with
+    ``uniquify_states(states, states_size)`` at a divisible size, **not** from ``sqd``'s trimmed
+    return. A ``states`` passed already sharded must be replicated, its ``255`` filler being
+    load-bearing.
 
     Args:
         vec: Vector to multiply. Placed on the live mesh unless already there.
@@ -1956,10 +1774,11 @@ def apply_h(
     Raises:
         ValueError: If the named arrays do not select exactly one X source and one diagonal input
             (including naming none at all); if ``diagonals`` is combined with ``xsignatures``; if
-            ``coeffs`` is missing where required or supplied alongside ``diagonals``; or if
-            ``states`` is None without ``diagonals``. Under a mesh with ``xsignatures=``, also if
-            ``states`` disagrees with ``vec``'s trailing axis, or if its row count does not divide
-            the device count.
+            ``coeffs`` is missing where required or supplied alongside ``diagonals``; if ``states``
+            is None without ``diagonals``; or if an array's dtype kind does not match its keyword.
+
+            Under a mesh with ``xsignatures=``, also if ``states`` disagrees with ``vec``'s trailing
+            axis, or if its row count does not divide the device count.
     """
     xgiven = [
         opt for opt in (("xsources", xsources), ("xsignatures", xsignatures)) if opt[1] is not None
