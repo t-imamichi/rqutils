@@ -275,6 +275,18 @@ class _State(NamedTuple):
     ax: jax.Array
 
 
+class _LocgContext(NamedTuple):
+    """What the step functions share, closed over rather than carried: static fields stay static."""
+
+    matvec: Callable[..., jax.Array]
+    args: tuple
+    atol: jax.Array | float
+    rtol: jax.Array | float
+    batch_matvec: bool
+    debug: bool
+    log_level: int
+
+
 def normalize(vector: jax.Array, norm: jax.Array | None = None) -> jax.Array:
     """Divide by the norm, leaving a zero vector untouched instead of producing NaN.
 
@@ -824,150 +836,6 @@ def _ground_locg_callable(
             jax.lax.broadcasted_iota(xinit.dtype, (vspace[0],), 0, out_sharding=sharding) == xinit
         ).astype(vspace[1])
 
-    def compute_sas(vectors, mvs):
-        """Projected matrix over ``vectors``, given their (possibly precomputed) images."""
-        nv = len(vectors)
-        sas = jnp.zeros((nv, nv), dtype=vectors[0].dtype)
-        for iv1, mv1 in enumerate(mvs):
-            for iv2 in range(iv1 + 1, nv):
-                sas = sas.at[iv2, iv1].set(jnp.sum(vectors[iv2].conjugate() * mv1))
-        sas += sas.conjugate().T
-        for iv1, (v1, mv1) in enumerate(zip(vectors, mvs)):
-            sas = sas.at[iv1, iv1].set(jnp.sum(v1.conjugate() * mv1))
-
-        return sas
-
-    def diagnostics(xcurr, ycurr, rcurr, theta, kappa=None, scale=None, converged=None):
-        # Batched like body()'s pair, and it cannot change the trajectory: `diagnostics` is scan's
-        # output, never its carry, so any debug=True divergence comes from body()'s pair.
-        if batch_matvec:
-            mvs = tuple(matvec(jnp.stack((xcurr, ycurr, rcurr)), *args))
-        else:
-            mvs = tuple(matvec(v, *args) for v in (xcurr, ycurr, rcurr))
-        sas = compute_sas((xcurr, ycurr, rcurr), mvs)
-        # rho is <x|Ax>, which compute_sas has just computed as the [0, 0] entry. Recomputing it
-        # here cost a fourth matvec that XLA did not eliminate.
-        rho = sas[0, 0].real
-
-        if kappa is None:
-            kappa = jnp.zeros(3, dtype=xcurr.dtype)
-        if scale is None:
-            scale = jnp.array(0.0)
-        if converged is None:
-            converged = jnp.array(False)
-
-        return {
-            "x": xcurr,
-            "y": ycurr,
-            "r": rcurr,
-            "theta": theta,
-            "rho": rho,
-            "kappa": kappa,
-            "sas": sas,
-            # `rtol_scale`, formerly "reltol": the scale rtol multiplies, never a tolerance
-            # (NOTES.md, "ground_locg debug diagnostics: `reltol` became `rtol_scale`").
-            "rtol_scale": scale,
-            "converged": converged,
-        }
-
-    def body_iter0(xcurr):
-        """Steepest-descent seed. Returns Ax so no later step recomputes it."""
-        xnext = xcurr
-        ax = matvec(xcurr, *args)
-        rho = jnp.sum(xcurr.conjugate() * ax).real
-        rnext = ax - rho * xnext
-        seed = _Seed(x=xnext, r=rnext, ax=ax, rho=rho)
-        diag = diagnostics(xnext, jnp.zeros_like(xnext), rnext, rho) if debug else None
-        return seed, diag
-
-    def body_iter1(xcurr, rcurr, axcurr, rho):
-        # Zero-direction guard as in body(), on {x, p}: `_project_out`, never a bare normalize
-        # (NOTES.md, "A rounding-floor residual is not zero, and `== 0.0` is the wrong guard").
-        tmp_p, norm_p = _project_out((xcurr,), rcurr)
-        r_is_zero = norm_p == 0.0
-        tmp_p = normalize(tmp_p, norm_p)
-        # Reuse Ax from body_iter0 rather than recomputing it inside compute_sas.
-        sas = compute_sas((xcurr, tmp_p), (axcurr, matvec(tmp_p, *args)))
-        # Lift p out of contention so theta = rho and xnext == xcurr; not body()'s bound specialized
-        # (NOTES.md, "`ground_locg`: `body_iter1`'s exclusion bound is not `body()`'s specialized").
-        excluded = 2.0 * jnp.abs(rho) + 1.0
-        sas = jnp.where(r_is_zero, sas.at[1, 1].set(excluded.astype(sas.dtype)), sas)
-        theta, kappa = eigenpair_2x2(sas)
-        tmp_t = tmp_p * kappa[0] - xcurr * kappa[1]
-        tmp_u = xcurr * kappa[0] + tmp_p * kappa[1]
-        xnext = normalize(tmp_u)
-        ynext = normalize(_reorthogonalize(tmp_t, xnext))
-        axnext = matvec(xnext, *args)
-        rnext = axnext - theta * xnext
-        # A zeroed residual means {x} already spans the relevant space: seed the flag, not False, or
-        # while_loop feeds a zeroed search direction into body()'s Rayleigh-Ritz step.
-        state = _State(
-            niter=0, converged=r_is_zero, theta=theta, x=xnext, y=ynext, r=rnext, ax=axnext
-        )
-        diag = (
-            diagnostics(xnext, ynext, rnext, theta, jnp.insert(kappa, 1, 0.0), converged=r_is_zero)
-            if debug
-            else None
-        )
-        return state, diag
-
-    def body(state):
-        xcurr, ycurr, rcurr, axcurr = state.x, state.y, state.r, state.ax
-        if log_level <= logging.DEBUG:
-            jax.debug.print("LOCG iteration {}", state.niter)
-
-        # Project out both X and P, then renormalize: _project_out only guarantees |tmp_p| >= 0.99,
-        # and a short tmp_p scales sas[2, 2] into a spurious minimum under a large positive shift.
-        tmp_p, norm_p = _project_out((xcurr, ycurr), rcurr)
-        p_is_zero = norm_p == 0.0
-        tmp_p = normalize(tmp_p, norm_p)
-        # xcurr's image is carried, so three matvecs, not four; the independent pair batches as one
-        # (2, N) call, judged by theta (NOTES.md, "ground_locg.body: the batched matvec pair").
-        if batch_matvec:
-            aycurr, ap = matvec(jnp.stack((ycurr, tmp_p)), *args)
-        else:
-            aycurr, ap = matvec(ycurr, *args), matvec(tmp_p, *args)
-        sas = compute_sas((xcurr, ycurr, tmp_p), (axcurr, aycurr, ap))
-        # A zeroed tmp_p leaves a zero diagonal Rayleigh-Ritz would pick for a positive-definite A,
-        # then divide by; lift it out, and report p_is_zero as convergence below.
-        diag_xy = jnp.diagonal(sas).real[:2]
-        excluded = jnp.max(diag_xy) + jnp.sum(jnp.abs(diag_xy)) + 1.0
-        sas = jnp.where(p_is_zero, sas.at[2, 2].set(excluded.astype(sas.dtype)), sas)
-        theta, kappa = eigenpair_3x3(sas)
-        # New vectors
-        tmp_s = ycurr * kappa[1] + tmp_p * kappa[2]
-        tmp_u = xcurr * kappa[0] + tmp_s
-        # One joint reduction: XLA's combiner leaves two separate norms as two chained all-reduces.
-        su = jnp.stack((tmp_s, tmp_u))
-        norm_s, norm_u = jnp.sqrt(jnp.sum(jnp.real(su * jnp.conj(su)), axis=-1))
-        tmp_t = tmp_s * (kappa[0] / jnp.where(norm_s == 0.0, 1.0, norm_s)) - xcurr * norm_s
-        xnext = normalize(tmp_u, norm_u)
-        ynext = normalize(_reorthogonalize(tmp_t, xnext))
-        axnext = matvec(xnext, *args)
-        rnext = axnext - xnext * theta
-        norm_rnext = jnp.linalg.norm(rnext)
-        # ||r|| < max(atol, rtol * (||Ax|| + |theta|)), either arm sufficing: no `n` factor, and
-        # `abs` so it cannot cancel (NOTES.md, "ground_locg.body: the convergence test's scale").
-        scale = jnp.linalg.norm(axnext) + jnp.abs(theta)
-        # A zeroed search direction means {x, y} already spans the residual: we are at a stationary
-        # point of the Rayleigh quotient and no further iteration can lower theta.
-        converged = jnp.logical_or(norm_rnext < jnp.maximum(atol, rtol * scale), p_is_zero)
-        if log_level <= logging.DEBUG:
-            jax.debug.print("Residual {}, scale {}, converged: {}", norm_rnext, scale, converged)
-
-        state = _State(
-            niter=state.niter + 1,
-            converged=converged,
-            theta=theta,
-            x=xnext,
-            y=ynext,
-            r=rnext,
-            ax=axnext,
-        )
-        if debug:
-            return state, diagnostics(xnext, ynext, rnext, theta, kappa, scale, converged)
-        return state
-
     if log_level <= logging.DEBUG:
         jax.debug.print("Performing first LOBPCG steps")
 
@@ -998,17 +866,26 @@ def _ground_locg_callable(
                 )
             xinit = _chebyshev_prefilter(matvec, args, xinit, degree, cycles, prefilter_hi)
 
-    seed, diag0 = body_iter0(xinit)
-    # Seed theta with the Rayleigh quotient of xinit so that maxiter=0 returns a meaningful value
-    # rather than the state initializer.
-    rho_init = seed.rho
-
     if rtol is None:
         # Only rtol takes None: 4*eps of the operator dtype (never xinit's), 8x the residual floor
         # (NOTES.md, "ground_locg: the `rtol=None` default").
         rtol = 4.0 * float(jnp.finfo(work_dtype).eps)
 
-    state, diag1 = body_iter1(seed.x, seed.r, seed.ax, rho_init)
+    ctx = _LocgContext(
+        matvec=matvec,
+        args=args,
+        atol=atol,
+        rtol=rtol,
+        batch_matvec=batch_matvec,
+        debug=debug,
+        log_level=log_level,
+    )
+    seed, diag0 = _body_iter0(ctx, xinit)
+    # Seed theta with the Rayleigh quotient of xinit so that maxiter=0 returns a meaningful value
+    # rather than the state initializer.
+    rho_init = seed.rho
+
+    state, diag1 = _body_iter1(ctx, seed.x, seed.r, seed.ax, rho_init)
     if debug:
         diag0, diag1 = jax.tree.map(lambda a: jnp.expand_dims(a, 0), (diag0, diag1))
 
@@ -1023,18 +900,172 @@ def _ground_locg_callable(
         return rho_init, xinit, 0, empty
 
     if debug:
-        state, diagnostics_out = jax.lax.scan(lambda s, _: body(s), state, length=maxiter)
+        state, diagnostics_out = jax.lax.scan(lambda s, _: _body(ctx, s), state, length=maxiter)
         diagnostics_out = jax.tree.map(
             lambda d0, d1, dr: jnp.concatenate([d0, d1, dr], axis=0), diag0, diag1, diagnostics_out
         )
     else:
         state = jax.lax.while_loop(
-            lambda s: jnp.logical_and(s.niter < maxiter, ~s.converged), body, state
+            lambda s: jnp.logical_and(s.niter < maxiter, ~s.converged),
+            lambda s: _body(ctx, s),
+            state,
         )
 
     if debug:
         return state.theta, state.x, state.niter, state.converged, diagnostics_out
     return state.theta, state.x, state.niter, state.converged
+
+
+def _compute_sas(vectors, mvs):
+    """Projected matrix over ``vectors``, given their (possibly precomputed) images."""
+    nv = len(vectors)
+    sas = jnp.zeros((nv, nv), dtype=vectors[0].dtype)
+    for iv1, mv1 in enumerate(mvs):
+        for iv2 in range(iv1 + 1, nv):
+            sas = sas.at[iv2, iv1].set(jnp.sum(vectors[iv2].conjugate() * mv1))
+    sas += sas.conjugate().T
+    for iv1, (v1, mv1) in enumerate(zip(vectors, mvs)):
+        sas = sas.at[iv1, iv1].set(jnp.sum(v1.conjugate() * mv1))
+
+    return sas
+
+
+def _diagnostics(ctx, xcurr, ycurr, rcurr, theta, kappa=None, scale=None, converged=None):
+    """One ``debug=True`` diagnostics row, at three extra matvecs."""
+    # Batched like body()'s pair, and it cannot change the trajectory: `diagnostics` is scan's
+    # output, never its carry, so any debug=True divergence comes from body()'s pair.
+    if ctx.batch_matvec:
+        mvs = tuple(ctx.matvec(jnp.stack((xcurr, ycurr, rcurr)), *ctx.args))
+    else:
+        mvs = tuple(ctx.matvec(v, *ctx.args) for v in (xcurr, ycurr, rcurr))
+    sas = _compute_sas((xcurr, ycurr, rcurr), mvs)
+    # rho is <x|Ax>, which compute_sas has just computed as the [0, 0] entry. Recomputing it
+    # here cost a fourth matvec that XLA did not eliminate.
+    rho = sas[0, 0].real
+
+    if kappa is None:
+        kappa = jnp.zeros(3, dtype=xcurr.dtype)
+    if scale is None:
+        scale = jnp.array(0.0)
+    if converged is None:
+        converged = jnp.array(False)
+
+    return {
+        "x": xcurr,
+        "y": ycurr,
+        "r": rcurr,
+        "theta": theta,
+        "rho": rho,
+        "kappa": kappa,
+        "sas": sas,
+        # `rtol_scale`, formerly "reltol": the scale rtol multiplies, never a tolerance
+        # (NOTES.md, "ground_locg debug diagnostics: `reltol` became `rtol_scale`").
+        "rtol_scale": scale,
+        "converged": converged,
+    }
+
+
+def _body_iter0(ctx, xcurr):
+    """Steepest-descent seed. Returns Ax so no later step recomputes it."""
+    xnext = xcurr
+    ax = ctx.matvec(xcurr, *ctx.args)
+    rho = jnp.sum(xcurr.conjugate() * ax).real
+    rnext = ax - rho * xnext
+    seed = _Seed(x=xnext, r=rnext, ax=ax, rho=rho)
+    diag = _diagnostics(ctx, xnext, jnp.zeros_like(xnext), rnext, rho) if ctx.debug else None
+    return seed, diag
+
+
+def _body_iter1(ctx, xcurr, rcurr, axcurr, rho):
+    """First Rayleigh-Ritz step, on {x, p}: no y direction exists yet. Returns the initial carry."""
+    # Zero-direction guard as in body(), on {x, p}: `_project_out`, never a bare normalize
+    # (NOTES.md, "A rounding-floor residual is not zero, and `== 0.0` is the wrong guard").
+    tmp_p, norm_p = _project_out((xcurr,), rcurr)
+    r_is_zero = norm_p == 0.0
+    tmp_p = normalize(tmp_p, norm_p)
+    # Reuse Ax from body_iter0 rather than recomputing it inside compute_sas.
+    sas = _compute_sas((xcurr, tmp_p), (axcurr, ctx.matvec(tmp_p, *ctx.args)))
+    # Lift p out of contention so theta = rho and xnext == xcurr; not body()'s bound specialized
+    # (NOTES.md, "`ground_locg`: `body_iter1`'s exclusion bound is not `body()`'s specialized").
+    excluded = 2.0 * jnp.abs(rho) + 1.0
+    sas = jnp.where(r_is_zero, sas.at[1, 1].set(excluded.astype(sas.dtype)), sas)
+    theta, kappa = eigenpair_2x2(sas)
+    tmp_t = tmp_p * kappa[0] - xcurr * kappa[1]
+    tmp_u = xcurr * kappa[0] + tmp_p * kappa[1]
+    xnext = normalize(tmp_u)
+    ynext = normalize(_reorthogonalize(tmp_t, xnext))
+    axnext = ctx.matvec(xnext, *ctx.args)
+    rnext = axnext - theta * xnext
+    # A zeroed residual means {x} already spans the relevant space: seed the flag, not False, or
+    # while_loop feeds a zeroed search direction into body()'s Rayleigh-Ritz step.
+    state = _State(niter=0, converged=r_is_zero, theta=theta, x=xnext, y=ynext, r=rnext, ax=axnext)
+    diag = (
+        _diagnostics(
+            ctx, xnext, ynext, rnext, theta, jnp.insert(kappa, 1, 0.0), converged=r_is_zero
+        )
+        if ctx.debug
+        else None
+    )
+    return state, diag
+
+
+def _body(ctx, state):
+    """One LOBPCG iteration on {x, y, p}: the ``while_loop`` / ``scan`` body."""
+    xcurr, ycurr, rcurr, axcurr = state.x, state.y, state.r, state.ax
+    if ctx.log_level <= logging.DEBUG:
+        jax.debug.print("LOCG iteration {}", state.niter)
+
+    # Project out both X and P, then renormalize: _project_out only guarantees |tmp_p| >= 0.99,
+    # and a short tmp_p scales sas[2, 2] into a spurious minimum under a large positive shift.
+    tmp_p, norm_p = _project_out((xcurr, ycurr), rcurr)
+    p_is_zero = norm_p == 0.0
+    tmp_p = normalize(tmp_p, norm_p)
+    # xcurr's image is carried, so three matvecs, not four; the independent pair batches as one
+    # (2, N) call, judged by theta (NOTES.md, "ground_locg.body: the batched matvec pair").
+    if ctx.batch_matvec:
+        aycurr, ap = ctx.matvec(jnp.stack((ycurr, tmp_p)), *ctx.args)
+    else:
+        aycurr, ap = ctx.matvec(ycurr, *ctx.args), ctx.matvec(tmp_p, *ctx.args)
+    sas = _compute_sas((xcurr, ycurr, tmp_p), (axcurr, aycurr, ap))
+    # A zeroed tmp_p leaves a zero diagonal Rayleigh-Ritz would pick for a positive-definite A,
+    # then divide by; lift it out, and report p_is_zero as convergence below.
+    diag_xy = jnp.diagonal(sas).real[:2]
+    excluded = jnp.max(diag_xy) + jnp.sum(jnp.abs(diag_xy)) + 1.0
+    sas = jnp.where(p_is_zero, sas.at[2, 2].set(excluded.astype(sas.dtype)), sas)
+    theta, kappa = eigenpair_3x3(sas)
+    # New vectors
+    tmp_s = ycurr * kappa[1] + tmp_p * kappa[2]
+    tmp_u = xcurr * kappa[0] + tmp_s
+    # One joint reduction: XLA's combiner leaves two separate norms as two chained all-reduces.
+    su = jnp.stack((tmp_s, tmp_u))
+    norm_s, norm_u = jnp.sqrt(jnp.sum(jnp.real(su * jnp.conj(su)), axis=-1))
+    tmp_t = tmp_s * (kappa[0] / jnp.where(norm_s == 0.0, 1.0, norm_s)) - xcurr * norm_s
+    xnext = normalize(tmp_u, norm_u)
+    ynext = normalize(_reorthogonalize(tmp_t, xnext))
+    axnext = ctx.matvec(xnext, *ctx.args)
+    rnext = axnext - xnext * theta
+    norm_rnext = jnp.linalg.norm(rnext)
+    # ||r|| < max(atol, rtol * (||Ax|| + |theta|)), either arm sufficing: no `n` factor, and
+    # `abs` so it cannot cancel (NOTES.md, "ground_locg.body: the convergence test's scale").
+    scale = jnp.linalg.norm(axnext) + jnp.abs(theta)
+    # A zeroed search direction means {x, y} already spans the residual: we are at a stationary
+    # point of the Rayleigh quotient and no further iteration can lower theta.
+    converged = jnp.logical_or(norm_rnext < jnp.maximum(ctx.atol, ctx.rtol * scale), p_is_zero)
+    if ctx.log_level <= logging.DEBUG:
+        jax.debug.print("Residual {}, scale {}, converged: {}", norm_rnext, scale, converged)
+
+    state = _State(
+        niter=state.niter + 1,
+        converged=converged,
+        theta=theta,
+        x=xnext,
+        y=ynext,
+        r=rnext,
+        ax=axnext,
+    )
+    if ctx.debug:
+        return state, _diagnostics(ctx, xnext, ynext, rnext, theta, kappa, scale, converged)
+    return state
 
 
 def _reorthogonalize(vector, against, passes=2):
