@@ -26,6 +26,7 @@ from rqutils.sqd._sparse import (
     _ELL_WIDTHS,
     _SPARSE_APPLY,
     _padded,
+    _search_pairs,
     _size_class,
     _sparse_operator,
 )
@@ -884,6 +885,32 @@ def ell_fixture(rng):
     codes = np.array(sorted(ball + extra.tolist()))
     states = (codes[:, None] >> np.arange(n - 1, -1, -1)) & 1
     return strings, rng.normal(size=len(strings)), states.astype(np.uint8)
+
+
+class TestSearchPairs:
+    """``_search_pairs``, the sparse builders' host search, returns ``get_xsource``'s pairs.
+
+    Two-word states (64 <= n <= 127) search a key packing each word's rank, which is exact only while
+    both ranks are checked present: a target word absent from the subspace clamps to a neighbour's rank.
+    """
+
+    @pytest.mark.parametrize("num_qubits", [40, 100, 140])  # one word, two words, device fallback
+    def test_matches_get_xsource(self, num_qubits):
+        rng = np.random.default_rng(num_qubits)
+        h = PauliSumXZ.from_paulisum((real_pauli_strings(num_qubits, 6, rng), rng.normal(size=6)))
+        base = h.pack_states(rng.integers(0, 2, (40, num_qubits), dtype=np.uint8))
+        # Random states at this n never connect; their X images do, so sources are found, not just missed.
+        packed = np.unique(np.concatenate([base, *(base ^ x for x in h.x[:4])]), axis=0)
+        size = len(packed) + 7  # fillers too
+        states_u = uniquify_states(_pad_states(packed, size), size)
+        rows = np.arange(size)
+        found = 0
+        for (i, j), x in zip(_search_pairs(h.x, states_u), h.x, strict=True):
+            ref = np.asarray(get_xsource(x, states_u))
+            keep = ref > rows
+            assert np.array_equal(i, rows[keep]) and np.array_equal(j, ref[keep])
+            found += len(i)
+        assert found > 0, "the fixture must exercise a match"
 
 
 class TestEllKernel:

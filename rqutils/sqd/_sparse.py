@@ -3,6 +3,7 @@
 import functools
 import logging
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import jax
 import jax.numpy as jnp
@@ -11,7 +12,7 @@ import numpy as np
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd._diagonal import _z_parity, get_diagonal
 from rqutils.sqd._solve import _SOLVE_STATIC, Matvec, SqdResult, _solve
-from rqutils.sqd._states import _MAX_STATES, StateList, get_xsource
+from rqutils.sqd._states import _MAX_STATES, StateList, _is_filler, get_xsource
 
 #: Entries per scanned chunk, so the sparse kernels' temporaries are ``O(chunk)`` (``poc/sparse-pairs.md``).
 _CHUNK = 1 << 15
@@ -33,6 +34,62 @@ def _check_entries(count: int) -> None:
             f"the sparse operator has {count} entries, beyond the 2^31 - 1 addressable with int32 "
             "indices; use matvec=Matvec.INDICES or a smaller subspace"
         )
+
+
+#: Rows per block of a host search, bounding each thread's temporaries.
+_SEARCH_ROWS = 1 << 18
+
+
+def _words(rows: np.ndarray) -> np.ndarray:
+    """MSW-first uint64 words per row, zero-padded on the left, so row order is word-tuple order."""
+    rows = np.pad(rows, ((0, 0), (-rows.shape[1] % 8, 0)))
+    return np.ascontiguousarray(rows).view(">u8").astype(np.uint64)
+
+
+def _search_pairs(x: np.ndarray, states_u: StateList) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Per X signature, the ``(i, j)`` with ``j > i`` that :func:`get_xsource` finds, one group a thread.
+
+    Searches the states' own sorted order on the host: one word as is, two as the pair of each word's
+    rank among its distinct values, which is exact and still sorted. Wider states (n > 127) keep the
+    device search. Fillers sort last and never pair, so only real rows are searched.
+    """
+    host = np.asarray(states_u)
+    real = int(np.count_nonzero(_is_filler(host) == 0))
+    words = _words(host[:real])
+    if words.shape[1] > 2:
+        rows = np.arange(len(host), dtype=np.int32)
+        pairs = []
+        for xg in x:
+            j = np.asarray(get_xsource(xg, states_u))
+            keep = j > rows  # absent sources (-1) and filler rows (always absent) drop
+            pairs.append((rows[keep], j[keep]))
+        return pairs
+    ranks = [np.unique(words[:, w]) for w in range(words.shape[1])] if words.shape[1] == 2 else []
+
+    def key(w):
+        """``(key, present)``: the rank pair packed into one uint64, and whether both words occur."""
+        if not ranks:
+            return w[:, 0], True
+        r = [np.minimum(np.searchsorted(u, w[:, k]), len(u) - 1) for k, u in enumerate(ranks)]
+        present = (ranks[0][r[0]] == w[:, 0]) & (ranks[1][r[1]] == w[:, 1])
+        return (r[0].astype(np.uint64) << np.uint64(32)) | r[1].astype(np.uint64), present
+
+    keys = key(words)[0]
+
+    def one(xw):
+        i_out, j_out = [], []
+        for lo in range(0, real, _SEARCH_ROWS):
+            target, present = key(words[lo : lo + _SEARCH_ROWS] ^ xw)
+            j = np.minimum(np.searchsorted(keys, target), real - 1)
+            i = np.arange(lo, lo + len(target), dtype=np.int32)
+            keep = present & (keys[j] == target) & (j > i)
+            i_out.append(i[keep])
+            j_out.append(j[keep].astype(np.int32))
+        return np.concatenate(i_out), np.concatenate(j_out)
+
+    # np.searchsorted releases the GIL, so threads scale where the jitted search runs on one core.
+    with ThreadPoolExecutor() as pool:
+        return list(pool.map(one, _words(np.asarray(x))))
 
 
 def _padded(count: int, fill: int) -> np.ndarray:
@@ -195,13 +252,9 @@ def _sparse_operator(
     groups = range(first, hamiltonian.x.shape[0])
     coeffs = np.asarray(hamiltonian.c)
     kmax = max((int(np.count_nonzero(coeffs[g])) for g in groups), default=1)
-    rows = np.arange(size, dtype=np.int32)
-    pairs = {}
-    for g in groups:
-        j = np.asarray(get_xsource(hamiltonian.x[g], states_u))
-        keep = j > rows  # each pair once; absent sources (-1) and filler rows (always absent) drop
-        pairs[g] = (rows[keep], j[keep])
-    del rows
+    pairs = dict(
+        zip(groups, _search_pairs(np.asarray(hamiltonian.x)[groups], states_u), strict=True)
+    )
 
     def on_device(host, c_set):
         # Pops each host array as it is copied, so no host entry array outlives its device copy.
