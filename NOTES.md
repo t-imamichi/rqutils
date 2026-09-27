@@ -2564,9 +2564,9 @@ leaves numpy's byte-table fast path.
 
 ### sqd: real X groups scanned as float64 (2026-09-27)
 
-`from_paulisum` orders the real-coefficient groups first (`num_real_groups`) and `run_sqd` scans them as
-float64: `TABLES` temp 2577 → 1633 B/slot and 1.13×, `INDICES` 1.14× per warm solve (n=60 open XXZ
-`type2`, 118 of 120 groups real), bit-identical to the unsplit scan. `poc/real-groups.md` §3
+Built for `TABLES` only. Real-first groups held as float64 cut `TABLES` memory to 0.63–0.66× at equal or
+better speed; `INDICES` is Hamiltonian-dependent at equal iterations (1.18× on `type2`, **0.92×** on
+`type1`, cause not found), so it and `ONTHEFLY` stay unsplit. `poc/real-groups.md` §6
 
 ### paulis.symplectic.from_paulisum: no quadratic group-bys
 

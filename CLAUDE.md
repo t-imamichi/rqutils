@@ -287,10 +287,11 @@ ingest). Terms are grouped by unique X signature, Z groups zero-padded to a rect
   the `+1` silently returns a *permutation*.
 - **A complex coefficient raises** (non-Hermitian); there is no `force_real` flag and none could work.
   Check `.c.dtype` if you need float64.
-- **Real groups come first, counted by the static `num_real_groups`**, so `run_sqd` scans them as
-  float64 even when one odd-Y term makes `.c` complex (`TABLES` 0.63× memory, 1.13–1.14× per solve).
-  Never reorder groups after construction: a complex group inside that prefix loses its imaginary part
-  silently. `0`, the default, promises nothing.
+- **Real groups come first, counted by the static `num_real_groups`**, so `run_sqd`'s `TABLES` caches
+  their diagonals as float64 even when one odd-Y term makes `.c` complex (0.63–0.66× memory). Only
+  `TABLES` splits: `INDICES` measured 0.92× on one Hamiltonian (`poc/real-groups.md` §6). Never reorder
+  groups after construction: a complex group inside that prefix loses its imaginary part silently. `0`,
+  the default, promises nothing.
 
 ### `sqd/` — sample-based quantum diagonalization
 

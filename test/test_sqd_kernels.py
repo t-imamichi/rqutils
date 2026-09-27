@@ -739,8 +739,8 @@ class TestRealGroupSplit:
     """``run_sqd`` scans the real X groups with float64 coefficients and the complex rest separately.
 
     One odd-Y term makes ``.c`` complex128 for every group; the split keeps the real groups' diagonals
-    in float64, measured 2577 -> 1633 B/slot of ``TABLES`` temp and 1.13-1.14x per solve at n=60 open
-    XXZ, 118 of 120 groups real (``NOTES.md``, "sqd: real X groups scanned as float64"). The unsplit
+    in float64, measured 2577 -> 1633 B/slot of ``TABLES`` temp at n=60 open XXZ, 118 of 120 groups
+    real (``NOTES.md``, "sqd: real X groups scanned as float64"). The unsplit
     arm is the same Hamiltonian with ``num_real_groups=0``, the value that promises nothing.
     """
 
