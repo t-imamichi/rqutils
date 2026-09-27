@@ -106,7 +106,11 @@ def main() -> None:
     parser.add_argument("--sizes", type=int, nargs="+", default=[100_000, 1_000_000])
     parser.add_argument("--patterns", nargs="+", default=["type1", "type2", "type3", "type4"])
     parser.add_argument(
-        "--matvecs", type=Matvec, nargs="+", default=[Matvec.INDICES, Matvec.TABLES]
+        "--matvecs",
+        type=Matvec,
+        choices=list(Matvec),
+        nargs="+",
+        default=[Matvec.INDICES, Matvec.TABLES],
     )
     parser.add_argument("--deltas", type=float, nargs="+", default=list(DELTAS))
     parser.add_argument(

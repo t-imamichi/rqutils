@@ -188,7 +188,8 @@ def sqd(
             eigenvalue (and a wrong-width basis). Every other qubit count is rejected on width.
         matvec: A :class:`Matvec` member: ``ONTHEFLY``, ``INDICES`` (default) or ``TABLES``, which
             of the source indices and diagonals to cache; or a sparse kernel, which stores the
-            in-subspace transitions instead. See the module documentation for the kernels and their resource tradeoff.
+            in-subspace transitions instead. See the module documentation for the kernels and
+            their resource tradeoff.
 
             A sparse ``matvec`` is built on the host before the solve (logged as its own phase),
             its array shapes rounded up to size classes so the solve recompiles per class rather
@@ -239,11 +240,11 @@ def sqd(
             **while** ``rtol`` is zero; or if ``rtol`` is at least 0.5, where any vector would report
             convergence.
 
-            If a sparse ``matvec`` is used under a mesh, or its
-            operator reaches :math:`2^{31}` entries.
+            If a sparse ``matvec`` is used under a mesh, or its operator reaches :math:`2^{31}`
+            entries.
         TypeError: If ``matvec`` is not a :class:`Matvec` member, a plain string included; if
-            ``prefilter`` is neither None nor a ``(degree, cycles)`` pair of ints; or if ``atol`` is not a real number, or ``rtol``
-            neither None nor one.
+            ``prefilter`` is neither None nor a ``(degree, cycles)`` pair of ints; or if ``atol`` is
+            not a real number, or ``rtol`` neither None nor one.
     """
     hamiltonian, states_p, states_size = _sqd_inputs(
         hamiltonian, states, states_size, packed, matvec, atol, rtol, prefilter

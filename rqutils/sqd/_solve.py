@@ -200,8 +200,9 @@ def run_sqd(
     _check_matvec(matvec)
     if matvec in _SPARSE_MATVECS:
         raise ValueError(
-            f"run_sqd cannot build matvec={matvec!r}: its entry counts are data-dependent, so the "
-            "operator is built host-side before the solve. Call sqd(..., matvec=...) instead."
+            f"run_sqd cannot build matvec=Matvec.{matvec.name}: its entry counts are data-dependent, "
+            "so the operator is built host-side before the solve. Call sqd(..., matvec=...) "
+            "instead."
         )
     _check_prefilter(prefilter)
     sharding = None
