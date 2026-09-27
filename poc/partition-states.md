@@ -505,6 +505,22 @@ silent form.
    `static_argnums`, and `N` must divide `d` (`sqd` already rounds `states_size` to a multiple of
    `mesh.size`, so the machinery exists). `uniquify_states`' word packing remains *"the wrong trade for an
    out-of-core design"* at the `2^31` ceiling (6–15 GB of extra buffer), unaffected by anything here.
+5. **The per-matvec vector exchange is uncosted** (from Westerhout & Chamberlain, arXiv:2308.16712,
+   2026-09-27). Everything above prices the one-off routed `get_xsource`; once `vec` is partitioned, every
+   matvec still needs remote `vec` values, and today's sharded path all-gathers them — N·16–32 B back on
+   every device, the kind of term the partitioning exists to shed. Their exact-diagonalization matvec
+   (up to 1.7e11 states) uses the same layout this line chose — **whole-key hashing** (a SplitMix64-style
+   finalizer, like `mix64`) and a **local binary search** per shard (~16% of their matvec, cheap only
+   because their symmetry-adapted element generation is expensive; ours is 66–97%) — and closes the gap
+   with a **push** matvec: the owner of `x_j` sends `(target, H_ij·x_j)` to the target's owner, which adds
+   it in; nothing returns. Scaling: 51× on 64 nodes (42 spins), 73–75% efficiency at 256 nodes, 7–8× faster
+   than SPINPACK at 32. The JAX form to prototype: keep each hit's `(destination, local row)` from the
+   setup routing; per matvec scale locally, one `all_to_all` of values (counts known exactly after setup,
+   so no slack), `segment_sum` into `y`; pipeline by X-group chunks so chunk k's collective overlaps chunk
+   k+1's compute, messages ≥ ~8 KB (their InfiniBand figure). Estimated, not measured: push moves ~J·h/d
+   the all-gather's bytes (2–12× more at d=4), so it wins on memory before traffic; summing by target on
+   the sender bounds both. Their one-sided asynchronous puts do not map to XLA's bulk collectives — take
+   the overlap, not the model. Wider keys (n > 63) must mix every key word into the hash.
 
 ## 13. The scripts
 

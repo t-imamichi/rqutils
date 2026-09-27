@@ -231,6 +231,29 @@ Hamming shells. Shell `h` for `type1`/`type2` is read off `type4`/`type3`, which
    samples. Pruning pushes `h` up, and n=20's 0.354 shows how far `h` can go; a replayed spinchain run
    (`skqd/replay.py`) would give the true subspace.
 5. **ELLC — done, beside `"csr"`, not replacing it:** `sqd(matvec="ell")` (§9).
+6. **What to try on the GPU, from the literature (2026-09-27).**
+   - *Scan-step size first.* A `2^15`-entry step means ~6,000 steps per matvec at N = 2·10⁷; at ~10 µs of
+     launch cost each that is ~60 ms against ~5 ms of memory traffic (an estimate). Sweep `2^15`–`2^22`
+     entries per step, and a whole bucket with no scan, counting kernels per matvec.
+   - *`"ell"`'s row write:* each row is in one bucket, so `.at[rows].set(val, unique_indices=True,
+     indices_are_sorted=True)` can replace the `add` and avoid atomics.
+   - *Layout within a piece:* `(pieces, w, R)` with `sum(axis=1)` against today's `(pieces, R, w)` — a
+     thread-per-row mapping wants column-major slices for coalesced reads (Anzt, Tomov & Dongarra, SELL-P
+     on NVIDIA GPUs, UT EECS-14-727, 2014, who ran 0.95–1.72× cuSPARSE CSR on denser FEM matrices); check
+     the gather fuses into the reduce.
+   - *`(N, 2)` vectors*, so a gather fetches both batched values in one 32 B read.
+   - *Coarser class grids* (×1.5, powers of 2): fewer scans and launches, at the padding measured in §10.
+   - *`"pairs"` without atomics:* one X group is a perfect matching (a state occurs in at most one pair
+     per group), so chunks that do not straddle a group have all-distinct scatter targets and can declare
+     `unique_indices=True`. RACE's distance-2 colouring (Alappat et al., arXiv:1907.06487) is unnecessary
+     here and would not apply anyway: it needs RCM levels, which these graphs lack.
+   - *Baseline:* cuSPARSE CSR through `jax.experimental.sparse`.
+
+   RACE's traffic model also explains `"pairs"`' CPU result: half storage wins (1.4–1.5×, up to 2×) only
+   with row-sorted storage, matrix bytes dominating, and small vector traffic after RCM. Group-ordered
+   pairs with a 32 B complex batched element and no RCM gain predict ~0.43× full storage — the measured
+   2.2× gap to `"ell"`. Their quantum test matrices (Spin-26, Hubbard-14) had the worst vector traffic of
+   all theirs.
 
 ## 8. The script
 
