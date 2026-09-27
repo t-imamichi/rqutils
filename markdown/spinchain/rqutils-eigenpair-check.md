@@ -3,6 +3,10 @@
 From the `rqutils` side, unprompted. Commit `bed4757` on `dev`, version still `0.2.0` (unreleased).
 **Revised the same day** on `reorg-layout`: the check now reuses a full `xsources` cache, cutting its
 cost from +3.2–7.9% to +0.3–0.9% (§1, §5).
+**Updated 2026-09-27 for `matvec=`**, which replaced `cache_level`
+(`markdown/spinchain/rqutils-matvec.md`). The tuples below are kept where they label a measurement:
+`(1, 0)` is `Matvec.INDICES`, and `(1, 2)` is `Matvec.TABLES`. `(1, 1)` and `xcache_groups` have since
+been removed.
 
 > **Status: shipped, always on.** After every solve, `sqd()` recomputes `‖Hv − Ev‖` independently and
 > raises `EigenpairCheckError` if the pair it is about to return is not an eigenpair — the
@@ -35,9 +39,10 @@ raise EigenpairCheckError  if not r <= threshold   # `not <=`, so a NaN residual
 - **`rtol=None` resolves to `4·eps`** of the coefficient dtype, exactly as the solver resolves it, so
   the check tests the same criterion the solve used.
 - **The check never uses a cached diagonal**: it rebuilds every diagonal from the Z signatures, so a
-  defect in the `(1, 1)`/`(1, 2)` diagonal caches cannot vouch for itself. **It reuses the source
-  indices when all of them are cached** (`cache_level[0] = 1`, no partial `xcache_groups`) and searches
-  afresh otherwise. Redoing the search was ~90% of the original check's cost.
+  defect in `Matvec.TABLES`' diagonal cache cannot vouch for itself. **It reuses the source indices
+  when they are cached** (`INDICES`, `TABLES`) and searches afresh otherwise: under `ONTHEFLY`, and
+  under the sparse kernels (`PAIRS`, `CSR`, `ELL`), whose check reads none of their stored data. Redoing
+  the search was ~90% of the original check's cost.
 - **One difference from your guard, stated plainly**: `_apply_projected` pins `(0, 0)`, so it also
   re-derives the source-index array. The rqutils check no longer does when that array is cached. What
   that gives up is narrow: both call the same `get_xsource`, so only a defect in the precompute scan
@@ -134,11 +139,15 @@ field from your log line.
 
 One matvec per solve. Measured at `J=120` X groups, `N=30k` states, warm, 9 interleaved rounds:
 
-| `cache_level` | spinchain `DiagCache` | time (first version) | time (revised) | XLA temp (revised) |
+| `cache_level` (now `matvec`) | spinchain `DiagCache` | time (first version) | time (revised) | XLA temp (revised) |
 |---|---|---|---|---|
-| `(1, 0)` | — (sqd default) | +3.2% | **+0.9%** | +0.25 MiB |
-| `(1, 1)` | — | — | **+0.3%** | +0.35 MiB |
-| `(1, 2)` | `SPEED` | +7.9% | **+0.6%** | +0.35 MiB |
+| `(1, 0)` (`INDICES`) | `MEMORY` (sqd default) | +3.2% | **+0.9%** | +0.25 MiB |
+| `(1, 1)` (removed) | — | — | **+0.3%** | +0.35 MiB |
+| `(1, 2)` (`TABLES`) | `SPEED` | +7.9% | **+0.6%** | +0.35 MiB |
+
+The sparse kernels are not in this table, and their check pays the fresh search. At n=60, `2^17` states,
+the check is about 0.15 s of a 1.26 s `PAIRS` call. That is the gap left after the 0.17 s construction
+and the 0.93 s solve (`poc/sparse-pairs.md` §9).
 
 **Net for spinchain**: your guard costs about 6% of a warm solve (its own repack, re-uniquify lexsort,
 operator rebuild and a `(0, 0)` matvec), all of which goes away, so every level now comes out ahead,
@@ -152,7 +161,8 @@ There is no flag to turn the check off in `sqd()`; the plumbing (`run_sqd(check_
 - Both scalars go through `_host_scalar`, the same non-collective read as the eigenvalue. They are
   replicated, so every rank takes the same branch and raises together — no collective sits inside the
   conditional.
-- Verified on 4 virtual CPU devices (`poc/sharding.py`, all six cache levels agree). **Not verified on
+- Verified on 4 virtual CPU devices (`poc/sharding.py`: all six cache levels agreed then, and the three
+  dense kernels agree today; the sparse kernels raise under a mesh). **Not verified on
   a real multi-process run** — the `rqutils` sandbox cannot bind a coordinator port. If you run SKQD
   across nodes, an `mpirun` smoke test after upgrading is worth the minute.
 
