@@ -1323,6 +1323,13 @@ Caching only the identity group (`J' = 1`, ~24 B/slot) gives **1.26× / 1.38×**
 2)`'s 2.83× / 3.46×: a third of the recompute, at ~73 ms per MiB against the whole cache's ~29. On XXZ a
 prefix already is largest-first. `poc/diag-cache.md` §7.
 
+### The Z parity is already streaming-optimal on CPU: XOR-folding and one-pass forms lose (2026-09-27)
+
+Neither faster form of `popcount(s & z) & 1` beats `get_diagonal`'s per-term loop. XOR-folding ties, or
+loses 0.57× as `uint64` words. Reading the states once per group loses 4–9× at `2^15`–`2^21`, both as a
+broadcast and as the int8 GEMM Ozaki scheme II suggests. On CPU the lever is caching the diagonal, not
+recomputing it faster; the GPU int8 path is open. `poc/parity-xor.md` §2
+
 ### The diagonal split at large `N`: the overhead is a *ratio*, and "flat 1.1 MB" was an artifact (2026-08-30)
 
 Peak temp is **16 B/slot**, linear in `N`: **4.0% of the memory saved** at every `states_size` up to
