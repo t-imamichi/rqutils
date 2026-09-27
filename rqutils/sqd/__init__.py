@@ -107,9 +107,11 @@ the compute time and memory footprint, as is always the case with caching.
 
 Caching the source indices :math:`[j^{i}]` takes :math:`4 J N` bytes (int32 indices, since
 :math:`N < 2^{31}`; see the next section). Caching the composed diagonals :math:`C^{(j)}` takes
-:math:`8 J N` or :math:`16 J N` bytes, real or complex (terms with odd numbers of Ys). Caching both
-also frees :math:`S`, which is no longer read, so at small :math:`n` the full cache can be the cheaper
-option in memory too.
+:math:`8 N` bytes for each X group with real coefficients and :math:`16 N` for each complex one (a
+group holding a term with an odd number of Ys): the real groups come first
+(:attr:`~rqutils.paulis.symplectic.PauliSumXZ.num_real_groups`) and are held as ``float64``. Caching
+both also frees :math:`S`, which is no longer read, so at small :math:`n` the full cache can be the
+cheaper option in memory too.
 
 ``matvec`` names the kernel by what it stores, as a :class:`Matvec` member:
 

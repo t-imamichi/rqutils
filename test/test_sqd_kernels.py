@@ -2,6 +2,8 @@
 and the matvec kernels. Organized by defect, like ``test_sqd.py``.
 """
 
+import dataclasses
+import itertools
 import warnings
 
 import jax.numpy as jnp
@@ -19,8 +21,9 @@ from conftest import (
 )
 
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import Matvec, apply_h, get_xsource, hproj, sqd, uniquify_states
+from rqutils.sqd import Matvec, apply_h, get_xsource, hproj, run_sqd, sqd, uniquify_states
 from rqutils.sqd._dense import _pack_scanned
+from rqutils.sqd._solve import _group_parts
 from rqutils.sqd._sparse import (
     _CHUNK,
     _ELL_WIDTHS,
@@ -730,6 +733,59 @@ class TestMatvecKernels:
             apply_h(p["vector"], xsources=p["xsources"], diagonals=p["diagonals"], states=None)
         ).real
         assert np.abs(got - p["matrix"] @ p["vector"]).max() < 1e-12
+
+
+class TestRealGroupSplit:
+    """``run_sqd`` scans the real X groups with float64 coefficients and the complex rest separately.
+
+    One odd-Y term makes ``.c`` complex128 for every group; the split keeps the real groups' diagonals
+    in float64, measured 2577 -> 1633 B/slot of ``TABLES`` temp and 1.13-1.14x per solve at n=60 open
+    XXZ, 118 of 120 groups real (``NOTES.md``, "sqd: real X groups scanned as float64"). The unsplit
+    arm is the same Hamiltonian with ``num_real_groups=0``, the value that promises nothing.
+    """
+
+    @staticmethod
+    def split_and_unsplit():
+        coeffs = np.random.default_rng(3).normal(size=7)
+        strings = ["ZIIII", "YZIII", "XXIII", "IXYII", "IIZZI", "IIIYY", "IIIXX"]
+        split = PauliSumXZ.from_paulisum((strings, coeffs))
+        unsplit = dataclasses.replace(split, num_real_groups=0)
+        assert [len(_group_parts(h)) for h in (split, unsplit)] == [2, 1], "one arm must not split"
+        return split, unsplit
+
+    def test_split_is_bit_identical_to_unsplit(self):
+        """A real diagonal times a complex entry equals a zero-imaginary complex one exactly."""
+        split, unsplit = self.split_and_unsplit()
+        states = np.array(list(itertools.product([0, 1], repeat=5)), dtype=np.uint8)
+        a, b = (sqd(h, states, matvec=Matvec.TABLES) for h in (split, unsplit))
+        assert a[0] == b[0]
+        assert np.array_equal(a[1], b[1])
+
+    def test_tables_caches_the_real_diagonals_in_float64(self):
+        """8 B per state per real group less temp: the split is taken, not just computed."""
+        split, unsplit = self.split_and_unsplit()
+        size = 4096
+        states = np.array(list(itertools.product([0, 1], repeat=5)), dtype=np.uint8)
+        states_p = _pad_states(split.pack_states(states), size)
+        temp = [
+            run_sqd.lower(h, states_p, size, False, matvec=Matvec.TABLES)
+            .compile()
+            .memory_analysis()
+            .temp_size_in_bytes
+            for h in (unsplit, split)
+        ]
+        assert temp[0] - temp[1] >= 0.9 * 8 * split.num_real_groups * size, temp
+
+    @pytest.mark.parametrize("matvec", [Matvec.ONTHEFLY, Matvec.INDICES])
+    def test_other_kernels_do_not_split(self, matvec):
+        """Only ``TABLES`` splits: it slowed ``INDICES`` to 0.92x on one Hamiltonian."""
+        split, unsplit = self.split_and_unsplit()
+        states = np.array(list(itertools.product([0, 1], repeat=5)), dtype=np.uint8)
+        states_p = _pad_states(split.pack_states(states), 64)
+        hlo = [
+            run_sqd.lower(h, states_p, 64, False, matvec=matvec).as_text() for h in (split, unsplit)
+        ]
+        assert hlo[0] == hlo[1]
 
 
 def sparse_fixture(kind, rng):

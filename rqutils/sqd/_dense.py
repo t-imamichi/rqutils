@@ -255,6 +255,7 @@ def _apply_h_kernel(
     scanned: tuple[NDArray, ...],
     states: StateList | None,
     matvec: str,
+    init: jax.Array | None = None,
 ) -> jax.Array:
     r"""Return :math:`Hv`, resolving the per-X-group inputs according to the ``matvec`` name.
 
@@ -263,7 +264,8 @@ def _apply_h_kernel(
     keyword, so it is bound via :func:`functools.partial` rather than passed through ``args``.
     The name resolution lives in the wrapper, in plain Python, so it costs nothing per call.
 
-    See :func:`apply_h` for the input sets and argument semantics.
+    See :func:`apply_h` for the input sets and argument semantics. ``init`` seeds the accumulator
+    (zeros by default).
 
     Raises:
         ValueError: If ``states`` is None for a kernel other than ``"tables"``.
@@ -278,4 +280,4 @@ def _apply_h_kernel(
         diagonal = val[1] if matvec == "tables" else get_diagonal(val[1], val[2], states)
         return out + apply_xgrp(xsource, diagonal, vec), None
 
-    return jax.lax.scan(fn, jnp.zeros_like(vec), scanned)[0]
+    return jax.lax.scan(fn, jnp.zeros_like(vec) if init is None else init, scanned)[0]

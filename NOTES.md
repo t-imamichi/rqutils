@@ -2562,6 +2562,12 @@ boundaries. The binary check also skips `min()` for unsigned and bool input. Rej
 (128 → 122 MiB) but is **1.53× slower** (19.0 against 12.4 ms median, 1/25 paired wins), as `count`
 leaves numpy's byte-table fast path.
 
+### sqd: real X groups scanned as float64 (2026-09-27)
+
+`from_paulisum` orders the real-coefficient groups first (`num_real_groups`) and `run_sqd` scans them as
+float64: `TABLES` temp 2577 → 1633 B/slot and 1.13×, `INDICES` 1.14× per warm solve (n=60 open XXZ
+`type2`, 118 of 120 groups real), bit-identical to the unsplit scan. `poc/real-groups.md` §3
+
 ### paulis.symplectic.from_paulisum: no quadratic group-bys
 
 - A one-hot matmul summing duplicate strings materialized a dense `(n_unique, n_terms)` mask: **64 MB,

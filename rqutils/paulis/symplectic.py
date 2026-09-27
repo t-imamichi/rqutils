@@ -119,12 +119,16 @@ class PauliSumXZ:
             phase turns real input complex. Check ``.c.dtype`` if you need float64; there is
             deliberately no flag to request it, since no flag could grant it.
         num_qubits: Number of qubits, static under JAX transforms.
+        num_real_groups: How many leading X groups have real coefficients, static under JAX
+            transforms. :meth:`from_paulisum` orders those groups first, so a complex ``c`` can
+            still be read as float64 over ``c[:num_real_groups]``. ``0`` promises nothing.
     """
 
     x: np.ndarray[tuple[int, int], np.dtype[np.uint8]]
     z: np.ndarray[tuple[int, int, int], np.dtype[np.uint8]]
     c: np.ndarray[tuple[int, int], np.dtype[np.inexact]]
     num_qubits: int = field(metadata={"static": True})
+    num_real_groups: int = field(default=0, metadata={"static": True})
 
     @staticmethod
     def pack_states(
@@ -214,8 +218,8 @@ class PauliSumXZ:
         The only constructor, and the signature half of the bit-alignment contract: it inserts the
         pad bit at position 0 unconditionally, matching what :meth:`pack_states` inserts on the state
         side. Terms are grouped by unique X signature, the Z groups zero-padded to a rectangle, the
-        :math:`(-i)^{\\mathrm{popcount}(x \\wedge z)}` phase folded into the coefficients, and the
-        result bit-packed.
+        :math:`(-i)^{\\mathrm{popcount}(x \\wedge z)}` phase folded into the coefficients, the groups
+        with real coefficients ordered first (``num_real_groups``), and the result bit-packed.
 
         Duplicate Pauli strings are summed and zero-coefficient terms dropped, so the term count of
         the result can be below that of the input.
@@ -310,14 +314,22 @@ class PauliSumXZ:
 
         # Narrow to float64 only when every string has an even Y count; odd-Y is complex128 by
         # design (NOTES.md, "`paulis/symplectic`: why there is no `force_real` flag").
-        if np.all(phcoeffs.imag == 0.0):
+        real = np.all(phcoeffs.imag == 0.0, axis=1)
+        if np.all(real):
             phcoeffs = phcoeffs.real
+        else:
+            # Real groups first, stably, so a kernel can hold their diagonals in float64 and the
+            # identity group (always real, sorted first by np.unique) stays at index 0.
+            order = np.argsort(~real, kind="stable")
+            xsignatures = xsignatures[order]
+            zsignatures = zsignatures[order]
+            phcoeffs = phcoeffs[order]
 
         # The pad bit is unconditional and the X side reuses pack_states: one alignment code path
         # (NOTES.md, "paulis.symplectic: the pad bit is unconditional").
         xsignatures = cls.pack_states(xsignatures)
         zsignatures = np.packbits(np.pad(zsignatures, {2: (1, 0)}), axis=-1)
-        return cls(xsignatures, zsignatures, phcoeffs, num_qubits)
+        return cls(xsignatures, zsignatures, phcoeffs, num_qubits, int(np.count_nonzero(real)))
 
     @property
     def arrays(self) -> "PackedArrays":
