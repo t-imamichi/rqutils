@@ -242,13 +242,17 @@ def run_sqd(
     # "tables" only: its cached diagonals are the win, and the split slowed "indices" on one
     # Hamiltonian (NOTES.md, "sqd: real X groups scanned as float64").
     parts = _group_parts(hamiltonian) if matvec == "tables" else (hamiltonian.arrays,)
+    groups = None  # (xsource, z, c) per part, once the xsources are searched
 
     if matvec != "onthefly":
         if log_level <= logging.DEBUG:
             jax.debug.print("Precomputing xsources")
 
-        xsources = tuple(
-            jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, part[0])[1]
+        groups = tuple(
+            (
+                jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, part[0])[1],
+                *part[1:],
+            )
             for part in parts
         )
         if sharding:
@@ -267,11 +271,10 @@ def run_sqd(
             for part in parts
         )
         scanned = tuple(
-            _pack_scanned(matvec, xs, d, None) for xs, d in zip(xsources, diagonals, strict=True)
+            _pack_scanned(matvec, g[0], d, None) for g, d in zip(groups, diagonals, strict=True)
         )
     else:
-        xgroup = xsources[0] if matvec == "indices" else hamiltonian.x
-        scanned = (_pack_scanned(matvec, xgroup, hamiltonian.z, hamiltonian.c),)
+        scanned = (_pack_scanned(matvec, *(hamiltonian.arrays if groups is None else groups[0])),)
     # Bind matvec via partial, not static_argnames: ground_locg splats args positionally, so it
     # would be traced and retrace the kernel every matvec. "tables" reads no states.
     apply = functools.partial(_apply_parts, matvec=matvec)
@@ -288,9 +291,7 @@ def run_sqd(
         apply,
         args,
         diag0,
-        None
-        if matvec == "onthefly"
-        else tuple((xs, *p[1:]) for xs, p in zip(xsources, parts, strict=True)),
+        groups,
         sharding,
         return_eigvec=return_eigvec,
         maxiter=maxiter,
@@ -308,7 +309,7 @@ def _solve(
     apply: Callable[..., jax.Array],
     args: tuple,
     diag0: Callable[[], jax.Array],
-    xsources: tuple[tuple[jax.Array, jax.Array, jax.Array], ...] | None,
+    groups: tuple[tuple[jax.Array, jax.Array, jax.Array], ...] | None,
     sharding: PartitionSpec | None,
     *,
     return_eigvec: bool,
@@ -322,8 +323,8 @@ def _solve(
     """The solve every kernel shares, traced inside :func:`run_sqd` or :func:`_run_sparse`.
 
     ``apply(vec, *args)`` is the operator and ``diag0()`` the identity-X group's diagonal;
-    ``xsources`` is ``None`` unless cached source indices exist for the residual check to reuse, as
-    ``(xsource, z, c)`` per group part.
+    ``groups`` holds ``(xsource, z, c)`` per group part when cached source indices exist for the
+    residual check to reuse, else ``None``.
     """
     states_size = states_u.shape[0]
 
@@ -378,9 +379,8 @@ def _solve(
     if check_residual:
         # Diagonals always recomputed, so no cached one vouches for itself; cached xsources are reused,
         # since redoing the J-fold search was ~90% of the check (NOTES.md, "`EigenpairCheckError`").
-        ref = Matvec.ONTHEFLY if xsources is None else Matvec.INDICES
-        groups = (hamiltonian.arrays,) if xsources is None else xsources
-        scanned_ref = tuple(_pack_scanned(ref, *group) for group in groups)
+        ref = Matvec.ONTHEFLY if groups is None else Matvec.INDICES
+        scanned_ref = tuple(_pack_scanned(ref, *g) for g in groups or (hamiltonian.arrays,))
         ax = _apply_parts(eigvec, scanned_ref, states_u, ref)
         result = result._replace(
             residual=jnp.linalg.norm(ax - eigval * eigvec), ax_norm=jnp.linalg.norm(ax)

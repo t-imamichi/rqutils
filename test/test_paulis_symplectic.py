@@ -17,13 +17,12 @@ effect was silently discarding the imaginary part of a non-Hermitian operator. S
 :class:`TestCoefficientDtype`.
 """
 
-import itertools
 import warnings
 
 import jax
 import numpy as np
 import pytest
-from conftest import dense_pauli_sum, gate_unitary
+from conftest import dense_pauli_sum, eigval_of, gate_unitary, lowest_projected, mixed_real_complex
 
 from rqutils.paulis.symplectic import PauliSumXZ
 
@@ -580,12 +579,9 @@ class TestRealGroupsFirst:
     group inside that prefix would have its imaginary part silently dropped by that ``.real``.
     """
 
-    # Groups: identity (ZIIII, IIZZI) real, YZIII complex, XXIII real, IXYII complex, IIIYY + IIIXX real.
-    MIXED = ("ZIIII", "YZIII", "XXIII", "IXYII", "IIZZI", "IIIYY", "IIIXX")
-
     def test_real_groups_lead_and_are_counted(self):
-        coeffs = np.random.default_rng(3).normal(size=len(self.MIXED))
-        hamiltonian = PauliSumXZ.from_paulisum((list(self.MIXED), coeffs))
+        strings, coeffs, _ = mixed_real_complex(np.random.default_rng(3))
+        hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs))
         real = np.all(np.asarray(hamiltonian.c).imag == 0, axis=1)
         assert hamiltonian.num_real_groups == 3 == np.count_nonzero(real)
         assert np.all(real[:3]) and not np.any(real[3:])
@@ -593,13 +589,9 @@ class TestRealGroupsFirst:
 
     def test_reordering_leaves_the_operator_unchanged(self):
         """The full-space ``sqd`` energy against an independent dense construction."""
-        from rqutils.sqd import sqd
-
-        coeffs = np.random.default_rng(3).normal(size=len(self.MIXED))
-        states = np.array(list(itertools.product([0, 1], repeat=5)), dtype=np.uint8)
-        energy = sqd((list(self.MIXED), list(coeffs)), states, return_eigvec=False)
-        exact = np.linalg.eigvalsh(dense_pauli_sum(list(self.MIXED), coeffs))[0]
-        assert energy == pytest.approx(exact, abs=1e-12)
+        strings, coeffs, states = mixed_real_complex(np.random.default_rng(3))
+        exact = lowest_projected(strings, coeffs, states)
+        assert eigval_of(strings, coeffs, states) == pytest.approx(exact, abs=1e-12)
 
     def test_an_all_real_sum_counts_every_group(self):
         hamiltonian = PauliSumXZ.from_paulisum((["ZIIII", "XXIII", "IIIYY"], [1.0, 0.5, 0.25]))

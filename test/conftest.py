@@ -224,6 +224,16 @@ def real_pauli_strings(num_qubits, count, rng, letters="IXYZ"):
     return strings
 
 
+def mixed_real_complex(rng):
+    """``(strings, coeffs, states)``: 5 groups, the identity and two more real, two complex (odd Y).
+
+    ``states`` is the full 5-qubit basis, lex-sorted.
+    """
+    strings = ["ZIIII", "YZIII", "XXIII", "IXYII", "IIZZI", "IIIYY", "IIIXX"]
+    states = ((np.arange(32)[:, None] >> np.arange(4, -1, -1)) & 1).astype(np.uint8)
+    return strings, rng.normal(size=len(strings)), states
+
+
 def unique_states(num_draws, num_qubits, rng):
     """Return a lex-sorted, duplicate-free state array drawn from ``rng``.
 

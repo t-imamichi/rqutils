@@ -312,18 +312,15 @@ class PauliSumXZ:
             iphases = np.sum(xsig & zsigs, axis=1) & 3
             phcoeffs[isig, : counts[isig]] = coeffs[ipaulis] * phase_table[iphases]
 
+        # Real groups first, stably, so a kernel can hold their diagonals in float64 and the identity
+        # group (always real, sorted first by np.unique) stays at index 0.
+        real = np.all(phcoeffs.imag == 0.0, axis=1)
+        order = np.argsort(~real, kind="stable")
+        xsignatures, zsignatures, phcoeffs = xsignatures[order], zsignatures[order], phcoeffs[order]
         # Narrow to float64 only when every string has an even Y count; odd-Y is complex128 by
         # design (NOTES.md, "`paulis/symplectic`: why there is no `force_real` flag").
-        real = np.all(phcoeffs.imag == 0.0, axis=1)
         if np.all(real):
             phcoeffs = phcoeffs.real
-        else:
-            # Real groups first, stably, so a kernel can hold their diagonals in float64 and the
-            # identity group (always real, sorted first by np.unique) stays at index 0.
-            order = np.argsort(~real, kind="stable")
-            xsignatures = xsignatures[order]
-            zsignatures = zsignatures[order]
-            phcoeffs = phcoeffs[order]
 
         # The pad bit is unconditional and the X side reuses pack_states: one alignment code path
         # (NOTES.md, "paulis.symplectic: the pad bit is unconditional").
