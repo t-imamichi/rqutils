@@ -138,11 +138,11 @@ from _scaling_common import fmt_ratio, header, init_devices, make_1d_mesh, timei
 from qiskit.quantum_info import SparsePauliOp
 
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import run_sqd, sqd
+from rqutils.sqd import Matvec, run_sqd, sqd
 from rqutils.sqd._solve import _host_scalar
 from rqutils.sqd._states import _pad_states
 
-MATVEC = options.matvec
+MATVEC = Matvec(options.matvec)
 
 
 def xxz_hamiltonian(num_qubits: float, jz: float) -> PauliSumXZ:

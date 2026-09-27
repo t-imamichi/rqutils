@@ -27,7 +27,7 @@ from qiskit.quantum_info import SparsePauliOp
 
 from rqutils.ground_locg import ground_locg
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import get_diagonal, get_xsource, uniquify_states
+from rqutils.sqd import Matvec, get_diagonal, get_xsource, uniquify_states
 from rqutils.sqd._dense import _apply_h_kernel, _pack_scanned
 from rqutils.sqd._solve import _spread_seed
 from rqutils.sqd._states import _pad_states
@@ -96,21 +96,23 @@ def main() -> None:
 
     two_arm = jax.jit(
         lambda v, cached, rest, st: (
-            _apply_h_kernel(v, cached, None, matvec="tables")
-            + _apply_h_kernel(v, rest, st, matvec="indices")
+            _apply_h_kernel(v, cached, None, matvec=Matvec.TABLES)
+            + _apply_h_kernel(v, rest, st, matvec=Matvec.INDICES)
         )
     )
 
     def arm(order: np.ndarray, num_cached: int) -> tuple:
         sel, rest = np.sort(order[:num_cached]), np.sort(order[num_cached:])
-        cached = _pack_scanned("tables", xs[sel], dg[sel], ham.c[sel])
-        uncached = _pack_scanned("indices", xs[rest], ham.z[rest], ham.c[rest])
+        cached = _pack_scanned(Matvec.TABLES, xs[sel], dg[sel], ham.c[sel])
+        uncached = _pack_scanned(Matvec.INDICES, xs[rest], ham.z[rest], ham.c[rest])
         return cached, uncached, int(k[rest].sum())
 
     prefix = np.arange(num_groups)
     largest = np.argsort(-k, kind="stable")
     reference = np.asarray(
-        _apply_h_kernel(vec, _pack_scanned("tables", xs, dg, ham.c), None, matvec="tables")
+        _apply_h_kernel(
+            vec, _pack_scanned(Matvec.TABLES, xs, dg, ham.c), None, matvec=Matvec.TABLES
+        )
     )
 
     arms = {}

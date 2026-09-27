@@ -19,7 +19,7 @@ from conftest import (
 )
 
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import apply_h, get_xsource, hproj, sqd, uniquify_states
+from rqutils.sqd import Matvec, apply_h, get_xsource, hproj, sqd, uniquify_states
 from rqutils.sqd._dense import _pack_scanned
 from rqutils.sqd._sparse import (
     _CHUNK,
@@ -818,7 +818,7 @@ class TestSparseKernels:
     def test_sqd_energy_matches_indices(self, kind, matvec):
         """Energies only: another summation order shifts the trajectory, so iteration counts differ."""
         strings, coeffs, states = sparse_fixture(kind, np.random.default_rng(20260926))
-        want = eigval_of(strings, coeffs, states, matvec="indices")
+        want = eigval_of(strings, coeffs, states, matvec=Matvec.INDICES)
         assert eigval_of(strings, coeffs, states, matvec=matvec) == pytest.approx(want, abs=1e-10)
 
     def test_size_class_rounding(self):
@@ -925,5 +925,7 @@ class TestEllKernel:
 
     def test_sqd_energy_matches_indices(self):
         strings, coeffs, states = ell_fixture(np.random.default_rng(20260927))
-        want = eigval_of(strings, coeffs, states, matvec="indices")
-        assert eigval_of(strings, coeffs, states, matvec="ell") == pytest.approx(want, abs=1e-10)
+        want = eigval_of(strings, coeffs, states, matvec=Matvec.INDICES)
+        assert eigval_of(strings, coeffs, states, matvec=Matvec.ELL) == pytest.approx(
+            want, abs=1e-10
+        )

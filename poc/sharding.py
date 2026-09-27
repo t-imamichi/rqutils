@@ -62,7 +62,7 @@ import numpy as np
 from _scaling_common import header, init_devices, make_1d_mesh, make_problem
 
 from rqutils.sqd import hproj, sqd
-from rqutils.sqd._matvec import _MATVECS
+from rqutils.sqd._matvec import _DENSE_MATVECS
 
 
 def check_single_vs_sharded():
@@ -107,7 +107,7 @@ def check_single_vs_sharded():
 def check_all_matvecs(problem, eig_dense):
     header("POC 7d: every matvec, sharded vs single-device vs dense")
     print("Two sharding bugs lived in the then-three cache_level[0] == 0 cells, uncovered because")
-    print("this script and the pytest arm both ran only sqd's default, now matvec='indices':")
+    print("this script and the pytest arm both ran only sqd's default, now matvec=Matvec.INDICES:")
     print("  * _accumulate_diagonal put a rank-2 PartitionSpec on a rank-1 accumulator (all six).")
     print("  * _spread_seed's jnp.where mixed a replicated predicate with a partitioned vec, since")
     print(
@@ -127,7 +127,7 @@ def check_all_matvecs(problem, eig_dense):
     print(
         f"  {'matvec':>12s}  {'single':>16s}  {'sharded':>16s}  {'|s-1dev|':>10s}  {'|s-dense|':>10s}"
     )
-    for matvec in _MATVECS:
+    for matvec in _DENSE_MATVECS:  # the sparse kernels raise under a mesh
         single = float(sqd(p.hamiltonian, p.states, return_eigvec=False, matvec=matvec))
         with jax.set_mesh(mesh):
             sharded = float(sqd(p.hamiltonian, p.states, return_eigvec=False, matvec=matvec))

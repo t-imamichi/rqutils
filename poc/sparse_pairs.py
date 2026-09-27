@@ -61,7 +61,7 @@ from scipy.sparse.csgraph import reverse_cuthill_mckee
 
 from rqutils.ground_locg import ground_locg
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import get_diagonal, get_xsource, run_sqd, sqd, uniquify_states
+from rqutils.sqd import Matvec, get_diagonal, get_xsource, run_sqd, sqd, uniquify_states
 from rqutils.sqd._dense import _apply_h_kernel, _pack_scanned
 from rqutils.sqd._diagonal import _z_parity
 from rqutils.sqd._solve import _spread_seed
@@ -966,14 +966,18 @@ def operators(ham, states, size, arms):
     if {"(1,0)", "(1,2)"} & set(arms):
         xs = jax.lax.scan(lambda _, x: (None, get_xsource(x, su)), None, ham.x)[1]
         if "(1,0)" in arms:
-            k10 = functools.partial(_apply_h_kernel, matvec="indices")
-            ops["(1,0)"] = (jax.jit(k10), (_pack_scanned("indices", xs, ham.z, ham.c), su), None)
+            k10 = functools.partial(_apply_h_kernel, matvec=Matvec.INDICES)
+            ops["(1,0)"] = (
+                jax.jit(k10),
+                (_pack_scanned(Matvec.INDICES, xs, ham.z, ham.c), su),
+                None,
+            )
         if "(1,2)" in arms:
             dg = jax.lax.scan(
                 lambda _, v: (None, get_diagonal(v[0], v[1], su)), None, (ham.z, ham.c)
             )[1]
-            k12 = functools.partial(_apply_h_kernel, matvec="tables")
-            ops["(1,2)"] = (jax.jit(k12), (_pack_scanned("tables", xs, dg, ham.c), None), None)
+            k12 = functools.partial(_apply_h_kernel, matvec=Matvec.TABLES)
+            ops["(1,2)"] = (jax.jit(k12), (_pack_scanned(Matvec.TABLES, xs, dg, ham.c), None), None)
     k0 = functools.partial(matvec_c0, kmax=kmax)
     if rcm_arms:
         t0 = time.perf_counter()
@@ -1185,7 +1189,7 @@ def peak_child(args) -> dict:
     baseline = peak()
     t0 = time.perf_counter()
     if args.child == "(1,0)":  # production: run_sqd precomputes its own (J, N) source array
-        solve, x, setup = (lambda: run_sqd(ham, states_p, size, False, "indices")), (), 0.0
+        solve, x, setup = (lambda: run_sqd(ham, states_p, size, False, Matvec.INDICES)), (), 0.0
     else:
         ops, info = operators(ham, states, size, [args.child])
         fn, xargs, _ = ops[args.child]

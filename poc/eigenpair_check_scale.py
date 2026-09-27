@@ -29,7 +29,7 @@ jax.config.update("jax_enable_x64", True)
 import numpy as np
 from qiskit.quantum_info import SparsePauliOp
 
-from rqutils.sqd import hproj, sqd
+from rqutils.sqd import Matvec, hproj, sqd
 
 DELTAS = (0.5, 2.0)
 
@@ -145,7 +145,7 @@ def main() -> None:
                 sum_c = float(np.abs(ham.coeffs).sum())
                 for matvec in args.matvecs:
                     t0 = time.perf_counter()
-                    eigval = sqd(ham, states, return_eigvec=False, matvec=matvec)
+                    eigval = sqd(ham, states, return_eigvec=False, matvec=Matvec(matvec))
                     seconds = time.perf_counter() - t0
                     residual, threshold = handler.take()
                     print(

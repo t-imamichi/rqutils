@@ -89,7 +89,7 @@ def sqd(
     states_size: int | None = None,
     return_eigvec: bool = True,
     packed: bool = False,
-    matvec: Matvec = "indices",
+    matvec: Matvec = Matvec.INDICES,
     maxiter: int = 1000,
     atol: float = 0.0,
     rtol: float | None = None,

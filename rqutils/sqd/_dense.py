@@ -10,7 +10,7 @@ from jax.sharding import PartitionSpec, get_abstract_mesh
 from numpy.typing import NDArray
 
 from rqutils.sqd._diagonal import get_diagonal
-from rqutils.sqd._matvec import DenseMatvec
+from rqutils.sqd._matvec import Matvec
 from rqutils.sqd._states import StateList, get_xsource
 
 # Dtype kind per `apply_h` keyword: `u` packed bytes, `i` positions (-1 = absent), `fc` float or
@@ -72,7 +72,7 @@ def apply_xgrp(
 
 
 def _pack_scanned(
-    matvec: DenseMatvec, xgroup: NDArray, diagonal_arg: NDArray, coeffs: NDArray | None
+    matvec: Matvec, xgroup: NDArray, diagonal_arg: NDArray, coeffs: NDArray | None
 ) -> tuple[NDArray, ...]:
     """Lay out the tuple ``_apply_h_kernel`` scans over, for one resolved ``matvec``.
 
@@ -176,7 +176,7 @@ def apply_h(
     if precomputed and xname == "xsignatures":
         raise ValueError(
             "apply_h: diagonals= requires xsources=, not xsignatures= -- that pairing was removed as "
-            'dominated by matvec="indices"; pass xsources= from get_xsource'
+            "dominated by matvec=Matvec.INDICES; pass xsources= from get_xsource"
         )
     matvec = "tables" if precomputed else "indices" if xname == "xsources" else "onthefly"
 
@@ -255,7 +255,7 @@ def _apply_h_kernel(
     vec: NDArray[np.inexact],
     scanned: tuple[NDArray, ...],
     states: StateList | None,
-    matvec: DenseMatvec,
+    matvec: Matvec,
 ) -> jax.Array:
     r"""Return :math:`Hv`, resolving the per-X-group inputs according to the ``matvec`` name.
 

@@ -314,7 +314,8 @@ and fills `residual`/`ax_norm` only under `check_residual=True`; pad its input w
   on width (`uint64` keys for `B ≤ 8` bytes, explicit lexicographic beyond) — a **correctness** boundary,
   not a performance one.
 
-**`matvec=` names the kernel by what it stores**: `"onthefly"` (nothing; sources searched and factors
+**`matvec=` takes a `Matvec` member** (a `StrEnum`; plain strings raise `TypeError`, since the string form was
+never released) **naming the kernel by what it stores**: `"onthefly"` (nothing; sources searched and factors
 computed every matvec — the memory floor), `"indices"` (per-group source-index tables; the default) and
 `"tables"` (indices *and* factors), plus three sparse kernels: `"pairs"` (each transition once, with its
 factor), `"csr"` (both directions by target row, `float64` factors where a group is real) and `"ell"`
@@ -433,7 +434,7 @@ derive a bound from a callable.
 **`batch_matvec` stacks each group of independent applications into one `(k, n)` call** — the
 steady-state iteration's pair, and `debug=True`'s three diagnostics. Needs no kernel change: `sqd`'s
 `apply_xgrp` indexes `vec.at[..., xsource]` and scales elementwise, both width-agnostic. 1.15–1.21×
-end-to-end at `matvec="indices"` (1.61–1.81× on the pair alone), and it **cuts the sharded
+end-to-end at `matvec=Matvec.INDICES` (1.61–1.81× on the pair alone), and it **cuts the sharded
 all-gathers** in the compiled loop body **3 → 2** (4 devices, `"indices"`; `test/sharded/batch_matvec.py`
 asserts it — the once-recorded 6 → 3 does not reproduce), because the operator's gather is paid once
 per group — `jnp.stack` on a `P('x')`

@@ -54,7 +54,7 @@ def prefilter_specs(strings, coeffs, states):
     """``{devices: {label: [vinit spec, filtered spec]}}``, with the matvec assembled as ``run_sqd`` does.
 
     Not through ``sqd``: it reshards the eigenvector to ``P(None)`` on return, which hides the
-    partitioning the filter must preserve. Mirrors ``matvec="indices"``.
+    partitioning the filter must preserve. Mirrors ``matvec=Matvec.INDICES``.
     """
     hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs))
     states_p = PauliSumXZ.pack_states(states)

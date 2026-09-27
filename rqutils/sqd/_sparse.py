@@ -10,7 +10,7 @@ import numpy as np
 
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd._diagonal import _z_parity, get_diagonal
-from rqutils.sqd._matvec import SparseMatvec
+from rqutils.sqd._matvec import Matvec
 from rqutils.sqd._solve import _SOLVE_STATIC, SqdResult, _solve
 from rqutils.sqd._states import _MAX_STATES, StateList, get_xsource
 
@@ -32,7 +32,7 @@ def _check_entries(count: int) -> None:
     if count > _MAX_STATES:
         raise ValueError(
             f"the sparse operator has {count} entries, beyond the 2^31 - 1 addressable with int32 "
-            'indices; use matvec="indices" or a smaller subspace'
+            "indices; use matvec=Matvec.INDICES or a smaller subspace"
         )
 
 
@@ -174,7 +174,7 @@ def _ell_buckets(
 
 
 def _sparse_operator(
-    hamiltonian: PauliSumXZ, states_u: StateList, matvec: SparseMatvec
+    hamiltonian: PauliSumXZ, states_u: StateList, matvec: Matvec
 ) -> tuple[jax.Array, ...]:
     """Build a sparse ``matvec``'s operator arrays on the host, one X group's search at a time.
 
@@ -290,7 +290,7 @@ def _run_sparse(
     operator: tuple[jax.Array, ...],
     states_size: int,
     return_eigvec: bool,
-    matvec: SparseMatvec,
+    matvec: Matvec,
     maxiter: int = 1000,
     atol: float = 0.0,
     rtol: float | None = None,

@@ -38,6 +38,7 @@ from conftest import (
 
 from rqutils.sqd import (
     EigenpairCheckError,
+    Matvec,
     get_diagonal,
     get_xsource,
     hproj,
@@ -67,7 +68,7 @@ def run_sqd_jaxpr(rng, **kwargs):
     hamiltonian = PauliSumXZ.from_paulisum((strings, list(rng.normal(size=len(strings)))))
     states_p = pack_padded(unique_states(12, 4, rng))
     return str(
-        jax.make_jaxpr(lambda h, s: run_sqd(h, s, 16, False, "indices", maxiter=50, **kwargs))(
+        jax.make_jaxpr(lambda h, s: run_sqd(h, s, 16, False, Matvec.INDICES, maxiter=50, **kwargs))(
             hamiltonian, states_p
         )
     )
@@ -221,14 +222,18 @@ class TestMatvecValidation:
     exactly as ``(0, 0)`` at 7.2x the cost, and ``(1, 5)`` surfaced as ``UnboundLocalError``.
     """
 
-    @pytest.mark.parametrize("bad", ["indice", "Indices", "on-the-fly", "", "table"])
-    def test_unknown_name_raises_listing_every_valid_name(self, bad):
-        """A typo must be reported, and the message must list what to pass instead."""
+    @pytest.mark.parametrize("bad", ["indices", "ell", "indice", "Indices", ""])
+    def test_plain_string_raises_listing_every_member(self, bad):
+        """Only a ``Matvec`` member is accepted -- a valid name as a string too -- and the message lists them."""
         states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
-        with pytest.raises(ValueError, match="matvec") as excinfo:
+        with pytest.raises(TypeError, match="Matvec member") as excinfo:
             sqd((["ZI"], [1.0]), states, return_eigvec=False, matvec=bad)
-        for name in MATVECS:
-            assert repr(name) in str(excinfo.value)
+        for member in MATVECS:
+            assert f"Matvec.{member.name}" in str(excinfo.value)
+
+    def test_members_match_the_hand_written_list(self):
+        """conftest spells the kernels out, so one added to or dropped from ``Matvec`` fails here."""
+        assert list(Matvec) == MATVECS
 
     @pytest.mark.parametrize("bad", [(1, 0), (0, 0), (1, 2), 1, True, None, ["indices"]])
     def test_non_str_raises_type_error(self, bad):
@@ -262,8 +267,8 @@ class TestMatvecValidation:
 
         states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
         hamiltonian = PauliSumXZ.from_paulisum((["ZI"], [1.0]))
-        with pytest.raises(ValueError, match="matvec"):
-            run_sqd(hamiltonian, pack_padded(states), 2, False, "indice")
+        with pytest.raises(TypeError, match="Matvec member"):
+            run_sqd(hamiltonian, pack_padded(states), 2, False, "indices")
         # The sparse kernels are built host-side by sqd, so run_sqd must point there, not trace them.
         for name in SPARSE_MATVECS:
             with pytest.raises(ValueError, match=r"Call sqd\(\.\.\., matvec=\.\.\.\)"):
@@ -1006,7 +1011,7 @@ class TestEigenpairCheck:
             (search_off, diag_off), (search_on, diag_on) = count(False), count(True)
             return search_on - search_off, diag_on - diag_off
 
-        assert calls("tables") == (0, 1), "tables: (extra searches, extra diagonal builds)"
+        assert calls(Matvec.TABLES) == (0, 1), "tables: (extra searches, extra diagonal builds)"
         for matvec in SPARSE_MATVECS:
             assert calls(matvec) == (1, 1), f"{matvec}: the check must run the onthefly kernel"
 
@@ -1279,7 +1284,7 @@ class TestAtolAndRtol:
 
         hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_p = PauliSumXZ.pack_states(states)
-        result = run_sqd(hamiltonian, states_p, states_p.shape[0], False, "indices", maxiter=1)
+        result = run_sqd(hamiltonian, states_p, states_p.shape[0], False, Matvec.INDICES, maxiter=1)
         theta, converged = float(result.eigval), bool(result.converged)
         assert not converged
         assert np.isfinite(theta) and theta > reference, (theta, reference)

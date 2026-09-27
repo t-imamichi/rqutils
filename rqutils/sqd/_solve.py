@@ -16,7 +16,7 @@ from rqutils.ground_locg import _check_prefilter, ground_locg, residual_floor
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd._dense import _apply_h_kernel, _pack_scanned
 from rqutils.sqd._diagonal import get_diagonal
-from rqutils.sqd._matvec import _SPARSE_MATVECS, DenseMatvec, _check_matvec
+from rqutils.sqd._matvec import _SPARSE_MATVECS, Matvec, _check_matvec
 from rqutils.sqd._states import StateList, _is_filler, get_xsource, uniquify_states
 
 
@@ -128,7 +128,7 @@ def run_sqd(
     states_p: StateList,
     states_size: int,
     return_eigvec: bool,
-    matvec: DenseMatvec = "indices",
+    matvec: Matvec = Matvec.INDICES,
     maxiter: int = 1000,
     atol: float = 0.0,
     rtol: float | None = None,

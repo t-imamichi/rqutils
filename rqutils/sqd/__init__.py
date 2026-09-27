@@ -111,17 +111,17 @@ Caching the source indices :math:`[j^{i}]` takes :math:`4 J N` bytes (int32 indi
 also frees :math:`S`, which is no longer read, so at small :math:`n` the full cache can be the cheaper
 option in memory too.
 
-``matvec`` names the kernel by what it stores:
+``matvec`` names the kernel by what it stores, as a :class:`Matvec` member:
 
-- ``"onthefly"``: nothing; the sources are searched and the diagonals computed per matvec.
-- ``"indices"`` (the default): the source indices :math:`[j^{i}]` of every X group.
-- ``"tables"``: the source indices and the composed diagonals :math:`C^{(j)}`.
-- ``"pairs"``: each transition :math:`(a, b)`, :math:`a < b`, of a non-identity X group once, with
+- ``Matvec.ONTHEFLY``: nothing; the sources are searched and the diagonals computed per matvec.
+- ``Matvec.INDICES`` (the default): the source indices :math:`[j^{i}]` of every X group.
+- ``Matvec.TABLES``: the source indices and the composed diagonals :math:`C^{(j)}`.
+- ``Matvec.PAIRS``: each transition :math:`(a, b)`, :math:`a < b`, of a non-identity X group once, with
   :math:`d = C^{(j)}_a`, applied as :math:`v'_a \mathrel{+}= d v_b` and
   :math:`v'_b \mathrel{+}= \bar{d} v_a` -- exact, since :math:`H_{ba} = \overline{H_{ab}}` per X signature.
-- ``"csr"``: both directions of every transition, sorted by target, with ``float64`` factors for
+- ``Matvec.CSR``: both directions of every transition, sorted by target, with ``float64`` factors for
   the all-real groups and ``complex128`` for the rest.
-- ``"ell"``: the same transitions and split, with rows bucketed by degree rounded up on a
+- ``Matvec.ELL``: the same transitions and split, with rows bucketed by degree rounded up on a
   :math:`\times 1.25` grid into dense ``(rows, width)`` blocks, so each row is one gathered sum rather
   than a scatter per entry (``poc/sparse-pairs.md``, section 10).
 
@@ -156,6 +156,8 @@ SQD API
 
 .. autofunction:: sqd
 .. autoexception:: EigenpairCheckError
+.. autoclass:: Matvec
+   :members:
 .. autofunction:: hproj
 
 States are packed with :meth:`~rqutils.paulis.symplectic.PauliSumXZ.pack_states`, which inserts the
@@ -166,17 +168,15 @@ pad bit that aligns them with the Hamiltonian's signatures, and recovered with
 from rqutils.sqd._core import LOG, EigenpairCheckError, HamiltonianInput, Vector, hproj, sqd
 from rqutils.sqd._dense import apply_h, apply_xgrp
 from rqutils.sqd._diagonal import get_diagonal
-from rqutils.sqd._matvec import DenseMatvec, Matvec, SparseMatvec
+from rqutils.sqd._matvec import Matvec
 from rqutils.sqd._solve import SqdResult, run_sqd
 from rqutils.sqd._states import StateList, get_xsource, uniquify_states
 
 __all__ = [
     "LOG",
-    "DenseMatvec",
     "EigenpairCheckError",
     "HamiltonianInput",
     "Matvec",
-    "SparseMatvec",
     "SqdResult",
     "StateList",
     "Vector",
