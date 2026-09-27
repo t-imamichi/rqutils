@@ -593,6 +593,29 @@ def sqd(
             ``(degree, cycles)`` pair of ints; or if ``atol`` is not a real number, or ``rtol``
             neither None nor one.
     """
+    hamiltonian, states_p, states_size = _sqd_inputs(
+        hamiltonian, states, states_size, packed, matvec, atol, rtol, prefilter
+    )
+    result = _solve_sqd(
+        hamiltonian, states_p, states_size, return_eigvec, matvec, maxiter, atol, rtol, prefilter
+    )
+    eigval = _checked_eigval(result, hamiltonian, maxiter, atol, rtol)
+    if return_eigvec:
+        return (eigval, *_eigvec_and_basis(result, hamiltonian, packed))
+    return eigval
+
+
+def _sqd_inputs(
+    hamiltonian: HamiltonianInput,
+    states: StateList,
+    states_size: int | None,
+    packed: bool,
+    matvec: Matvec,
+    atol: float,
+    rtol: float | None,
+    prefilter: tuple[int, int] | None,
+) -> tuple[PauliSumXZ, StateList, int]:
+    """Validate :func:`sqd`'s arguments; return the Hamiltonian, padded packed states, ``states_size``."""
     _check_matvec(matvec)
     if matvec in _SPARSE_MATVECS and not get_abstract_mesh().empty:
         raise ValueError(
@@ -630,7 +653,21 @@ def sqd(
     # Pad the input to states_size too: its leading dimension is part of run_sqd's jit cache key
     # (NOTES.md, "sqd.sqd: pad the input states too").
     states_p = _pad_states(states_p, states_size)
+    return hamiltonian, states_p, states_size
 
+
+def _solve_sqd(
+    hamiltonian: PauliSumXZ,
+    states_p: StateList,
+    states_size: int,
+    return_eigvec: bool,
+    matvec: Matvec,
+    maxiter: int,
+    atol: float,
+    rtol: float | None,
+    prefilter: tuple[int, int] | None,
+) -> "SqdResult":
+    """Build a sparse operator if ``matvec`` names one, then solve with the residual check on."""
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
     if matvec in _SPARSE_MATVECS:
@@ -652,6 +689,13 @@ def sqd(
         check_residual=True,
     )
     LOG.info("Found ground eigenpair in %f seconds.", time.time() - start)
+    return result
+
+
+def _checked_eigval(
+    result: "SqdResult", hamiltonian: PauliSumXZ, maxiter: int, atol: float, rtol: float | None
+) -> float:
+    """The eigenvalue as a host float, after raising on non-convergence or a failed residual check."""
     eigval = float(_host_scalar(result.eigval))
     # Raise here because run_sqd is jitted: an unconverged theta is a finite upper bound, not
     # distinguishable by inspection; markdown/locg.md's I4 hid behind the discarded flag.
@@ -684,17 +728,23 @@ def sqd(
             "inconsistent with its eigenvalue, which raising `maxiter` or loosening a tolerance "
             "cannot fix; please report it with the Hamiltonian and states."
         )
-    if return_eigvec:
-        eigvec, states_u, subspace_dim = result.eigvec, result.states, result.subspace_dim
-        # One `packed` flag governs both directions, so a round trip needs no re-pack (sqd is not a
-        # converter). num_qubits, not states.shape[1], which is the packed width on that path.
-        basis_states = (
-            states_u[:subspace_dim]
-            if packed
-            else PauliSumXZ.unpack_states(states_u[:subspace_dim], hamiltonian.num_qubits)
-        )
-        return (eigval, np.array(eigvec[:subspace_dim]), np.asarray(basis_states))
     return eigval
+
+
+def _eigvec_and_basis(
+    result: "SqdResult", hamiltonian: PauliSumXZ, packed: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """The eigenvector and the basis it is expressed in, packed exactly when the input was."""
+    eigvec, states_u, subspace_dim = result.eigvec, result.states, result.subspace_dim
+    assert eigvec is not None and states_u is not None and subspace_dim is not None  # return_eigvec
+    # One `packed` flag governs both directions, so a round trip needs no re-pack (sqd is not a
+    # converter). num_qubits, not states.shape[1], which is the packed width on that path.
+    basis_states = (
+        states_u[:subspace_dim]
+        if packed
+        else PauliSumXZ.unpack_states(states_u[:subspace_dim], hamiltonian.num_qubits)
+    )
+    return np.array(eigvec[:subspace_dim]), np.asarray(basis_states)
 
 
 def hproj(
