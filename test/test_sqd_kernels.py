@@ -890,11 +890,11 @@ def ell_fixture(rng):
 class TestSearchPairs:
     """``_search_pairs``, the sparse builders' host search, returns ``get_xsource``'s pairs.
 
-    Two-word states (64 <= n <= 127) search a key packing each word's rank, which is exact only while
-    both ranks are checked present: a target word absent from the subspace clamps to a neighbour's rank.
+    The rank fold sends a target absent from the subspace to some row, so it is exact only through the
+    word comparison that rejects that row; one, two and three words per state.
     """
 
-    @pytest.mark.parametrize("num_qubits", [40, 100, 140])  # one word, two words, device fallback
+    @pytest.mark.parametrize("num_qubits", [40, 100, 140])
     def test_matches_get_xsource(self, num_qubits):
         rng = np.random.default_rng(num_qubits)
         h = PauliSumXZ.from_paulisum((real_pauli_strings(num_qubits, 6, rng), rng.normal(size=6)))

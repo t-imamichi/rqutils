@@ -1315,8 +1315,8 @@ smaller operator, peak 1.3× C2R's from compiling 19 bucket scans (§10). **Ship
 
 The per-group `get_xsource` loop was 93% of an n=100 `"ell"` build (9.07 of 9.74 s, `type2`, `2^20`
 Néel-flip subspace, 200 groups): XLA runs that search on one core. `_search_pairs` searches with numpy,
-which releases the GIL, one group per thread; two-word states (n ≤ 127) search a key packing each word's
-rank, exact and still sorted. `"ell"` 9.74 → 2.49 s, `"csr"` 9.88 → 2.36 s; at n=60 the search alone
+which releases the GIL, one group per thread; a state wider than one word folds each word's rank into its
+row index, exact through a word comparison, at any width. `"ell"` 9.74 → 2.49 s, `"csr"` 9.88 → 2.36 s; at n=60 the search alone
 3.6 → 0.46 s. Rejected: a numpy hash table (slower than the ranks at `2^17`), and DuckDB, 2.0× faster at
 n=100 `2^20` for the whole front end but a new dependency and a second code path. No committed script
 reproduces these numbers.
