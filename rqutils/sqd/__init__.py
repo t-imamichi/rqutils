@@ -168,8 +168,7 @@ pad bit that aligns them with the Hamiltonian's signatures, and recovered with
 from rqutils.sqd._core import LOG, EigenpairCheckError, HamiltonianInput, Vector, hproj, sqd
 from rqutils.sqd._dense import apply_h, apply_xgrp
 from rqutils.sqd._diagonal import get_diagonal
-from rqutils.sqd._matvec import Matvec
-from rqutils.sqd._solve import SqdResult, run_sqd
+from rqutils.sqd._solve import Matvec, SqdResult, run_sqd
 from rqutils.sqd._states import StateList, get_xsource, uniquify_states
 
 __all__ = [

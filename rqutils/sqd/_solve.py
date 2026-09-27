@@ -1,9 +1,10 @@
-"""The jitted solve every kernel shares, and :func:`run_sqd`, its entry point for the dense kernels."""
+"""The kernel names, the jitted solve every kernel shares, and :func:`run_sqd` for the dense ones."""
 
 import functools
 import logging
 from collections.abc import Callable
-from typing import NamedTuple
+from enum import StrEnum
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -16,8 +17,46 @@ from rqutils.ground_locg import _check_prefilter, ground_locg, residual_floor
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd._dense import _apply_h_kernel, _pack_scanned
 from rqutils.sqd._diagonal import get_diagonal
-from rqutils.sqd._matvec import _SPARSE_MATVECS, Matvec, _check_matvec
 from rqutils.sqd._states import StateList, _is_filler, get_xsource, uniquify_states
+
+
+class Matvec(StrEnum):
+    """A :func:`~rqutils.sqd.sqd` matvec kernel, named by what it stores (module documentation).
+
+    Pass a member (``Matvec.ELL``); a plain string is rejected. Members are ``str`` subclasses only so
+    that the kernels' internal equality tests stay plain.
+    """
+
+    ONTHEFLY = "onthefly"
+    INDICES = "indices"
+    TABLES = "tables"
+    PAIRS = "pairs"
+    CSR = "csr"
+    ELL = "ell"
+
+
+_DENSE_MATVECS = (Matvec.ONTHEFLY, Matvec.INDICES, Matvec.TABLES)
+#: The kernels whose operator arrays :func:`sqd` builds host-side; single-device for now.
+_SPARSE_MATVECS = (Matvec.PAIRS, Matvec.CSR, Matvec.ELL)
+_MATVECS = tuple(Matvec)
+
+
+def _check_matvec(matvec: Any) -> None:
+    """Raise unless ``matvec`` is a :class:`Matvec` member.
+
+    Every branch on ``matvec`` is an equality test with an implicit ``else``, so an unvalidated value
+    would be absorbed into some kernel rather than reported.
+
+    Args:
+        matvec: The caller's value, unvalidated.
+
+    Raises:
+        TypeError: If it is not a :class:`Matvec` member: a plain string such as ``"ell"``, or the
+            removed ``cache_level`` tuple, included.
+    """
+    if not isinstance(matvec, Matvec):
+        names = ", ".join(f"Matvec.{m.name}" for m in Matvec)
+        raise TypeError(f"`matvec` must be a Matvec member, one of {names}; got {matvec!r}")
 
 
 def _residual_floor_of(hamiltonian: PauliSumXZ) -> float:

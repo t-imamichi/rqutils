@@ -62,7 +62,7 @@ import numpy as np
 from _scaling_common import header, init_devices, make_1d_mesh, make_problem
 
 from rqutils.sqd import hproj, sqd
-from rqutils.sqd._matvec import _DENSE_MATVECS
+from rqutils.sqd._solve import _DENSE_MATVECS
 
 
 def check_single_vs_sharded():

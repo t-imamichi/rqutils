@@ -10,8 +10,7 @@ import numpy as np
 
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd._diagonal import _z_parity, get_diagonal
-from rqutils.sqd._matvec import Matvec
-from rqutils.sqd._solve import _SOLVE_STATIC, SqdResult, _solve
+from rqutils.sqd._solve import _SOLVE_STATIC, Matvec, SqdResult, _solve
 from rqutils.sqd._states import _MAX_STATES, StateList, get_xsource
 
 #: Entries per scanned chunk, so the sparse kernels' temporaries are ``O(chunk)`` (``poc/sparse-pairs.md``).

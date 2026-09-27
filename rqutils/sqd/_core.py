@@ -15,8 +15,16 @@ from scipy.sparse import coo_array, csr_array
 from rqutils.ground_locg import _check_prefilter, _check_tols
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd._diagonal import get_diagonal
-from rqutils.sqd._matvec import _SPARSE_MATVECS, Matvec, _check_matvec
-from rqutils.sqd._solve import _RESIDUAL_SLACK, SqdResult, _host_scalar, _residual_floor_of, run_sqd
+from rqutils.sqd._solve import (
+    _RESIDUAL_SLACK,
+    _SPARSE_MATVECS,
+    Matvec,
+    SqdResult,
+    _check_matvec,
+    _host_scalar,
+    _residual_floor_of,
+    run_sqd,
+)
 from rqutils.sqd._sparse import _run_sparse, _sparse_operator
 from rqutils.sqd._states import (
     _MAX_STATES,
