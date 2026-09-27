@@ -35,10 +35,8 @@ class Matvec(StrEnum):
     ELL = "ell"
 
 
-_DENSE_MATVECS = (Matvec.ONTHEFLY, Matvec.INDICES, Matvec.TABLES)
 #: The kernels whose operator arrays :func:`sqd` builds host-side; single-device for now.
 _SPARSE_MATVECS = (Matvec.PAIRS, Matvec.CSR, Matvec.ELL)
-_MATVECS = tuple(Matvec)
 
 
 def _check_matvec(matvec: Any) -> None:
@@ -46,9 +44,6 @@ def _check_matvec(matvec: Any) -> None:
 
     Every branch on ``matvec`` is an equality test with an implicit ``else``, so an unvalidated value
     would be absorbed into some kernel rather than reported.
-
-    Args:
-        matvec: The caller's value, unvalidated.
 
     Raises:
         TypeError: If it is not a :class:`Matvec` member: a plain string such as ``"ell"``, or the
