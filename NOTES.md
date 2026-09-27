@@ -2541,6 +2541,17 @@ Before `astype`, which erases the evidence (256 wraps to 0, -1 to 255). min/max 
 `(states == 0) | (states == 1)`: **1.05 ms against 4.14 ms** at N=1M, n=32, equivalent for the integer
 and bool dtypes it receives since only 0 and 1 lie in [0, 1].
 
+### paulis.symplectic.pack_states: chunked by rows (2026-09-27)
+
+`astype(np.uint8)` then `np.pad` held two full copies of the input on top of it: **242 MiB** transient
+peak at `2^21` × 60 for a 120 MiB input and a 16 MiB output. Packing `2^16`-row chunks through one
+zeroed `(chunk, n + 1)` buffer into a preallocated output peaks at **20.3 MiB**, output included, and is
+not slower (48 against 55 ms), bit-identical across widths 1–100, four dtypes and forced chunk
+boundaries. The binary check also skips `min()` for unsigned and bool input. Rejected alongside:
+`np.unpackbits(..., count=1 + n)` in `unpack_states` trims the returned basis's hidden base by 5%
+(128 → 122 MiB) but is **1.53× slower** (19.0 against 12.4 ms median, 1/25 paired wins), as `count`
+leaves numpy's byte-table fast path.
+
 ### paulis.symplectic.from_paulisum: no quadratic group-bys
 
 - A one-hot matmul summing duplicate strings materialized a dense `(n_unique, n_terms)` mask: **64 MB,

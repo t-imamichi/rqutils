@@ -55,6 +55,8 @@ import jax
 import numpy as np
 from jax.tree_util import register_dataclass
 
+_PACK_ROWS = 1 << 16
+
 
 def _is_sparse_pauli_op(obj: Any) -> bool:
     """True if ``obj`` is a qiskit ``SparsePauliOp``, importing qiskit only on a name match.
@@ -162,10 +164,12 @@ class PauliSumXZ:
                 for both :func:`rqutils.sqd.sqd` and :func:`rqutils.sqd.hproj`, and the scan is
                 ``O(N*n)`` on an array :func:`numpy.packbits` is about to walk anyway.
         """
-        # Checked before `astype`, which erases the evidence (256 -> 0, -1 -> 255); min/max, 1 pass
-        # (NOTES.md, "paulis.symplectic.pack_states: the 0/1 check").
+        # Checked before the uint8 cast, which erases the evidence (256 -> 0, -1 -> 255); min/max, and
+        # no min for unsigned or bool (NOTES.md, "paulis.symplectic.pack_states: the 0/1 check").
         states = np.asarray(states)
-        if states.size and (states.min() < 0 or states.max() > 1):
+        if states.size and (
+            (states.dtype.kind not in "ub" and states.min() < 0) or states.max() > 1
+        ):
             bad = states[(states != 0) & (states != 1)]
             suffix = f" and {bad.size - 1} other non-binary entries" if bad.size > 1 else ""
             raise ValueError(
@@ -174,7 +178,16 @@ class PauliSumXZ:
                 "would otherwise pack to the all-ones bitstring for every row and collapse the "
                 "subspace to a single state. Convert with `(spins + 1) // 2` or `spins > 0`."
             )
-        return np.packbits(np.pad(states.astype(np.uint8), {1: (1, 0)}), axis=1)
+        # Row chunks through one buffer, not two full copies (`astype`, then `np.pad`): 242 -> 20
+        # MiB peak at 2^21 x 60 (NOTES.md, "paulis.symplectic.pack_states: chunked by rows").
+        num_states, num_qubits = states.shape
+        packed = np.empty((num_states, num_qubits // 8 + 1), dtype=np.uint8)
+        buffer = np.zeros((min(num_states, _PACK_ROWS), num_qubits + 1), dtype=np.uint8)
+        for start in range(0, num_states, _PACK_ROWS):
+            rows = states[start : start + _PACK_ROWS]
+            buffer[: len(rows), 1:] = rows
+            packed[start : start + len(rows)] = np.packbits(buffer[: len(rows)], axis=1)
+        return packed
 
     @staticmethod
     def unpack_states(

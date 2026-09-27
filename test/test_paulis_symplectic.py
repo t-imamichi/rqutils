@@ -423,6 +423,18 @@ class TestPadding:
         # Trailing bits are packbits' own zero fill, not payload.
         assert np.all(bits[:, 1 + num_qubits :] == 0)
 
+    @pytest.mark.parametrize("num_states", [5, 6, 7])
+    def test_pack_states_chunk_boundaries_keep_every_row(self, monkeypatch, num_states):
+        """Packing runs in row chunks through one reused buffer; a partial last chunk or a stale
+        buffer row must not drop, shift or leak rows. Chunks of 3 put 5, 6 and 7 rows on each side
+        of a boundary; the reference is the unchunked ``pad``-then-``packbits`` expression.
+        """
+        monkeypatch.setattr("rqutils.paulis.symplectic._PACK_ROWS", 3)
+        rng = np.random.default_rng(20260927 + num_states)
+        states = rng.integers(0, 2, size=(num_states, 9), dtype=np.uint8)
+        expected = np.packbits(np.pad(states, ((0, 0), (1, 0))), axis=1)
+        assert np.array_equal(PauliSumXZ.pack_states(states), expected)
+
     @pytest.mark.parametrize("num_qubits", [1, 4, 7, 8, 9, 16, 17])
     def test_unpack_states_inverts_pack_states(self, num_qubits):
         """The ``+1`` offset must agree between the two directions, or the round trip shifts."""
