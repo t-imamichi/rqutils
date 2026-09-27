@@ -536,6 +536,15 @@ plausible value inside code that looks correct, and this library's data reaches 
   dropping the complex set fails 8 tests. **Rule: never reduce a complex array to a truth value; compare
   first (`!= 0`, `.imag != 0`), or reduce on the host with numpy.**
 
+* **`jnp.asarray` of a numpy array or view does not snapshot it: mutating the source afterwards can race the
+  transfer.** The host-to-device copy is asynchronous, so writing into the numpy array before the device
+  array is ready can change what the device computes on. Measured building `sqd(matvec="ell")`: factor
+  chunks passed as *views* of `s`, then `s[~valid] = 0` in place, gave wrong factors (max error 53360
+  against 1e-11) in about one suite run in three, and 20–26 corrupt operators in 300 builds. The earlier
+  code was safe only because `np.pad` had handed JAX private copies. **Rule: after `jnp.asarray(x)` (or a
+  jitted call on it), do not write into `x` until the result is `block_until_ready()`, or pass a copy.** No
+  deterministic test catches this; a stress loop of repeated builds compared against the first does.
+
 ---
 
 ## Suggested order

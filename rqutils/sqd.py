@@ -507,8 +507,8 @@ def sqd(
     unconditionally, so the two are aligned by construction.
 
     ``matvec`` names the matrix-vector kernel: ``"onthefly"`` caches nothing, ``"indices"`` caches
-    the per-group source indices, ``"tables"`` caches the source indices and the diagonals, and
-    ``"pairs"``/``"csr"``/``"ell"`` store only the transitions inside the subspace.
+    the per-group source indices, ``"tables"`` caches the source indices and the diagonals, and the
+    sparse kernels (see the module documentation) store only the transitions inside the subspace.
 
     Everything after ``states`` is **keyword-only**. It used to be positional-or-keyword, which made
     ``sqd(ham, states, True)`` a valid ``states_size`` of 1 (``True == 1``) rather than the
@@ -616,13 +616,12 @@ def sqd(
             an array that came from ``pack_states``. Note the returned width is *also* wrong in that
             case, which gives a second chance to notice.
         matvec: ``"onthefly"``, ``"indices"`` (default) or ``"tables"``: which of the source indices
-            and diagonals to cache; or ``"pairs"``/``"csr"``/``"ell"``, which store the in-subspace
-            transitions instead. See the module documentation for the resource tradeoff involved.
+            and diagonals to cache; or a sparse kernel, which stores the in-subspace transitions
+            instead. See the module documentation for the kernels and their resource tradeoff.
 
-            ``"pairs"``, ``"csr"`` and ``"ell"`` are built on the host before the solve (logged as
-            their own phase), with the entry count rounded up to a size class so the solve recompiles
-            per class rather than per subspace; ``"ell"``'s class is its set of degree widths plus a
-            piece count per width. Single-device only for now.
+            A sparse ``matvec`` is built on the host before the solve (logged as its own phase),
+            its array shapes rounded up to size classes so the solve recompiles per class rather
+            than per subspace. Single-device only for now.
         prefilter: ``(degree, cycles)`` Chebyshev prefilter, forwarded verbatim to
             :func:`rqutils.ground_locg.ground_locg` -- see its docstring for the semantics, the cost
             and the knob-choosing guidance. Validated by
@@ -685,8 +684,8 @@ def sqd(
             criterion; if ``atol`` is below the achievable eigen-residual floor
             :math:`4\,\varepsilon\sum_k|c_k|` **while** ``rtol`` is zero, so no arm can fire; or if
             ``rtol`` is at least 0.5, where its bound reaches :math:`\|H\|_2` and any vector would
-            report convergence; if ``matvec`` is not a kernel name; if ``matvec`` is ``"pairs"``,
-            ``"csr"`` or ``"ell"`` under a mesh, or their operator reaches :math:`2^{31}` entries.
+            report convergence; if ``matvec`` is not a kernel name; if a sparse ``matvec`` is used
+            under a mesh, or its operator reaches :math:`2^{31}` entries.
         TypeError: If ``matvec`` is not a ``str``, or ``prefilter`` is neither None nor a
             ``(degree, cycles)`` pair of ints.
     """
@@ -1035,8 +1034,8 @@ def run_sqd(
             cached). :func:`sqd` turns it on and raises on the result.
 
     Raises:
-        ValueError: If ``matvec`` is ``"pairs"``, ``"csr"`` or ``"ell"``, which only :func:`sqd` can
-            build.
+        ValueError: If ``matvec`` is a sparse kernel (see the module documentation), which only
+            :func:`sqd` can build.
     """
     # Static, so this runs once per trace; sqd validates too, and this covers direct poc/ callers.
     _check_matvec(matvec)
@@ -1214,11 +1213,7 @@ def _size_class(chunks: int) -> int:
 
 
 def _check_entries(count: int) -> None:
-    """Raise if a sparse operator's ``count`` entries reach :math:`2^{31}`, past int32 indexing.
-
-    Raises:
-        ValueError: If ``count`` exceeds :math:`2^{31} - 1`.
-    """
+    """Raise ValueError if ``count`` entries reach :math:`2^{31}`, past int32 indexing."""
     if count > _MAX_STATES:
         raise ValueError(
             f"the sparse operator has {count} entries, beyond the 2^31 - 1 addressable with int32 "
@@ -1230,7 +1225,7 @@ def _padded(count: int, fill: int) -> np.ndarray:
     """A flat int32 array of ``count`` entries rounded up to whole chunks of a size class, all ``fill``.
 
     Raises:
-        ValueError: If ``count`` reaches :math:`2^{31}`, past the int32 indices the entries are stored in.
+        ValueError: See :func:`_check_entries`.
     """
     _check_entries(count)
     return np.full(_size_class(-(-count // _CHUNK)) * _CHUNK, fill, dtype=np.int32)
@@ -1275,13 +1270,43 @@ def _flat_factors(
 
     A fixed chunk shape, so it compiles once per coefficient dtype rather than per bucket shape.
     """
-    count = len(t)
-    t, s, g = (np.pad(a, (0, -count % _CHUNK)).reshape(-1, 1, _CHUNK) for a in (t, s, g))
-    chunks = [
-        _entry_factors(*(jnp.asarray(a[k]) for a in (t, s, g)), z, c, states, kmax)
-        for k in range(len(t))
-    ]
-    return jnp.concatenate(chunks, axis=None)[:count]
+    out = []
+    for k in range(0, len(t), _CHUNK):
+        chunk = [a[k : k + _CHUNK] for a in (t, s, g)]
+        n = len(chunk[0])
+        if n < _CHUNK:
+            chunk = [np.pad(a, (0, _CHUNK - n)) for a in chunk]
+        f = _entry_factors(*(jnp.asarray(a[None]) for a in chunk), z, c, states, kmax)
+        out.append(f[0, :n])
+    return jnp.concatenate(out)
+
+
+def _sort_by_target(
+    pairs: dict[int, tuple[np.ndarray, np.ndarray]],
+    subset: list[int],
+    size: int,
+    alloc: Callable[[int], list[np.ndarray]],
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """Counting-sort ``subset``'s transitions, both directions, by target into ``alloc(count)``.
+
+    ``alloc`` returns arrays for ``(target, source, group)`` or ``(source, group)``. A row occurs at
+    most once per group, so each group's fill is conflict-free (``poc/sparse-pairs.md``, section 2);
+    each group is popped from ``pairs`` once written. Returns the arrays and each row's end offset.
+    """
+    end = np.zeros(size + 1, np.int64)
+    for g in subset:
+        for rows in pairs[g]:
+            end[rows + 1] += 1
+    np.cumsum(end, out=end)
+    out = alloc(int(end[-1]))
+    for g in subset:
+        i, j = pairs.pop(g)
+        for target, source in ((i, j), (j, i)):
+            pos = end[target]
+            for array, value in zip(out, (target, source, g)[-len(out) :]):
+                array[pos] = value
+            end[target] += 1
+    return out, end[:-1]
 
 
 def _ell_buckets(
@@ -1298,20 +1323,10 @@ def _ell_buckets(
     Raises:
         ValueError: If the padded slot count reaches :math:`2^{31}` -- see :func:`_check_entries`.
     """
-    deg = np.zeros(size, np.int32)
-    for g in subset:
-        for rows in pairs[g]:
-            deg[rows] += 1  # a row occurs at most once per group
-    pos = np.cumsum(deg, dtype=np.int64) - deg  # row starts, advanced to row ends by the fill
-    src = np.empty(int(deg.sum(dtype=np.int64)), np.int32)
-    grp = np.empty_like(src)
-    for g in subset:
-        i, j = pairs.pop(g)
-        for target, source in ((i, j), (j, i)):
-            p = pos[target]
-            src[p], grp[p] = source, g
-            pos[target] += 1
-    pos -= deg
+    (src, grp), end = _sort_by_target(
+        pairs, subset, size, lambda count: [np.empty(count, np.int32) for _ in range(2)]
+    )
+    deg = np.diff(end, prepend=0)
     width = np.where(deg > 0, _ELL_WIDTHS[np.searchsorted(_ELL_WIDTHS, deg)], 0)
     # Rows per piece fixed per width and pieces size-classed, so shapes come from a bounded set.
     plan = []
@@ -1321,34 +1336,32 @@ def _ell_buckets(
         plan.append((w, per, _size_class(-(-len(rows) // per)), rows))
     del width
     _check_entries(sum(w * per * pieces for w, per, pieces, _ in plan))
+    pos = (end - deg).astype(np.int32)  # row starts
+    del end
     buckets = []
     for w, per, pieces, rows in plan:
+        pad = (0, pieces * per - len(rows))
         # Padding rows repeat a real row with no entries: a dummy output slot costs two (2, N) copies.
-        r = np.full(pieces * per, rows[0], np.int32)
-        r[: len(rows)] = rows
-        count = np.zeros(pieces * per, np.int32)
-        count[: len(rows)] = deg[rows]
-        valid = np.arange(w) < count[:, None]
-        slot = np.where(valid, pos[r][:, None] + np.arange(w), 0)
-        s, g = src[slot], grp[slot]
-        del slot
-        t = np.broadcast_to(r[:, None], valid.shape)
+        r = np.pad(rows, pad, constant_values=rows[0]).reshape(pieces, per)
+        lane = np.arange(w, dtype=np.int32)
+        valid = lane < np.pad(deg[rows], pad).reshape(pieces, per, 1)
+        slot = np.where(valid, pos[r][..., None] + lane, 0)
         # An empty slot gets source = target, which _entry_factors' t == s rule zeroes.
-        fac = _flat_factors(
-            t.ravel(), np.where(valid, s, t).ravel(), g.ravel(), z, c_set, states_u, kmax
-        )
-        del t, g
+        s, g = np.where(valid, src[slot], r[..., None]), grp[slot]
+        del slot
+        fac = _flat_factors(np.repeat(r, w), s.ravel(), g.ravel(), z, c_set, states_u, kmax)
+        del g
+        fac.block_until_ready()  # the host-to-device copies of s are asynchronous
         s[~valid] = 0
         del valid
-        buckets += [jnp.asarray(r.reshape(pieces, per)), jnp.asarray(s.reshape(pieces, per, w))]
-        buckets.append(fac.reshape(pieces, per, w))
+        buckets += [jnp.asarray(r), jnp.asarray(s), fac.reshape(s.shape)]
     return buckets
 
 
 def _sparse_operator(
     hamiltonian: PauliSumXZ, states_u: StateList, matvec: SparseMatvec
 ) -> tuple[jax.Array, ...]:
-    """Build the ``"pairs"``, ``"csr"`` or ``"ell"`` operator arrays on the host, one X group's search at a time.
+    """Build a sparse ``matvec``'s operator arrays on the host, one X group's search at a time.
 
     Returns ``(d0, i, j, d)`` for ``"pairs"`` and ``(d0, rt, rs, rd, qt, qs, qd)`` for ``"csr"``, each
     entry array ``(chunks, _CHUNK)``; ``r``/``q`` are the real-coefficient groups (float64 factors)
@@ -1359,7 +1372,7 @@ def _sparse_operator(
     row's degree, and padding rows, have source 0 and factor 0.
 
     Raises:
-        ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_padded`.
+        ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_check_entries`.
     """
     size = states_u.shape[0]
     z, c = jnp.asarray(hamiltonian.z), jnp.asarray(hamiltonian.c)
@@ -1401,22 +1414,9 @@ def _sparse_operator(
         if matvec == "ell":
             arrays += _ell_buckets(pairs, subset, size, z, c_set, states_u, kmax)
             continue
-        # Counting sort by target straight into padded chunks: a row occurs at most once per group,
-        # so each group's fill is conflict-free (poc/sparse-pairs.md, section 2).
-        start = np.zeros(size + 1, np.int64)
-        for g in subset:
-            i, j = pairs[g]
-            start[i + 1] += 1
-            start[j + 1] += 1
-        np.cumsum(start, out=start)
-        host = [_padded(int(start[-1]), fill) for fill in (size - 1, size - 1, 0)]
-        for g in subset:
-            i, j = pairs.pop(g)
-            for target, source in ((i, j), (j, i)):
-                pos = start[target]
-                host[0][pos], host[1][pos], host[2][pos] = target, source, g
-                start[target] += 1
-        del start
+        host = _sort_by_target(
+            pairs, subset, size, lambda count: [_padded(count, f) for f in (size - 1, size - 1, 0)]
+        )[0]
         arrays += on_device(host, c_set)
     return tuple(arrays)
 
@@ -1902,8 +1902,8 @@ def apply_h(
     r"""Return :math:`Hv`, naming the per-X-group inputs so a mispairing cannot be expressed.
 
     Name the per-X-group arrays you have and the kernel follows from them. Exactly three input sets
-    are accepted, one per dense :func:`sqd` ``matvec``; ``"pairs"``/``"csr"``/``"ell"`` are
-    ``sqd``-only:
+    are accepted, one per dense :func:`sqd` ``matvec``; the sparse kernels (see the module
+    documentation) are ``sqd``-only:
 
     .. code-block:: python
 

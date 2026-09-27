@@ -22,9 +22,7 @@ from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import (
     _CHUNK,
     _ELL_WIDTHS,
-    _apply_csr,
-    _apply_ell,
-    _apply_pairs,
+    _SPARSE_APPLY,
     _is_lex_sorted,
     _pack_scanned,
     _pack_state_keys,
@@ -753,7 +751,25 @@ def sparse_fixture(kind, rng):
     return strings, rng.normal(size=len(strings)), states[:20]
 
 
-APPLY_SPARSE = {"pairs": _apply_pairs, "csr": _apply_csr, "ell": _apply_ell}
+def sparse_operator_of(h, states, states_size, matvec):
+    """``(states_u, operator)`` for unpacked ``states``, through :func:`sqd`'s own pipeline."""
+    states_u = uniquify_states(_pad_states(pack_padded(states), states_size), states_size)
+    return states_u, _sparse_operator(h, states_u, matvec)
+
+
+def assert_matches_indices(apply, operator, h, states_u, num_states, rng):
+    """``apply`` against ``"indices"``' product on an ``(N,)`` and a ``(2, N)`` vector."""
+    xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in h.x])
+    size = states_u.shape[0]
+    vec = rng.normal(size=(2, size)) + 1j * rng.normal(size=(2, size))
+    # Zero on fillers, as every solver vector is: there the dense identity group gathers the
+    # first filler's entry rather than its own, a difference nothing can observe.
+    vec[:, num_states:] = 0.0
+    for v in (vec[0], vec):  # width-agnostic: (N,) and (k, N)
+        want = apply_h(v, states=states_u, xsources=xsources, zsignatures=h.z, coeffs=h.c)
+        got = apply(jnp.asarray(v), *operator)  # private: the solver passes jax arrays
+        assert got.shape == v.shape
+        assert np.abs(np.asarray(got) - np.asarray(want)).max() < 1e-11
 
 
 class TestSparseKernels:
@@ -778,8 +794,7 @@ class TestSparseKernels:
             "fixture must be exactly states_size=20 so that arm is filler-free"
         )
         h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        states_u = uniquify_states(_pad_states(pack_padded(states), states_size), states_size)
-        operator = _sparse_operator(h, states_u, matvec)
+        states_u, operator = sparse_operator_of(h, states, states_size, matvec)
 
         real = ~np.any(np.asarray(h.c).imag != 0, axis=1)[1:]
         expect = {
@@ -802,18 +817,7 @@ class TestSparseKernels:
             if matvec == "ell":
                 assert len(operator) == 1, "zero entries is no bucket"
             assert all(a.shape == (1, _CHUNK) for a in operator[1:]), "zero entries is one chunk"
-
-        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in h.x])
-        apply = APPLY_SPARSE[matvec]
-        vec = rng.normal(size=(2, states_size)) + 1j * rng.normal(size=(2, states_size))
-        # Zero on fillers, as every solver vector is: there the dense identity group gathers the
-        # first filler's entry rather than its own, a difference nothing can observe.
-        vec[:, len(states) :] = 0.0
-        for v in (vec[0], vec):  # width-agnostic: (N,) and (k, N)
-            want = apply_h(v, states=states_u, xsources=xsources, zsignatures=h.z, coeffs=h.c)
-            got = apply(jnp.asarray(v), *operator)  # private: the solver passes jax arrays
-            assert got.shape == v.shape
-            assert np.abs(np.asarray(got) - np.asarray(want)).max() < 1e-11
+        assert_matches_indices(_SPARSE_APPLY[matvec], operator, h, states_u, len(states), rng)
 
     @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
     @pytest.mark.parametrize("kind", KINDS)
@@ -833,39 +837,34 @@ class TestSparseKernels:
             assert chunks <= size < chunks * 1.125 + 1
             assert size < 16 or 8 <= size >> shift < 16
 
-    @pytest.mark.parametrize("matvec", ["pairs", "csr"])  # "ell": TestEllKernel
-    def test_one_size_class_compiles_once(self, matvec, monkeypatch):
-        """Two subspaces with different entry counts in one class share the jitted solve."""
+    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
+    def test_one_shape_class_compiles_once(self, matvec, monkeypatch):
+        """Two subspaces with different entry counts but equal operator shapes share the solve."""
         import rqutils.sqd as sqd_module
 
-        monkeypatch.setattr(sqd_module, "_CHUNK", 1)  # one entry per chunk: counts are chunk counts
-        rng = np.random.default_rng(5)
-        strings = real_pauli_strings(6, 10, rng)
-        h = PauliSumXZ.from_paulisum((strings, rng.normal(size=len(strings)).tolist()))
-        states = unique_states(40, 6, rng)[:32]
-
-        def entries(rows):
-            states_u = uniquify_states(_pad_states(pack_padded(rows), 32), 32)
-            operator = _sparse_operator(h, states_u, matvec)
-            return int(np.count_nonzero(np.asarray(operator[1]) != np.asarray(operator[2]))), rows
-
-        by_class = {}
-        for keep in range(16, 33):
-            count, rows = entries(states[:keep])
-            by_class.setdefault(_size_class(count), {}).setdefault(count, rows)
-        # Two distinct counts in one class, and a subspace from any other class as the control.
-        shared = next(size for size, rows in by_class.items() if len(rows) >= 2)
-        first, second = list(by_class[shared].values())[:2]
-        other = next(next(iter(rows.values())) for size, rows in by_class.items() if size != shared)
+        monkeypatch.setattr(sqd_module, "_CHUNK", 16)  # so "pairs"/"csr" span several chunks too
+        strings, coeffs, states = ell_fixture(np.random.default_rng(20260927))
+        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_size = 64  # ell_fixture has 43 states
+        by_shapes = {}
+        for keep in range(20, len(states) + 1):
+            _, operator = sparse_operator_of(h, states[:keep], states_size, matvec)
+            entries = sum(int(np.count_nonzero(np.asarray(f))) for f in operator[3::3])
+            shapes = tuple(a.shape for a in operator)
+            by_shapes.setdefault(shapes, {}).setdefault(entries, states[:keep])
+        shared = next(shapes for shapes, rows in by_shapes.items() if len(rows) >= 2)
+        (count_a, first), (count_b, second) = list(by_shapes[shared].items())[:2]
+        assert count_a != count_b, f"the pair must differ in entry count: {count_a}, {count_b}"
+        other = next(next(iter(rows.values())) for s, rows in by_shapes.items() if s != shared)
 
         def compiles(rows):
             before = sqd_module._run_sparse._cache_size()
-            sqd(h, rows, states_size=32, return_eigvec=False, matvec=matvec)
+            sqd(h, rows, states_size=states_size, return_eigvec=False, matvec=matvec)
             return sqd_module._run_sparse._cache_size() - before
 
         compiles(first)
-        assert compiles(second) == 0, "a second subspace in the same size class recompiled"
-        assert compiles(other) == 1, "control: a different size class must compile afresh"
+        assert compiles(second) == 0, "a second subspace with the same operator shapes recompiled"
+        assert compiles(other) == 1, "control: different operator shapes must compile afresh"
 
     def test_entry_count_guard(self):
         """Raises before allocating: the passing side is every sparse solve in this file."""
@@ -894,7 +893,7 @@ def ell_fixture(rng):
 
 
 class TestEllKernel:
-    """What is specific to ``"ell"``: degree classes, padded slots, padding rows, the compile set.
+    """What is specific to ``"ell"``: degree classes, padded slots and padding rows.
 
     A degree rounded *down* drops a row's last entries, and a padding row given its real row's
     factors adds that row again; both keep every internal path self-consistent, so the product is
@@ -902,12 +901,6 @@ class TestEllKernel:
     """
 
     STATES_SIZE = 64  # the fixture has 43 states, so 21 filler rows
-
-    def operator(self, strings, coeffs, states):
-        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        padded = _pad_states(pack_padded(states), self.STATES_SIZE)
-        states_u = uniquify_states(padded, self.STATES_SIZE)
-        return h, states_u, _sparse_operator(h, states_u, "ell")
 
     @pytest.mark.parametrize("chunk", [None, 8])
     def test_product_matches_indices(self, chunk, monkeypatch):
@@ -918,7 +911,8 @@ class TestEllKernel:
             monkeypatch.setattr(sqd_module, "_CHUNK", chunk)
         rng = np.random.default_rng(20260927)
         strings, coeffs, states = ell_fixture(rng)
-        h, states_u, operator = self.operator(strings, coeffs, states)
+        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_u, operator = sparse_operator_of(h, states, self.STATES_SIZE, "ell")
         xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in h.x])
 
         # Degrees from the search alone, per coefficient set, to show the fixture reaches each case.
@@ -933,41 +927,9 @@ class TestEllKernel:
         assert any(b[0].size > np.unique(np.asarray(b[0])).size for b in buckets), "no padding row"
         if chunk is not None:
             assert any(b[0].shape[0] > 1 for b in buckets), "no bucket spans several pieces"
-
-        vec = rng.normal(size=(2, self.STATES_SIZE)) + 1j * rng.normal(size=(2, self.STATES_SIZE))
-        vec[:, len(states) :] = 0.0
-        for v in (vec[0], vec):
-            want = apply_h(v, states=states_u, xsources=xsources, zsignatures=h.z, coeffs=h.c)
-            got = _apply_ell(jnp.asarray(v), *operator)
-            assert got.shape == v.shape
-            assert np.abs(np.asarray(got) - np.asarray(want)).max() < 1e-11
+        assert_matches_indices(_SPARSE_APPLY["ell"], operator, h, states_u, len(states), rng)
 
     def test_sqd_energy_matches_indices(self):
         strings, coeffs, states = ell_fixture(np.random.default_rng(20260927))
         want = eigval_of(strings, coeffs, states, matvec="indices")
         assert eigval_of(strings, coeffs, states, matvec="ell") == pytest.approx(want, abs=1e-10)
-
-    def test_one_grid_class_compiles_once(self):
-        """Two subspaces with different operators but the same widths and piece classes share the solve."""
-        import rqutils.sqd as sqd_module
-
-        strings, coeffs, states = ell_fixture(np.random.default_rng(20260927))
-        by_shapes = {}
-        for keep in range(20, len(states) + 1):
-            _, _, operator = self.operator(strings, coeffs, states[:keep])
-            shapes = tuple((a.shape, np.asarray(a).dtype.str) for a in operator)
-            entries = sum(int(np.count_nonzero(np.asarray(fac))) for fac in operator[3::3])
-            by_shapes.setdefault(shapes, {}).setdefault(entries, states[:keep])
-        shared = next(rows for rows in by_shapes.values() if len(rows) >= 2)
-        first, second = list(shared.values())[:2]
-        other = next(next(iter(rows.values())) for rows in by_shapes.values() if rows is not shared)
-        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-
-        def compiles(rows):
-            before = sqd_module._run_sparse._cache_size()
-            sqd(h, rows, states_size=self.STATES_SIZE, return_eigvec=False, matvec="ell")
-            return sqd_module._run_sparse._cache_size() - before
-
-        compiles(first)
-        assert compiles(second) == 0, "a second subspace in the same grid classes recompiled"
-        assert compiles(other) == 1, "control: different widths must compile afresh"
