@@ -611,9 +611,9 @@ def ground_locg(
             callable must preserve its input's sharding in the output** -- this routine is
             sharding-transparent only through that contract, which is why every ``apply_*`` in
             :mod:`rqutils.sqd` passes ``out_sharding=jax.typeof(vec).sharding``.
-        xinit: Initial vector, or an integer index selecting a one-hot vector (which requires
-            ``vspace`` if ``mat`` is callable). A plain Python ``int`` is accepted. Must have a
-            non-vanishing overlap with :math:`v_0`.
+        xinit: Initial vector of shape ``(N,)``, or an integer index selecting a one-hot vector
+            (which requires ``vspace`` if ``mat`` is callable). A plain Python ``int`` is accepted.
+            Must have a non-vanishing overlap with :math:`v_0`.
         args: Additional arguments to callable ``mat``.
         maxiter: Maximum number of gradient descent iterations.
         atol: **Absolute** bound on the eigen-residual :math:`\|Ax - \theta x\|_2`, holding at
@@ -710,7 +710,7 @@ def ground_locg(
 
             Also if ``batch_matvec`` is set while ``mat`` is an array, rather than silently ignoring
             the flag; if ``prefilter`` runs on a callable ``mat`` with no ``prefilter_hi``; or if a
-            ``prefilter`` entry is negative.
+            ``prefilter`` entry is negative; or if a vector ``xinit`` is not 1-D.
         TypeError: If ``prefilter`` is neither None nor a ``(degree, cycles)`` pair of ints.
     """
     _check_prefilter(prefilter)
@@ -724,6 +724,9 @@ def ground_locg(
                 "selects a one-hot vector, so an out-of-range index yields the zero vector and a "
                 "converged 0.0 rather than an error"
             )
+    elif not jnp.issubdtype(jnp.result_type(xinit), jnp.integer) and jnp.ndim(xinit) != 1:
+        # Otherwise a (N, 1) xinit fails deep in while_loop on a carry-shape mismatch.
+        raise ValueError(f"xinit must be 1-D, got shape {jnp.shape(xinit)}; pass xinit.ravel()")
     if callable(mat):
         return _ground_locg_callable(
             mat,

@@ -1259,6 +1259,22 @@ class TestIntegerXinitRange:
             )
 
 
+class TestXinitMustBe1D:
+    """A ``(N, 1)`` ``xinit`` raised a carry-shape ``TypeError`` from ``while_loop`` since ``90d3947``.
+
+    The stacked norm reduces over ``axis=-1``, so ``(N, 1)`` gave ``(N,)`` norms and a ``(N, N)``
+    carry, an error naming neither ``xinit`` nor its shape. The entry check names both.
+    """
+
+    def test_column_xinit_raises_naming_shape(self):
+        mat = jnp.array(np.diag([1.5, 0.5, -0.5, -1.5]))
+        xinit = jnp.ones((4, 1))
+        with pytest.raises(ValueError, match=r"1-D, got shape \(4, 1\)"):
+            ground_locg(mat, xinit, maxiter=1)
+        with pytest.raises(ValueError, match=r"1-D, got shape \(4, 1\)"):
+            ground_locg(lambda vec: mat @ vec, xinit, maxiter=1)
+
+
 class TestRtolNoneIsDtypeDerived:
     """``rtol=None`` must resolve against the *promoted* dtype, not a hardcoded float64 constant.
 
