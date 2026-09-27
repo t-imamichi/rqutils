@@ -1,6 +1,6 @@
 """The dense kernels, ``"onthefly"``, ``"indices"`` and ``"tables"``, and :func:`apply_h`."""
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import jax
 import jax.core
@@ -11,9 +11,6 @@ from numpy.typing import NDArray
 
 from rqutils.sqd._diagonal import get_diagonal
 from rqutils.sqd._states import StateList, get_xsource
-
-if TYPE_CHECKING:  # annotation only: _solve imports this module
-    from rqutils.sqd._solve import Matvec
 
 # Dtype kind per `apply_h` keyword: `u` packed bytes, `i` positions (-1 = absent), `fc` float or
 # complex. It separates arrays whose shapes collide, (2, 2) at n=15 with 2 states.
@@ -74,7 +71,7 @@ def apply_xgrp(
 
 
 def _pack_scanned(
-    matvec: "Matvec", xgroup: NDArray, diagonal_arg: NDArray, coeffs: NDArray | None
+    matvec: str, xgroup: NDArray, diagonal_arg: NDArray, coeffs: NDArray | None
 ) -> tuple[NDArray, ...]:
     """Lay out the tuple ``_apply_h_kernel`` scans over, for one resolved ``matvec``.
 
@@ -257,7 +254,7 @@ def _apply_h_kernel(
     vec: NDArray[np.inexact],
     scanned: tuple[NDArray, ...],
     states: StateList | None,
-    matvec: "Matvec",
+    matvec: str,
 ) -> jax.Array:
     r"""Return :math:`Hv`, resolving the per-X-group inputs according to the ``matvec`` name.
 

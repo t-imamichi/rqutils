@@ -192,6 +192,7 @@ def run_sqd(
             cached). :func:`sqd` turns it on and raises on the result.
 
     Raises:
+        TypeError: If ``matvec`` is not a :class:`Matvec` member.
         ValueError: If ``matvec`` is a sparse kernel (see the module documentation), which only
             :func:`sqd` can build.
     """
@@ -342,7 +343,9 @@ def _solve(
     if check_residual:
         # Diagonals always recomputed, so no cached one vouches for itself; cached xsources are reused,
         # since redoing the J-fold search was ~90% of the check (NOTES.md, "`EigenpairCheckError`").
-        ref, xgroup = ("onthefly", hamiltonian.x) if xsources is None else ("indices", xsources)
+        ref, xgroup = (
+            (Matvec.ONTHEFLY, hamiltonian.x) if xsources is None else (Matvec.INDICES, xsources)
+        )
         scanned_ref = _pack_scanned(ref, xgroup, hamiltonian.z, hamiltonian.c)
         ax = _apply_h_kernel(eigvec, scanned_ref, states_u, matvec=ref)
         result = result._replace(

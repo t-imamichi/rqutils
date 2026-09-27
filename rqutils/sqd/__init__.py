@@ -131,8 +131,8 @@ the ``-1`` absent marker; :func:`sqd` builds them host-side before the solve, th
 for now, and ``poc/sparse-pairs.md`` has the measurements.
 
 **The source-index setup dominates the solve, so this is not a symmetric memory-for-speed dial:**
-``"onthefly"`` pays the :math:`J`-fold :func:`get_xsource` search once per matvec rather than once per
-solve. Prefer ``"indices"`` or ``"tables"`` unless the memory genuinely will not fit (``NOTES.md``,
+``Matvec.ONTHEFLY`` pays the :math:`J`-fold :func:`get_xsource` search once per matvec rather than once
+per solve. Prefer ``Matvec.INDICES`` or ``Matvec.TABLES`` unless the memory genuinely will not fit (``NOTES.md``,
 "``sqd``: ``get_xsource`` setup dominates a solve"; ``markdown/scaling-pocs.md``).
 
 Distributed arrays and scaling limits

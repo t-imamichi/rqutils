@@ -119,8 +119,8 @@ def sqd(
     spurious (fill-in) entries. ``PauliSumXZ`` reserves the same bit in its signatures
     unconditionally, so the two are aligned by construction.
 
-    ``matvec`` names the matrix-vector kernel: ``"onthefly"`` caches nothing, ``"indices"`` caches
-    the per-group source indices, ``"tables"`` caches the source indices and the diagonals, and the
+    ``matvec`` names the matrix-vector kernel: ``Matvec.ONTHEFLY`` caches nothing, ``INDICES`` the
+    per-group source indices, ``TABLES`` the source indices and the diagonals, and the
     sparse kernels (see the module documentation) store only the transitions inside the subspace.
 
     Everything after ``states`` is **keyword-only** (``NOTES.md``, "sqd.sqd: why keyword-only").
@@ -186,9 +186,9 @@ def sqd(
             It is a declaration, and a wrong one is not always caught: at ``num_qubits == 1`` the two
             widths coincide, so unpacked states with ``packed=True`` silently return a different
             eigenvalue (and a wrong-width basis). Every other qubit count is rejected on width.
-        matvec: ``"onthefly"``, ``"indices"`` (default) or ``"tables"``: which of the source indices
-            and diagonals to cache; or a sparse kernel, which stores the in-subspace transitions
-            instead. See the module documentation for the kernels and their resource tradeoff.
+        matvec: A :class:`Matvec` member: ``ONTHEFLY``, ``INDICES`` (default) or ``TABLES``, which
+            of the source indices and diagonals to cache; or a sparse kernel, which stores the
+            in-subspace transitions instead. See the module documentation for the kernels and their resource tradeoff.
 
             A sparse ``matvec`` is built on the host before the solve (logged as its own phase),
             its array shapes rounded up to size classes so the solve recompiles per class rather
@@ -239,10 +239,10 @@ def sqd(
             **while** ``rtol`` is zero; or if ``rtol`` is at least 0.5, where any vector would report
             convergence.
 
-            If ``matvec`` is not a kernel name; if a sparse ``matvec`` is used under a mesh, or its
+            If a sparse ``matvec`` is used under a mesh, or its
             operator reaches :math:`2^{31}` entries.
-        TypeError: If ``matvec`` is not a ``str``; if ``prefilter`` is neither None nor a
-            ``(degree, cycles)`` pair of ints; or if ``atol`` is not a real number, or ``rtol``
+        TypeError: If ``matvec`` is not a :class:`Matvec` member, a plain string included; if
+            ``prefilter`` is neither None nor a ``(degree, cycles)`` pair of ints; or if ``atol`` is not a real number, or ``rtol``
             neither None nor one.
     """
     hamiltonian, states_p, states_size = _sqd_inputs(
@@ -271,8 +271,8 @@ def _sqd_inputs(
     _check_matvec(matvec)
     if matvec in _SPARSE_MATVECS and not get_abstract_mesh().empty:
         raise ValueError(
-            f"matvec={matvec!r} is single-device for now; call sqd outside the mesh context, or use "
-            "a dense kernel (onthefly, indices, tables) for a sharded solve"
+            f"matvec=Matvec.{matvec.name} is single-device for now; call sqd outside the mesh "
+            "context, or use Matvec.ONTHEFLY, INDICES or TABLES for a sharded solve"
         )
     _check_prefilter(prefilter)
     if states_size is None:
@@ -318,7 +318,7 @@ def _solve_sqd(
     atol: float,
     rtol: float | None,
     prefilter: tuple[int, int] | None,
-) -> "SqdResult":
+) -> SqdResult:
     """Build a sparse operator if ``matvec`` names one, then solve with the residual check on."""
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
@@ -345,7 +345,7 @@ def _solve_sqd(
 
 
 def _checked_eigval(
-    result: "SqdResult", hamiltonian: PauliSumXZ, maxiter: int, atol: float, rtol: float | None
+    result: SqdResult, hamiltonian: PauliSumXZ, maxiter: int, atol: float, rtol: float | None
 ) -> float:
     """The eigenvalue as a host float, after raising on non-convergence or a failed residual check."""
     eigval = float(_host_scalar(result.eigval))
@@ -384,7 +384,7 @@ def _checked_eigval(
 
 
 def _eigvec_and_basis(
-    result: "SqdResult", hamiltonian: PauliSumXZ, packed: bool
+    result: SqdResult, hamiltonian: PauliSumXZ, packed: bool
 ) -> tuple[np.ndarray, np.ndarray]:
     """The eigenvector and the basis it is expressed in, packed exactly when the input was."""
     eigvec, states_u, subspace_dim = result.eigvec, result.states, result.subspace_dim

@@ -105,7 +105,9 @@ def main() -> None:
     parser.add_argument("--num-qubits", type=int, default=30)
     parser.add_argument("--sizes", type=int, nargs="+", default=[100_000, 1_000_000])
     parser.add_argument("--patterns", nargs="+", default=["type1", "type2", "type3", "type4"])
-    parser.add_argument("--matvecs", nargs="+", default=["indices", "tables"])
+    parser.add_argument(
+        "--matvecs", type=Matvec, nargs="+", default=[Matvec.INDICES, Matvec.TABLES]
+    )
     parser.add_argument("--deltas", type=float, nargs="+", default=list(DELTAS))
     parser.add_argument(
         "--dense-check", type=int, default=0, help="N for a dense cross-check instead"
@@ -145,7 +147,7 @@ def main() -> None:
                 sum_c = float(np.abs(ham.coeffs).sum())
                 for matvec in args.matvecs:
                     t0 = time.perf_counter()
-                    eigval = sqd(ham, states, return_eigvec=False, matvec=Matvec(matvec))
+                    eigval = sqd(ham, states, return_eigvec=False, matvec=matvec)
                     seconds = time.perf_counter() - t0
                     residual, threshold = handler.take()
                     print(

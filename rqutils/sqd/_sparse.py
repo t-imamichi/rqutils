@@ -279,7 +279,7 @@ def _apply_ell(vec: jax.Array, d0: jax.Array, *buckets: jax.Array) -> jax.Array:
     return out
 
 
-_SPARSE_APPLY = {"pairs": _apply_pairs, "csr": _apply_csr, "ell": _apply_ell}
+_SPARSE_APPLY = {Matvec.PAIRS: _apply_pairs, Matvec.CSR: _apply_csr, Matvec.ELL: _apply_ell}
 
 
 @jax.jit(static_argnames=_SOLVE_STATIC)

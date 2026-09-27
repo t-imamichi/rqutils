@@ -62,7 +62,6 @@ import numpy as np
 from _scaling_common import header, init_devices, make_1d_mesh, make_problem
 
 from rqutils.sqd import Matvec, hproj, sqd
-from rqutils.sqd._solve import _SPARSE_MATVECS
 
 
 def check_single_vs_sharded():
@@ -127,7 +126,8 @@ def check_all_matvecs(problem, eig_dense):
     print(
         f"  {'matvec':>12s}  {'single':>16s}  {'sharded':>16s}  {'|s-1dev|':>10s}  {'|s-dense|':>10s}"
     )
-    for matvec in [m for m in Matvec if m not in _SPARSE_MATVECS]:  # sparse ones raise under a mesh
+    # The sparse kernels raise under a mesh.
+    for matvec in (Matvec.ONTHEFLY, Matvec.INDICES, Matvec.TABLES):
         single = float(sqd(p.hamiltonian, p.states, return_eigvec=False, matvec=matvec))
         with jax.set_mesh(mesh):
             sharded = float(sqd(p.hamiltonian, p.states, return_eigvec=False, matvec=matvec))
