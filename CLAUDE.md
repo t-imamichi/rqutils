@@ -260,7 +260,7 @@ Five reasons a mutant survives that are *not* missing coverage:
 
 ## Architecture
 
-Eight modules under `rqutils/`, largely independent: only `sqd.py → {paulis/symplectic.py,
+Eight modules under `rqutils/`, largely independent: only `sqd/ → {paulis/symplectic.py,
 ground_locg.py}` and `qprint.py → paulis/general.py` couple them. `_types.py` and `math.py` are support.
 
 ### Two unrelated Pauli representations — do not confuse them
@@ -288,7 +288,7 @@ ingest). Terms are grouped by unique X signature, Z groups zero-padded to a rect
 - **A complex coefficient raises** (non-Hermitian); there is no `force_real` flag and none could work.
   Check `.c.dtype` if you need float64.
 
-### `sqd.py` — sample-based quantum diagonalization
+### `sqd/` — sample-based quantum diagonalization
 
 Project a Pauli-sum Hamiltonian onto the subspace spanned by computational-basis bitstrings and solve
 matrix-free. `sqd(...)` is the entry point, `hproj(...)` the dense/debug path — and `hproj` **raises under
@@ -398,7 +398,7 @@ extra O(N) reduction to learn that. Nor can 2 drop to 1 — a well-conditioned f
 apart, but `TestProjectOut` fails at once.
 
 **Sharding-transparent only if the `mat` callable preserves output sharding** — that contract is why
-every `apply_*` in `sqd.py` passes `out_sharding=jax.typeof(vec).sharding`.
+every `apply_*` in `sqd/` passes `out_sharding=jax.typeof(vec).sharding`.
 
 **Convergence is `‖r‖ < max(atol, rtol·(‖Ax‖ + |θ|))`** — either arm suffices.
 
@@ -460,8 +460,8 @@ pair as unsatisfiable; a direct `ground_locg` call does not validate, which is w
 instrument.
 
 **A validator belongs in the module that owns the gate it compensates for.** `_check_prefilter` and
-`_check_tols` live here, not in `sqd.py`, because this module holds the branches that would otherwise
-absorb a malformed value silently. `sqd.py` imports them — and is the caller for `_check_tols`, being the
+`_check_tols` live here, not in `sqd/`, because this module holds the branches that would otherwise
+absorb a malformed value silently. `sqd/` imports them — and is the caller for `_check_tols`, being the
 outermost point where `Σ|c_k|` is concrete (`run_sqd` is jitted, and a traced value cannot raise).
 
 ### `svsim.py`

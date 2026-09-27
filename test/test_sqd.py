@@ -949,9 +949,9 @@ class TestEigenpairCheck:
     """
 
     def test_a_sign_flipped_eigenvector_raises_the_subclass(self, monkeypatch):
-        import rqutils.sqd as sqd_module
+        import rqutils.sqd._solve as solve_module
 
-        real = sqd_module.ground_locg
+        real = solve_module.ground_locg
 
         def flipped(*args, **kwargs):
             eigval, eigvec, iters, converged = real(*args, **kwargs)
@@ -962,7 +962,7 @@ class TestEigenpairCheck:
         strings = real_pauli_strings(6, 8, rng)
         coeffs = rng.normal(size=len(strings))
         states = unique_states(20, 6, rng)
-        monkeypatch.setattr(sqd_module, "ground_locg", flipped)
+        monkeypatch.setattr(solve_module, "ground_locg", flipped)
         run_sqd.clear_cache()  # `ground_locg` is read at trace time
         try:
             with pytest.raises(EigenpairCheckError) as excinfo:

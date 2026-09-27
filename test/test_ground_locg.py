@@ -261,7 +261,7 @@ class TestEigenpair3x3:
         """Item I1: at shift 1e9 the radicand under ``sqrt`` went negative and returned NaN.
 
         Not an exotic input -- this is the ordinary case for a physical Hamiltonian, which is rarely
-        traceless, and is exactly what ``sqd.py`` feeds this solver.
+        traceless, and is exactly what ``rqutils.sqd`` feeds this solver.
         """
         mat = np.diag([1.0, 2.0, 3.0]) + 1e9 * np.eye(3)
         eigval, eigvec = eigenpair_3x3(jnp.asarray(mat))
@@ -603,7 +603,7 @@ class TestZeroResidualAfterSeedStep:
     selecting the null direction and collapsing theta towards 0 rather than reporting the correct
     Rayleigh quotient.
 
-    This is not a contrived corner case: ``sqd.py`` seeds ``vinit`` as an exact one-hot vector at the
+    This is not a contrived corner case: ``rqutils.sqd`` seeds ``vinit`` as an exact one-hot vector at the
     minimum-diagonal index whenever the Hamiltonian is diagonal (``jnp.all(hamiltonian.x[0] == 0)``),
     which is exactly this input shape -- a one-hot vector against a diagonal operator is an exact
     eigenvector, giving an exactly-zero residual after the seed step.

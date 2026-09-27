@@ -19,6 +19,8 @@ help:
 html: Makefile
 	sphinx-apidoc -f -e --automodule-options "show-inheritance" --no-toc -o $(SOURCEDIR)/apidoc ../rqutils/
 	rm $(SOURCEDIR)/apidoc/rqutils.rst
+# rqutils.sqd's submodules are all private: keep the module page, not the package one's :members:.
+	printf 'rqutils.sqd module\n==================\n\n.. automodule:: rqutils.sqd\n   :show-inheritance:\n' > $(SOURCEDIR)/apidoc/rqutils.sqd.rst
 	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 
 clean: Makefile

@@ -840,9 +840,9 @@ class TestSparseKernels:
     @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
     def test_one_shape_class_compiles_once(self, matvec, monkeypatch):
         """Two subspaces with different entry counts but equal operator shapes share the solve."""
-        import rqutils.sqd as sqd_module
+        import rqutils.sqd._sparse as sparse_module
 
-        monkeypatch.setattr(sqd_module, "_CHUNK", 16)  # so "pairs"/"csr" span several chunks too
+        monkeypatch.setattr(sparse_module, "_CHUNK", 16)  # so "pairs"/"csr" span several chunks too
         strings, coeffs, states = ell_fixture(np.random.default_rng(20260927))
         h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_size = 64  # ell_fixture has 43 states
@@ -858,9 +858,9 @@ class TestSparseKernels:
         other = next(next(iter(rows.values())) for s, rows in by_shapes.items() if s != shared)
 
         def compiles(rows):
-            before = sqd_module._run_sparse._cache_size()
+            before = sparse_module._run_sparse._cache_size()
             sqd(h, rows, states_size=states_size, return_eigvec=False, matvec=matvec)
-            return sqd_module._run_sparse._cache_size() - before
+            return sparse_module._run_sparse._cache_size() - before
 
         compiles(first)
         assert compiles(second) == 0, "a second subspace with the same operator shapes recompiled"
@@ -905,10 +905,10 @@ class TestEllKernel:
     @pytest.mark.parametrize("chunk", [None, 8])
     def test_product_matches_indices(self, chunk, monkeypatch):
         """Also at ``_CHUNK = 8``, where a bucket spans several pieces and so a scan of more than one."""
-        import rqutils.sqd as sqd_module
+        import rqutils.sqd._sparse as sparse_module
 
         if chunk is not None:
-            monkeypatch.setattr(sqd_module, "_CHUNK", chunk)
+            monkeypatch.setattr(sparse_module, "_CHUNK", chunk)
         rng = np.random.default_rng(20260927)
         strings, coeffs, states = ell_fixture(rng)
         h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))

@@ -139,7 +139,9 @@ def check_all_matvecs(problem, eig_dense):
 
 def check_mesh_padding():
     header("POC 7b: sqd's mesh-size padding -- states_size not divisible by mesh.size")
-    print("sqd pads states_size up to a multiple of mesh.size (sqd.py:240-243). That branch is")
+    print(
+        "sqd pads states_size up to a multiple of mesh.size (sqd._core._sqd_inputs). That branch is"
+    )
     print("unreachable single-device. Feed it deliberately awkward lengths and check the answer")
     print("is unchanged, since padding must be transparent.")
     print()
@@ -162,7 +164,9 @@ def check_mesh_padding():
 def check_eigvec_path():
     header("POC 7c: return_eigvec=True under sharding -- reshard round-trip")
     print("run_sqd reshards eigvec and states_u back to PartitionSpec(None) before returning")
-    print("(sqd.py:497-499). Check the returned vector is a genuine eigenvector, not just that the")
+    print(
+        "(sqd._solve._solve). Check the returned vector is a genuine eigenvector, not just that the"
+    )
     print("call succeeds: ||Hv - ev|| / ||v|| against the dense projection.")
     print()
     mesh = make_1d_mesh()

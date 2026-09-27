@@ -1,6 +1,6 @@
 """Decompose SQD's cost to find which ceiling binds, before optimizing any of them.
 
-Three separate limits are documented in ``rqutils/sqd.py``: the ``N <= 2**31`` single-device sort,
+Three separate limits are documented in ``rqutils.sqd``: the ``N <= 2**31`` single-device sort,
 per-device memory for the caches, and the ``O(J*N)`` per-matvec cost. They scale differently, so
 "improve scaling" means nothing until we know which one is in front. This script measures the three
 components against N and against J independently:
@@ -124,7 +124,7 @@ def main():
         )
 
     header("BASELINE 4: memory footprint of the caches (bytes, analytic)")
-    print("Per rqutils/sqd.py's module docstring: 4JN for source indices, 8JN/16JN for diagonals.")
+    print("Per rqutils.sqd's module docstring: 4JN for source indices, 8JN/16JN for diagonals.")
     print(f"{'N':>12s}  {'J':>4s}  {'S':>10s}  {'xsrc 4JN':>12s}  {'diag 16JN':>12s}")
     for num_states in [1_000_000, 100_000_000, 2**31]:
         for j in [50, 500]:
