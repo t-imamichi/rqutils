@@ -61,19 +61,11 @@ from scipy.sparse.csgraph import reverse_cuthill_mckee
 
 from rqutils.ground_locg import ground_locg
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import (
-    _apply_h_kernel,
-    _is_filler,
-    _pack_scanned,
-    _pad_states,
-    _spread_seed,
-    _z_parity,
-    get_diagonal,
-    get_xsource,
-    run_sqd,
-    sqd,
-    uniquify_states,
-)
+from rqutils.sqd import get_diagonal, get_xsource, run_sqd, sqd, uniquify_states
+from rqutils.sqd._dense import _apply_h_kernel, _pack_scanned
+from rqutils.sqd._diagonal import _z_parity
+from rqutils.sqd._solve import _spread_seed
+from rqutils.sqd._states import _is_filler, _pad_states
 
 CHUNK = 1 << 15
 ARMS = (

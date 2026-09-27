@@ -15,14 +15,10 @@ from jax.sharding import PartitionSpec, get_abstract_mesh
 
 from rqutils.ground_locg import ground_locg
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import (
-    _apply_h_kernel,
-    _pack_scanned,
-    _pad_states,
-    _spread_seed,
-    get_xsource,
-    uniquify_states,
-)
+from rqutils.sqd import get_xsource, uniquify_states
+from rqutils.sqd._dense import _apply_h_kernel, _pack_scanned
+from rqutils.sqd._solve import _spread_seed
+from rqutils.sqd._states import _pad_states
 
 # 37 draws collapse to ~34 unique rows; `_pad_states` raises if that ever exceeds STATES_SIZE.
 NUM_QUBITS, NUM_STATES, NUM_TERMS, STATES_SIZE = 8, 37, 6, 64

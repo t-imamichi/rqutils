@@ -37,12 +37,7 @@ from conftest import (
 )
 
 from rqutils.sqd import (
-    _MAX_STATES,
     EigenpairCheckError,
-    _pad_states,
-    _run_sparse,
-    _sparse_operator,
-    _spread_seed,
     get_diagonal,
     get_xsource,
     hproj,
@@ -50,6 +45,9 @@ from rqutils.sqd import (
     sqd,
     uniquify_states,
 )
+from rqutils.sqd._solve import _spread_seed
+from rqutils.sqd._sparse import _run_sparse, _sparse_operator
+from rqutils.sqd._states import _MAX_STATES, _pad_states
 
 
 def run_sqd_jaxpr(rng, **kwargs):

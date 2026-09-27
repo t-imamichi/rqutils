@@ -13,6 +13,8 @@ import rqutils.sqd as sqd_module
 from rqutils.ground_locg import _chebyshev_prefilter
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import sqd
+from rqutils.sqd._solve import _spread_seed
+from rqutils.sqd._states import _pad_states
 
 # 37 states, indivisible by every mesh size, pad to 64, which each divides.
 NUM_QUBITS, NUM_STATES, NUM_TERMS, STATES_SIZE = 8, 37, 5, 64
@@ -56,7 +58,7 @@ def prefilter_specs(strings, coeffs, states):
     """
     hamiltonian = PauliSumXZ.from_paulisum((strings, coeffs))
     states_p = PauliSumXZ.pack_states(states)
-    states_p = sqd_module._pad_states(states_p, STATES_SIZE)
+    states_p = _pad_states(states_p, STATES_SIZE)
     specs = {}
     for num_devices in MESH_SIZES:
         specs[num_devices] = {}
@@ -73,7 +75,7 @@ def prefilter_specs(strings, coeffs, states):
             )
             matvec = functools.partial(sqd_module.apply_h, xsources=xsources, diagonals=diagonals)
             for label, spec in (("part", PartitionSpec("x")), ("repl", PartitionSpec(None))):
-                vinit = sqd_module._spread_seed(STATES_SIZE, states_u, hamiltonian.c.dtype, spec)
+                vinit = _spread_seed(STATES_SIZE, states_u, hamiltonian.c.dtype, spec)
                 filtered = _chebyshev_prefilter(
                     matvec, (), vinit, PREFILTER[0], PREFILTER[1], jnp.abs(hamiltonian.c).sum()
                 )

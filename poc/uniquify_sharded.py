@@ -95,7 +95,8 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from rqutils.sqd import _pack_state_words, uniquify_states
+from rqutils.sqd import uniquify_states
+from rqutils.sqd._states import _pack_state_words
 
 # Sorts above every real packed word, so a padding slot never compares equal to real data. The
 # packed rows carry a zero pad bit at position 0 (see `sqd`), so all-ones is unreachable.

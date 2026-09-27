@@ -61,7 +61,8 @@ jax.config.update("jax_enable_x64", True)
 import numpy as np
 from _scaling_common import header, init_devices, make_1d_mesh, make_problem
 
-from rqutils.sqd import _MATVECS, hproj, sqd
+from rqutils.sqd import hproj, sqd
+from rqutils.sqd._matvec import _MATVECS
 
 
 def check_single_vs_sharded():

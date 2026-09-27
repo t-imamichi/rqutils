@@ -19,23 +19,17 @@ from conftest import (
 )
 
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import (
+from rqutils.sqd import apply_h, get_xsource, hproj, sqd, uniquify_states
+from rqutils.sqd._dense import _pack_scanned
+from rqutils.sqd._sparse import (
     _CHUNK,
     _ELL_WIDTHS,
     _SPARSE_APPLY,
-    _is_lex_sorted,
-    _pack_scanned,
-    _pack_state_keys,
-    _pad_states,
     _padded,
     _size_class,
     _sparse_operator,
-    apply_h,
-    get_xsource,
-    hproj,
-    sqd,
-    uniquify_states,
 )
+from rqutils.sqd._states import _is_lex_sorted, _pack_state_keys, _pad_states
 
 # Every keyword `apply_h_kwargs` may ask for, so a caller with no real arrays can fill them all.
 _APPLY_H_ARRAY_KEYS = (

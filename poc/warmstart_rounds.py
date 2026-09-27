@@ -38,7 +38,8 @@ from sparse_pairs import recovery_scores, run_sqd_vinit, term_masks, to_codes
 
 from rqutils.ground_locg import ground_locg
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import _pad_states, apply_h, get_diagonal, get_xsource, uniquify_states
+from rqutils.sqd import apply_h, get_diagonal, get_xsource, uniquify_states
+from rqutils.sqd._states import _pad_states
 
 PREFILTERS = ((32, 2), (16, 1), None)
 ARMS = ("cold", "zeropad", "spnew", "mix", "first", "first+sp")

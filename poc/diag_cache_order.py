@@ -27,15 +27,10 @@ from qiskit.quantum_info import SparsePauliOp
 
 from rqutils.ground_locg import ground_locg
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import (
-    _apply_h_kernel,
-    _pack_scanned,
-    _pad_states,
-    _spread_seed,
-    get_diagonal,
-    get_xsource,
-    uniquify_states,
-)
+from rqutils.sqd import get_diagonal, get_xsource, uniquify_states
+from rqutils.sqd._dense import _apply_h_kernel, _pack_scanned
+from rqutils.sqd._solve import _spread_seed
+from rqutils.sqd._states import _pad_states
 
 FRACTIONS = (0.125, 0.25, 0.5)
 

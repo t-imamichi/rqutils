@@ -12,11 +12,8 @@ from conftest import (
     unique_states,
 )
 
-from rqutils.sqd import (
-    _is_lex_sorted,
-    hproj,
-    uniquify_states,
-)
+from rqutils.sqd import hproj, uniquify_states
+from rqutils.sqd._states import _is_lex_sorted
 
 
 class TestHproj:

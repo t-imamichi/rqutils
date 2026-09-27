@@ -34,15 +34,9 @@ import scipy.sparse.linalg as sla
 
 from rqutils.ground_locg import ground_locg
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import (
-    _pad_states,
-    _spread_seed,
-    apply_h,
-    get_diagonal,
-    get_xsource,
-    hproj,
-    uniquify_states,
-)
+from rqutils.sqd import apply_h, get_diagonal, get_xsource, hproj, uniquify_states
+from rqutils.sqd._solve import _spread_seed
+from rqutils.sqd._states import _pad_states
 
 
 def xxz_strings(nq, delta, bx):

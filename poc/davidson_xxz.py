@@ -21,7 +21,8 @@ import scipy.sparse.linalg as spla
 
 from rqutils.ground_locg import _chebyshev_prefilter, ground_locg
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd import _pad_states, apply_h, get_diagonal, get_xsource, hproj, uniquify_states
+from rqutils.sqd import apply_h, get_diagonal, get_xsource, hproj, uniquify_states
+from rqutils.sqd._states import _pad_states
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--num-qubits", type=int, default=20)

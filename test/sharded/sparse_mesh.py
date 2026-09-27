@@ -5,7 +5,8 @@ import jax
 import numpy as np
 from common import emit, mesh
 
-from rqutils.sqd import _SPARSE_MATVECS, sqd
+from rqutils.sqd import sqd
+from rqutils.sqd._matvec import _SPARSE_MATVECS
 
 HAM = (["XXII", "IZZI", "ZIII"], [0.7, -1.3, 0.4])
 STATES = np.array([[0, 0, 0, 0], [1, 1, 0, 0], [0, 1, 1, 0], [1, 0, 1, 0]], dtype=np.uint8)

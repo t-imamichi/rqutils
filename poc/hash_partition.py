@@ -62,7 +62,8 @@ jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 
-from rqutils.sqd import _pack_state_keys, get_xsource
+from rqutils.sqd import get_xsource
+from rqutils.sqd._states import _pack_state_keys
 
 NQ = 60
 RNG = np.random.default_rng(11)

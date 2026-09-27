@@ -75,7 +75,8 @@ import jax.numpy as jnp
 from jax.sharding import AxisType
 from jax.sharding import PartitionSpec as P
 
-from rqutils.sqd import _pack_state_keys, get_xsource
+from rqutils.sqd import get_xsource
+from rqutils.sqd._states import _pack_state_keys
 
 # Sorts above every real key, so a padded slot never matches a target. The packed keys carry a zero
 # pad bit at position 0 (see `sqd`), so all-ones is unreachable by construction.

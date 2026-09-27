@@ -15,9 +15,7 @@ from conftest import (
     run_sharded_child,
 )
 
-from rqutils.sqd import (
-    _host_scalar,
-)
+from rqutils.sqd._solve import _host_scalar
 
 
 class TestShardedSqd:
