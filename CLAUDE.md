@@ -316,12 +316,15 @@ and fills `residual`/`ax_norm` only under `check_residual=True`; pad its input w
 
 **`matvec=` names the kernel by what it stores**: `"onthefly"` (nothing; sources searched and factors
 computed every matvec — the memory floor), `"indices"` (per-group source-index tables; the default) and
-`"tables"` (indices *and* factors), plus the two sparse kernels: `"pairs"` (each transition once, with its
-factor) and `"csr"` (both directions by target row, `float64` factors where a group is real). Their entry
-counts depend on the data, so `sqd()` builds them **host-side before the jitted solve**, rounding the chunk
-count to `m·2^k` (8 ≤ m < 16) so the solve recompiles per size class. They are `sqd`-only (`run_sqd` and
-`apply_h` reject them), **single-device** (they raise under a mesh), and their residual check runs
-`"onthefly"`, so it reads none of their cached data. Measurements: `poc/sparse-pairs.md`. Before
+`"tables"` (indices *and* factors), plus three sparse kernels: `"pairs"` (each transition once, with its
+factor), `"csr"` (both directions by target row, `float64` factors where a group is real) and `"ell"`
+(rows bucketed by degree rounded up to a ×1.25 grid: a gather-reduce per row, one write per row — the
+fastest, ~2× `"csr"` per solve). Their entry counts depend on the data, so `sqd()` builds them
+**host-side before the jitted solve**, rounding chunk and piece counts to `m·2^k` (8 ≤ m < 16) so the solve
+recompiles per size class — `"ell"` keys on every (width, piece class) pair, so it recompiles more often
+than `"csr"`, and each of its bucket scans adds compile memory (fixed in N). They are `sqd`-only (`run_sqd`
+and `apply_h` reject them), **single-device** (they raise under a mesh), and their residual check runs
+`"onthefly"`, so it reads none of their cached data. Measurements: `poc/sparse-pairs.md` §9–§10. Before
 2026-09-26 this was `cache_level=(source_indices, diagonals)`, the three being `(0, 0)`, `(1, 0)` and
 `(1, 2)`; `NOTES.md` and older docs still use the tuples. The other three tuples were dominated on memory
 *and* time (`NOTES.md`'s n=100 memory and n=22 six-level timing tables), which is why no name exists for them.

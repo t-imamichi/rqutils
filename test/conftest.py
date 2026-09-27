@@ -389,7 +389,7 @@ def assert_imports_without(module, blocked, extra_source=""):
 # The dense kernels: the only ones `apply_h` selects and the only ones a mesh accepts.
 DENSE_MATVECS = ["onthefly", "indices", "tables"]
 # Built host-side by `sqd`, single-device.
-SPARSE_MATVECS = ["pairs", "csr"]
+SPARSE_MATVECS = ["pairs", "csr", "ell"]
 MATVECS = DENSE_MATVECS + SPARSE_MATVECS
 
 

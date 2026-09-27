@@ -230,8 +230,7 @@ Hamming shells. Shell `h` for `type1`/`type2` is read off `type4`/`type3`, which
 4. **Pruned recovery and real samples.** §5's recovery subspace neither prunes nor starts from Krylov
    samples. Pruning pushes `h` up, and n=20's 0.354 shows how far `h` can go; a replayed spinchain run
    (`skqd/replay.py`) would give the true subspace.
-5. **Replace the `"csr"` kernel with ELLC (§10).** It is 2.0–2.4× faster per whole solve than C2R with a
-   smaller operator; the name (`"ell"` or `"rows"`) is undecided.
+5. **ELLC — done, beside `"csr"`, not replacing it:** `sqd(matvec="ell")` (§9).
 
 ## 8. The script
 
@@ -272,6 +271,22 @@ Real factors cut C2's operator 28–31% at no measured speed cost (§4, item 3),
 transition twice and so carries twice the factors; the same split on pairs (P2R, §4 item 5) halves as many
 bytes, moves the peak only 1–5% (within noise), and costs 9–10% of an in-cache solve. Revisit P2R only if
 a GPU run is bound by device memory, where the solve-memory row (up to −9%) is what counts.
+
+**`"ell"` in the library (2026-09-27), beside `"csr"`.** ELLC as `sqd(matvec="ell")`: widths on a
+fixed ×1.25 grid, rows per piece `R = 2^15 // w` fixed per width and piece counts rounded to the size
+classes (so array shapes, and the jitted solve, repeat across subspaces), factors through the existing
+`_entry_factors` in fixed chunks. Warm `sqd` at n=60 `2^17` (build / solve alone in brackets):
+
+| | `"indices"` | `"pairs"` | `"csr"` | `"ell"` |
+| --- | --- | --- | --- | --- |
+| `type1` | 6.22 s | 1.26 s (0.16 / 0.93) | 1.62 s (0.18 / 1.28) | **1.06 s** (0.19 / 0.70), 13 buckets |
+| `type2` | 10.24 s | 2.34 s (0.33 / 1.74) | 3.42 s (0.35 / 2.76) | **1.79 s** (0.36 / 1.11), 16 buckets |
+
+Solve alone, `"ell"` is 1.83× / 2.50× `"csr"` (POC: 2.0× / 2.4×). Peak RSS at `2^19` `type2`, two calls:
+packed input 381 / 582 MiB for `"csr"` / `"ell"`, unpacked 471 / 704 — ×1.5, mostly the bucket scans'
+compile memory (`"ell"`'s operator is the smaller, 95 against 108 MiB). It also recompiles more often:
+across 9 growing prefixes of one `2^17` subspace, 4 compiles against `"csr"`'s 2, each new top width or a
+bucket crossing its size class costing one.
 
 ## 10. Rows bucketed by degree (ELL): faster than C2R, and the grid that makes it affordable
 

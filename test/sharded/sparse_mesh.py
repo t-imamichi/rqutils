@@ -1,4 +1,4 @@
-"""``sqd(matvec="pairs"|"csr")`` must reject a live mesh and work once it exits; see
+"""``sqd(matvec="pairs"|"csr"|"ell")`` must reject a live mesh and work once it exits; see
 ``TestShardedSparseRejects``."""
 
 import jax

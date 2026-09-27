@@ -252,7 +252,7 @@ class TestMatvecValidation:
 
     @pytest.mark.parametrize("matvec", MATVECS)
     def test_every_valid_name_is_still_accepted(self, matvec):
-        """The guard must accept every kernel name, the host-built ``"pairs"``/``"csr"`` included."""
+        """The guard must accept every kernel name, the host-built sparse ones included."""
         states = np.array([[0, 1], [1, 0]], dtype=np.uint8)
         assert isinstance(
             float(sqd((["ZI"], [1.0]), states, return_eigvec=False, matvec=matvec)), float
@@ -266,7 +266,7 @@ class TestMatvecValidation:
         hamiltonian = PauliSumXZ.from_paulisum((["ZI"], [1.0]))
         with pytest.raises(ValueError, match="matvec"):
             run_sqd(hamiltonian, pack_padded(states), 2, False, "indice")
-        # pairs/csr are built host-side by sqd, so run_sqd must point there rather than trace them.
+        # The sparse kernels are built host-side by sqd, so run_sqd must point there, not trace them.
         for name in SPARSE_MATVECS:
             with pytest.raises(ValueError, match=r"Call sqd\(\.\.\., matvec=\.\.\.\)"):
                 run_sqd(hamiltonian, pack_padded(states), 2, False, name)
@@ -981,7 +981,7 @@ class TestEigenpairCheck:
         sites in the jaxpr; "onthefly" and "indices" are skipped, where the check's kernel is the
         solve's and JAX prints the shared jaxpr once -- which leaves "tables" as the one countable one.
 
-        ``"pairs"``/``"csr"`` cache every factor and no source index, so their check must run
+        The sparse kernels cache every factor and no source index, so their check must run
         ``"onthefly"``: one search and one diagonal build, where reusing the solve's operator is (0, 0).
         """
         from rqutils.paulis.symplectic import PauliSumXZ

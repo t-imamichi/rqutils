@@ -125,9 +125,12 @@ be the cheaper option in memory too.
   :math:`v'_b \mathrel{+}= \bar{d} v_a` -- exact, since :math:`H_{ba} = \overline{H_{ab}}` per X signature.
 - ``"csr"``: both directions of every transition, sorted by target, with ``float64`` factors for
   the all-real groups and ``complex128`` for the rest.
+- ``"ell"``: the same transitions and split, with rows bucketed by degree rounded up on a
+  :math:`\times 1.25` grid into dense ``(rows, width)`` blocks, so each row is one gathered sum rather
+  than a scatter per entry (``poc/sparse-pairs.md``, section 10).
 
 The other dense storage combinations are dominated on both memory and time (``NOTES.md``). The last
-two store only the transitions that land inside the subspace, where the source indices mostly hold
+three store only the transitions that land inside the subspace, where the source indices mostly hold
 the ``-1`` absent marker; :func:`sqd` builds them host-side before the solve, they are single-device
 for now, and ``poc/sparse-pairs.md`` has the measurements.
 
@@ -254,7 +257,7 @@ def _check_array_role(name: str, array: Any) -> None:
 
 
 type DenseMatvec = Literal["onthefly", "indices", "tables"]
-type SparseMatvec = Literal["pairs", "csr"]
+type SparseMatvec = Literal["pairs", "csr", "ell"]
 type Matvec = DenseMatvec | SparseMatvec
 _DENSE_MATVECS: tuple[DenseMatvec, ...] = get_args(DenseMatvec.__value__)
 #: The kernels whose operator arrays :func:`sqd` builds host-side; single-device for now.
@@ -505,7 +508,7 @@ def sqd(
 
     ``matvec`` names the matrix-vector kernel: ``"onthefly"`` caches nothing, ``"indices"`` caches
     the per-group source indices, ``"tables"`` caches the source indices and the diagonals, and
-    ``"pairs"``/``"csr"`` store only the transitions inside the subspace.
+    ``"pairs"``/``"csr"``/``"ell"`` store only the transitions inside the subspace.
 
     Everything after ``states`` is **keyword-only**. It used to be positional-or-keyword, which made
     ``sqd(ham, states, True)`` a valid ``states_size`` of 1 (``True == 1``) rather than the
@@ -613,12 +616,13 @@ def sqd(
             an array that came from ``pack_states``. Note the returned width is *also* wrong in that
             case, which gives a second chance to notice.
         matvec: ``"onthefly"``, ``"indices"`` (default) or ``"tables"``: which of the source indices
-            and diagonals to cache; or ``"pairs"``/``"csr"``, which store the in-subspace transitions
-            instead. See the module documentation for the resource tradeoff involved.
+            and diagonals to cache; or ``"pairs"``/``"csr"``/``"ell"``, which store the in-subspace
+            transitions instead. See the module documentation for the resource tradeoff involved.
 
-            ``"pairs"`` and ``"csr"`` are built on the host before the solve (logged as their own
-            phase), with the entry count rounded up to a size class so the solve recompiles per
-            class rather than per subspace. Single-device only for now.
+            ``"pairs"``, ``"csr"`` and ``"ell"`` are built on the host before the solve (logged as
+            their own phase), with the entry count rounded up to a size class so the solve recompiles
+            per class rather than per subspace; ``"ell"``'s class is its set of degree widths plus a
+            piece count per width. Single-device only for now.
         prefilter: ``(degree, cycles)`` Chebyshev prefilter, forwarded verbatim to
             :func:`rqutils.ground_locg.ground_locg` -- see its docstring for the semantics, the cost
             and the knob-choosing guidance. Validated by
@@ -681,8 +685,8 @@ def sqd(
             criterion; if ``atol`` is below the achievable eigen-residual floor
             :math:`4\,\varepsilon\sum_k|c_k|` **while** ``rtol`` is zero, so no arm can fire; or if
             ``rtol`` is at least 0.5, where its bound reaches :math:`\|H\|_2` and any vector would
-            report convergence; if ``matvec`` is not a kernel name; if ``matvec`` is ``"pairs"`` or
-            ``"csr"`` under a mesh, or their operator reaches :math:`2^{31}` entries.
+            report convergence; if ``matvec`` is not a kernel name; if ``matvec`` is ``"pairs"``,
+            ``"csr"`` or ``"ell"`` under a mesh, or their operator reaches :math:`2^{31}` entries.
         TypeError: If ``matvec`` is not a ``str``, or ``prefilter`` is neither None nor a
             ``(degree, cycles)`` pair of ints.
     """
@@ -1031,7 +1035,8 @@ def run_sqd(
             cached). :func:`sqd` turns it on and raises on the result.
 
     Raises:
-        ValueError: If ``matvec`` is ``"pairs"`` or ``"csr"``, which only :func:`sqd` can build.
+        ValueError: If ``matvec`` is ``"pairs"``, ``"csr"`` or ``"ell"``, which only :func:`sqd` can
+            build.
     """
     # Static, so this runs once per trace; sqd validates too, and this covers direct poc/ callers.
     _check_matvec(matvec)
@@ -1208,17 +1213,26 @@ def _size_class(chunks: int) -> int:
     return max(-(-chunks >> shift) << shift, 1)
 
 
-def _padded(count: int, fill: int) -> np.ndarray:
-    """A flat int32 array of ``count`` entries rounded up to whole chunks of a size class, all ``fill``.
+def _check_entries(count: int) -> None:
+    """Raise if a sparse operator's ``count`` entries reach :math:`2^{31}`, past int32 indexing.
 
     Raises:
-        ValueError: If ``count`` reaches :math:`2^{31}`, past the int32 indices the entries are stored in.
+        ValueError: If ``count`` exceeds :math:`2^{31} - 1`.
     """
     if count > _MAX_STATES:
         raise ValueError(
             f"the sparse operator has {count} entries, beyond the 2^31 - 1 addressable with int32 "
             'indices; use matvec="indices" or a smaller subspace'
         )
+
+
+def _padded(count: int, fill: int) -> np.ndarray:
+    """A flat int32 array of ``count`` entries rounded up to whole chunks of a size class, all ``fill``.
+
+    Raises:
+        ValueError: If ``count`` reaches :math:`2^{31}`, past the int32 indices the entries are stored in.
+    """
+    _check_entries(count)
     return np.full(_size_class(-(-count // _CHUNK)) * _CHUNK, fill, dtype=np.int32)
 
 
@@ -1243,14 +1257,106 @@ def _entry_factors(
     return jax.lax.map(one, (target, source, group))
 
 
+#: ``"ell"``'s row widths, a x1.25 geometric grid: few buckets (each its own compiled scan) at a few
+#: percent padding (``poc/sparse-pairs.md``, section 10).
+_ELL_WIDTHS = np.unique(np.ceil(1.25 ** np.arange(100)).astype(np.int64))
+
+
+def _flat_factors(
+    t: np.ndarray,
+    s: np.ndarray,
+    g: np.ndarray,
+    z: jax.Array,
+    c: jax.Array,
+    states: StateList,
+    kmax: int,
+) -> jax.Array:
+    """:func:`_entry_factors` over flat host entries, one ``(1, _CHUNK)`` chunk per call.
+
+    A fixed chunk shape, so it compiles once per coefficient dtype rather than per bucket shape.
+    """
+    count = len(t)
+    t, s, g = (np.pad(a, (0, -count % _CHUNK)).reshape(-1, 1, _CHUNK) for a in (t, s, g))
+    chunks = [
+        _entry_factors(*(jnp.asarray(a[k]) for a in (t, s, g)), z, c, states, kmax)
+        for k in range(len(t))
+    ]
+    return jnp.concatenate(chunks, axis=None)[:count]
+
+
+def _ell_buckets(
+    pairs: dict[int, tuple[np.ndarray, np.ndarray]],
+    subset: list[int],
+    size: int,
+    z: jax.Array,
+    c_set: jax.Array,
+    states_u: StateList,
+    kmax: int,
+) -> list[jax.Array]:
+    """``"ell"``'s ``(rows, src, fac)`` per width for one coefficient set; see :func:`_sparse_operator`.
+
+    Raises:
+        ValueError: If the padded slot count reaches :math:`2^{31}` -- see :func:`_check_entries`.
+    """
+    deg = np.zeros(size, np.int32)
+    for g in subset:
+        for rows in pairs[g]:
+            deg[rows] += 1  # a row occurs at most once per group
+    pos = np.cumsum(deg, dtype=np.int64) - deg  # row starts, advanced to row ends by the fill
+    src = np.empty(int(deg.sum(dtype=np.int64)), np.int32)
+    grp = np.empty_like(src)
+    for g in subset:
+        i, j = pairs.pop(g)
+        for target, source in ((i, j), (j, i)):
+            p = pos[target]
+            src[p], grp[p] = source, g
+            pos[target] += 1
+    pos -= deg
+    width = np.where(deg > 0, _ELL_WIDTHS[np.searchsorted(_ELL_WIDTHS, deg)], 0)
+    # Rows per piece fixed per width and pieces size-classed, so shapes come from a bounded set.
+    plan = []
+    for w in np.unique(width[width > 0]).tolist():
+        per = max(1, _CHUNK // w)
+        rows = np.flatnonzero(width == w).astype(np.int32)
+        plan.append((w, per, _size_class(-(-len(rows) // per)), rows))
+    del width
+    _check_entries(sum(w * per * pieces for w, per, pieces, _ in plan))
+    buckets = []
+    for w, per, pieces, rows in plan:
+        # Padding rows repeat a real row with no entries: a dummy output slot costs two (2, N) copies.
+        r = np.full(pieces * per, rows[0], np.int32)
+        r[: len(rows)] = rows
+        count = np.zeros(pieces * per, np.int32)
+        count[: len(rows)] = deg[rows]
+        valid = np.arange(w) < count[:, None]
+        slot = np.where(valid, pos[r][:, None] + np.arange(w), 0)
+        s, g = src[slot], grp[slot]
+        del slot
+        t = np.broadcast_to(r[:, None], valid.shape)
+        # An empty slot gets source = target, which _entry_factors' t == s rule zeroes.
+        fac = _flat_factors(
+            t.ravel(), np.where(valid, s, t).ravel(), g.ravel(), z, c_set, states_u, kmax
+        )
+        del t, g
+        s[~valid] = 0
+        del valid
+        buckets += [jnp.asarray(r.reshape(pieces, per)), jnp.asarray(s.reshape(pieces, per, w))]
+        buckets.append(fac.reshape(pieces, per, w))
+    return buckets
+
+
 def _sparse_operator(
     hamiltonian: PauliSumXZ, states_u: StateList, matvec: SparseMatvec
 ) -> tuple[jax.Array, ...]:
-    """Build the ``"pairs"`` or ``"csr"`` operator arrays on the host, one X group's search at a time.
+    """Build the ``"pairs"``, ``"csr"`` or ``"ell"`` operator arrays on the host, one X group's search at a time.
 
     Returns ``(d0, i, j, d)`` for ``"pairs"`` and ``(d0, rt, rs, rd, qt, qs, qd)`` for ``"csr"``, each
     entry array ``(chunks, _CHUNK)``; ``r``/``q`` are the real-coefficient groups (float64 factors)
     and the rest. Padding entries have equal endpoints and a zero factor.
+
+    ``"ell"`` returns ``d0`` then, per set (real first) and ascending row width ``w``, ``rows``
+    ``(pieces, R)``, ``src`` and ``fac`` ``(pieces, R, w)``, ``R = max(1, _CHUNK // w)``; slots past a
+    row's degree, and padding rows, have source 0 and factor 0.
 
     Raises:
         ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_padded`.
@@ -1292,6 +1398,9 @@ def _sparse_operator(
         ([g for g in groups if real[g]], c.real),
         ([g for g in groups if not real[g]], c),
     ):
+        if matvec == "ell":
+            arrays += _ell_buckets(pairs, subset, size, z, c_set, states_u, kmax)
+            continue
         # Counting sort by target straight into padded chunks: a row occurs at most once per group,
         # so each group's fill is conflict-free (poc/sparse-pairs.md, section 2).
         start = np.zeros(size + 1, np.int64)
@@ -1341,6 +1450,24 @@ def _apply_csr(vec: jax.Array, d0: jax.Array, *entries: jax.Array) -> jax.Array:
     return out
 
 
+def _apply_ell(vec: jax.Array, d0: jax.Array, *buckets: jax.Array) -> jax.Array:
+    """``"ell"``: ``d0 * vec``, then per ``(rows, src, fac)`` piece ``out[rows] += sum(fac * vec[src])``."""
+    sharding = jax.typeof(vec).sharding
+
+    def body(acc, piece):
+        rows, src, fac = piece
+        val = jnp.sum(fac * vec.at[..., src].get(out_sharding=sharding), axis=-1)
+        return acc.at[..., rows].add(val), None
+
+    out = d0 * vec
+    for k in range(0, len(buckets), 3):
+        out = jax.lax.scan(body, out, buckets[k : k + 3])[0]
+    return out
+
+
+_SPARSE_APPLY = {"pairs": _apply_pairs, "csr": _apply_csr, "ell": _apply_ell}
+
+
 @jax.jit(static_argnames=_SOLVE_STATIC)
 def _run_sparse(
     hamiltonian: PauliSumXZ,
@@ -1356,15 +1483,14 @@ def _run_sparse(
     log_level: int = logging.INFO,
     check_residual: bool = False,
 ) -> SqdResult:
-    """:func:`run_sqd` for ``"pairs"``/``"csr"``, given :func:`_sparse_operator`'s arrays.
+    """:func:`run_sqd` for the sparse kernels, given :func:`_sparse_operator`'s arrays.
 
     The residual check runs the ``"onthefly"`` kernel, so it reads none of ``operator``.
     """
-    apply = _apply_pairs if matvec == "pairs" else _apply_csr
     return _solve(
         hamiltonian,
         states_u,
-        apply,
+        _SPARSE_APPLY[matvec],
         operator,
         lambda: operator[0],
         None,
@@ -1776,7 +1902,8 @@ def apply_h(
     r"""Return :math:`Hv`, naming the per-X-group inputs so a mispairing cannot be expressed.
 
     Name the per-X-group arrays you have and the kernel follows from them. Exactly three input sets
-    are accepted, one per dense :func:`sqd` ``matvec``; ``"pairs"``/``"csr"`` are ``sqd``-only:
+    are accepted, one per dense :func:`sqd` ``matvec``; ``"pairs"``/``"csr"``/``"ell"`` are
+    ``sqd``-only:
 
     .. code-block:: python
 

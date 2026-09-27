@@ -1308,8 +1308,8 @@ construction and no duplicate transients. **Shipped 2026-09-26 as `sqd(matvec="p
 single-device: warm `sqd` at n=60 `type1` `2^17` takes 1.26 s / 1.63 s against `"indices"`' 6.25 s
 (`poc/sparse-pairs.md` §9). **Its successor is ELLC (2026-09-27):** rows bucketed by degree rounded to a
 ×1.25 grid, a gather-reduce per row instead of a scatter per entry — 2.0–2.4× C2R per whole solve at a
-smaller operator, peak 1.3× C2R's from compiling 19 bucket scans (§10). Open: GPU timing, sharding, a
-pruned recovery subspace, and shipping ELLC as the csr kernel.
+smaller operator, peak 1.3× C2R's from compiling 19 bucket scans (§10). **Shipped beside `"csr"` as
+`sqd(matvec="ell")`** (§9). Open: GPU timing, sharding, a pruned recovery subspace.
 
 ### Partial diagonal cache: *which* groups to cache barely matters, only how many (2026-09-25)
 
