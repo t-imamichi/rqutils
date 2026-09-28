@@ -62,7 +62,8 @@ Warm `sqd` at n=60, `2^17` states, packed input (`poc/sparse-pairs.md` §9):
 | `type2` | 10.24 s | 2.34 s | 3.42 s | **1.79 s** |
 
 On the same fixture `TABLES` measured 2.22 s (`type1`), so `ELL` is about 2× your current default there.
-All kernels return the same energy.
+All kernels return the same energy to within the solve's tolerance, not bit for bit: each sums in its
+own order.
 
 **Constraints:**
 
