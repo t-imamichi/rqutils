@@ -970,10 +970,8 @@ class TestSearchPairs:
 
 
 class TestPairsOrder:
-    """``"pairs"`` stores its pairs sorted by ``i`` across groups, not group by group.
-
-    Group by group, every chunk's ``out[i]`` and ``vec[i]`` span all states; sorted, they are local:
-    1.9-2.2x per matvec at n=60 ``2^20`` (``NOTES.md``, "sqd sparse kernels: pairs sorted by i").
+    """``"pairs"`` stores its pairs sorted by ``i`` across groups, not group by group (``NOTES.md``,
+    "sqd sparse kernels: pairs sorted by i").
     """
 
     def test_pairs_are_sorted_by_i_and_complete(self):
@@ -983,23 +981,13 @@ class TestPairsOrder:
         states_u, (_, pi, pj, _) = sparse_operator_of(h, states, 32, Matvec.PAIRS)
         i, j = (np.asarray(a).ravel() for a in (pi, pj))
         real = i < j  # padding entries have i == j
-        rows = np.arange(32)
         offdiag = int(not np.asarray(h.x[0]).any())  # as the build: skip an identity group
-        by_group = [
-            (rows[k], x[k])
-            for x in (np.asarray(get_xsource(x, states_u)) for x in h.x[offdiag:])
-            for k in [x > rows]
-        ]
-        gi = np.concatenate([a for a, _ in by_group])
-        assert np.any(np.diff(gi) < 0), (
-            "the fixture's group-by-group order must not already be sorted"
-        )
+        gi, gj = (np.concatenate(a) for a in zip(*_search_pairs(h.x[offdiag:], states_u)))
+        assert np.any(np.diff(gi) < 0), "the group-by-group order must not already be sorted"
         assert np.all(np.diff(i[real]) >= 0), "pairs must be sorted by i"
-        got = sorted(zip(i[real].tolist(), j[real].tolist(), strict=True))
-        want = sorted(
-            zip(gi.tolist(), np.concatenate([b for _, b in by_group]).tolist(), strict=True)
+        assert sorted(zip(i[real].tolist(), j[real].tolist())) == sorted(
+            zip(gi.tolist(), gj.tolist())
         )
-        assert got == want
 
 
 class TestEllKernel:

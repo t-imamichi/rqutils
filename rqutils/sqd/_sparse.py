@@ -78,18 +78,20 @@ def _host_sources[T](
         pairs, rank = distinct(pack(rank, inverse))
         levels.append((values, pairs))
         own.append(inverse)
-
-    def word_rank(k, values, target, lo, xw):
-        rows = slice(lo, lo + len(target))
-        return own[k][rows] if xw[k] == 0 else np.searchsorted(values, target[:, k])
+    values = [first, *(v for v, _ in levels)]
 
     def one(xw):
         xsource = np.full(len(host), -1, np.int32)
         for lo in range(0, real, _SEARCH_ROWS):
             target = words[lo : lo + _SEARCH_ROWS] ^ xw
-            rank = word_rank(0, first, target, lo, xw)
-            for k, (values, pairs) in enumerate(levels, start=1):
-                rank = np.searchsorted(pairs, pack(rank, word_rank(k, values, target, lo, xw)))
+            rows = slice(lo, lo + len(target))
+            ranks = [
+                own[k][rows] if xw[k] == 0 else np.searchsorted(v, target[:, k])
+                for k, v in enumerate(values)
+            ]
+            rank = ranks[0]
+            for (_, pairs), word in zip(levels, ranks[1:], strict=True):
+                rank = np.searchsorted(pairs, pack(rank, word))
             j = np.minimum(rank, real - 1).astype(np.int32)
             hit = np.all(words[j] == target, axis=1)
             xsource[lo : lo + len(target)][hit] = j[hit]
@@ -97,6 +99,7 @@ def _host_sources[T](
 
     # np.searchsorted releases the GIL, so threads scale where the jitted search runs on one core.
     # A sliding window, not batches: at most `workers` groups in flight, none waiting on the slowest.
+    # ponytail: Executor.map(buffersize=workers) replaces this once the floor is Python 3.14.
     workers = os.cpu_count() or 1
     with ThreadPoolExecutor(workers) as pool:
         pending = deque()
@@ -202,7 +205,7 @@ def _sort_by_target(
     alloc: Callable[[int], list[np.ndarray]],
     both: bool = True,
 ) -> tuple[list[np.ndarray], np.ndarray]:
-    """Counting-sort ``subset``'s transitions, both directions, by target into ``alloc(count)``.
+    """Counting-sort ``subset``'s transitions by target into ``alloc(count)``, both directions by default.
 
     With ``both=False``, each pair once as ``(i, j)``, sorted by ``i``: ``"pairs"``' layout.
 
@@ -308,9 +311,12 @@ def _sparse_operator(
         t, s, g = (jnp.asarray(host.pop(0).reshape(-1, _CHUNK)) for _ in range(3))
         return t, s, _entry_factors(t, s, g, z, c_set, states_u, kmax)
 
-    alloc = lambda count: [_padded(count, f) for f in (size - 1, size - 1, 0)]  # i, j, group
+    def alloc(count):  # i, j, group
+        return [_padded(count, f) for f in (size - 1, size - 1, 0)]
+
     if matvec == "pairs":
-        # Sorted by i across groups, so out[i] and vec[i] are local: 1.9-2.2x per matvec at 2^20.
+        # Sorted by i across groups, so out[i] and vec[i] are local (NOTES.md, "sqd sparse kernels:
+        # pairs sorted by i").
         host = _sort_by_target(pairs, list(groups), size, alloc, both=False)[0]
         return (d0, *on_device(host, c))
 
