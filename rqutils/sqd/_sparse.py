@@ -3,7 +3,6 @@
 import functools
 import logging
 import os
-from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
@@ -98,17 +97,10 @@ def _host_sources[T](
         return reduce(xsource)
 
     # np.searchsorted releases the GIL, so threads scale where the jitted search runs on one core.
-    # A sliding window, not batches: at most `workers` groups in flight, none waiting on the slowest.
-    # ponytail: Executor.map(buffersize=workers) replaces this once the floor is Python 3.14.
+    # buffersize bounds the groups in flight or unread, with no barrier waiting on the slowest.
     workers = os.cpu_count() or 1
     with ThreadPoolExecutor(workers) as pool:
-        pending = deque()
-        for xw in _words(np.asarray(x)):
-            pending.append(pool.submit(one, xw))
-            if len(pending) >= workers:
-                yield pending.popleft().result()
-        while pending:
-            yield pending.popleft().result()
+        yield from pool.map(one, _words(np.asarray(x)), buffersize=workers)
 
 
 def _search_pairs(x: np.ndarray, states_u: StateList) -> list[tuple[np.ndarray, np.ndarray]]:
