@@ -1342,8 +1342,11 @@ per pair (`vec[j]`, `out[i]`, `vec[i]`, `out[j]`) were random. Counting-sorted b
 (`_sort_by_target(both=False)`), the `i` side is local: one batched matvec at n=60 `2^20` 151.4 → 69.5
 ns/state (`type2`), 55.0 → 28.9 (`type1`), unchanged at `2^17`, where the vectors fit in cache. Whole
 warm `sqd` 21.28 → 13.59 s at `2^20`, 1.107 → 1.077 s at `2^17`; same memory, `Hv` within 3.2e-14 from
-the new summation order. `"csr"` and `"ell"` already store by target; the dense kernels sweep `out` in
-order, their one random access the source gather. No committed script reproduces these numbers.
+the new summation order. The sort is not free: the `"pairs"` build rose 0.73–0.77 → 0.92–0.96 s at n=60
+`2^20` (two interleaved rounds against `b5cb5da`), the serial counting-sort pass the old concatenation
+lacked — repaid ~35× by the 7.4 s the solve saves there, and inside the noise of a whole call at `2^17`.
+`"csr"` and `"ell"` already store by target; the dense kernels sweep `out` in order, their one random
+access the source gather. No committed script reproduces these numbers.
 
 ### Partial diagonal cache: *which* groups to cache barely matters, only how many (2026-09-25)
 
