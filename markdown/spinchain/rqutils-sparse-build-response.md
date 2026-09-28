@@ -1,8 +1,9 @@
 # Response: the sparse check no longer repeats the search; `ELL`'s retrace stays, with a figure
 
-Reply to spinchain's `rqutils-sparse-build-request.md`, from the `rqutils` side. The changes are on branch
-`sparse-followup` (not yet on `dev`), on top of `e4da18a`. Measured on one laptop CPU (10 cores, 64 GiB),
-without the persistent compile cache.
+Reply to spinchain's `rqutils-sparse-build-request.md`, from the `rqutils` side. Everything below is on
+`dev` at `8d27837`: the check and the timer through `b5cb5da`, and the later changes in §7. **`dev` now
+requires Python 3.14** (§7.3). Measured on one laptop CPU (10 cores, 64 GiB), without the persistent
+compile cache.
 
 > **Status: asks 1, 3 and 4 done; ask 5 answered with a figure; ask 2 not taken up.**
 >
@@ -105,3 +106,38 @@ Not attempted this round. With the check off the search, a build of your n=30 95
 
 - **The n=30 pipeline, `ELL` against `TABLES`, recovery especially.** That is the check estimate in §2.2.
 - **Your n=60 fixed-subspace row.** The check was also part of the 5.8 s non-build time there.
+- **`PAIRS` at your memory-bound config's 4M states.** §7.1 changed its speed past the cache and left its
+  memory alone, which is the trade your §4 was weighing.
+
+## 7. Also on `dev` since this reply was drafted
+
+### 7.1 `PAIRS` stores its pairs sorted by `i` (`d84c4a3`)
+
+`PAIRS` stored its pairs group by group, and each group's `i` spans every state, so all four accesses per
+pair were random. They are now counting-sorted by `i` across groups, so the `i` side is local.
+
+| n=60, `2^20` | before | after |
+| --- | --- | --- |
+| one batched matvec, `type2` | 151.4 ns/state | **69.5 ns/state** |
+| one batched matvec, `type1` | 55.0 ns/state | **28.9 ns/state** |
+| warm `sqd`, `type2`, build and check included | 21.28 s | **13.59 s** |
+
+At `2^17`, where the vectors fit in cache, it is unchanged (1.107 against 1.077 s). The memory is the
+same. The energy moves in the last bits, since the additions happen in another order: `Hv` agreed to
+3.2e-14 here. Your 1e-12 comparison across kernels is unaffected. **An exact `==` replay of a `PAIRS`
+energy across this revision will fail once.**
+
+### 7.2 The build (`92b33ef`, `a5bd4a5`)
+
+- **A regression from `e411ac5`, fixed.** When the search was shared with the residual check, groups ran
+  in batches, each waiting on its slowest group. They now run in a sliding window, which gave 3.00 against
+  2.60 s for the n=100 `2^20` search.
+- **A word an X signature leaves unchanged takes the state's own rank, with no search.** This helps only
+  past 63 qubits, where a state spans two 64-bit words. The n=100 `PAIRS` build went 3.25 → 2.07 s. Your
+  n=30 and n=60 builds are unaffected.
+
+### 7.3 Python 3.14 is now the floor (`8d27837`)
+
+`requires-python` is `>=3.14`. The sliding window is now `Executor.map(buffersize=)`, which is new in
+3.14. **An environment on 3.12 or 3.13 will not install this revision.** `b5cb5da`, which is on
+`origin/dev`, is the last revision on 3.12.
