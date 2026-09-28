@@ -947,7 +947,13 @@ class TestSearchPairs:
     @pytest.mark.parametrize("num_qubits", [40, 100, 140])
     def test_matches_get_xsource(self, num_qubits):
         rng = np.random.default_rng(num_qubits)
-        h = PauliSumXZ.from_paulisum((real_pauli_strings(num_qubits, 6, rng), rng.normal(size=6)))
+        # Hops at both ends and the middle leave whole words unchanged, which skips their search.
+        hops = [
+            "I" * k + "XX" + "I" * (num_qubits - k - 2)
+            for k in (0, num_qubits // 2, num_qubits - 2)
+        ]
+        strings = real_pauli_strings(num_qubits, 6, rng) + hops
+        h = PauliSumXZ.from_paulisum((strings, rng.normal(size=len(strings))))
         base = h.pack_states(rng.integers(0, 2, (40, num_qubits), dtype=np.uint8))
         # Random states at this n never connect; their X images do, so sources are found, not just missed.
         packed = np.unique(np.concatenate([base, *(base ^ x for x in h.x[:4])]), axis=0)

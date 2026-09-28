@@ -3,6 +3,7 @@
 import functools
 import logging
 import os
+from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
@@ -69,30 +70,42 @@ def _host_sources[T](
         return ordered[new], np.cumsum(new) - 1
 
     # Rows are lex-sorted, so the first word and every rank pair are sorted; only later words sort.
+    # `own` keeps each state's word ranks: a word an X signature leaves unchanged needs no search.
     first, rank = distinct(words[:, 0])
-    levels = []
+    levels, own = [], [rank]
     for w in words.T[1:]:
         values, inverse = np.unique(w, return_inverse=True)
         pairs, rank = distinct(pack(rank, inverse))
         levels.append((values, pairs))
+        own.append(inverse)
+
+    def word_rank(k, values, target, lo, xw):
+        rows = slice(lo, lo + len(target))
+        return own[k][rows] if xw[k] == 0 else np.searchsorted(values, target[:, k])
 
     def one(xw):
         xsource = np.full(len(host), -1, np.int32)
         for lo in range(0, real, _SEARCH_ROWS):
             target = words[lo : lo + _SEARCH_ROWS] ^ xw
-            rank = np.searchsorted(first, target[:, 0])
-            for (values, pairs), w in zip(levels, target.T[1:], strict=True):
-                rank = np.searchsorted(pairs, pack(rank, np.searchsorted(values, w)))
+            rank = word_rank(0, first, target, lo, xw)
+            for k, (values, pairs) in enumerate(levels, start=1):
+                rank = np.searchsorted(pairs, pack(rank, word_rank(k, values, target, lo, xw)))
             j = np.minimum(rank, real - 1).astype(np.int32)
             hit = np.all(words[j] == target, axis=1)
             xsource[lo : lo + len(target)][hit] = j[hit]
         return reduce(xsource)
 
     # np.searchsorted releases the GIL, so threads scale where the jitted search runs on one core.
-    xwords, workers = _words(np.asarray(x)), os.cpu_count() or 1
+    # A sliding window, not batches: at most `workers` groups in flight, none waiting on the slowest.
+    workers = os.cpu_count() or 1
     with ThreadPoolExecutor(workers) as pool:
-        for k in range(0, len(xwords), workers):
-            yield from pool.map(one, xwords[k : k + workers])
+        pending = deque()
+        for xw in _words(np.asarray(x)):
+            pending.append(pool.submit(one, xw))
+            if len(pending) >= workers:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
 
 
 def _search_pairs(x: np.ndarray, states_u: StateList) -> list[tuple[np.ndarray, np.ndarray]]:
