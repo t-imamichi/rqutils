@@ -1325,7 +1325,7 @@ reproduces these numbers.
 
 The in-jit `"onthefly"` check repeated the J-fold device search, 0.31 s of a 0.74 s `"ell"` solve (n=60
 `type2`, `2^17`). `_sparse_residual` now runs after the solve, per group, from host-searched sources and
-recomputed diagonals, with the operator freed first; warm `sqd` 0.857 → 0.643 s (`"ell"`), −0.21–0.24 s on
+recomputed diagonals, with the operator freed first; warm `sqd` 0.857 → 0.629 s (`"ell"`), −0.23–0.25 s on
 all three, energies bit-identical. It reuses the search as the dense kernels reuse cached xsources.
 Rejected for `"ell"`'s per-subspace retrace: a per-`states_size` shape memory with headroom. Growing
 Hamming-shell bases move rows to wider buckets (width 19: 1 → 4 → 8 pieces per +12%), so every growing

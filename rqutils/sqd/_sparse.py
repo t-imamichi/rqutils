@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd._dense import apply_xgrp
+from rqutils.sqd._dense import _apply_h_kernel, _pack_scanned
 from rqutils.sqd._diagonal import _z_parity, get_diagonal
 from rqutils.sqd._solve import _SOLVE_STATIC, Matvec, SqdResult, _solve
 from rqutils.sqd._states import _MAX_STATES, StateList, _is_filler
@@ -106,22 +106,19 @@ def _search_pairs(x: np.ndarray, states_u: StateList) -> list[tuple[np.ndarray, 
     return list(_host_sources(x, states_u, pairs))
 
 
-@jax.jit
-def _add_group(ax, vec, xsource, zsignature, coeffs, states):
-    return ax + apply_xgrp(xsource, get_diagonal(zsignature, coeffs, states), vec)
-
-
 def _sparse_residual(
     hamiltonian: PauliSumXZ, states_u: StateList, eigval: jax.Array, eigvec: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
-    """``(||Hv - Ev||, ||Hv||)`` one group at a time: host-searched sources, recomputed diagonals.
+    """``(||Hv - Ev||, ||Hv||)`` by the ``"indices"`` kernel one group at a time, from host-searched sources.
 
-    Reads none of the sparse operator, which can be freed first, and reuses the search as the dense
-    kernels reuse cached xsources: the device search it replaces was 42% of an ``"ell"`` solve.
+    Reads none of the sparse operator, and reuses the search as the dense kernels reuse cached xsources
+    (``NOTES.md``, "sqd sparse kernels: the residual check runs on the host").
     """
+    x, z, c = hamiltonian.arrays
     ax = jnp.zeros_like(eigvec)
-    for g, xsource in enumerate(_host_sources(hamiltonian.x, states_u, lambda j: j)):
-        ax = _add_group(ax, eigvec, xsource, hamiltonian.z[g], hamiltonian.c[g], states_u)
+    for g, xsource in enumerate(_host_sources(x, states_u, lambda j: j)):
+        scanned = _pack_scanned(Matvec.INDICES, xsource[None], z[g : g + 1], c[g : g + 1])
+        ax = _apply_h_kernel(eigvec, scanned, states_u, matvec=Matvec.INDICES, init=ax)
     return jnp.linalg.norm(ax - eigval * eigvec), jnp.linalg.norm(ax)
 
 
@@ -368,7 +365,7 @@ def _apply_ell(vec: jax.Array, d0: jax.Array, *buckets: jax.Array) -> jax.Array:
 _SPARSE_APPLY = {Matvec.PAIRS: _apply_pairs, Matvec.CSR: _apply_csr, Matvec.ELL: _apply_ell}
 
 
-@jax.jit(static_argnames=[a for a in _SOLVE_STATIC if a != "check_residual"])
+@jax.jit(static_argnames=_SOLVE_STATIC)
 def _run_sparse(
     hamiltonian: PauliSumXZ,
     states_u: StateList,

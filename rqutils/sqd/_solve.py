@@ -144,8 +144,7 @@ class SqdResult(NamedTuple):
     ax_norm: jax.Array | None = None
 
 
-#: Static arguments of the jitted solve entry points: :func:`run_sqd`, and :func:`_run_sparse` less
-#: ``check_residual``.
+#: Static arguments of both jitted solve entry points, :func:`run_sqd` and :func:`_run_sparse`.
 _SOLVE_STATIC = [
     "states_size",
     "return_eigvec",
@@ -153,7 +152,6 @@ _SOLVE_STATIC = [
     "maxiter",
     "prefilter",
     "log_level",
-    "check_residual",
 ]
 
 
@@ -183,7 +181,7 @@ def _apply_parts(
     return out
 
 
-@jax.jit(static_argnames=_SOLVE_STATIC)
+@jax.jit(static_argnames=[*_SOLVE_STATIC, "check_residual"])
 def run_sqd(
     hamiltonian: PauliSumXZ,
     states_p: StateList,

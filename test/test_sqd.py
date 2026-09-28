@@ -952,7 +952,9 @@ class TestEigenpairCheck:
     swapping them is a no-op. Measured here: 5.7e+00 against a threshold of 7.8e-14.
     """
 
-    def test_a_sign_flipped_eigenvector_raises_the_subclass(self, monkeypatch):
+    @pytest.mark.parametrize("matvec", [Matvec.INDICES, *SPARSE_MATVECS])
+    def test_a_sign_flipped_eigenvector_raises_the_subclass(self, matvec, monkeypatch):
+        """Sparse kernels included: their check runs on the host (:class:`TestSparseEigenpairCheck`)."""
         import rqutils.sqd._solve as solve_module
 
         real = solve_module.ground_locg
@@ -968,12 +970,14 @@ class TestEigenpairCheck:
         states = unique_states(20, 6, rng)
         monkeypatch.setattr(solve_module, "ground_locg", flipped)
         run_sqd.clear_cache()  # `ground_locg` is read at trace time
+        _run_sparse.clear_cache()
         try:
             with pytest.raises(EigenpairCheckError) as excinfo:
-                sqd((strings, coeffs.tolist()), states, return_eigvec=False)
+                sqd((strings, coeffs.tolist()), states, matvec=matvec, return_eigvec=False)
         finally:
             monkeypatch.undo()
             run_sqd.clear_cache()  # or later tests reuse the defective trace
+            _run_sparse.clear_cache()
         # Callers retry on this substring (non-convergence); a wrong pair must not match it.
         assert "did not converge" not in str(excinfo.value)
 
@@ -1008,8 +1012,7 @@ class TestEigenpairCheck:
 class TestSparseEigenpairCheck:
     """The sparse kernels' check runs on the host, from searched sources and recomputed diagonals.
 
-    It replaced an in-jit ``"onthefly"`` check whose device search was 42% of an ``"ell"`` solve (n=60,
-    ``2^17``), so it must still be a real ``Hv``, and still catch a wrong pair.
+    It must still compute the true ``Hv``; that it catches a wrong pair is in :class:`TestEigenpairCheck`.
     """
 
     @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
@@ -1026,30 +1029,6 @@ class TestSparseEigenpairCheck:
         hv = apply_h(result.eigvec, states=states_u, xsources=xsources, zsignatures=h.z, coeffs=h.c)
         assert float(ax_norm) == pytest.approx(float(np.linalg.norm(hv)), rel=1e-12)
         assert float(residual) < 1e-12 * float(ax_norm), float(residual)
-
-    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
-    def test_a_sign_flipped_eigenvector_raises(self, matvec, monkeypatch):
-        import rqutils.sqd._solve as solve_module
-
-        real = solve_module.ground_locg
-
-        def flipped(*args, **kwargs):
-            eigval, eigvec, iters, converged = real(*args, **kwargs)
-            dominant = jnp.arange(eigvec.shape[-1]) == jnp.argmax(jnp.abs(eigvec))
-            return eigval, jnp.where(dominant, -eigvec, eigvec), iters, converged
-
-        rng = np.random.default_rng(20260825)
-        strings = real_pauli_strings(6, 8, rng)
-        coeffs = rng.normal(size=len(strings))
-        states = unique_states(20, 6, rng)
-        monkeypatch.setattr(solve_module, "ground_locg", flipped)
-        _run_sparse.clear_cache()  # `ground_locg` is read at trace time
-        try:
-            with pytest.raises(EigenpairCheckError):
-                sqd((strings, coeffs.tolist()), states, matvec=matvec, return_eigvec=False)
-        finally:
-            monkeypatch.undo()
-            _run_sparse.clear_cache()  # or later tests reuse the defective trace
 
 
 class TestAtolAndRtol:

@@ -8,7 +8,7 @@ without the persistent compile cache.
 >
 > - **Ask 3 was worth more than it looked.** The sparse kernels' residual check re-ran the full
 >   per-group device search: 0.31 s of a 0.74 s `ELL` solve at n=60, `2^17`. It now runs on the host.
->   Warm `sqd` takes 0.21–0.24 s less on all three kernels, with bit-identical energies (§2).
+>   Warm `sqd` takes 0.23–0.25 s less on all three kernels, with bit-identical energies (§2).
 > - **The check may be most of your unexplained ~2 s.** `TABLES` never paid that search, because its
 >   check reuses cached source indices (§2.2).
 > - **Ask 5 has no cheap fix for growing bases.** A shape memory with headroom still retraced on every
@@ -51,9 +51,9 @@ three kernels, and a test pins that.
 
 | warm `sqd`, n=60 `type2`, `2^17` | before | after |
 | --- | --- | --- |
-| `ELL` | 0.857 s | **0.643 s** |
-| `PAIRS` | 1.062 s | 0.835 s |
-| `CSR` | 1.599 s | 1.355 s |
+| `ELL` | 0.857 s | **0.629 s** |
+| `PAIRS` | 1.062 s | 0.825 s |
+| `CSR` | 1.599 s | 1.348 s |
 
 ### 2.2 Your recovery gap
 

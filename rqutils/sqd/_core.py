@@ -332,8 +332,6 @@ def _solve_sqd(
         del operator  # the check reads none of it
         residual, ax_norm = _sparse_residual(hamiltonian, states_u, result.eigval, result.eigvec)
         result = result._replace(residual=residual, ax_norm=ax_norm)
-        if not return_eigvec:
-            result = result._replace(eigvec=None, states=None, subspace_dim=None)
     else:
         result = run_sqd(
             hamiltonian, states_p, states_size, return_eigvec, matvec, check_residual=True, **tols
