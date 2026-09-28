@@ -1332,6 +1332,16 @@ Hamming-shell bases move rows to wider buckets (width 19: 1 → 4 → 8 pieces p
 call still retraced at 1.25–1.5× headroom; constant-size 5% turnover retraced nothing without it. It
 saved one compile in nine calls. No committed script reproduces these numbers.
 
+### sqd sparse kernels: pairs sorted by i (2026-09-28)
+
+`"pairs"` stored its pairs group by group, each group's `i` spanning every state, so all four accesses
+per pair (`vec[j]`, `out[i]`, `vec[i]`, `out[j]`) were random. Counting-sorted by `i` across groups
+(`_sort_by_target(both=False)`), the `i` side is local: one batched matvec at n=60 `2^20` 151.4 → 69.5
+ns/state (`type2`), 55.0 → 28.9 (`type1`), unchanged at `2^17`, where the vectors fit in cache. Whole
+warm `sqd` 21.28 → 13.59 s at `2^20`, 1.107 → 1.077 s at `2^17`; same memory, `Hv` within 3.2e-14 from
+the new summation order. `"csr"` and `"ell"` already store by target; the dense kernels sweep `out` in
+order, their one random access the source gather. No committed script reproduces these numbers.
+
 ### Partial diagonal cache: *which* groups to cache barely matters, only how many (2026-09-25)
 
 At equal bytes, largest-`K_g`-first beats a prefix by only **1.02–1.03×** (whole solve 1.023×, n=18 JW)
