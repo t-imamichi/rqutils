@@ -3,7 +3,7 @@
 import functools
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import jax
@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from rqutils.paulis.symplectic import PauliSumXZ
+from rqutils.sqd._dense import apply_xgrp
 from rqutils.sqd._diagonal import _z_parity, get_diagonal
 from rqutils.sqd._solve import _SOLVE_STATIC, Matvec, SqdResult, _solve
 from rqutils.sqd._states import _MAX_STATES, StateList, _is_filler
@@ -46,13 +47,15 @@ def _words(rows: np.ndarray) -> np.ndarray:
     return np.pad(rows, ((0, 0), (-rows.shape[1] % 8, 0))).view(">u8").astype(np.uint64)
 
 
-def _search_pairs(x: np.ndarray, states_u: StateList) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Per X signature, the ``(i, j)`` with ``j > i`` that :func:`get_xsource` finds, one group a thread.
+def _host_sources[T](
+    x: np.ndarray, states_u: StateList, reduce: Callable[[np.ndarray], T]
+) -> Iterator[T]:
+    """Per X signature, in order, ``reduce`` of :func:`get_xsource`'s int32 sources, one group a thread.
 
     Folds each row's words, MSW-first, into its rank among the states' sorted rows: ``(rank << 32) |
     word rank`` stays in uint64 while both are below :math:`2^{31}`. A state's rank is its row index;
     any other target gets some index, which the word comparison rejects. Fillers sort last and never
-    pair, so only real rows are searched.
+    pair, so only real rows are searched. ``reduce`` runs in the thread; one window of groups is live.
     """
     host = np.asarray(states_u)
     real = len(host) - int(np.count_nonzero(_is_filler(host)))
@@ -74,22 +77,52 @@ def _search_pairs(x: np.ndarray, states_u: StateList) -> list[tuple[np.ndarray, 
         levels.append((values, pairs))
 
     def one(xw):
-        i_out, j_out = [], []
+        xsource = np.full(len(host), -1, np.int32)
         for lo in range(0, real, _SEARCH_ROWS):
             target = words[lo : lo + _SEARCH_ROWS] ^ xw
             rank = np.searchsorted(first, target[:, 0])
             for (values, pairs), w in zip(levels, target.T[1:], strict=True):
                 rank = np.searchsorted(pairs, pack(rank, np.searchsorted(values, w)))
             j = np.minimum(rank, real - 1).astype(np.int32)
-            i = np.arange(lo, lo + len(target), dtype=np.int32)
-            keep = np.all(words[j] == target, axis=1) & (j > i)
-            i_out.append(i[keep])
-            j_out.append(j[keep])
-        return np.concatenate(i_out), np.concatenate(j_out)
+            hit = np.all(words[j] == target, axis=1)
+            xsource[lo : lo + len(target)][hit] = j[hit]
+        return reduce(xsource)
 
     # np.searchsorted releases the GIL, so threads scale where the jitted search runs on one core.
-    with ThreadPoolExecutor(os.cpu_count()) as pool:
-        return list(pool.map(one, _words(np.asarray(x))))
+    xwords, workers = _words(np.asarray(x)), os.cpu_count() or 1
+    with ThreadPoolExecutor(workers) as pool:
+        for k in range(0, len(xwords), workers):
+            yield from pool.map(one, xwords[k : k + workers])
+
+
+def _search_pairs(x: np.ndarray, states_u: StateList) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Per X signature, the ``(i, j)`` with ``j > i`` that :func:`get_xsource` finds."""
+    rows = np.arange(states_u.shape[0], dtype=np.int32)
+
+    def pairs(j):
+        keep = j > rows  # each pair once; absent sources (-1) and fillers drop
+        return rows[keep], j[keep]
+
+    return list(_host_sources(x, states_u, pairs))
+
+
+@jax.jit
+def _add_group(ax, vec, xsource, zsignature, coeffs, states):
+    return ax + apply_xgrp(xsource, get_diagonal(zsignature, coeffs, states), vec)
+
+
+def _sparse_residual(
+    hamiltonian: PauliSumXZ, states_u: StateList, eigval: jax.Array, eigvec: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    """``(||Hv - Ev||, ||Hv||)`` one group at a time: host-searched sources, recomputed diagonals.
+
+    Reads none of the sparse operator, which can be freed first, and reuses the search as the dense
+    kernels reuse cached xsources: the device search it replaces was 42% of an ``"ell"`` solve.
+    """
+    ax = jnp.zeros_like(eigvec)
+    for g, xsource in enumerate(_host_sources(hamiltonian.x, states_u, lambda j: j)):
+        ax = _add_group(ax, eigvec, xsource, hamiltonian.z[g], hamiltonian.c[g], states_u)
+    return jnp.linalg.norm(ax - eigval * eigvec), jnp.linalg.norm(ax)
 
 
 def _padded(count: int, fill: int) -> np.ndarray:
@@ -352,7 +385,7 @@ def _run_sparse(
 ) -> SqdResult:
     """:func:`run_sqd` for the sparse kernels, given :func:`_sparse_operator`'s arrays.
 
-    The residual check runs the ``"onthefly"`` kernel, so it reads none of ``operator``.
+    :func:`sqd` passes ``check_residual=False`` and checks with :func:`_sparse_residual` instead.
     """
     return _solve(
         hamiltonian,

@@ -1321,6 +1321,17 @@ row index, exact through a word comparison, at any width. `"ell"` 9.74 → 2.49 
 n=100 `2^20` for the whole front end but a new dependency and a second code path. No committed script
 reproduces these numbers.
 
+### sqd sparse kernels: the residual check runs on the host (2026-09-28)
+
+The in-jit `"onthefly"` check repeated the J-fold device search, 0.31 s of a 0.74 s `"ell"` solve (n=60
+`type2`, `2^17`). `_sparse_residual` now runs after the solve, per group, from host-searched sources and
+recomputed diagonals, with the operator freed first; warm `sqd` 0.857 → 0.643 s (`"ell"`), −0.21–0.24 s on
+all three, energies bit-identical. It reuses the search as the dense kernels reuse cached xsources.
+Rejected for `"ell"`'s per-subspace retrace: a per-`states_size` shape memory with headroom. Growing
+Hamming-shell bases move rows to wider buckets (width 19: 1 → 4 → 8 pieces per +12%), so every growing
+call still retraced at 1.25–1.5× headroom; constant-size 5% turnover retraced nothing without it. It
+saved one compile in nine calls. No committed script reproduces these numbers.
+
 ### Partial diagonal cache: *which* groups to cache barely matters, only how many (2026-09-25)
 
 At equal bytes, largest-`K_g`-first beats a prefix by only **1.02–1.03×** (whole solve 1.023×, n=18 JW)

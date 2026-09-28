@@ -1,6 +1,5 @@
 """The body of :mod:`rqutils.sqd`: :func:`sqd`, :func:`hproj` and :class:`EigenpairCheckError`."""
 
-import functools
 import logging
 import time
 from collections.abc import Sequence
@@ -25,7 +24,7 @@ from rqutils.sqd._solve import (
     _residual_floor_of,
     run_sqd,
 )
-from rqutils.sqd._sparse import _run_sparse, _sparse_operator
+from rqutils.sqd._sparse import _run_sparse, _sparse_operator, _sparse_residual
 from rqutils.sqd._states import (
     _MAX_STATES,
     StateList,
@@ -323,24 +322,24 @@ def _solve_sqd(
     """Build a sparse operator if ``matvec`` names one, then solve with the residual check on."""
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
+    tols = {"maxiter": maxiter, "atol": atol, "rtol": rtol, "prefilter": prefilter}
     if matvec in _SPARSE_MATVECS:
         # run_sqd is jitted and the entry counts are data-dependent, so the operator is built here.
         states_u = uniquify_states(states_p, states_size)
         operator = _sparse_operator(hamiltonian, states_u, matvec)
         LOG.info("Built the %s operator in %f seconds.", matvec, time.time() - start)
-        solve = functools.partial(_run_sparse, hamiltonian, states_u, operator)
+        result = _run_sparse(hamiltonian, states_u, operator, states_size, True, matvec, **tols)
+        del operator  # the check reads none of it
+        residual, ax_norm = _sparse_residual(hamiltonian, states_u, result.eigval, result.eigvec)
+        result = result._replace(residual=residual, ax_norm=ax_norm)
+        if not return_eigvec:
+            result = result._replace(eigvec=None, states=None, subspace_dim=None)
     else:
-        solve = functools.partial(run_sqd, hamiltonian, states_p)
-    result = solve(
-        states_size,
-        return_eigvec,
-        matvec,
-        maxiter=maxiter,
-        atol=atol,
-        rtol=rtol,
-        prefilter=prefilter,
-        check_residual=True,
-    )
+        result = run_sqd(
+            hamiltonian, states_p, states_size, return_eigvec, matvec, check_residual=True, **tols
+        )
+    # Dispatch is asynchronous: without the wait this logs before the solve has run.
+    jax.block_until_ready(result)
     LOG.info("Found ground eigenpair in %f seconds.", time.time() - start)
     return result
 

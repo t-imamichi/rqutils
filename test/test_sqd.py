@@ -39,6 +39,7 @@ from conftest import (
 from rqutils.sqd import (
     EigenpairCheckError,
     Matvec,
+    apply_h,
     get_diagonal,
     get_xsource,
     hproj,
@@ -47,7 +48,7 @@ from rqutils.sqd import (
     uniquify_states,
 )
 from rqutils.sqd._solve import _spread_seed
-from rqutils.sqd._sparse import _run_sparse, _sparse_operator
+from rqutils.sqd._sparse import _run_sparse, _sparse_operator, _sparse_residual
 from rqutils.sqd._states import _MAX_STATES, _pad_states
 
 
@@ -983,50 +984,72 @@ class TestEigenpairCheck:
         the cache), while a cached diagonal is what it exists to cross-check. Counted as named call
         sites in the jaxpr; "onthefly" and "indices" are skipped, where the check's kernel is the
         solve's and JAX prints the shared jaxpr once -- which leaves "tables" as the one countable one.
-
-        The sparse kernels cache every factor and no source index, so their check must run
-        ``"onthefly"``: one search and one diagonal build, where reusing the solve's operator is (0, 0).
+        The sparse kernels' check runs on the host (:class:`TestSparseEigenpairCheck`).
         """
         from rqutils.paulis.symplectic import PauliSumXZ
 
         rng = np.random.default_rng(3)
         h = PauliSumXZ.from_paulisum((real_pauli_strings(4, 6, rng), rng.normal(size=6).tolist()))
         states_p = pack_padded(unique_states(12, 4, rng))
-        states_u = uniquify_states(_pad_states(states_p, 16), 16)
 
         def calls(matvec):
             def count(check):
-                if matvec in SPARSE_MATVECS:
-                    operator = _sparse_operator(h, states_u, matvec)
-                    solve = lambda a, b: _run_sparse(
-                        a, b, operator, 16, False, matvec, check_residual=check
-                    )
-                    traced = jax.make_jaxpr(solve)(h, states_u)
-                else:
-                    traced = jax.make_jaxpr(
-                        lambda a, b: run_sqd(a, b, 16, False, matvec, check_residual=check)
-                    )(h, states_p)
+                traced = jax.make_jaxpr(
+                    lambda a, b: run_sqd(a, b, 16, False, matvec, check_residual=check)
+                )(h, states_p)
                 return str(traced).count("name=get_xsource"), str(traced).count("name=get_diagonal")
 
             (search_off, diag_off), (search_on, diag_on) = count(False), count(True)
             return search_on - search_off, diag_on - diag_off
 
         assert calls(Matvec.TABLES) == (0, 1), "tables: (extra searches, extra diagonal builds)"
-        for matvec in SPARSE_MATVECS:
-            assert calls(matvec) == (1, 1), f"{matvec}: the check must run the onthefly kernel"
+
+
+class TestSparseEigenpairCheck:
+    """The sparse kernels' check runs on the host, from searched sources and recomputed diagonals.
+
+    It replaced an in-jit ``"onthefly"`` check whose device search was 42% of an ``"ell"`` solve (n=60,
+    ``2^17``), so it must still be a real ``Hv``, and still catch a wrong pair.
+    """
 
     @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
-    def test_a_sparse_solve_passes_the_check(self, matvec):
-        """The check's onthefly product must agree with the solve's operator on a genuine pair."""
+    def test_a_genuine_pair_passes_with_the_true_hv(self, matvec):
         from rqutils.paulis.symplectic import PauliSumXZ
 
         rng = np.random.default_rng(3)
         h = PauliSumXZ.from_paulisum((["YZII", "XXII", "IZZI", "IIYY"], [0.5, -0.3, 0.7, 0.2]))
         states_u = uniquify_states(_pad_states(pack_padded(unique_states(12, 4, rng)), 16), 16)
         operator = _sparse_operator(h, states_u, matvec)
-        result = _run_sparse(h, states_u, operator, 16, False, matvec, check_residual=True)
-        assert bool(result.converged)
-        assert float(result.residual) < 1e-12 * float(result.ax_norm), float(result.residual)
+        result = _run_sparse(h, states_u, operator, 16, True, matvec)
+        residual, ax_norm = _sparse_residual(h, states_u, result.eigval, result.eigvec)
+        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in h.x])
+        hv = apply_h(result.eigvec, states=states_u, xsources=xsources, zsignatures=h.z, coeffs=h.c)
+        assert float(ax_norm) == pytest.approx(float(np.linalg.norm(hv)), rel=1e-12)
+        assert float(residual) < 1e-12 * float(ax_norm), float(residual)
+
+    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
+    def test_a_sign_flipped_eigenvector_raises(self, matvec, monkeypatch):
+        import rqutils.sqd._solve as solve_module
+
+        real = solve_module.ground_locg
+
+        def flipped(*args, **kwargs):
+            eigval, eigvec, iters, converged = real(*args, **kwargs)
+            dominant = jnp.arange(eigvec.shape[-1]) == jnp.argmax(jnp.abs(eigvec))
+            return eigval, jnp.where(dominant, -eigvec, eigvec), iters, converged
+
+        rng = np.random.default_rng(20260825)
+        strings = real_pauli_strings(6, 8, rng)
+        coeffs = rng.normal(size=len(strings))
+        states = unique_states(20, 6, rng)
+        monkeypatch.setattr(solve_module, "ground_locg", flipped)
+        _run_sparse.clear_cache()  # `ground_locg` is read at trace time
+        try:
+            with pytest.raises(EigenpairCheckError):
+                sqd((strings, coeffs.tolist()), states, matvec=matvec, return_eigvec=False)
+        finally:
+            monkeypatch.undo()
+            _run_sparse.clear_cache()  # or later tests reuse the defective trace
 
 
 class TestAtolAndRtol:
