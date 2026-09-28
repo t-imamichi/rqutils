@@ -144,7 +144,8 @@ class SqdResult(NamedTuple):
     ax_norm: jax.Array | None = None
 
 
-#: Static arguments of both jitted solve entry points, :func:`run_sqd` and :func:`_run_sparse`.
+#: Static arguments of the jitted solve entry points: :func:`run_sqd`, and :func:`_run_sparse` less
+#: ``check_residual``.
 _SOLVE_STATIC = [
     "states_size",
     "return_eigvec",

@@ -368,7 +368,7 @@ def _apply_ell(vec: jax.Array, d0: jax.Array, *buckets: jax.Array) -> jax.Array:
 _SPARSE_APPLY = {Matvec.PAIRS: _apply_pairs, Matvec.CSR: _apply_csr, Matvec.ELL: _apply_ell}
 
 
-@jax.jit(static_argnames=_SOLVE_STATIC)
+@jax.jit(static_argnames=[a for a in _SOLVE_STATIC if a != "check_residual"])
 def _run_sparse(
     hamiltonian: PauliSumXZ,
     states_u: StateList,
@@ -381,11 +381,10 @@ def _run_sparse(
     rtol: float | None = None,
     prefilter: tuple[int, int] | None = (32, 2),
     log_level: int = logging.INFO,
-    check_residual: bool = False,
 ) -> SqdResult:
     """:func:`run_sqd` for the sparse kernels, given :func:`_sparse_operator`'s arrays.
 
-    :func:`sqd` passes ``check_residual=False`` and checks with :func:`_sparse_residual` instead.
+    It runs no residual check: :func:`sqd` checks with :func:`_sparse_residual` after it returns.
     """
     return _solve(
         hamiltonian,
@@ -401,5 +400,5 @@ def _run_sparse(
         rtol=rtol,
         prefilter=prefilter,
         log_level=log_level,
-        check_residual=check_residual,
+        check_residual=False,
     )
