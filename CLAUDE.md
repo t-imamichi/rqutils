@@ -229,6 +229,10 @@ Five reasons a mutant survives that are *not* missing coverage:
 - **Use `eigvalsh` or sparse `eigsh(k=1)`, never `eigh`** — 77 s vs 0.02 s at the sizes here.
 - **A/B whole calls against a worktree of the pre-change revision**, not a predicate in isolation. A
   predicate microbenchmark has twice reported a regression that whole-call timing showed to be zero.
+- **An in-process A/B of a patched kernel needs a function of its own per arm, and a check that it took.**
+  A second `jax.jit` of the same function reuses the first's trace, so a table read at trace time is
+  patched for neither: both arms ran the shipped kernel. Assert the arms' `.lower(...).as_text()` differ.
+  `poc/sparse-layout.md` §4.
 - **A/B both arms warm.** Changing a traced expression invalidates the compilation cache; one cold run
   measured 125 s against a warm 20 s, which reads as catastrophic and is not.
 - **Pass arrays as arguments to a `jit`ted benchmark, never close over them.** XLA constant-folds a
