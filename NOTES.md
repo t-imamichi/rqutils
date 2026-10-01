@@ -2320,6 +2320,12 @@ GH200, `type1`/`type2` `2^20`–`2^22`, one process: `"tables"` 3.05–4.54× `"
 ~2.2× its memory, fastest in 5 of 6; `"pairs"` 2.44–3.94× at ~0.55×. `"ell"` loses to host build (44% at
 `2^22`) and compile (0.84× `"indices"` cold). `"indices"` stays the CPU-chosen default. `poc/sparse-gpu.md` §7, §8
 
+### sqd sparse kernels on a GPU: `"pairs"` wants bigger chunks, and a sorted-scatter hint slows it (2026-10-02)
+
+GH200, `type1` `2^20`/`2^22`: `_CHUNK` `2^15` → `2^19` is 2.73×/1.39× per iteration (128 → 8, 320 → 20
+steps, +8 MiB temp); a merged two-direction scatter ties it there; `indices_are_sorted` on `out[i]` is
+0.37–0.64× (`"csr"` sets it — a suspect); `float64` factors save 24–27% at 0.37–0.94×. `poc/sparse-pairs-tune.md` §2, §3
+
 ### sqd sparse kernels: a state-major `(N, 2)` gather layout loses on CPU (2026-10-01)
 
 M1, n=60 `type1`, `2^17`/`2^19`: gathering from `(N, 2)` instead of `(2, N)` is 0.83–0.87× on the matvec
