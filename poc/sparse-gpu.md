@@ -9,6 +9,11 @@ so `"indices"` is the only reference. `type3`/`type4` and `type2` at `2^20` are 
 and a repeat of `type1` `2^20`/`2^21`, come from a third run at `c63f067`, `"indices"` and `"pairs"` only;
 the script is unchanged since, and the library's change between (`605ad4a`) touches only the host build.
 
+**Every sparse time here is the pre-`0d25235` kernels**, which on CUDA split and rejoined their complex
+scan carry at every step (`poc/sparse-split.md` §1). §1, §3 and §6's speeds and rankings describe that
+defect; memory (§4) and the build (§2) do not depend on it. Fixed, the sparse kernels beat `"indices"`
+at every size measured (`poc/sparse-split.md` §4).
+
 ## 1. Whole solves against `"indices"`
 
 `"indices"`' time over each arm's (median, s):
@@ -118,14 +123,10 @@ at `2^10`–`2^13` gave identical counts.
 - **`"csr"` and `"ell"` lose past the cliff**, by 2–4×. On the GPU, the CPU's case for them (sequential
   writes) does not carry.
 
-**For spinchain-scale runs, keep `"indices"`** (the default), and reach for `"pairs"` only when a single
-GPU's memory binds. Three reasons, the second a projection:
-
-- Past the cliff `"pairs"` buys memory, not time (above), and `"csr"`/`"ell"` buy neither.
-- Memory does not bind at n=60: `"indices"` peaked at 0.89 GiB at `2^21`, so ~9 GiB at 20M if it scales
-  linearly — not measured.
-- The gap widens with N, measured to `2^22`: per iteration `"pairs"` goes 1.57× → 1.09× → 0.53×
-  `"indices"` over `2^20`–`2^22`. `"csr"`/`"ell"` stop at `2^21`.
+**Retracted: "for spinchain-scale runs, keep `"indices"`".** It rested on the pre-fix kernels above.
+With `0d25235`, `"pairs"` is 3.8–6.7× and `"ell"` 4.3–5.8× `"indices"` per iteration over `2^20`–`2^22`
+(`type1`, cross-run), `"pairs"` at −39% memory (`poc/sparse-split.md` §4); a same-process run and `type2`
+are open there.
 
 Under a mesh the sparse kernels raise, which leaves `"onthefly"`, `"indices"` and `"tables"`. **`"tables"`
 is unmeasured on any GPU** and is the open candidate (§7): it caches the diagonal factors whose

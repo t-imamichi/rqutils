@@ -328,8 +328,11 @@ never released) **naming the kernel by what it stores**: `"onthefly"` (nothing; 
 computed every matvec — the memory floor), `"indices"` (per-group source-index tables; the default) and
 `"tables"` (indices *and* factors), plus three sparse kernels: `"pairs"` (each transition once, with its
 factor), `"csr"` (both directions by target row, `float64` factors where a group is real) and `"ell"`
-(rows bucketed by degree rounded up to a ×1.25 grid: a gather-reduce per row, one write per row — the
-fastest, ~2× `"csr"` per solve). Their entry counts depend on the data, so `sqd()` builds them
+(rows bucketed by degree rounded up to a ×1.25 grid: a gather-reduce per row, one write per row — on
+CPU the fastest, ~2× `"csr"` per solve). **On CUDA `_scan_add` carries a complex `out` as real and
+imaginary parts; don't merge them** — XLA's GPU scatter would split the whole carry every scan step,
+2.5–17.9× per iteration. The split loses on CPU, so `platform_dependent` keeps it CUDA-only
+(`poc/sparse-split.md`). The sparse kernels' entry counts depend on the data, so `sqd()` builds them
 **host-side before the jitted solve**, rounding chunk and piece counts to `m·2^k` (8 ≤ m < 16) so the solve
 recompiles per size class — `"ell"` keys on every (width, piece class) pair, so it recompiles more often
 than `"csr"`, and each of its bucket scans adds compile memory (fixed in N). They are `sqd`-only (`run_sqd`

@@ -2295,10 +2295,9 @@ device). `poc/prefilter-gpu.md` §7, §9.
 
 ### sqd sparse kernels on a GPU: `"pairs"` wins until the vectors leave L2 (2026-10-01)
 
-GH200, n=60 `type1`/`type2`: `"pairs"` is the fastest sparse kernel everywhere (CPU's ranking inverted),
-2.6–9.3× `"indices"` through `2^19`, gone by `2^21` (0.57–0.99×) and 0.49× at `2^22`, while −39% memory
-stays. The solve, not the build (≤8.5%), steps 2.2–2.5× per state at `2^19` → `2^20`, where `(2, N)`
-vectors pass the 50 MB L2 (inferred), and `"pairs"` again 1.81× at `2^21` → `2^22`, cause open. `poc/sparse-gpu.md` §3
+GH200, n=60, pre-`0d25235` kernels: `"pairs"` led the sparse kernels, 2.6–9.3× `"indices"` through `2^19`,
+gone by `2^21` and 0.49× at `2^22`, at −39% memory. Both per-state steps, read as L2, were the per-step
+complex-carry split that `0d25235` fixes; "keep `"indices"`" is retracted. `poc/sparse-gpu.md` §3, `poc/sparse-split.md` §4
 
 ### sqd sparse kernels: a state-major `(N, 2)` gather layout loses on CPU (2026-10-01)
 
@@ -2317,7 +2316,8 @@ On the GH200 it is 1.00× at `2^20`/`2^21` (every tile within 0.7%), evidence ag
 
 GH200 profile: 72–88% of a `"pairs"` matvec from `2^20` is `wrapped_real`/`imag`/`complex`, a full pass
 over the complex carry per scan step, so cost is `O(N × steps)`. `_scan_add` now carries real and
-imaginary parts on CUDA only: ungated, CPU ran 0.68–0.90× with +1 `out` of temp. GPU speed unmeasured. `poc/sparse-split.md` §1, §3
+imaginary parts on CUDA only: GH200 2.5–17.9× per iteration, no temp cost, every sparse kernel past
+`"indices"` (cross-run); ungated, CPU ran 0.68–0.90× with +1 `out`, hence the gate. `poc/sparse-split.md` §1, §3, §4
 
 ## Warm starts, collectives and the eigenpair check (2026-09)
 

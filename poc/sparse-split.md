@@ -1,9 +1,9 @@
 # The sparse kernels' complex scan carry on a GPU
 
-`poc/sparse_profile.py` and `poc/sparse_split.py` (§6), 2026-10-01: one NVIDIA GH200 120GB for §1, one
-Apple M1 (8 cores, 16 GiB) for §3. Fixture as `poc/sparse-gpu.md`: spinchain's open-XXZ `xxz` at n=60,
+`poc/sparse_profile.py` and `poc/sparse_split.py` (§7), 2026-10-01/02: one NVIDIA GH200 120GB for §1 and
+§4, one Apple M1 (8 cores, 16 GiB) for §3. Fixture as `poc/sparse-gpu.md`: spinchain's open-XXZ `xxz` at n=60,
 `δ = 0.5`, `type1` (`J = 62`, `complex128`), Hamming-shell subspaces around both Néel states. The fix
-(§2) is in the library; its GPU speed is unmeasured (§4).
+(§2) is in the library at `0d25235`, and §4 measures it.
 
 ## 1. The defect: three per-step passes over `out`
 
@@ -59,22 +59,47 @@ split slower), split wins in brackets; `temp` is the `(2, N)` matvec's `temp_siz
 - Gated, the CPU path is the previous kernel: bit-identical on 42 cases (three kernels, five coefficient
   layouts, real and complex vectors, 1-D and `(2, N)`), and `poc/sparse_split.py` reads 1.00× there.
 
-## 4. What it means
+## 4. On the GPU: 2.5–17.9× per iteration
 
-If the GPU branch removes §1's three kernels, the profile leaves ~9.8 ms per 1-D and ~9.3 ms per
-`(2, N)` `"pairs"` matvec at `2^22`, against 47.4 and 78.5 — enough that `"pairs"` would beat
-`"indices"` (76.64 ms per iteration) there, inverting `poc/sparse-gpu.md` §6. **That is a projection
-from the profile, not a measurement.** The memory cost is §3's extra `out`, against `"pairs"`' −39%.
+GH200 at `0d25235`, `poc/sparse_split.py --log2-sizes 20 21 22`, 5 interleaved rounds; the split won
+every round of every cell. Per solve iteration, old → split; `"indices"` is from `poc/sparse-gpu.md`'s
+third run, another process, so that column is cross-run:
 
-## 5. Open
+| kernel | `2^20` | `2^21` | `2^22` |
+| --- | --- | --- | --- |
+| `"pairs"` | 17.32 → **4.28 ms** (4.05×) | 39.49 → **6.59 ms** (6.00×) | 145.62 → 20.35 ms (7.15×) |
+| `"ell"` | 35.95 → 6.36 ms (5.66×) | 79.24 → 7.63 ms (10.39×) | 276.44 → **15.48 ms** (17.85×) |
+| `"csr"` | 50.79 → 20.23 ms (2.51×) | 100.57 → 26.92 ms (3.74×) | 329.68 → 58.00 ms (5.68×) |
+| `"indices"` | 27.35 ms | 43.88 ms | 76.64 ms |
 
-1. **The GPU A/B**: `uv run python poc/sparse_split.py --log2-sizes 20 21 22` on the GH200 (whole solves
-   per iteration, both matvecs, and temp), and `poc/sparse_profile.py` again to confirm the three
-   kernels are gone.
-2. **ROCm**, which the gate does not cover; unmeasured whether its XLA scatter splits the same way.
-3. **`poc/sparse-gpu.md`'s recommendations**, to be redone from the fixed kernels.
+- **The speedup grows with N**, as `O(N × steps)` predicts: the `(2, N)` matvec gains 5.58/8.30/9.72× on
+  `"pairs"` and 7.97/14.23/23.55× on `"ell"` over `2^20`–`2^22`.
+- **Every sparse kernel now beats `"indices"`** per iteration at every size: `"pairs"` 6.4/6.7/3.8×,
+  `"ell"` 4.3/5.8/5.0×, `"csr"` 1.35/1.63/1.32×. The fastest is `"pairs"` to `2^21` and `"ell"` at `2^22`,
+  where `"pairs"`' per-state cost rises (4.1, 3.1, 4.9 ns) and `"ell"`'s stays flat (6.1, 3.6, 3.7).
+- **No memory cost on the GPU**: the `(2, N)` matvec's temp is equal in every cell (32/64/128 MiB), unlike
+  §3's CPU split. Iterations match (one 126/127 repeat at `"pairs"` `2^22`); matvecs agree to 6.4e-16,
+  eigenvalues to 1.1e-14.
+- **The profile confirms the mechanism.** `poc/sparse_profile.py` after the fix: `wrapped_complex` and
+  `loop_imag_real_fusion` run once per call (1–4% together); the four scatters are 84–89% and the
+  per-step add 9–12%. Device time at `2^22` is 10.77 ms (1-D) and 9.52 ms (`(2, N)`), against §1's 47.44
+  and 78.46. Its 1-D figure exceeds the A/B's timed 7.35 ms at `2^22` — unresolved, likely profiler
+  overhead.
 
-## 6. The scripts
+## 5. What it means
+
+The sparse kernels' GPU result in `poc/sparse-gpu.md` was this defect. Fixed, `"pairs"` and `"ell"` are
+3.8–6.7× `"indices"` per iteration on one GH200, `"pairs"` at −39% memory — the opposite of that
+write-up's "keep `"indices"`". The CPU keeps its complex carry and is unchanged.
+
+## 6. Open
+
+1. **A same-process run against `"indices"`, and `type2`**:
+   `poc/sparse_gpu.py --patterns type1 type2 --arms indices pairs ell --log2-sizes 20 21 22`.
+2. **Past `2^22`**, where `"pairs"`' per-state rise decides it against `"ell"`.
+3. **ROCm**, which the gate does not cover; unmeasured whether its XLA scatter splits the same way.
+
+## 7. The scripts
 
 `poc/sparse_profile.py`:
 
@@ -98,5 +123,5 @@ from the profile, not a measurement.** The memory cost is §3's extra `out`, aga
 
 `sparse_profile.py` reads device events from the trace's `/device:` processes and falls back to host XLA
 ops with no device (labelled so). `sparse_split.py`'s old arm is the kernels as of `474aafb`, copied
-verbatim. Runs here: the profile once on the GH200 (§1); the split A/B on CPU at `2^17 19` ungated (§3)
-and at `2^12` gated.
+verbatim. Runs here: the profile on the GH200 at `474aafb` (§1) and at `0d25235` with `--log2-sizes 20 22` (§4);
+the split A/B on CPU at `2^17 19` ungated (§3) and at `2^12` gated, and on the GH200 at `0d25235` (§4).
