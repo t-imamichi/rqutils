@@ -73,7 +73,8 @@ call. A GPU-only chunk size is the change to make, once §5's sweep places it; `
 | `--pattern` | `type1` | one of `poc/eigenpair_check_scale.patterns` |
 | `--log2-sizes` | `20 22` | subspace sizes `2^k` |
 | `--chunks` | `15 17 19` | log2 of `_CHUNK`, the operator's shapes following it |
-| `--variants` | `base sorted merged real` | kernels, each run at every chunk |
+| `--matvec` | `pairs` | `pairs`, or `csr` for §5 item 2 |
+| `--variants` | every one of `--matvec`'s | `base sorted merged real` for `pairs`, `base unsorted` for `csr`; each run at every chunk |
 | `--rounds` | `5` | interleaved rounds after one warm-up per arm |
 
 `base` at `2^15` is the reference and always runs. Each arm compiles its own solve, asserted pairwise

@@ -11,14 +11,17 @@ kernel a fraction of the GPU. Arms are every ``--chunks`` × ``--variants``:
 - ``real``: ``"csr"``'s split, real groups' pairs with ``float64`` factors and the rest ``complex128``,
   two scans; the memory lever.
 
-The reference is ``base`` at ``2^15``, the shipped kernel. Every arm keeps the library's CUDA-only carry
+``--matvec csr`` runs ``"csr"`` instead, with ``base`` (the library, ``indices_are_sorted=True``) and
+``unsorted`` (the same without the hint, which slows ``"pairs"``' scatter on the GH200).
+
+The reference is ``base`` at ``2^15``, the shipped kernel, for either ``--matvec``. Every arm keeps the library's CUDA-only carry
 split (``_scan_add``'s rule), gets a function of its own to jit, and the lowered solves are asserted
 pairwise distinct. Arms are warm and interleaved; ``solve`` is per iteration (GPU scatter order varies
 iteration counts); eigenvalues must agree to ``1e-12`` relative. ``op`` is the operator's device bytes,
 ``temp`` XLA's ``temp_size_in_bytes`` for the ``(2, N)`` matvec. Fixture as ``poc/sparse_gpu.py``.
 
 Run: uv run python poc/sparse_pairs_tune.py [--log2-sizes 20 22] [--chunks 15 17 19]
-     [--variants base sorted merged real] [--rounds 5]
+     [--variants base sorted merged real] [--rounds 5] [--matvec csr --variants base unsorted]
 """
 
 import argparse
@@ -44,16 +47,20 @@ from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import Matvec, get_diagonal, uniquify_states
 from rqutils.sqd._core import _sqd_inputs
 
-VARIANTS = ("base", "sorted", "merged", "real")
+VARIANTS = {"pairs": ("base", "sorted", "merged", "real"), "csr": ("base", "unsorted")}
 parser = argparse.ArgumentParser()
 parser.add_argument("--num-qubits", type=int, default=60)
 parser.add_argument("--pattern", default="type1")
 parser.add_argument("--delta", type=float, default=0.5)
 parser.add_argument("--log2-sizes", type=int, nargs="+", default=[20, 22])
 parser.add_argument("--chunks", type=int, nargs="+", default=[15, 17, 19], help="log2 of _CHUNK")
-parser.add_argument("--variants", nargs="+", default=list(VARIANTS), choices=VARIANTS)
+parser.add_argument("--matvec", default="pairs", choices=list(VARIANTS))
+parser.add_argument("--variants", nargs="+", help="default: every variant of --matvec")
 parser.add_argument("--rounds", type=int, default=5)
 options = parser.parse_args()
+options.variants = options.variants or list(VARIANTS[options.matvec])
+if unknown := set(options.variants) - set(VARIANTS[options.matvec]):
+    parser.error(f"--matvec {options.matvec} has no variants {sorted(unknown)}")
 
 ITERATIONS = []
 _ground_locg = solve_mod.ground_locg
@@ -125,12 +132,26 @@ def apply_real(vec, d0, *sets):
     return out
 
 
+def apply_csr_unsorted(vec, d0, *entries):
+    def updates(chunk):
+        ti, si, di = chunk
+        return [(ti, di * vec[..., si])]
+
+    out = d0 * vec
+    for k in range(0, len(entries), 3):
+        out = sm._scan_add(updates, out, entries[k : k + 3])
+    return out
+
+
 KERNELS = {
-    "base": sm._apply_pairs,
-    "sorted": apply_sorted,
-    "merged": apply_merged,
-    "real": apply_real,
-}
+    "pairs": {
+        "base": sm._apply_pairs,
+        "sorted": apply_sorted,
+        "merged": apply_merged,
+        "real": apply_real,
+    },
+    "csr": {"base": sm._apply_csr, "unsorted": apply_csr_unsorted},
+}[options.matvec]
 
 
 def real_operator(h, states_u, pairs):
@@ -168,13 +189,13 @@ def timed(fn):
 ham = PauliSumXZ.from_paulisum(
     xxz(options.num_qubits, options.delta, *patterns(options.num_qubits)[options.pattern])
 )
-arm = Matvec.PAIRS
+arm = Matvec(options.matvec)
 shipped = sm._CHUNK
 arms = [(c, v) for c in options.chunks for v in options.variants]
 ref = (15, "base")
 if ref not in arms:
     arms.insert(0, ref)
-print(f"{jax.devices()[0].device_kind}, n={options.num_qubits} {options.pattern}, matvec=pairs")
+print(f"{jax.devices()[0].device_kind}, n={options.num_qubits} {options.pattern}, matvec={arm}")
 print(
     "arm          N    | solve/iter (ms) x wins | 1-D (ms) x wins | (2, N) (ms) x wins |"
     " op / temp (MiB) | iters | eigval diff | steps"
