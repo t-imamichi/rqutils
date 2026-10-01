@@ -2306,6 +2306,12 @@ M1, n=60 `type1`, `2^17`/`2^19`: gathering from `(N, 2)` instead of `(2, N)` is 
 and 0.95–0.98× per solve iteration for all three sparse kernels, flat in N, bit-identical matvecs. A first
 run's solve figures were void: a second `jax.jit` of one function reused the first's trace. `poc/sparse-layout.md` §2, §4
 
+### sqd sparse kernels: a tiled `"pairs"` order is 1.08× per iteration on CPU (2026-10-01)
+
+M1, n=60 `type1`, `2^17`/`2^19`: sorting pairs by `(i >> 12, j >> 12, i)` is 1.08× per solve iteration
+(10/10 rounds), almost all from the 1-D matvec (1.20–1.27×; `(2, N)` 1.03–1.05×), at unchanged memory.
+Smaller tiles won monotonically to the sweep's edge; host sort cost and the GPU unmeasured. `poc/sparse-tiles.md` §2
+
 ## Warm starts, collectives and the eigenpair check (2026-09)
 
 ### Warm-starting the growing subspace: four hypotheses eliminated, and the fixture gate is the result (2026-09-17)

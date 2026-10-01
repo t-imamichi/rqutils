@@ -125,7 +125,7 @@ recomputation is what hides `"indices"`' latency past the cliff, so caching them
    (`poc/sparse-pairs.md`'s arms table), ~20 GB for `type2` at `2^23`.
 4. **The levers past the cliff, unmeasured**: a locality-preserving state order (RCM did nothing on CPU,
    `poc/sparse-pairs.md` §4, since these graphs are hypercube-like); a matvec blocked so each block's
-   slice of `vec` fits L2; `"pairs"` without atomics (`poc/sparse-pairs.md` §7.6, which also lists the
+   slice of `vec` fits L2 (on CPU a tiled `"pairs"` order is 1.08× per iteration, `poc/sparse-tiles.md`); `"pairs"` without atomics (`poc/sparse-pairs.md` §7.6, which also lists the
    scan-step and layout sweeps).
 5. **Nondeterministic iteration counts** (§5): confirm the scatter-add cause, and whether
    XLA's `--xla_gpu_deterministic_ops` removes it, at what cost.

@@ -1,0 +1,87 @@
+# A tiled entry order for `"pairs"`
+
+`poc/sparse_tiles.py` (§6), one Apple M1 (8 cores, 16 GiB), CPU only, 2026-10-01. Fixture as
+`poc/sparse-gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`, `complex128`),
+Hamming-shell subspaces around both Néel states. Nothing here is in the library.
+
+## 1. The idea
+
+`"pairs"` stores each transition once as `(i, j, d)`, sorted by `i` across groups since `d84c4a3`, so
+`vec[i]`/`out[i]` stream while `vec[j]`/`out[j]` land anywhere in the vector. Sorting by
+`(i >> s, j >> s, i)` instead makes consecutive chunks touch one `2^s`-state slice of each side. It was
+`poc/sparse-gpu.md` §7.4's blocked-matvec lever for the L2 cliff. Only the data order changes, so one
+compiled solve serves every arm. Arms:
+
+- `i`: shipped.
+- `group`: `(group, i)`, close to the order before `d84c4a3`.
+- `tile12`, `tile14`, `tile16`: the tiled key at `s` = 12, 14, 16.
+
+## 2. Results
+
+Median of 5 interleaved rounds, each ratio against `i`, with how many rounds the arm won. `1-D` and
+`(2, N)` are the bare kernel on a fixed vector of that shape; the solve runs both.
+
+| order | N | solve/iter | ratio | wins | 1-D matvec | ratio | wins | `(2, N)` matvec | ratio | wins | iters |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `i` | `2^17` | 9.23 ms | — | — | 2.02 ms | — | — | 2.26 ms | — | — | 106 |
+| `group` | `2^17` | 8.71 ms | 1.06× | 5/5 | 1.43 ms | 1.41× | 5/5 | 2.67 ms | 0.85× | 0/5 | 105 |
+| `tile12` | `2^17` | 8.58 ms | **1.08×** | 5/5 | 1.68 ms | 1.20× | 5/5 | 2.15 ms | 1.05× | 5/5 | 105 |
+| `tile14` | `2^17` | 8.88 ms | 1.04× | 4/5 | 1.77 ms | 1.14× | 5/5 | 2.17 ms | 1.04× | 4/5 | 96 |
+| `tile16` | `2^17` | 9.32 ms | 0.99× | 0/5 | 1.98 ms | 1.02× | 4/5 | 2.27 ms | 0.99× | 3/5 | 96 |
+| `i` | `2^19` | 51.58 ms | — | — | 8.49 ms | — | — | 10.35 ms | — | — | 64 |
+| `group` | `2^19` | 62.69 ms | 0.82× | 0/5 | 8.77 ms | 0.97× | 3/5 | 20.10 ms | 0.52× | 0/5 | 64 |
+| `tile12` | `2^19` | 47.68 ms | **1.08×** | 5/5 | 6.66 ms | **1.27×** | 5/5 | 10.07 ms | 1.03× | 4/5 | 64 |
+| `tile14` | `2^19` | 48.82 ms | 1.06× | 5/5 | 7.44 ms | 1.14× | 5/5 | 10.24 ms | 1.01× | 4/5 | 64 |
+| `tile16` | `2^19` | 49.46 ms | 1.04× | 5/5 | 7.76 ms | 1.09× | 5/5 | 10.39 ms | 1.00× | 3/5 | 64 |
+
+- **`tile12` is 1.08× per solve iteration at both sizes**, winning 10 of 10 rounds, at the same 64
+  iterations at `2^19`. An earlier run of the script, before the 1-D column, measured 1.08× and 1.11×.
+- **The gain is in the 1-D matvec**: 1.20–1.27× against 1.03–1.05× on `(2, N)`. The solve's 1-D calls
+  are the prefilter's 32 Chebyshev steps and `body()`'s third matvec. Why the batch gains so much less
+  is not established.
+- **Smaller tiles win, monotonically**: 12 > 14 > 16 in every column at both sizes. `s = 12` is the
+  smallest tried, so the optimum may lie lower (§5). At 64 B/state for a batched vector and its output, a
+  `2^12` slice is 256 KiB, far below the 12 MB L2 the sweep was sized for.
+- **`group` is not a candidate**: it halves `(2, N)` throughput at `2^19` (0.52×) and loses 0.82× per
+  solve iteration, despite a 1.41× 1-D matvec at `2^17`.
+- Every arm holds the same entries as `i` and a different order (both asserted). Eigenvalues agree to
+  2.9e-16; iteration counts differ at `2^17` (106/105/96) because scatter order changes rounding, which is
+  why the solve is timed per iteration.
+
+## 3. What it costs
+
+Device memory is unchanged: the same three arrays, permuted. The host build gains an `np.lexsort` over
+the real entries, **unmeasured** — the timings above exclude the build.
+
+## 4. What it means
+
+A free per-iteration win on CPU at no memory cost, the first lever past the cache to measure positive
+(`poc/sparse-layout.md`'s state-major gather lost 0.95–0.98×). At 1.08× it does not change
+`poc/sparse-pairs.md` §10's CPU ranking, where `"ell"` leads at ~2× `"csr"`, nor `poc/sparse-gpu.md` §6's
+GPU recommendation, whose L2 cliff this was aimed at.
+
+## 5. Open
+
+1. **The GPU** — `uv run python poc/sparse_tiles.py --log2-sizes 19 20 21 --tiles 10 12 14 16 18` on the
+   GH200, where a large-tile guess put `s` near 18.
+2. **Tiles below 12**, since the sweep is monotone to its edge.
+3. **`2^20` and up on CPU**, and the host build cost of the sort.
+4. **The same key for `"csr"`/`"ell"`**, which sort by target row and so would lose `indices_are_sorted`
+   and their one-write-per-row structure respectively.
+
+## 6. The script
+
+`poc/sparse_tiles.py`, its argparse checked against this section:
+
+| flag | default | meaning |
+| --- | --- | --- |
+| `--num-qubits`, `--delta` | `60`, `0.5` | the `xxz` fixture |
+| `--pattern` | `type1` | one of `poc/eigenpair_check_scale.patterns` |
+| `--log2-sizes` | `17 19` | subspace sizes `2^k` |
+| `--tiles` | `12 14 16` | the `s` of each `tileS` arm; `i` and `group` always run |
+| `--rounds` | `5` | interleaved rounds after one warm-up per arm |
+
+It wraps `_sort_by_target` on the host and permutes `"pairs"`' real entries (padding, `i == j`, stays
+last), then builds each arm's operator through `_sparse_operator` itself. `solve` is `_run_sparse` with
+`return_eigvec=False`, divided by that solve's iteration count, captured by wrapping `ground_locg` with a
+host callback as `poc/sparse_gpu.py` does. Runs here: the default sweep, twice; §2 is the second run.
