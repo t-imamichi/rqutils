@@ -2300,6 +2300,12 @@ GH200, n=60 `type1`/`type2`: `"pairs"` is the fastest sparse kernel everywhere (
 stays. The solve, not the host build (≤8.5%), makes a one-time 2.2–2.5× per-state step between `2^19` and
 `2^20`, where `complex128` `(2, N)` vectors pass the 50 MB L2 — inferred, not profiled. `poc/sparse-gpu.md` §3
 
+### sqd sparse kernels: a state-major `(N, 2)` gather layout loses on CPU (2026-10-01)
+
+M1, n=60 `type1`, `2^17`/`2^19`: gathering from `(N, 2)` instead of `(2, N)` is 0.83–0.87× on the matvec
+and 0.95–0.98× per solve iteration for all three sparse kernels, flat in N, bit-identical matvecs. A first
+run's solve figures were void: a second `jax.jit` of one function reused the first's trace. `poc/sparse-layout.md` §2, §4
+
 ## Warm starts, collectives and the eigenpair check (2026-09)
 
 ### Warm-starting the growing subspace: four hypotheses eliminated, and the fixture gate is the result (2026-09-17)
