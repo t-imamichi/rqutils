@@ -309,7 +309,7 @@ def init_devices(devices: str | None, host_devices: int = 4) -> str:
     return f"{ndev} {kind} {backend} device(s){over}"
 
 
-def make_1d_mesh(axis: str = "x", devices: list | None = None):
+def make_1d_mesh(axis: str = "x", devices: "list | None" = None):
     """Build a 1-D mesh over every device, including across a multi-slice (multi-node) topology.
 
     ``jax.make_mesh`` **rejects multi-slice topologies outright**: it routes through
