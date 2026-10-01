@@ -223,7 +223,7 @@ Hamming shells. Shell `h` for `type1`/`type2` is read off `type4`/`type3`, which
 
 ## 7. Open before a library version
 
-1. **GPU timing** of P0 and C2R against `(1, 0)` and `(1, 2)` — the deciding measurement.
+1. **GPU timing — measured** for the shipped kernels against `"indices"`: `poc/sparse-gpu.md`.
 2. **Sharding.** A pair's endpoints can sit on different devices; CSR needs its sources gathered.
 3. **API — done.** P2 and C2R ship as `sqd(matvec="pairs")` and `sqd(matvec="csr")` (§9); P0 and C0i16
    were not shipped.

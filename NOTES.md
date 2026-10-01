@@ -2293,6 +2293,13 @@ The leak is flat on a second CUDA device (+0.000 GB retained and drift, 0.950 GB
 16.0x/14.6x/10.8x are lower bounds under a ~1.46 s floor, so don't quote them; Claim 3 is unrun (one
 device). `poc/prefilter-gpu.md` §7, §9.
 
+### sqd sparse kernels on a GPU: `"pairs"` wins until the vectors leave L2 (2026-10-01)
+
+GH200, n=60 `type1`/`type2`: `"pairs"` is the fastest sparse kernel everywhere (CPU's ranking inverted),
+2.6–9.3× `"indices"` through `2^19`, but every win is gone by `2^21` (0.57–0.99×) while the −34–39% memory
+stays. The solve, not the host build (≤8.5%), makes a one-time 2.2–2.5× per-state step between `2^19` and
+`2^20`, where `complex128` `(2, N)` vectors pass the 50 MB L2 — inferred, not profiled. `poc/sparse-gpu.md` §3
+
 ## Warm starts, collectives and the eigenpair check (2026-09)
 
 ### Warm-starting the growing subspace: four hypotheses eliminated, and the fixture gate is the result (2026-09-17)
