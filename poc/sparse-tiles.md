@@ -10,7 +10,7 @@ Hamming-shell subspaces around both Néel states. Nothing here is in the library
 `"pairs"` stores each transition once as `(i, j, d)`, sorted by `i` across groups since `d84c4a3`, so
 `vec[i]`/`out[i]` stream while `vec[j]`/`out[j]` land anywhere in the vector. Sorting by
 `(i >> s, j >> s, i)` instead makes consecutive chunks touch one `2^s`-state slice of each side. It was
-`poc/sparse-gpu.md` §7.4's blocked-matvec lever for the L2 cliff. Only the data order changes, so one
+`poc/sparse-gpu.md` §8.4's blocked-matvec lever for the L2 cliff. Only the data order changes, so one
 compiled solve serves every arm. Arms:
 
 - `i`: shipped.
@@ -91,8 +91,8 @@ A free per-iteration win on CPU at no memory cost, the first lever past the cach
 there (`poc/sparse-layout.md`'s state-major gather lost 0.95–0.98×). At 1.08× it does not change
 `poc/sparse-pairs.md` §10's CPU ranking, where `"ell"` leads at ~2× `"csr"`.
 
-**On the GPU, where it was aimed, it buys nothing**, so `poc/sparse-gpu.md` §6's recommendation stands
-and the cliff it targeted is probably not locality. Not worth shipping for a CPU-only 1.08×.
+**On the GPU, where it was aimed, it buys nothing**: the cliff it targeted was not locality but the
+per-step carry split (`poc/sparse-split.md` §1). Not worth shipping for a CPU-only 1.08×.
 
 ## 6. Open
 

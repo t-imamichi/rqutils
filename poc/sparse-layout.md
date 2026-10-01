@@ -58,7 +58,7 @@ Open:
 
 1. **The GPU**, which is where §1 aimed: a 32 B sector holds exactly the `(N, 2)` pair, and
    `poc/sparse-gpu.md` §3's cliff is bandwidth-shaped where this CPU's is not. No CPU evidence now
-   favours it; `poc/sparse-gpu.md` §7.4's tiled order (pairs sorted by `(i >> s, j >> s, i)`) ranks first.
+   favours it; `poc/sparse-gpu.md` §8.4's tiled order (pairs sorted by `(i >> s, j >> s, i)`) ranks first.
    Run: `uv run python poc/sparse_layout.py --log2-sizes 19 20 21` on the GPU host.
 2. **A layout carried through the solver**, so no matvec transposes: `ground_locg` would hold `(N, 2)`
    throughout. Untried; it is the only form in which the transpose cost could vanish.

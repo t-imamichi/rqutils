@@ -2299,6 +2299,12 @@ GH200, n=60, pre-`0d25235` kernels: `"pairs"` led the sparse kernels, 2.6–9.3�
 gone by `2^21` and 0.49× at `2^22`, at −39% memory. Both per-state steps, read as L2, were the per-step
 complex-carry split that `0d25235` fixes; "keep `"indices"`" is retracted. `poc/sparse-gpu.md` §3, `poc/sparse-split.md` §4
 
+### sqd dense kernels on a GPU: `"indices"` is three quarters diagonal recompute, `"tables"` 2.9–5.6× its matvec (2026-10-02)
+
+GH200 profile, `type1` `2^20`/`2^22`: no carry split in the dense kernels (they never scatter). `"indices"`
+spends ~75% recomputing diagonals (179 term-passes, 241 host syncs per matvec); `"tables"` drops it, its
+`(2, N)` matvec matching the fixed `"pairs"` at `2^22` — the mesh candidate, unmeasured in solves. `poc/sparse-gpu.md` §6
+
 ### sqd sparse kernels: a state-major `(N, 2)` gather layout loses on CPU (2026-10-01)
 
 M1, n=60 `type1`, `2^17`/`2^19`: gathering from `(N, 2)` instead of `(2, N)` is 0.83–0.87× on the matvec

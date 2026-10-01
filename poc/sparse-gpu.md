@@ -1,6 +1,6 @@
 # Sparse matvec kernels on a GPU
 
-`poc/sparse_gpu.py` (§8), one NVIDIA GH200 120GB, 2026-10-01: the GPU timing that `poc/sparse-pairs.md` §7
+`poc/sparse_gpu.py` (§9), one NVIDIA GH200 120GB, 2026-10-01: the GPU timing that `poc/sparse-pairs.md` §7
 left open, through the shipped `sqd(matvec=...)` kernels. Fixture as there: spinchain's open-XXZ `xxz` at
 n=60, `δ = 0.5`, Hamming-shell subspaces around both Néel states; `type1` (`J = 62`) and `type2`
 (`J = 120`), both `complex128` (61 of 62 and 118 of 120 groups real). Every timing is a warm median of 3;
@@ -41,7 +41,7 @@ at every size measured (`poc/sparse-split.md` §4).
 
 ## 2. The host build is not the cost
 
-`type1` `2^21`, median per stage (§8 defines them):
+`type1` `2^21`, median per stage (§9 defines them):
 
 | arm | build | solve | check | build share |
 | --- | --- | --- | --- | --- |
@@ -75,18 +75,17 @@ does not.
   64 B/state: 32 MiB at `2^19`, 64 MiB at `2^20`, against the H100's 50 MB L2 (NVIDIA's specification, not
   measured here). This is the CPU's §3 finding at a larger cache: there P2 doubled per state from `2^17` to
   `2^19`, as the same arrays grew from 8 to 32 MiB. **Inferred, not measured** — the size of the step and
-  its location fit, but no L2 hit rate was read (§7). **Retracted for the sparse kernels**: a profile puts
+  its location fit, but no L2 hit rate was read. **Retracted for the sparse kernels**: a profile puts
   72–88% of a `"pairs"` matvec from `2^20` in XLA splitting and rejoining the complex scan carry at every
   step, so both steps are the scan's step count, not L2 (`poc/sparse-split.md` §1, which also has the fix).
-- **The second step is not L2**: the vectors were already 2× past it at `2^20` (64 MiB) and are 256 MiB
-  at `2^22`. Its cause is open (§7); GPU TLB reach is one candidate, unexamined.
-- **`"indices"` degrades less** because its per-state diagonal recomputation hides the latency, as on the
-  CPU. Its cost per state *falls* (26.1 → 20.9 → 18.3 ns over `2^20`–`2^22` in the third run), setup
+- **The second step is the same defect**: steps double, 160 → 320, from `2^21` to `2^22`.
+- **`"indices"` degrades less** because it never scatters, so it pays no per-step carry split; three
+  quarters of its matvec is recomputing the diagonal (§6). Its cost per state *falls* (26.1 → 20.9 → 18.3 ns over `2^20`–`2^22` in the third run), setup
   amortizing. That is why `"pairs"`' lead goes from 3.3× to a tie and then to 0.53× per iteration.
 
 ## 4. Memory
 
-`peak_bytes_in_use`, one fresh process per arm (§8), GiB:
+`peak_bytes_in_use`, one fresh process per arm (§9), GiB:
 
 | pattern | N | `"indices"` | `"pairs"` | `"csr"` | `"ell"` |
 | --- | --- | --- | --- | --- | --- |
@@ -112,7 +111,42 @@ summing in nondeterministic order would produce exactly this, and `"ell"`'s per-
 order, which fits it being the one kernel that never varied across repeats. CPU runs of the same script
 at `2^10`–`2^13` gave identical counts.
 
-## 6. What it means
+## 6. The dense kernels' matvec, profiled
+
+`poc/sparse_profile.py --matvec indices` and `--matvec tables` at `bc596f8`, `type1`, device time per
+matvec over 10 calls. **No `wrapped_real`/`wrapped_imag`/`wrapped_complex` appears in either**: their scan
+gathers and adds elementwise, never scatters, so `poc/sparse-split.md` §1's defect does not reach them.
+
+`"indices"`, share of the 1-D matvec at `2^20` / `2^22` (6.38 / 24.07 ms):
+
+| work | kernels | share |
+| --- | --- | --- |
+| diagonal: a full pass per Z term, ΣK = 179 per call | `loop_add_fusion` + `input_reduce_fusion` (179/call) | 51% / 57% |
+| diagonal: zeroing each group's accumulator | `loop_broadcast_fusion` (63/call) | 12% / 11% |
+| `get_diagonal`'s `while_loop`: host round trip per step | `MemcpyD2H` + `memcpy32_post` + `loop_and_fusion` (186–241/call) | 13% / 4% |
+| gather, scale and add per group | `loop_add_fusion_2` (62/call) | 20% / 25% |
+
+- **About three quarters is recomputing the diagonal**, the per-term streaming loop `poc/parity-xor.md`
+  §2 found optimal on CPU. The gather is the minority; it alone doubles from 1-D to `(2, N)`.
+- **The `while_loop` costs a device-to-host copy per step** on the GPU, 241 per call: fixed latency
+  (0.8–1.0 ms per call), so 13% at `2^20` and 4% at `2^22`. It bounds what a sync-free loop could recover.
+
+`"tables"` caches those diagonals, leaving one fused gather-multiply-add per group (61 per call, no host
+copies):
+
+| matvec | `"indices"` | `"tables"` | ratio | `"pairs"`, fixed (`poc/sparse-split.md` §4) |
+| --- | --- | --- | --- | --- |
+| `2^20` 1-D | 6.38 ms | 1.14 ms | 5.6× | 1.37 ms |
+| `2^20` `(2, N)` | 7.70 ms | 2.69 ms | 2.9× | 1.58 ms |
+| `2^22` 1-D | 24.07 ms | 5.13 ms | 4.7× | 10.77 ms |
+| `2^22` `(2, N)` | 28.35 ms | 9.19 ms | 3.1× | 9.52 ms |
+
+- **At `2^22` `"tables"`' matvec matches the fixed `"pairs"`**, and it works under a mesh, where the sparse
+  kernels raise. Its price is ~`20·J` B/state (`poc/sparse-pairs.md`'s arms table): ~5 GB at `type1`
+  `2^22`, ~25 GB at 20M states, divided across a mesh's devices but for the replicated states.
+- These are device times per matvec, not solves; §8 item 3 is the solve run.
+
+## 7. What it means
 
 - **Up to `2^19` on this GPU, `"pairs"` is the kernel**: 2.6–9.3× `"indices"`, at −41% to −47% memory by
   `2^19`.
@@ -129,32 +163,29 @@ With `0d25235`, `"pairs"` is 3.8–6.7× and `"ell"` 4.3–5.8× `"indices"` per
 are open there.
 
 Under a mesh the sparse kernels raise, which leaves `"onthefly"`, `"indices"` and `"tables"`. **`"tables"`
-is unmeasured on any GPU** and is the open candidate (§7): it caches the diagonal factors whose
-recomputation is what hides `"indices"`' latency past the cliff, so caching them could win or lose.
+is the candidate there**: its matvec is 2.9–5.6× `"indices"`' (§6), unmeasured in a whole solve (§8).
 
-## 7. Open
+## 8. Open
 
-1. **Confirm the L2 cause**: Nsight Compute's `lts__t_sector_hit_rate.pct` on one `"pairs"` solve at
-   `2^19` and `2^20`. A collapse across the step settles §3.
+1. **The L2 cause — settled otherwise**: both of §3's steps are the per-step carry split
+   (`poc/sparse-split.md` §1).
 2. **`type3`/`type4`**, and `type2` at `2^20`/`2^21` with this revision.
-3. **`"tables"`, and sizes past `2^22`**: `--arms indices tables pairs --log2-sizes 21 22 23`. `"tables"` stores ~`20·J` B/state
-   (`poc/sparse-pairs.md`'s arms table), ~20 GB for `type2` at `2^23`.
+3. **`"tables"` in whole solves**, beside the fixed sparse kernels in one process:
+   `--patterns type1 type2 --arms indices tables pairs ell --log2-sizes 20 21 22`, then `23`. `"tables"`
+   stores ~`20·J` B/state (`poc/sparse-pairs.md`'s arms table), ~20 GB for `type2` at `2^23`.
 4. **The levers past the cliff, unmeasured**: a locality-preserving state order (RCM did nothing on CPU,
    `poc/sparse-pairs.md` §4, since these graphs are hypercube-like); a matvec blocked so each block's
    slice of `vec` fits L2 (a tiled `"pairs"` order: 1.08× per iteration on CPU, 1.00× here,
    `poc/sparse-tiles.md` §3); `"pairs"` without atomics (`poc/sparse-pairs.md` §7.6, which also lists the
    scan-step and layout sweeps).
-5. **The second step** (§3), `"pairs"` 1.81× per state from `2^21` to `2^22`: past L2, so its cause
-   is unknown. Nsight Compute's TLB and DRAM metrics at both sizes would locate it; a `2^23` point would
-   show whether it is a step or a slope.
+5. **The second step — settled**: the same defect, steps doubling 160 → 320 (§3).
 6. **Nondeterministic iteration counts** (§5): confirm the scatter-add cause, and whether
    XLA's `--xla_gpu_deterministic_ops` removes it, at what cost.
-7. **Only one GPU.** A different L2 size moves the cliff, by this account in proportion (A100: 40 MB).
-   An A100 attempt gave no number: its child processes fell back to CPU on `cuInit(0)`'s
+7. **Only one GPU.** An A100 attempt gave no number: its child processes fell back to CPU on `cuInit(0)`'s
    `CUDA_ERROR_NO_DEVICE` — undiagnosed; the likeliest cause is `--device` overriding a scheduler's
    `CUDA_VISIBLE_DEVICES`.
 
-## 8. The script
+## 9. The script
 
 `poc/sparse_gpu.py`, its argparse checked against this section:
 
@@ -178,4 +209,5 @@ pattern), and the script warns when the warm-up and timed solves disagree on it.
 
 Runs here: `--device 0` (the default sweep, read through `type2` `2^19`), `--patterns type1 type2
 --log2-sizes 19 20 21 --device 0` (read through `type2` `2^19`), and, at `c63f067`, `--patterns type1
---arms indices pairs --log2-sizes 20 21 22` (§1's third run).
+--arms indices pairs --log2-sizes 20 21 22` (§1's third run). §6 is `poc/sparse_profile.py --matvec
+indices` and `--matvec tables`, `--log2-sizes 20 22`, at `bc596f8`.
