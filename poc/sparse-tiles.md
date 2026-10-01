@@ -1,7 +1,7 @@
 # A tiled entry order for `"pairs"`
 
-`poc/sparse_tiles.py` (§7), 2026-10-01: one Apple M1 (8 cores, 16 GiB) for §2, one NVIDIA GH200 120GB for
-§3. Fixture as
+`poc/sparse_tiles.py` (§7), 2026-10-01/02: one Apple M1 (8 cores, 16 GiB) for §2, one NVIDIA GH200 120GB
+for §3. Fixture as
 `poc/sparse-gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`, `complex128`),
 Hamming-shell subspaces around both Néel states. Nothing here is in the library.
 
@@ -49,10 +49,10 @@ Median of 5 interleaved rounds, each ratio against `i`, with how many rounds the
   2.9e-16; iteration counts differ at `2^17` (106/105/96) because scatter order changes rounding, which is
   why the solve is timed per iteration.
 
-## 3. On the GPU it does nothing
+## 3. On the GPU: nothing before the carry fix, 1.01–1.03× after
 
-GH200, `--log2-sizes 20 21 22 --tiles 10 12 14 16 18`, the script unchanged from §2's run. `2^22` was
-still running when this was written. Ratios against `i`; `wins` as in §2:
+**Before `0d25235`**, GH200, `--log2-sizes 20 21 22 --tiles 10 12 14 16 18`, the script unchanged from
+§2's run; its `2^22` rows were never read. Ratios against `i`; `wins` as in §2:
 
 | order | N | solve/iter | ratio | wins | 1-D matvec | ratio | wins | `(2, N)` matvec | ratio | wins |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -74,16 +74,42 @@ still running when this was written. Ratios against `i`; `wins` as in §2:
 - **This is evidence against `poc/sparse-gpu.md` §3's L2 reading for `"pairs"`.** A `tile10` block touches
   two 1024-state slices, ~64 KiB, so its gathers and scatters should hit L2 throughout; if missed
   `vec[j]`/`out[j]` lines were the cost, this would have recovered most of the cliff.
-- **The cost tracks the data, not the access pattern**: the `(2, N)` matvec is 1.79–2.01× the 1-D one in
-  every arm. Scatter-add atomic throughput and the chunk `scan`'s per-step cost both fit; neither is
-  measured.
+- **The cost tracked the data, not the access pattern**: the `(2, N)` matvec was 1.79–2.01× the 1-D one
+  in every arm. That was the per-step carry split, three full passes over `out` per scan step
+  (`poc/sparse-split.md` §1), which no entry order can change.
 - The shipped order reproduces `poc/sparse-gpu.md` §3 (17.45 and 40.15 ms per iteration). Eigenvalues agree
   to 3.9e-16; iteration counts vary by ±1 between repeats, as recorded there in §5.
+
+**After `0d25235`**, the same GH200 and fixture, `--log2-sizes 20 21 --tiles 10 12 14 16 18`, with the
+fixed kernel (the script calls the library's):
+
+| order | N | solve/iter | ratio | wins | 1-D matvec | ratio | wins | `(2, N)` matvec | ratio | wins |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `i` | `2^20` | 4.25 ms | — | — | 1.43 ms | — | — | 1.60 ms | — | — |
+| `group` | `2^20` | 4.36 ms | 0.98× | 0/5 | 1.46 ms | 0.98× | 1/5 | 1.66 ms | 0.97× | 0/5 |
+| `tile10` | `2^20` | 4.12 ms | 1.03× | 5/5 | 1.41 ms | 1.02× | 5/5 | 1.51 ms | 1.06× | 5/5 |
+| `tile18` | `2^20` | 4.20 ms | 1.01× | 5/5 | 1.42 ms | 1.01× | 5/5 | 1.57 ms | 1.02× | 5/5 |
+| `i` | `2^21` | 6.60 ms | — | — | 2.26 ms | — | — | 2.52 ms | — | — |
+| `group` | `2^21` | 6.96 ms | 0.95× | 0/5 | 2.33 ms | 0.97× | 0/5 | 2.75 ms | 0.91× | 0/5 |
+| `tile10` | `2^21` | 6.46 ms | 1.02× | 5/5 | 2.22 ms | 1.02× | 5/5 | 2.43 ms | 1.04× | 5/5 |
+| `tile18` | `2^21` | 6.56 ms | 1.01× | 5/5 | 2.25 ms | 1.00× | 5/5 | 2.49 ms | 1.01× | 5/5 |
+
+`tile12`–`tile16` sit between `tile10` and `tile18` in every column (1.01–1.05×, all 5/5).
+
+- **With the defect gone, order registers.** Every tile won all 5 rounds in every column at both sizes,
+  1.01–1.03× per iteration and up to 1.06× on the `(2, N)` matvec, smaller tiles mostly better — the CPU's
+  direction (§2) at a third of its size.
+- **Skipping the cross-group sort loses**: `group` is 0.95–0.98× per iteration and 0.91× on the `(2, N)`
+  matvec at `2^21`, while the sort is ~9–14% of a CPU `"pairs"` build (§4). It stays.
+- Eigenvalues agree to 5.3e-16; iteration counts vary by ±1, as before.
 
 ## 4. What it costs
 
 Device memory is unchanged: the same three arrays, permuted. The host build gains an `np.lexsort` over
-the real entries, **unmeasured** — the timings above exclude the build.
+the real entries, **unmeasured** — the timings above exclude the build. For scale, the shipped linear
+counting sort by `i` is 9–14% of a CPU `"pairs"` build (M1, `type1`/`type2` `2^20`/`2^21`, warm; the
+search is 80–87%, the device factors 4–6%), measured by wrapping `_sparse_operator`'s stages in a
+one-off session — no committed script reproduces it.
 
 ## 5. What it means
 
@@ -91,15 +117,16 @@ A free per-iteration win on CPU at no memory cost, the first lever past the cach
 there (`poc/sparse-layout.md`'s state-major gather lost 0.95–0.98×). At 1.08× it does not change
 `poc/sparse-pairs.md` §10's CPU ranking, where `"ell"` leads at ~2× `"csr"`.
 
-**On the GPU, where it was aimed, it buys nothing**: the cliff it targeted was not locality but the
-per-step carry split (`poc/sparse-split.md` §1). Not worth shipping for a CPU-only 1.08×.
+**On the GPU it was aimed at the wrong cause**: the cliff was the per-step carry split
+(`poc/sparse-split.md` §1), not locality. With that fixed it is a consistent 1.01–1.03× per iteration —
+at `type2` `2^22`, ~0.1 s of a 6.38 s call (`poc/sparse-gpu.md` §7), which an `O(E log E)` `lexsort`
+over 14M+ entries could cost back. Not worth shipping without a linear tile sort, measured.
 
 ## 6. Open
 
-1. **`2^22` on the GPU**, where `"pairs"` steps a second time (`poc/sparse-gpu.md` §3).
-2. **What the GPU cost is**: `jax.profiler.trace` around a few `"pairs"` matvecs at `2^19` and `2^20`,
-   for the scatter, gather and per-step split — which decides whether `"pairs"` without atomics
-   (`poc/sparse-pairs.md` §7.6) can help.
+1. **A linear tile sort and its build cost**: a counting sort by tile id over the already `i`-sorted
+   entries keeps `i` order within a tile; the bar is §5's ~2–3% of a GPU solve.
+2. **`2^22` with the fixed kernel**, and below `tile10` on the GPU, since smaller tiles still win.
 3. **Tiles below 12 on CPU**, since that sweep is monotone to its edge.
 4. **`2^20` and up on CPU**, and the host build cost of the sort.
 5. **The same key for `"csr"`/`"ell"`**, which sort by target row and so would lose `indices_are_sorted`
@@ -121,4 +148,5 @@ It wraps `_sort_by_target` on the host and permutes `"pairs"`' real entries (pad
 last), then builds each arm's operator through `_sparse_operator` itself. `solve` is `_run_sparse` with
 `return_eigvec=False`, divided by that solve's iteration count, captured by wrapping `ground_locg` with a
 host callback as `poc/sparse_gpu.py` does. Runs here: the default sweep on CPU, twice (§2 is the
-second), and `--log2-sizes 20 21 22 --tiles 10 12 14 16 18` on the GH200 (§3).
+second), and `--log2-sizes 20 21 22 --tiles 10 12 14 16 18` on the GH200 before `0d25235` and
+`--log2-sizes 20 21` with the same tiles after it (§3).

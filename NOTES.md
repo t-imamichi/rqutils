@@ -2321,8 +2321,8 @@ run's solve figures were void: a second `jax.jit` of one function reused the fir
 
 M1, n=60 `type1`, `2^17`/`2^19`: sorting pairs by `(i >> 12, j >> 12, i)` is 1.08× per solve iteration
 (10/10 rounds), almost all from the 1-D matvec (1.20–1.27×; `(2, N)` 1.03–1.05×), at unchanged memory.
-On the GH200 it is 1.00× at `2^20`/`2^21` (every tile within 0.7%), evidence against the L2 reading of
-`"pairs"`' cliff. `poc/sparse-tiles.md` §2, §3
+GH200: 1.00× before the carry fix (`0d25235`), 1.01–1.03× after (10/10); skipping the cross-group sort
+loses there (0.95–0.98×), so it stays. Not shipped: the gain is below a `lexsort`'s build cost. `poc/sparse-tiles.md` §2, §3
 
 ### sqd sparse kernels on a GPU: the cliff is XLA splitting the complex scan carry every step (2026-10-01)
 

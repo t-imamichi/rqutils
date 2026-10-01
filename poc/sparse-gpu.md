@@ -201,8 +201,8 @@ decision.
    `"tables"`' memory (~`20·J` B/state) starts to matter.
 4. **The levers past the cliff, unmeasured**: a locality-preserving state order (RCM did nothing on CPU,
    `poc/sparse-pairs.md` §4, since these graphs are hypercube-like); a matvec blocked so each block's
-   slice of `vec` fits L2 (a tiled `"pairs"` order: 1.08× per iteration on CPU, 1.00× here,
-   `poc/sparse-tiles.md` §3); `"pairs"` without atomics (`poc/sparse-pairs.md` §7.6, which also lists the
+   slice of `vec` fits L2 (a tiled `"pairs"` order: 1.08× per iteration on CPU, 1.00× here before the fix and
+   1.01–1.03× after, `poc/sparse-tiles.md` §3); `"pairs"` without atomics (`poc/sparse-pairs.md` §7.6, which also lists the
    scan-step and layout sweeps).
 5. **The second step — settled**: the same defect, steps doubling 160 → 320 (§3).
 6. **Nondeterministic iteration counts** (§5): confirm the scatter-add cause, and whether
