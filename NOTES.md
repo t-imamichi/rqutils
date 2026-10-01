@@ -2305,6 +2305,12 @@ GH200 profile, `type1` `2^20`/`2^22`: no carry split in the dense kernels (they 
 spends ~75% recomputing diagonals (179 term-passes, 241 host syncs per matvec); `"tables"` drops it, its
 `(2, N)` matvec matching the fixed `"pairs"` at `2^22` — the mesh candidate, unmeasured in solves. `poc/sparse-gpu.md` §6
 
+### sqd on a GPU after the carry fix: `"tables"` fastest end to end, `"pairs"` the memory option (2026-10-02)
+
+GH200, `type1`/`type2` `2^20`–`2^22`, one process: `"tables"` 3.05–4.54× `"indices"` per whole `sqd` call at
+~2.2× its memory, fastest in 5 of 6; `"pairs"` 2.44–3.94× at ~0.55×. `"ell"` loses to host build (44% at
+`2^22`) and compile (0.84× `"indices"` cold). `"indices"` stays the CPU-chosen default. `poc/sparse-gpu.md` §7, §8
+
 ### sqd sparse kernels: a state-major `(N, 2)` gather layout loses on CPU (2026-10-01)
 
 M1, n=60 `type1`, `2^17`/`2^19`: gathering from `(N, 2)` instead of `(2, N)` is 0.83–0.87× on the matvec

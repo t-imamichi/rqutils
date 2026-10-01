@@ -94,8 +94,8 @@ write-up's "keep `"indices"`". The CPU keeps its complex carry and is unchanged.
 
 ## 6. Open
 
-1. **A same-process run against `"indices"`, and `type2`**:
-   `poc/sparse_gpu.py --patterns type1 type2 --arms indices pairs ell --log2-sizes 20 21 22`.
+1. **A same-process run against `"indices"`, and `type2` — done**: `poc/sparse-gpu.md` §7, end to end
+   and with `"tables"`, which is fastest there in 5 of 6 cells.
 2. **Past `2^22`**, where `"pairs"`' per-state rise decides it against `"ell"`.
 3. **ROCm**, which the gate does not cover; unmeasured whether its XLA scatter splits the same way.
 

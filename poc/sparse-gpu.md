@@ -1,6 +1,6 @@
 # Sparse matvec kernels on a GPU
 
-`poc/sparse_gpu.py` (§9), one NVIDIA GH200 120GB, 2026-10-01: the GPU timing that `poc/sparse-pairs.md` §7
+`poc/sparse_gpu.py` (§10), one NVIDIA GH200 120GB, 2026-10-01/02: the GPU timing that `poc/sparse-pairs.md` §7
 left open, through the shipped `sqd(matvec=...)` kernels. Fixture as there: spinchain's open-XXZ `xxz` at
 n=60, `δ = 0.5`, Hamming-shell subspaces around both Néel states; `type1` (`J = 62`) and `type2`
 (`J = 120`), both `complex128` (61 of 62 and 118 of 120 groups real). Every timing is a warm median of 3;
@@ -9,10 +9,10 @@ so `"indices"` is the only reference. `type3`/`type4` and `type2` at `2^20` are 
 and a repeat of `type1` `2^20`/`2^21`, come from a third run at `c63f067`, `"indices"` and `"pairs"` only;
 the script is unchanged since, and the library's change between (`605ad4a`) touches only the host build.
 
-**Every sparse time here is the pre-`0d25235` kernels**, which on CUDA split and rejoined their complex
-scan carry at every step (`poc/sparse-split.md` §1). §1, §3 and §6's speeds and rankings describe that
-defect; memory (§4) and the build (§2) do not depend on it. Fixed, the sparse kernels beat `"indices"`
-at every size measured (`poc/sparse-split.md` §4).
+**§1–§5's sparse times are the pre-`0d25235` kernels**, which on CUDA split and rejoined their complex
+scan carry at every step (`poc/sparse-split.md` §1); their speeds and rankings describe that defect, while
+memory (§4) and the build (§2) do not depend on it. §6 profiles the dense kernels, and §7 is a fourth run
+with the fix, which §8's recommendations rest on.
 
 ## 1. Whole solves against `"indices"`
 
@@ -41,7 +41,7 @@ at every size measured (`poc/sparse-split.md` §4).
 
 ## 2. The host build is not the cost
 
-`type1` `2^21`, median per stage (§9 defines them):
+`type1` `2^21`, median per stage (§10 defines them):
 
 | arm | build | solve | check | build share |
 | --- | --- | --- | --- | --- |
@@ -85,7 +85,7 @@ does not.
 
 ## 4. Memory
 
-`peak_bytes_in_use`, one fresh process per arm (§9), GiB:
+`peak_bytes_in_use`, one fresh process per arm (§10), GiB:
 
 | pattern | N | `"indices"` | `"pairs"` | `"csr"` | `"ell"` |
 | --- | --- | --- | --- | --- | --- |
@@ -144,35 +144,61 @@ copies):
 - **At `2^22` `"tables"`' matvec matches the fixed `"pairs"`**, and it works under a mesh, where the sparse
   kernels raise. Its price is ~`20·J` B/state (`poc/sparse-pairs.md`'s arms table): ~5 GB at `type1`
   `2^22`, ~25 GB at 20M states, divided across a mesh's devices but for the replicated states.
-- These are device times per matvec, not solves; §8 item 3 is the solve run.
+- These are device times per matvec, not solves; §7 is the solve run.
 
-## 7. What it means
+## 7. Whole solves after the fix
 
-- **Up to `2^19` on this GPU, `"pairs"` is the kernel**: 2.6–9.3× `"indices"`, at −41% to −47% memory by
-  `2^19`.
-- **Past the L2 at `complex128`, only the memory win survives.** At `2^21` `"pairs"` ties `"indices"` on
-  `type1` (0.99×) and loses on `type2` (0.57×), at −39% memory; at `2^22` it loses on `type1` too (0.49×),
-  still at −39%. Spinchain's sizes (N = 1.5M–20M) are all
-  past the cliff.
-- **`"csr"` and `"ell"` lose past the cliff**, by 2–4×. On the GPU, the CPU's case for them (sequential
-  writes) does not carry.
+A fourth run after `0d25235` (the library is unchanged through `e62e172`): `--patterns type1 type2 --arms
+indices tables pairs ell --log2-sizes 20 21 22`, all four kernels in one process per size. Median whole
+`sqd` call in s (the sparse ones include their host build and check), and the ratio to `"indices"`:
 
-**Retracted: "for spinchain-scale runs, keep `"indices"`".** It rested on the pre-fix kernels above.
-With `0d25235`, `"pairs"` is 3.8–6.7× and `"ell"` 4.3–5.8× `"indices"` per iteration over `2^20`–`2^22`
-(`type1`, cross-run), `"pairs"` at −39% memory (`poc/sparse-split.md` §4); a same-process run and `type2`
-are open there.
+| pattern | N | `"indices"` | `"tables"` | `"pairs"` | `"ell"` |
+| --- | --- | --- | --- | --- | --- |
+| `type1` | `2^20` | 2.572 | **0.567 (4.54×)** | 0.727 (3.54×) | 1.349 (1.91×) |
+| `type1` | `2^21` | 5.357 | 1.382 (3.88×) | **1.361 (3.94×)** | 2.097 (2.55×) |
+| `type1` | `2^22` | 9.675 | **2.653 (3.65×)** | 3.757 (2.58×) | 4.353 (2.22×) |
+| `type2` | `2^20` | 6.353 | **1.646 (3.86×)** | 2.394 (2.65×) | 3.240 (1.96×) |
+| `type2` | `2^21` | 10.179 | **3.073 (3.31×)** | 4.176 (2.44×) | 5.974 (1.70×) |
+| `type2` | `2^22` | 15.554 | **5.100 (3.05×)** | 6.376 (2.44×) | 12.245 (1.27×) |
 
-Under a mesh the sparse kernels raise, which leaves `"onthefly"`, `"indices"` and `"tables"`. **`"tables"`
-is the candidate there**: its matvec is 2.9–5.6× `"indices"`' (§6), unmeasured in a whole solve (§8).
+- **`"tables"` is fastest in 5 of 6 cells**; `"pairs"` takes `type1` `2^21` by 1.5%. Every kernel beats
+  `"indices"` everywhere, and `type2`, where the pre-fix `"pairs"` was 0.57×, behaves like `type1`.
+- **Peak memory against `"indices"`**: `"tables"` 2.1–2.4×, `"pairs"` 0.53–0.60×, `"ell"` 0.56–0.64×
+  (`type2` `2^22`: 2.69, 6.44, 1.42, 1.62 GiB). Linear in N, `"tables"` would reach ~31 GiB for `type2`
+  at 20M states — a projection.
+- **The sparse kernels are now bound by their host stages**: at `type2` `2^22` the build and check are
+  1.60 + 0.58 s of `"pairs"`' 6.38 s (34%) and 4.75 + 0.58 s of `"ell"`'s 12.25 s (44%). On its solve
+  stage alone `"ell"` is the fastest kernel at `type1` `2^22` (15.91 ms per iteration against `"pairs"`'
+  20.48), and the build gives it back.
+- **A first call reorders them**: compile included, `type2` `2^22` reads `"indices"` 17.41 s, `"tables"`
+  6.98 (2.49×), `"pairs"` 8.94 (1.95×), `"ell"` **20.84 (0.84×)** — `"ell"`'s bucket shapes are costly to
+  compile, and a workflow calling `sqd` once per subspace pays it every time.
+- Iteration counts match across arms (one `"pairs"` 126/127 repeat at `type1` `2^22`, §5); every
+  eigenvalue agrees with `"indices"` to 5.3e-15.
 
-## 8. Open
+## 8. What it means
+
+Before `0d25235`, `"pairs"` led the sparse kernels to `2^19` and lost past it (0.49× at `type1` `2^22`),
+and "keep `"indices"`" followed; both were the per-step carry split, and that advice is retracted. On one
+GH200 now:
+
+| setting | kernel | measured |
+| --- | --- | --- |
+| memory does not bind | `"tables"` | 3.05–4.54× `"indices"` end to end, at ~2.2× its memory |
+| memory binds | `"pairs"` | 2.44–3.94×, at ~0.55× `"indices"`' memory; the next-best first call |
+| under a mesh | `"tables"` | the sparse kernels raise there; its multi-GPU solve is unmeasured |
+| any | not `"ell"` | its build and compile undo its per-iteration lead |
+
+`"indices"` stays the library default: that is a CPU choice, and switching per backend is a separate
+decision.
+
+## 9. Open
 
 1. **The L2 cause — settled otherwise**: both of §3's steps are the per-step carry split
    (`poc/sparse-split.md` §1).
-2. **`type3`/`type4`**, and `type2` at `2^20`/`2^21` with this revision.
-3. **`"tables"` in whole solves**, beside the fixed sparse kernels in one process:
-   `--patterns type1 type2 --arms indices tables pairs ell --log2-sizes 20 21 22`, then `23`. `"tables"`
-   stores ~`20·J` B/state (`poc/sparse-pairs.md`'s arms table), ~20 GB for `type2` at `2^23`.
+2. **`type3`/`type4`**; `type2` at `2^20`/`2^21` is §7's.
+3. **Past `2^22`**, toward spinchain's 20M: `--arms indices tables pairs --log2-sizes 23 24`, where
+   `"tables"`' memory (~`20·J` B/state) starts to matter.
 4. **The levers past the cliff, unmeasured**: a locality-preserving state order (RCM did nothing on CPU,
    `poc/sparse-pairs.md` §4, since these graphs are hypercube-like); a matvec blocked so each block's
    slice of `vec` fits L2 (a tiled `"pairs"` order: 1.08× per iteration on CPU, 1.00× here,
@@ -184,8 +210,11 @@ is the candidate there**: its matvec is 2.9–5.6× `"indices"`' (§6), unmeasur
 7. **Only one GPU.** An A100 attempt gave no number: its child processes fell back to CPU on `cuInit(0)`'s
    `CUDA_ERROR_NO_DEVICE` — undiagnosed; the likeliest cause is `--device` overriding a scheduler's
    `CUDA_VISIBLE_DEVICES`.
+8. **The sparse kernels' host build and check** (§7), now 34–44% of a `"pairs"`/`"ell"` solve at `2^22`.
+9. **`"ell"`'s compile cost** (§7's first calls), and whether the persistent compile cache recovers it.
+10. **`"tables"` on a multi-GPU mesh**, the setting §8 recommends it for.
 
-## 9. The script
+## 10. The script
 
 `poc/sparse_gpu.py`, its argparse checked against this section:
 
@@ -209,5 +238,6 @@ pattern), and the script warns when the warm-up and timed solves disagree on it.
 
 Runs here: `--device 0` (the default sweep, read through `type2` `2^19`), `--patterns type1 type2
 --log2-sizes 19 20 21 --device 0` (read through `type2` `2^19`), and, at `c63f067`, `--patterns type1
---arms indices pairs --log2-sizes 20 21 22` (§1's third run). §6 is `poc/sparse_profile.py --matvec
+--arms indices pairs --log2-sizes 20 21 22` (§1's third run); after `0d25235`, `--patterns type1 type2
+--arms indices tables pairs ell --log2-sizes 20 21 22` (§7). §6 is `poc/sparse_profile.py --matvec
 indices` and `--matvec tables`, `--log2-sizes 20 22`, at `bc596f8`.
