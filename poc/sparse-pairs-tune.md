@@ -1,8 +1,10 @@
 # Four `"pairs"` levers on a GPU
 
-`poc/sparse_pairs_tune.py` (§6) at `909ebf5`, one NVIDIA GH200 120GB, 2026-10-02. Fixture as
+`poc/sparse_pairs_tune.py` (§6) at `909ebf5` (§2) and `1443f48` (§3's sweep), one NVIDIA GH200 120GB,
+2026-10-02. Fixture as
 `poc/sparse-gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`, `complex128`),
-Hamming-shell subspaces around both Néel states. Nothing here is in the library.
+Hamming-shell subspaces around both Néel states. The chunk size is in the library since §3's sweep, as
+`_GPU_PAIRS_CHUNK`; the other three levers are not.
 
 ## 1. The levers
 
@@ -38,7 +40,17 @@ Every arm's eigenvalue agrees with the reference to 7.9e-16, and its iteration c
 
 - **Chunk size is the lever**: 128 → 8 steps at `2^20` and 320 → 20 at `2^22`, for 2.73× and 1.39× per
   iteration at +8 MiB of temp. It fits the launch-bound, under-filled-GPU reading of §1; `2^19`, the
-  largest tried, still edges `2^17`, so the optimum may lie higher (§5).
+  largest tried, still edges `2^17`. **A sweep past it finds the plateau there**:
+
+  | chunk | `2^20`, per iteration (temp) | `2^22`, per iteration (temp) |
+  | --- | --- | --- |
+  | `2^15` | 4.30 ms (32 MiB) | 20.25 ms (128 MiB) |
+  | `2^19` | 2.71× (40 MiB) | 1.37× (136 MiB) |
+  | `2^20` | 2.56× (48 MiB) | 1.37× (144 MiB) |
+  | `2^21` | 2.72× (64 MiB) | 1.39× (160 MiB) |
+
+  All 5/5 rounds. Past `2^19` only the temp grows, so `2^19` — the smallest size on the plateau — ships
+  for `"pairs"` on a GPU (`_GPU_PAIRS_CHUNK`); the CPU keeps `_CHUNK = 2^15`.
 - **`merged` pays only while steps are many**: 1.65× / 1.23× at `2^15`, a tie with `base` at `2^19`
   (1.66 against 1.64 ms, 14.68 against 14.89 ms). Halving the scatter launches matters only when the
   launches do.
@@ -54,14 +66,15 @@ Every arm's eigenvalue agrees with the reference to 7.9e-16, and its iteration c
 At `type1` `2^22` the best arm's 14.7 ms per iteration is below `"tables"`' 21.06
 (`poc/sparse-gpu.md` §7). With the single host search (`b38d48b`), a `"pairs"` call would land near
 `"tables"`' 2.65 s at about a quarter of its memory — a projection from the solve stage, not a whole
-call. A GPU-only chunk size is the change to make, once §5's sweep places it; `merged`, `sorted` and
-`real` are not worth building.
+call. The GPU-only chunk ships at `2^19`; `merged`, `sorted` and `real` are not worth building.
 
 ## 5. Open
 
-1. **Chunks past `2^19`**: `--chunks 19 20 21 --variants base`.
-2. **`"csr"` without the sorted hint** on the GPU.
-3. **The CPU's chunk size**, unmeasured here; `2^15` keeps its temporaries in cache.
+1. **`"csr"` without the sorted hint**, and `"csr"`/`"ell"` at a larger chunk, on the GPU:
+   `--matvec csr --chunks 15 19`.
+2. **The CPU's chunk size**, unmeasured here; `2^15` keeps its temporaries in cache.
+3. **The whole `"pairs"` call** against `"tables"` with the chunk and the single search (§4's projection):
+   `poc/sparse_gpu.py --arms indices tables pairs --log2-sizes 20 21 22`.
 
 ## 6. The script
 
@@ -79,4 +92,6 @@ call. A GPU-only chunk size is the change to make, once §5's sweep places it; `
 
 `base` at `2^15` is the reference and always runs. Each arm compiles its own solve, asserted pairwise
 distinct, and must match the reference eigenvalue and `(2, N)` product to `1e-12`; one host search
-serves every arm. Runs here: the default sweep on the GH200, and CPU smoke runs at `2^12` and `2^19`.
+serves every arm. It patches both `_CHUNK` and `_chunk`, so a GPU `"pairs"` arm takes its own chunk
+rather than `_GPU_PAIRS_CHUNK`. Runs here: the default sweep on the GH200 (§2), `--chunks 19 20 21
+--variants base` there (§3), and CPU smoke runs at `2^12` and `2^19`.

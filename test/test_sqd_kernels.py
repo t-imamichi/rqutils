@@ -28,7 +28,9 @@ from rqutils.sqd._solve import _group_parts
 from rqutils.sqd._sparse import (
     _CHUNK,
     _ELL_WIDTHS,
+    _GPU_PAIRS_CHUNK,
     _SPARSE_APPLY,
+    _chunk,
     _group_pairs,
     _host_sources,
     _padded,
@@ -914,6 +916,35 @@ class TestSparseKernels:
         compiles(first)
         assert compiles(second) == 0, "a second subspace with the same operator shapes recompiled"
         assert compiles(other) == 1, "control: different operator shapes must compile afresh"
+
+    def test_gpu_pairs_chunk(self, monkeypatch):
+        """``"pairs"`` alone steps ``_GPU_PAIRS_CHUNK`` entries on a GPU: ``_CHUNK`` under-filled a GH200
+        (2.71x/1.37x per iteration at ``2^20``/``2^22``, ``poc/sparse-pairs-tune.md``), while ``"csr"``,
+        ``"ell"`` and the CPU are unmeasured or chose ``_CHUNK``.
+        """
+        import rqutils.sqd._sparse as sparse_module
+
+        assert _GPU_PAIRS_CHUNK > _CHUNK
+        assert all(_chunk(m) == _CHUNK for m in SPARSE_MATVECS), "the CPU keeps _CHUNK"
+        monkeypatch.setattr(sparse_module.jax, "default_backend", lambda: "gpu")
+        assert {m: _chunk(m) for m in SPARSE_MATVECS} == {
+            Matvec.PAIRS: _GPU_PAIRS_CHUNK,
+            Matvec.CSR: _CHUNK,
+            Matvec.ELL: _CHUNK,
+        }
+
+    @pytest.mark.parametrize("matvec", [Matvec.PAIRS, Matvec.CSR])
+    def test_operator_follows_chunk(self, matvec, monkeypatch):
+        """The build lays entries out in ``_chunk(matvec)``-wide rows, and the product does not move."""
+        import rqutils.sqd._sparse as sparse_module
+
+        monkeypatch.setattr(sparse_module, "_chunk", lambda m: 64)
+        rng = np.random.default_rng(20261002)
+        strings, coeffs, states = sparse_fixture("mixed", rng)
+        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_u, operator = sparse_operator_of(h, states, 32, matvec)
+        assert all(a.shape[-1] == 64 for a in operator[1:]), [a.shape for a in operator[1:]]
+        assert_matches_indices(_SPARSE_APPLY[matvec], operator, h, states_u, len(states), rng)
 
     def test_entry_count_guard(self):
         """Raises before allocating: the passing side is every sparse solve in this file."""

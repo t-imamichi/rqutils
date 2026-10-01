@@ -19,6 +19,14 @@ from rqutils.sqd._states import _MAX_STATES, StateList, _is_filler
 
 #: Entries per scanned chunk, so the sparse kernels' temporaries are ``O(chunk)`` (``poc/sparse-pairs.md``).
 _CHUNK = 1 << 15
+#: ``"pairs"``' chunk on a GPU, which ``_CHUNK`` under-fills: 2.71x/1.37x per iteration on a GH200 at
+#: ``2^20``/``2^22``, the smallest size on the plateau, +8 MiB temp (``poc/sparse-pairs-tune.md``).
+_GPU_PAIRS_CHUNK = 1 << 19
+
+
+def _chunk(matvec: Matvec) -> int:
+    """Entries per scanned chunk for ``matvec`` on the default backend."""
+    return _GPU_PAIRS_CHUNK if matvec == "pairs" and jax.default_backend() == "gpu" else _CHUNK
 
 
 def _size_class(chunks: int) -> int:
@@ -173,14 +181,17 @@ def _sparse_residual(
     return jnp.linalg.norm(ax - eigval * eigvec), jnp.linalg.norm(ax)
 
 
-def _padded(count: int, fill: int) -> np.ndarray:
+def _padded(count: int, fill: int, chunk: int | None = None) -> np.ndarray:
     """A flat int32 array of ``count`` entries rounded up to whole chunks of a size class, all ``fill``.
+
+    ``chunk`` defaults to ``_CHUNK``.
 
     Raises:
         ValueError: See :func:`_check_entries`.
     """
     _check_entries(count)
-    return np.full(_size_class(-(-count // _CHUNK)) * _CHUNK, fill, dtype=np.int32)
+    chunk = chunk or _CHUNK
+    return np.full(_size_class(-(-count // chunk)) * chunk, fill, dtype=np.int32)
 
 
 @functools.partial(jax.jit, static_argnames="kmax")
@@ -323,7 +334,7 @@ def _sparse_operator(
     """Build a sparse ``matvec``'s operator arrays on the host, one X group's search at a time.
 
     Returns ``(d0, i, j, d)`` for ``"pairs"`` and ``(d0, rt, rs, rd, qt, qs, qd)`` for ``"csr"``, each
-    entry array ``(chunks, _CHUNK)``; ``r``/``q`` are the real-coefficient groups (float64 factors)
+    entry array ``(chunks, _chunk(matvec))``; ``r``/``q`` are the real-coefficient groups (float64 factors)
     and the rest. Padding entries have equal endpoints and a zero factor.
 
     ``"ell"`` returns ``d0`` then, per set (real first) and ascending row width ``w``, ``rows``
@@ -336,6 +347,7 @@ def _sparse_operator(
         ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_check_entries`.
     """
     size = states_u.shape[0]
+    chunk = _chunk(matvec)
     z, c = jnp.asarray(hamiltonian.z), jnp.asarray(hamiltonian.c)
     # A copy: _sort_by_target pops each group as it writes it.
     pairs = dict(_group_pairs(hamiltonian, states_u) if pairs is None else pairs)
@@ -347,11 +359,11 @@ def _sparse_operator(
 
     def on_device(host, c_set):
         # Pops each host array as it is copied, so no host entry array outlives its device copy.
-        t, s, g = (jnp.asarray(host.pop(0).reshape(-1, _CHUNK)) for _ in range(3))
+        t, s, g = (jnp.asarray(host.pop(0).reshape(-1, chunk)) for _ in range(3))
         return t, s, _entry_factors(t, s, g, z, c_set, states_u, kmax)
 
     def alloc(count):  # i, j, group
-        return [_padded(count, f) for f in (size - 1, size - 1, 0)]
+        return [_padded(count, f, chunk) for f in (size - 1, size - 1, 0)]
 
     if matvec == "pairs":
         # Sorted by i across groups, so out[i] and vec[i] are local (NOTES.md, "sqd sparse kernels:

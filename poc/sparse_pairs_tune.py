@@ -14,7 +14,8 @@ kernel a fraction of the GPU. Arms are every ``--chunks`` × ``--variants``:
 ``--matvec csr`` runs ``"csr"`` instead, with ``base`` (the library, ``indices_are_sorted=True``) and
 ``unsorted`` (the same without the hint, which slows ``"pairs"``' scatter on the GH200).
 
-The reference is ``base`` at ``2^15``, the shipped kernel, for either ``--matvec``. Every arm keeps the library's CUDA-only carry
+The reference is ``base`` at ``2^15``, the CPU's chunk (the GPU ships ``"pairs"`` at ``2^19`` since
+this ran, ``_GPU_PAIRS_CHUNK``), for either ``--matvec``. Every arm keeps the library's CUDA-only carry
 split (``_scan_add``'s rule), gets a function of its own to jit, and the lowered solves are asserted
 pairwise distinct. Arms are warm and interleaved; ``solve`` is per iteration (GPU scatter order varies
 iteration counts); eigenvalues must agree to ``1e-12`` relative. ``op`` is the operator's device bytes,
@@ -190,7 +191,7 @@ ham = PauliSumXZ.from_paulisum(
     xxz(options.num_qubits, options.delta, *patterns(options.num_qubits)[options.pattern])
 )
 arm = Matvec(options.matvec)
-shipped = sm._CHUNK
+shipped = sm._CHUNK, sm._chunk
 arms = [(c, v) for c in options.chunks for v in options.variants]
 ref = (15, "base")
 if ref not in arms:
@@ -211,7 +212,10 @@ for log2 in options.log2_sizes:
     ]
     calls, lowered, info = {}, {}, {}
     for chunk, variant in arms:
-        sm._CHUNK = 1 << chunk  # read at build time: the operator's shapes follow it
+        # Read at build time, and the operator's shapes follow; _chunk too, or a GPU "pairs" build
+        # would take _GPU_PAIRS_CHUNK in every arm.
+        sm._CHUNK = 1 << chunk
+        sm._chunk = lambda matvec: sm._CHUNK  # ty: ignore[invalid-assignment]
         if variant == "real":
             operator = jax.block_until_ready(real_operator(h, states_u, pairs))
         else:
@@ -229,7 +233,7 @@ for log2 in options.log2_sizes:
         info[key] = (sum(a.nbytes for a in operator) / 2**20, temp / 2**20, steps)
         for call in calls[key]:
             call()  # compile
-    sm._CHUNK = shipped
+    sm._CHUNK, sm._chunk = shipped
     sm._SPARSE_APPLY[arm] = KERNELS["base"]
     assert len(set(lowered.values())) == len(arms), "two arms compiled the same solve"
     products = {key: np.asarray(calls[key][2]()) for key in arms}

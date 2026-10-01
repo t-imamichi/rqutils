@@ -2322,9 +2322,9 @@ GH200, `type1`/`type2` `2^20`–`2^22`, one process: `"tables"` 3.05–4.54× `"
 
 ### sqd sparse kernels on a GPU: `"pairs"` wants bigger chunks, and a sorted-scatter hint slows it (2026-10-02)
 
-GH200, `type1` `2^20`/`2^22`: `_CHUNK` `2^15` → `2^19` is 2.73×/1.39× per iteration (128 → 8, 320 → 20
-steps, +8 MiB temp); a merged two-direction scatter ties it there; `indices_are_sorted` on `out[i]` is
-0.37–0.64× (`"csr"` sets it — a suspect); `float64` factors save 24–27% at 0.37–0.94×. `poc/sparse-pairs-tune.md` §2, §3
+GH200, `type1` `2^20`/`2^22`: `_CHUNK` `2^15` → `2^19` is 2.71×/1.37× per iteration at +8 MiB temp, the
+plateau's edge, so it ships as `_GPU_PAIRS_CHUNK` (GPU, `"pairs"` only). A merged scatter ties it there;
+`indices_are_sorted` on `out[i]` is 0.37–0.64× (`"csr"` sets it: a suspect); `float64` factors 0.37–0.94×. `poc/sparse-pairs-tune.md` §2, §3
 
 ### sqd sparse kernels: a state-major `(N, 2)` gather layout loses on CPU (2026-10-01)
 
