@@ -2313,6 +2313,12 @@ M1, n=60 `type1`, `2^17`/`2^19`: sorting pairs by `(i >> 12, j >> 12, i)` is 1.0
 On the GH200 it is 1.00× at `2^20`/`2^21` (every tile within 0.7%), evidence against the L2 reading of
 `"pairs"`' cliff. `poc/sparse-tiles.md` §2, §3
 
+### sqd sparse kernels on a GPU: the cliff is XLA splitting the complex scan carry every step (2026-10-01)
+
+GH200 profile: 72–88% of a `"pairs"` matvec from `2^20` is `wrapped_real`/`imag`/`complex`, a full pass
+over the complex carry per scan step, so cost is `O(N × steps)`. `_scan_add` now carries real and
+imaginary parts on CUDA only: ungated, CPU ran 0.68–0.90× with +1 `out` of temp. GPU speed unmeasured. `poc/sparse-split.md` §1, §3
+
 ## Warm starts, collectives and the eigenpair check (2026-09)
 
 ### Warm-starting the growing subspace: four hypotheses eliminated, and the fixture gate is the result (2026-09-17)

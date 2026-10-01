@@ -334,32 +334,71 @@ def _sparse_operator(
     return tuple(arrays)
 
 
+def _scan_add(
+    updates: Callable[[tuple[jax.Array, ...]], list[tuple[jax.Array, jax.Array]]],
+    out: jax.Array,
+    xs: tuple[jax.Array, ...],
+    ordered: bool = False,
+) -> jax.Array:
+    """``out`` after a scan adding each chunk's ``updates`` -- ``(index, value)`` -- into it.
+
+    On CUDA a complex ``out`` is carried as its real and imaginary parts: XLA's GPU scatter otherwise
+    splits the carry itself, a full pass over ``out`` per scan step. Elsewhere that costs 0.68-0.90x
+    and an extra ``out`` of temp, so the carry stays complex (``poc/sparse-split.md``).
+    """
+
+    def scan(*parts):
+        def body(parts, chunk):
+            for index, value in updates(chunk):
+                values = (value.real, value.imag) if len(parts) == 2 else (value,)
+                parts = tuple(
+                    p.at[..., index].add(v, indices_are_sorted=ordered)
+                    for p, v in zip(parts, values, strict=True)
+                )
+            return parts, None
+
+        return jax.lax.scan(body, parts, xs)[0]
+
+    def fused(out):
+        return scan(out)[0]
+
+    if not jnp.iscomplexobj(out):
+        return fused(out)
+
+    def split(out):
+        re, im = scan(out.real, out.imag)
+        return jax.lax.complex(re, im)
+
+    return jax.lax.platform_dependent(out, default=fused, cuda=split)
+
+
 def _apply_pairs(
     vec: jax.Array, d0: jax.Array, pi: jax.Array, pj: jax.Array, d: jax.Array
 ) -> jax.Array:
     """``"pairs"``: ``d0 * vec``, then per pair ``out[i] += d * vec[j]`` and ``out[j] += conj(d) * vec[i]``."""
     sharding = jax.typeof(vec).sharding
 
-    def body(out, chunk):
+    def updates(chunk):
         i, j, di = chunk
-        out = out.at[..., i].add(di * vec.at[..., j].get(out_sharding=sharding))
-        return out.at[..., j].add(jnp.conj(di) * vec.at[..., i].get(out_sharding=sharding)), None
+        return [
+            (i, di * vec.at[..., j].get(out_sharding=sharding)),
+            (j, jnp.conj(di) * vec.at[..., i].get(out_sharding=sharding)),
+        ]
 
-    return jax.lax.scan(body, d0 * vec, (pi, pj, d))[0]
+    return _scan_add(updates, d0 * vec, (pi, pj, d))
 
 
 def _apply_csr(vec: jax.Array, d0: jax.Array, *entries: jax.Array) -> jax.Array:
     """``"csr"``: ``d0 * vec``, then ``out[t] += d * vec[s]`` over each target-sorted ``(t, s, d)`` set."""
     sharding = jax.typeof(vec).sharding
 
-    def body(acc, chunk):
+    def updates(chunk):
         ti, si, di = chunk
-        gathered = vec.at[..., si].get(out_sharding=sharding)
-        return acc.at[..., ti].add(di * gathered, indices_are_sorted=True), None
+        return [(ti, di * vec.at[..., si].get(out_sharding=sharding))]
 
     out = d0 * vec
     for k in range(0, len(entries), 3):
-        out = jax.lax.scan(body, out, entries[k : k + 3])[0]
+        out = _scan_add(updates, out, entries[k : k + 3], ordered=True)
     return out
 
 
@@ -367,14 +406,13 @@ def _apply_ell(vec: jax.Array, d0: jax.Array, *buckets: jax.Array) -> jax.Array:
     """``"ell"``: ``d0 * vec``, then per ``(rows, src, fac)`` piece ``out[rows] += sum(fac * vec[src])``."""
     sharding = jax.typeof(vec).sharding
 
-    def body(acc, piece):
+    def updates(piece):
         rows, src, fac = piece
-        val = jnp.sum(fac * vec.at[..., src].get(out_sharding=sharding), axis=-1)
-        return acc.at[..., rows].add(val), None
+        return [(rows, jnp.sum(fac * vec.at[..., src].get(out_sharding=sharding), axis=-1))]
 
     out = d0 * vec
     for k in range(0, len(buckets), 3):
-        out = jax.lax.scan(body, out, buckets[k : k + 3])[0]
+        out = _scan_add(updates, out, buckets[k : k + 3])
     return out
 
 

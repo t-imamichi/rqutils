@@ -5,6 +5,7 @@ and the matvec kernels. Organized by defect, like ``test_sqd.py``.
 import dataclasses
 import warnings
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -915,6 +916,39 @@ class TestSparseKernels:
         """Raises before allocating: the passing side is every sparse solve in this file."""
         with pytest.raises(ValueError, match="2147483648 entries"):
             _padded(2**31, 0)
+
+
+class TestComplexScanCarry:
+    """On CUDA no sparse kernel scans over a ``complex128`` carry; elsewhere every one does.
+
+    XLA's GPU scatter splits a complex carry into real and imaginary parts and rejoins it at every scan
+    step, a full pass over ``out`` each: 75-88% of a GH200 ``"pairs"`` matvec from ``2^20``, the cliff
+    ``poc/sparse-gpu.md`` section 3 read as L2. On CPU the split is the slower one (0.68-0.90x per
+    iteration), so ``jax.lax.platform_dependent`` picks; this checks both branches as traced.
+    """
+
+    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
+    @pytest.mark.parametrize("batch", [(), (2,)])
+    def test_carry_per_platform(self, matvec, batch):
+        strings, coeffs, states = sparse_fixture("mixed", np.random.default_rng(20261001))
+        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_u, operator = sparse_operator_of(h, states, 32, matvec)
+        vec = jnp.ones((*batch, states_u.shape[0]), jnp.complex128)
+        jaxpr = jax.make_jaxpr(_SPARSE_APPLY[matvec])(vec, *operator)
+        switches = [e for e in jaxpr.eqns if "branches_platforms" in e.params]
+        assert switches, "the kernel must choose its carry per platform"
+        assert not [e for e in jaxpr.eqns if e.primitive.name == "scan"], (
+            "a scan outside the switch"
+        )
+        want = {("cuda",): [np.float64, np.float64], None: [np.complex128]}
+        for eqn in switches:
+            platforms = eqn.params["branches_platforms"]
+            assert set(platforms) == set(want), platforms
+            for branch, key in zip(eqn.params["branches"], platforms, strict=True):
+                scans = [e for e in branch.jaxpr.eqns if e.primitive.name == "scan"]
+                assert len(scans) == 1, f"{key}: {len(scans)} scans"
+                # The body emits no ys, so a scan's outputs are its carry.
+                assert [v.aval.dtype for v in scans[0].outvars] == want[key], key
 
 
 def ell_fixture(rng):

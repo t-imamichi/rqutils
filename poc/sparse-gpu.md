@@ -70,8 +70,9 @@ does not.
   64 B/state: 32 MiB at `2^19`, 64 MiB at `2^20`, against the H100's 50 MB L2 (NVIDIA's specification, not
   measured here). This is the CPU's §3 finding at a larger cache: there P2 doubled per state from `2^17` to
   `2^19`, as the same arrays grew from 8 to 32 MiB. **Inferred, not measured** — the size of the step and
-  its location fit, but no L2 hit rate was read (§7). And for `"pairs"` it now has evidence against it: a
-  tiled entry order whose blocks fit L2 many times over recovers at most 0.4% at `2^20`/`2^21` (`poc/sparse-tiles.md` §3).
+  its location fit, but no L2 hit rate was read (§7). **Retracted for the sparse kernels**: a profile puts
+  72–88% of a `"pairs"` matvec from `2^20` in XLA splitting and rejoining the complex scan carry at every
+  step, so both steps are the scan's step count, not L2 (`poc/sparse-split.md` §1, which also has the fix).
 - **The second step is not L2**: the vectors were already 2× past it at `2^20` (64 MiB) and are 256 MiB
   at `2^22`. Its cause is open (§7); GPU TLB reach is one candidate, unexamined.
 - **`"indices"` degrades less** because its per-state diagonal recomputation hides the latency, as on the
