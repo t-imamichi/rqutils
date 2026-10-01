@@ -158,21 +158,16 @@ def _sparse_residual(
     states_u: StateList,
     eigval: jax.Array,
     eigvec: jax.Array,
-    pairs: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
+    pairs: dict[int, tuple[np.ndarray, np.ndarray]],
 ) -> tuple[jax.Array, jax.Array]:
-    """``(||Hv - Ev||, ||Hv||)`` by the ``"indices"`` kernel one group at a time, from host-searched sources.
+    """``(||Hv - Ev||, ||Hv||)`` by the ``"indices"`` kernel one group at a time, from the build's ``pairs``.
 
-    Reads none of the sparse operator, and reuses the search as the dense kernels reuse cached xsources
-    (``NOTES.md``, "sqd sparse kernels: the residual check runs on the host"): the build's ``pairs``
-    when given (:func:`_group_pairs`), so it searches nothing, else a search of its own.
+    Reads none of the sparse operator, and reuses the search (:func:`_group_pairs`) as the dense kernels
+    reuse cached xsources (``NOTES.md``, "sqd sparse kernels: the residual check runs on the host").
     """
     x, z, c = hamiltonian.arrays
     ax = jnp.zeros_like(eigvec)
-    if pairs is None:
-        xsources = _host_sources(x, states_u, lambda j: j)
-    else:
-        xsources = _pair_xsources(x, states_u, pairs)
-    for g, xsource in enumerate(xsources):
+    for g, xsource in enumerate(_pair_xsources(x, states_u, pairs)):
         scanned = _pack_scanned(Matvec.INDICES, xsource[None], z[g : g + 1], c[g : g + 1])
         ax = _apply_h_kernel(eigvec, scanned, states_u, matvec=Matvec.INDICES, init=ax)
     return jnp.linalg.norm(ax - eigval * eigvec), jnp.linalg.norm(ax)
@@ -342,13 +337,13 @@ def _sparse_operator(
     """
     size = states_u.shape[0]
     z, c = jnp.asarray(hamiltonian.z), jnp.asarray(hamiltonian.c)
-    first = int(np.all(np.asarray(hamiltonian.x[0]) == 0))
+    # A copy: _sort_by_target pops each group as it writes it.
+    pairs = dict(_group_pairs(hamiltonian, states_u) if pairs is None else pairs)
+    first = int(0 not in pairs)  # _group_pairs skips a leading identity group
     d0 = get_diagonal(z[0], c[0], states_u) if first else jnp.zeros(size, c.dtype)
     groups = range(first, hamiltonian.x.shape[0])
     coeffs = np.asarray(hamiltonian.c)
     kmax = max((int(np.count_nonzero(coeffs[g])) for g in groups), default=1)
-    # A copy: _sort_by_target pops each group as it writes it.
-    pairs = dict(_group_pairs(hamiltonian, states_u) if pairs is None else pairs)
 
     def on_device(host, c_set):
         # Pops each host array as it is copied, so no host entry array outlives its device copy.

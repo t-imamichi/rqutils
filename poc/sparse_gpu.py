@@ -59,7 +59,7 @@ from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import Matvec, hproj, sqd, uniquify_states
 from rqutils.sqd._core import _checked_eigval, _sqd_inputs
 from rqutils.sqd._solve import _SPARSE_MATVECS
-from rqutils.sqd._sparse import _run_sparse, _sparse_operator, _sparse_residual
+from rqutils.sqd._sparse import _group_pairs, _run_sparse, _sparse_operator, _sparse_residual
 
 n = options.num_qubits
 ITERATIONS = []
@@ -86,12 +86,13 @@ def staged(ham, states, arm):
     ham, states_p, size = _sqd_inputs(ham, states, None, False, arm, 0.0, None, (32, 2))
     t0 = time.perf_counter()
     states_u = jax.block_until_ready(uniquify_states(states_p, size))
-    operator = jax.block_until_ready(_sparse_operator(ham, states_u, arm))
+    pairs = _group_pairs(ham, states_u)  # one search for the build and the check, as sqd
+    operator = jax.block_until_ready(_sparse_operator(ham, states_u, arm, pairs))
     t1 = time.perf_counter()
     result = jax.block_until_ready(_run_sparse(ham, states_u, operator, size, True, arm))
     del operator
     t2 = time.perf_counter()
-    residual, ax_norm = _sparse_residual(ham, states_u, result.eigval, result.eigvec)
+    residual, ax_norm = _sparse_residual(ham, states_u, result.eigval, result.eigvec, pairs)
     result = result._replace(residual=residual, ax_norm=ax_norm)
     eigval = _checked_eigval(result, ham, 1000, 0.0, None)
     t3 = time.perf_counter()

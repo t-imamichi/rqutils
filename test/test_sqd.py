@@ -1022,17 +1022,14 @@ class TestSparseEigenpairCheck:
         rng = np.random.default_rng(3)
         h = PauliSumXZ.from_paulisum((["YZII", "XXII", "IZZI", "IIYY"], [0.5, -0.3, 0.7, 0.2]))
         states_u = uniquify_states(_pad_states(pack_padded(unique_states(12, 4, rng)), 16), 16)
-        operator = _sparse_operator(h, states_u, matvec)
+        pairs = _group_pairs(h, states_u)
+        operator = _sparse_operator(h, states_u, matvec, pairs)
         result = _run_sparse(h, states_u, operator, 16, True, matvec)
-        residual, ax_norm = _sparse_residual(h, states_u, result.eigval, result.eigvec)
+        residual, ax_norm = _sparse_residual(h, states_u, result.eigval, result.eigvec, pairs)
         xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in h.x])
         hv = apply_h(result.eigvec, states=states_u, xsources=xsources, zsignatures=h.z, coeffs=h.c)
         assert float(ax_norm) == pytest.approx(float(np.linalg.norm(hv)), rel=1e-12)
         assert float(residual) < 1e-12 * float(ax_norm), float(residual)
-        # sqd passes the build's pairs so the check searches nothing; the sources are the same arrays.
-        pairs = _group_pairs(h, states_u)
-        reused = _sparse_residual(h, states_u, result.eigval, result.eigvec, pairs)
-        assert (float(reused[0]), float(reused[1])) == (float(residual), float(ax_norm))
 
 
 class TestAtolAndRtol:
