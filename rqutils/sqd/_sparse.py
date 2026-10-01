@@ -122,17 +122,57 @@ def _search_pairs(x: np.ndarray, states_u: StateList) -> list[tuple[np.ndarray, 
     return list(_host_sources(x, states_u, pairs))
 
 
+def _group_pairs(
+    hamiltonian: PauliSumXZ, states_u: StateList
+) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    """:func:`_search_pairs` keyed by group, for every group but a leading identity."""
+    first = int(np.all(np.asarray(hamiltonian.x[0]) == 0))
+    groups = range(first, hamiltonian.x.shape[0])
+    return dict(
+        zip(groups, _search_pairs(np.asarray(hamiltonian.x)[groups], states_u), strict=True)
+    )
+
+
+def _pair_xsources(
+    x: np.ndarray, states_u: StateList, pairs: dict[int, tuple[np.ndarray, np.ndarray]]
+) -> Iterator[np.ndarray]:
+    """:func:`_host_sources`' sources per X signature, rebuilt from ``pairs`` rather than searched.
+
+    XOR is an involution, so ``(i, j)`` gives both ``xsource[i] = j`` and ``xsource[j] = i``; an
+    identity group maps each real row to itself.
+    """
+    size = states_u.shape[0]
+    real = size - int(np.count_nonzero(_is_filler(np.asarray(states_u))))
+    for g, xg in enumerate(np.asarray(x)):
+        xsource = np.full(size, -1, np.int32)
+        if not xg.any():
+            xsource[:real] = np.arange(real, dtype=np.int32)
+        else:
+            i, j = pairs[g]
+            xsource[i], xsource[j] = j, i
+        yield xsource
+
+
 def _sparse_residual(
-    hamiltonian: PauliSumXZ, states_u: StateList, eigval: jax.Array, eigvec: jax.Array
+    hamiltonian: PauliSumXZ,
+    states_u: StateList,
+    eigval: jax.Array,
+    eigvec: jax.Array,
+    pairs: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """``(||Hv - Ev||, ||Hv||)`` by the ``"indices"`` kernel one group at a time, from host-searched sources.
 
     Reads none of the sparse operator, and reuses the search as the dense kernels reuse cached xsources
-    (``NOTES.md``, "sqd sparse kernels: the residual check runs on the host").
+    (``NOTES.md``, "sqd sparse kernels: the residual check runs on the host"): the build's ``pairs``
+    when given (:func:`_group_pairs`), so it searches nothing, else a search of its own.
     """
     x, z, c = hamiltonian.arrays
     ax = jnp.zeros_like(eigvec)
-    for g, xsource in enumerate(_host_sources(x, states_u, lambda j: j)):
+    if pairs is None:
+        xsources = _host_sources(x, states_u, lambda j: j)
+    else:
+        xsources = _pair_xsources(x, states_u, pairs)
+    for g, xsource in enumerate(xsources):
         scanned = _pack_scanned(Matvec.INDICES, xsource[None], z[g : g + 1], c[g : g + 1])
         ax = _apply_h_kernel(eigvec, scanned, states_u, matvec=Matvec.INDICES, init=ax)
     return jnp.linalg.norm(ax - eigval * eigvec), jnp.linalg.norm(ax)
@@ -280,7 +320,10 @@ def _ell_buckets(
 
 
 def _sparse_operator(
-    hamiltonian: PauliSumXZ, states_u: StateList, matvec: Matvec
+    hamiltonian: PauliSumXZ,
+    states_u: StateList,
+    matvec: Matvec,
+    pairs: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> tuple[jax.Array, ...]:
     """Build a sparse ``matvec``'s operator arrays on the host, one X group's search at a time.
 
@@ -292,6 +335,8 @@ def _sparse_operator(
     ``(pieces, R)``, ``src`` and ``fac`` ``(pieces, R, w)``, ``R = max(1, _CHUNK // w)``; slots past a
     row's degree, and padding rows, have source 0 and factor 0.
 
+    ``pairs`` is :func:`_group_pairs`' output, searched here when not given; it is left unconsumed.
+
     Raises:
         ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_check_entries`.
     """
@@ -302,9 +347,8 @@ def _sparse_operator(
     groups = range(first, hamiltonian.x.shape[0])
     coeffs = np.asarray(hamiltonian.c)
     kmax = max((int(np.count_nonzero(coeffs[g])) for g in groups), default=1)
-    pairs = dict(
-        zip(groups, _search_pairs(np.asarray(hamiltonian.x)[groups], states_u), strict=True)
-    )
+    # A copy: _sort_by_target pops each group as it writes it.
+    pairs = dict(_group_pairs(hamiltonian, states_u) if pairs is None else pairs)
 
     def on_device(host, c_set):
         # Pops each host array as it is copied, so no host entry array outlives its device copy.

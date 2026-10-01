@@ -29,7 +29,10 @@ from rqutils.sqd._sparse import (
     _CHUNK,
     _ELL_WIDTHS,
     _SPARSE_APPLY,
+    _group_pairs,
+    _host_sources,
     _padded,
+    _pair_xsources,
     _search_pairs,
     _size_class,
     _sparse_operator,
@@ -1001,6 +1004,30 @@ class TestSearchPairs:
             assert np.array_equal(i, rows[keep]) and np.array_equal(j, ref[keep])
             found += len(i)
         assert found > 0, "the fixture must exercise a match"
+
+    @pytest.mark.parametrize("num_qubits", [40, 100, 140])
+    def test_pairs_rebuild_the_searched_sources(self, num_qubits):
+        """The check rebuilds each group's sources from the build's pairs instead of searching again.
+
+        Both directions come from one pair, and an identity group maps a real row to itself and a
+        filler to -1; dropping either leaves a source array the search would not have returned.
+        """
+        rng = np.random.default_rng(num_qubits + 1)
+        hops = ["I" * k + "XX" + "I" * (num_qubits - k - 2) for k in (0, num_qubits // 2)]
+        strings = ["Z" + "I" * (num_qubits - 1), *real_pauli_strings(num_qubits, 6, rng), *hops]
+        h = PauliSumXZ.from_paulisum((strings, rng.normal(size=len(strings))))
+        assert not np.asarray(h.x[0]).any(), "the fixture needs a leading identity group"
+        base = h.pack_states(rng.integers(0, 2, (40, num_qubits), dtype=np.uint8))
+        packed = np.unique(np.concatenate([base, *(base ^ x for x in h.x[1:4])]), axis=0)
+        size = len(packed) + 7  # fillers too
+        states_u = uniquify_states(_pad_states(packed, size), size)
+        pairs = _group_pairs(h, states_u)
+        assert sum(len(i) for i, _ in pairs.values()) > 0, "the fixture must exercise a pair"
+        rebuilt = list(_pair_xsources(h.x, states_u, pairs))
+        searched = list(_host_sources(h.x, states_u, lambda j: j))
+        assert len(rebuilt) == len(searched) == h.x.shape[0]
+        for g, (a, b) in enumerate(zip(rebuilt, searched, strict=True)):
+            assert a.dtype == b.dtype and np.array_equal(a, b), f"group {g}"
 
 
 class TestPairsOrder:

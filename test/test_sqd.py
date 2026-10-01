@@ -48,7 +48,7 @@ from rqutils.sqd import (
     uniquify_states,
 )
 from rqutils.sqd._solve import _spread_seed
-from rqutils.sqd._sparse import _run_sparse, _sparse_operator, _sparse_residual
+from rqutils.sqd._sparse import _group_pairs, _run_sparse, _sparse_operator, _sparse_residual
 from rqutils.sqd._states import _MAX_STATES, _pad_states
 
 
@@ -1029,6 +1029,10 @@ class TestSparseEigenpairCheck:
         hv = apply_h(result.eigvec, states=states_u, xsources=xsources, zsignatures=h.z, coeffs=h.c)
         assert float(ax_norm) == pytest.approx(float(np.linalg.norm(hv)), rel=1e-12)
         assert float(residual) < 1e-12 * float(ax_norm), float(residual)
+        # sqd passes the build's pairs so the check searches nothing; the sources are the same arrays.
+        pairs = _group_pairs(h, states_u)
+        reused = _sparse_residual(h, states_u, result.eigval, result.eigvec, pairs)
+        assert (float(reused[0]), float(reused[1])) == (float(residual), float(ax_norm))
 
 
 class TestAtolAndRtol:

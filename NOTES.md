@@ -1335,6 +1335,15 @@ Hamming-shell bases move rows to wider buckets (width 19: 1 → 4 → 8 pieces p
 call still retraced at 1.25–1.5× headroom; constant-size 5% turnover retraced nothing without it. It
 saved one compile in nine calls. No committed script reproduces these numbers.
 
+### sqd sparse kernels: one host search for the build and the check (2026-10-02)
+
+`_sparse_residual` re-ran the build's whole per-group host search. `sqd` now searches once
+(`_group_pairs`) and the check rebuilds each group's sources from those pairs (`_pair_xsources`: both
+directions per pair, own rows for an identity group), at ~8 B/pair of host memory kept through the solve.
+Build plus check 1.41–1.53× on an M1 (n=60 `type1`/`type2`, `2^20`/`2^21`, `"pairs"` and `"ell"`, 5/5
+rounds each), residual bit-identical; ≤ the 0.58 s check on the GH200 (`poc/sparse-gpu.md` §7), unmeasured
+there. No committed script reproduces these numbers.
+
 ### sqd sparse kernels: pairs sorted by i (2026-09-28)
 
 `"pairs"` stored its pairs group by group, each group's `i` spanning every state, so all four accesses
