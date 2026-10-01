@@ -233,8 +233,9 @@ Hamming shells. Shell `h` for `type1`/`type2` is read off `type4`/`type3`, which
 5. **ELLC — done, beside `"csr"`, not replacing it:** `sqd(matvec="ell")` (§9).
 6. **What to try on the GPU, from the literature (2026-09-27).**
    - *Scan-step size first.* A `2^15`-entry step means ~6,000 steps per matvec at N = 2·10⁷; at ~10 µs of
-     launch cost each that is ~60 ms against ~5 ms of memory traffic (an estimate). Sweep `2^15`–`2^22`
-     entries per step, and a whole bucket with no scan, counting kernels per matvec.
+     launch cost each that is ~60 ms against ~5 ms of memory traffic (an estimate). **Measured**
+     (`poc/sparse-pairs-tune.md` §3): `"pairs"` plateaus at `2^19` on the GH200 and ships it there;
+     `2^15` is the CPU's optimum. `"ell"` and a whole bucket with no scan are unswept.
    - *`"ell"`'s row write:* each row is in one bucket, so `.at[rows].set(val, unique_indices=True,
      indices_are_sorted=True)` can replace the `add` and avoid atomics.
    - *Layout within a piece:* `(pieces, w, R)` with `sum(axis=1)` against today's `(pieces, R, w)` — a

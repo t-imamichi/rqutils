@@ -1,7 +1,7 @@
 # Four `"pairs"` levers on a GPU
 
 `poc/sparse_pairs_tune.py` (§6) at `909ebf5` (§2) and `1443f48` (§3's sweep and `"csr"` run), one NVIDIA
-GH200 120GB, 2026-10-02. Fixture as
+GH200 120GB, 2026-10-02; §3's CPU sweep at `a1fcde3` on one Apple M1 (8 cores, 16 GiB). Fixture as
 `poc/sparse-gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`, `complex128`),
 Hamming-shell subspaces around both Néel states. Two results are in the library since: the chunk size,
 as `_GPU_PAIRS_CHUNK`, and dropping the sorted hint on CUDA (§3); the other levers are not.
@@ -51,6 +51,19 @@ Every arm's eigenvalue agrees with the reference to 7.9e-16, and its iteration c
 
   All 5/5 rounds. Past `2^19` only the temp grows, so `2^19` — the smallest size on the plateau — ships
   for `"pairs"` on a GPU (`_GPU_PAIRS_CHUNK`); the CPU keeps `_CHUNK = 2^15`.
+- **On CPU `2^15` is already the optimum**: `--chunks 13 15 17 19 --variants base` for `"pairs"` and
+  `"csr"`, per iteration against `2^15`, at `2^17` / `2^19`:
+
+  | chunk | `"pairs"` | `"csr"` | temp |
+  | --- | --- | --- | --- |
+  | `2^13` | 0.95× / 0.96× | 0.97× / 0.94× | 0.3–0.6 MiB |
+  | `2^15` | 9.51 / 50.72 ms | 11.43 / 67.80 ms | 1.1–2.3 MiB |
+  | `2^17` | 1.04× / 1.01× | 0.86× / 1.03× | 9 MiB |
+  | `2^19` | 0.54× / 0.77× | 0.60× / 0.87× | 36 MiB |
+
+  `2^17`'s best case is +4% at 4× the temp, and `"csr"` loses 14% with it at `2^17`; the GPU's `2^19` is
+  13–46% slower, its temp spilling the cache (and at `2^17` mostly padding: one chunk holds the
+  operator). Eigenvalues agree to 4.6e-16. Hence the GPU-only gate.
 - **`merged` pays only while steps are many**: 1.65× / 1.23× at `2^15`, a tie with `base` at `2^19`
   (1.66 against 1.64 ms, 14.68 against 14.89 ms). Halving the scatter launches matters only when the
   launches do.
@@ -84,8 +97,7 @@ call. The GPU-only chunk ships at `2^19`; `merged`, `sorted` and `real` are not 
 ## 5. Open
 
 1. **`"ell"` at a larger chunk** on the GPU; the script has no `ell` mode.
-2. **The CPU's chunk size**, unmeasured here; `2^15` keeps its temporaries in cache.
-3. **The whole `"pairs"` call** against `"tables"` with the chunk and the single search (§4's projection):
+2. **The whole `"pairs"` call** against `"tables"` with the chunk and the single search (§4's projection):
    `poc/sparse_gpu.py --arms indices tables pairs --log2-sizes 20 21 22`.
 
 ## 6. The script
@@ -106,6 +118,7 @@ call. The GPU-only chunk ships at `2^19`; `merged`, `sorted` and `real` are not 
 distinct, and must match the reference eigenvalue and `(2, N)` product to `1e-12`; one host search
 serves every arm. It patches both `_CHUNK` and `_chunk`, so a GPU `"pairs"` arm takes its own chunk
 rather than `_GPU_PAIRS_CHUNK`. Runs here: the default sweep on the GH200 (§2), `--chunks 19 20 21
---variants base` and `--matvec csr --chunks 15 19` there (§3), and CPU smoke runs at `2^12` and `2^19`.
+--variants base` and `--matvec csr --chunks 15 19` there (§3), `--log2-sizes 17 19 --chunks 13 15 17 19
+--variants base` on the M1 for both `--matvec` (§3), and CPU smoke runs at `2^12` and `2^19`.
 Since the hint change, `--matvec csr`'s `base` is the library (no hint on CUDA) and `sorted` forces
 it; the run above had `base` with the hint and an `unsorted` arm without.

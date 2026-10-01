@@ -2323,7 +2323,7 @@ GH200, `type1`/`type2` `2^20`–`2^22`, one process: `"tables"` 3.05–4.54× `"
 ### sqd sparse kernels on a GPU: `"pairs"` wants bigger chunks, and a sorted-scatter hint slows it (2026-10-02)
 
 GH200, `type1` `2^20`/`2^22`: `_CHUNK` `2^15` → `2^19` is 2.71×/1.37× per iteration at +8 MiB temp, the
-plateau's edge, so it ships as `_GPU_PAIRS_CHUNK` (GPU, `"pairs"` only). A merged scatter ties it there;
+plateau's edge, so it ships as `_GPU_PAIRS_CHUNK` (GPU, `"pairs"`; `2^15` is the CPU's own optimum). Merging ties;
 `indices_are_sorted` on `out[i]` is 0.37–0.64×, and dropping it from `"csr"` is 2.12–3.24×, so CUDA now drops
 it everywhere (CPU keeps it); `float64` factors 0.37–0.94×. `poc/sparse-pairs-tune.md` §2, §3
 
