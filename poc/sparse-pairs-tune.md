@@ -1,10 +1,10 @@
 # Four `"pairs"` levers on a GPU
 
-`poc/sparse_pairs_tune.py` (§6) at `909ebf5` (§2) and `1443f48` (§3's sweep), one NVIDIA GH200 120GB,
-2026-10-02. Fixture as
+`poc/sparse_pairs_tune.py` (§6) at `909ebf5` (§2) and `1443f48` (§3's sweep and `"csr"` run), one NVIDIA
+GH200 120GB, 2026-10-02. Fixture as
 `poc/sparse-gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`, `complex128`),
-Hamming-shell subspaces around both Néel states. The chunk size is in the library since §3's sweep, as
-`_GPU_PAIRS_CHUNK`; the other three levers are not.
+Hamming-shell subspaces around both Néel states. Two results are in the library since: the chunk size,
+as `_GPU_PAIRS_CHUNK`, and dropping the sorted hint on CUDA (§3); the other levers are not.
 
 ## 1. The levers
 
@@ -57,7 +57,20 @@ Every arm's eigenvalue agrees with the reference to 7.9e-16, and its iteration c
 - **The sorted hint is a large slowdown**: 0.37–0.64× per iteration, 0.23–0.41× on the `(2, N)` matvec.
   On the GPU, XLA's scatter with `indices_are_sorted=True` is the slower one. The library's `"csr"`
   passes that flag, and `"csr"` is the slowest sparse kernel on the GH200 (58.00 ms per iteration
-  against `"pairs"`' 20.35 at `type2` `2^22`, `poc/sparse-split.md` §4) — a suspect, untested (§5).
+  against `"pairs"`' 20.35 at `type2` `2^22`, `poc/sparse-split.md` §4). **Confirmed** with
+  `--matvec csr --chunks 15 19`, `type1`, per iteration against the shipped `"csr"`:
+
+  | `"csr"` arm | `2^20` | `2^22` |
+  | --- | --- | --- |
+  | shipped (`2^15`, hint) | 20.27 ms | 58.32 ms |
+  | no hint, `2^15` | **3.24×** | 2.12× |
+  | no hint, `2^19` | 2.92× | **2.40×** |
+  | hint, `2^19` | 1.07× | 1.09× |
+
+  All 5/5; the `(2, N)` matvec gains 3.04–5.04×. `_scan_add` now drops the hint on CUDA, for every
+  sparse kernel and a real carry too; the CPU keeps it, unmeasured there. The larger chunk is mixed for
+  `"csr"` without the hint (0.90× at `2^20`, 1.13× at `2^22`), so it keeps `2^15`. Even fixed, `"csr"`
+  trails `"pairs"`: 24.32 against 14.76 ms per iteration at `2^22`, at 408 against 304 MiB.
 - **`real` costs more than it saves**: −24% to −27% operator memory, at 0.37–0.94× everywhere. Its
   0.37× at chunk `2^19`, `2^20` is unexplained.
 
@@ -70,8 +83,7 @@ call. The GPU-only chunk ships at `2^19`; `merged`, `sorted` and `real` are not 
 
 ## 5. Open
 
-1. **`"csr"` without the sorted hint**, and `"csr"`/`"ell"` at a larger chunk, on the GPU:
-   `--matvec csr --chunks 15 19`.
+1. **`"ell"` at a larger chunk** on the GPU; the script has no `ell` mode.
 2. **The CPU's chunk size**, unmeasured here; `2^15` keeps its temporaries in cache.
 3. **The whole `"pairs"` call** against `"tables"` with the chunk and the single search (§4's projection):
    `poc/sparse_gpu.py --arms indices tables pairs --log2-sizes 20 21 22`.
@@ -87,11 +99,13 @@ call. The GPU-only chunk ships at `2^19`; `merged`, `sorted` and `real` are not 
 | `--log2-sizes` | `20 22` | subspace sizes `2^k` |
 | `--chunks` | `15 17 19` | log2 of `_CHUNK`, the operator's shapes following it |
 | `--matvec` | `pairs` | `pairs`, or `csr` for §5 item 2 |
-| `--variants` | every one of `--matvec`'s | `base sorted merged real` for `pairs`, `base unsorted` for `csr`; each run at every chunk |
+| `--variants` | every one of `--matvec`'s | `base sorted merged real` for `pairs`, `base sorted` for `csr`; each run at every chunk |
 | `--rounds` | `5` | interleaved rounds after one warm-up per arm |
 
 `base` at `2^15` is the reference and always runs. Each arm compiles its own solve, asserted pairwise
 distinct, and must match the reference eigenvalue and `(2, N)` product to `1e-12`; one host search
 serves every arm. It patches both `_CHUNK` and `_chunk`, so a GPU `"pairs"` arm takes its own chunk
 rather than `_GPU_PAIRS_CHUNK`. Runs here: the default sweep on the GH200 (§2), `--chunks 19 20 21
---variants base` there (§3), and CPU smoke runs at `2^12` and `2^19`.
+--variants base` and `--matvec csr --chunks 15 19` there (§3), and CPU smoke runs at `2^12` and `2^19`.
+Since the hint change, `--matvec csr`'s `base` is the library (no hint on CUDA) and `sorted` forces
+it; the run above had `base` with the hint and an `unsorted` arm without.

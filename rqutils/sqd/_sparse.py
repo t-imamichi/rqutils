@@ -395,10 +395,11 @@ def _scan_add(
 
     On CUDA a complex ``out`` is carried as its real and imaginary parts: XLA's GPU scatter otherwise
     splits the carry itself, a full pass over ``out`` per scan step. Elsewhere that costs 0.68-0.90x
-    and an extra ``out`` of temp, so the carry stays complex (``poc/sparse-split.md``).
+    and an extra ``out`` of temp, so the carry stays complex (``poc/sparse-split.md``). CUDA also drops
+    ``ordered``, which slows its scatter 2.1-3.2x on ``"csr"`` (``poc/sparse-pairs-tune.md``).
     """
 
-    def scan(*parts):
+    def scan(parts, ordered):
         def body(parts, chunk):
             for index, value in updates(chunk):
                 values = (value.real, value.imag) if len(parts) == 2 else (value,)
@@ -410,17 +411,16 @@ def _scan_add(
 
         return jax.lax.scan(body, parts, xs)[0]
 
-    def fused(out):
-        return scan(out)[0]
+    def default(out):
+        return scan((out,), ordered)[0]
 
-    if not jnp.iscomplexobj(out):
-        return fused(out)
-
-    def split(out):
-        re, im = scan(out.real, out.imag)
+    def cuda(out):
+        if not jnp.iscomplexobj(out):
+            return scan((out,), False)[0]
+        re, im = scan((out.real, out.imag), False)
         return jax.lax.complex(re, im)
 
-    return jax.lax.platform_dependent(out, default=fused, cuda=split)
+    return jax.lax.platform_dependent(out, default=default, cuda=cuda)
 
 
 def _apply_pairs(

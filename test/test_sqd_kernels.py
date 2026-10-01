@@ -985,6 +985,47 @@ class TestComplexScanCarry:
                 assert [v.aval.dtype for v in scans[0].outvars] == want[key], key
 
 
+def scatter_hints(jaxpr):
+    """``indices_are_sorted`` of every ``scatter-add`` in ``jaxpr``, nested jaxprs included."""
+    hints = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "scatter-add":
+            hints.append(eqn.params["indices_are_sorted"])
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, tuple) else (param,):
+                inner = getattr(sub, "jaxpr", sub)
+                if hasattr(inner, "eqns"):
+                    hints += scatter_hints(inner)
+    return hints
+
+
+class TestSortedHintPerPlatform:
+    """On CUDA no sparse scatter carries ``indices_are_sorted``; elsewhere ``"csr"``'s still do.
+
+    The hint slowed XLA's GPU scatter: ``"csr"`` ran 2.12-3.24x per iteration on a GH200 without it, and
+    ``"pairs"`` 0.37-0.64x with it on ``out[i]`` (``poc/sparse-pairs-tune.md``). Unmeasured elsewhere, so
+    the CPU keeps it; a real carry takes the same switch.
+    """
+
+    @pytest.mark.parametrize("kind", ["mixed", "real"])
+    def test_csr_hint_per_platform(self, kind):
+        strings, coeffs, states = sparse_fixture(kind, np.random.default_rng(20261002))
+        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_u, operator = sparse_operator_of(h, states, 32, Matvec.CSR)
+        dtype = jnp.complex128 if np.iscomplexobj(np.asarray(h.c)) else jnp.float64
+        vec = jnp.ones(states_u.shape[0], dtype)
+        jaxpr = jax.make_jaxpr(_SPARSE_APPLY[Matvec.CSR])(vec, *operator)
+        switches = [e for e in jaxpr.eqns if "branches_platforms" in e.params]
+        assert switches, "each scan must choose its hint per platform"
+        for eqn in switches:
+            for branch, key in zip(
+                eqn.params["branches"], eqn.params["branches_platforms"], strict=True
+            ):
+                hints = scatter_hints(branch.jaxpr)
+                assert hints, f"{key}: no scatter"
+                assert set(hints) == ({False} if key == ("cuda",) else {True}), (key, hints)
+
+
 def ell_fixture(rng):
     """``(strings, coeffs, states)`` whose row degrees span several of ``"ell"``'s width classes.
 

@@ -332,7 +332,8 @@ factor), `"csr"` (both directions by target row, `float64` factors where a group
 CPU the fastest, ~2× `"csr"` per solve). **On CUDA `_scan_add` carries a complex `out` as real and
 imaginary parts; don't merge them** — XLA's GPU scatter would split the whole carry every scan step,
 2.5–17.9× per iteration. The split loses on CPU, so `platform_dependent` keeps it CUDA-only
-(`poc/sparse-split.md`). The sparse kernels' entry counts depend on the data, so `sqd()` builds them
+(`poc/sparse-split.md`). That branch also drops `indices_are_sorted`, which slows the GPU scatter 2–3×
+(`poc/sparse-pairs-tune.md`). The sparse kernels' entry counts depend on the data, so `sqd()` builds them
 **host-side before the jitted solve** (`"pairs"` in `2^19`-entry chunks on a GPU, `_GPU_PAIRS_CHUNK`, else
 `2^15`), rounding chunk and piece counts to `m·2^k` (8 ≤ m < 16) so the solve
 recompiles per size class — `"ell"` keys on every (width, piece class) pair, so it recompiles more often

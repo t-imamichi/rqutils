@@ -11,18 +11,18 @@ kernel a fraction of the GPU. Arms are every ``--chunks`` × ``--variants``:
 - ``real``: ``"csr"``'s split, real groups' pairs with ``float64`` factors and the rest ``complex128``,
   two scans; the memory lever.
 
-``--matvec csr`` runs ``"csr"`` instead, with ``base`` (the library, ``indices_are_sorted=True``) and
-``unsorted`` (the same without the hint, which slows ``"pairs"``' scatter on the GH200).
+``--matvec csr`` runs ``"csr"`` instead, with ``base`` (the library, which since this ran drops
+``indices_are_sorted`` on CUDA) and ``sorted`` (the hint forced back, as the library had it).
 
 The reference is ``base`` at ``2^15``, the CPU's chunk (the GPU ships ``"pairs"`` at ``2^19`` since
 this ran, ``_GPU_PAIRS_CHUNK``), for either ``--matvec``. Every arm keeps the library's CUDA-only carry
-split (``_scan_add``'s rule), gets a function of its own to jit, and the lowered solves are asserted
-pairwise distinct. Arms are warm and interleaved; ``solve`` is per iteration (GPU scatter order varies
+split (``_scan_add``'s rule), gets a function of its own to jit, and the solves are asserted
+pairwise distinct as traced. Arms are warm and interleaved; ``solve`` is per iteration (GPU scatter order varies
 iteration counts); eigenvalues must agree to ``1e-12`` relative. ``op`` is the operator's device bytes,
 ``temp`` XLA's ``temp_size_in_bytes`` for the ``(2, N)`` matvec. Fixture as ``poc/sparse_gpu.py``.
 
 Run: uv run python poc/sparse_pairs_tune.py [--log2-sizes 20 22] [--chunks 15 17 19]
-     [--variants base sorted merged real] [--rounds 5] [--matvec csr --variants base unsorted]
+     [--variants base sorted merged real] [--rounds 5] [--matvec csr --variants base sorted]
 """
 
 import argparse
@@ -48,7 +48,7 @@ from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import Matvec, get_diagonal, uniquify_states
 from rqutils.sqd._core import _sqd_inputs
 
-VARIANTS = {"pairs": ("base", "sorted", "merged", "real"), "csr": ("base", "unsorted")}
+VARIANTS = {"pairs": ("base", "sorted", "merged", "real"), "csr": ("base", "sorted")}
 parser = argparse.ArgumentParser()
 parser.add_argument("--num-qubits", type=int, default=60)
 parser.add_argument("--pattern", default="type1")
@@ -133,14 +133,14 @@ def apply_real(vec, d0, *sets):
     return out
 
 
-def apply_csr_unsorted(vec, d0, *entries):
+def apply_csr_sorted(vec, d0, *entries):
     def updates(chunk):
         ti, si, di = chunk
-        return [(ti, di * vec[..., si])]
+        return [(ti, di * vec[..., si], True)]
 
     out = d0 * vec
     for k in range(0, len(entries), 3):
-        out = sm._scan_add(updates, out, entries[k : k + 3])
+        out = scan_add(updates, out, entries[k : k + 3])
     return out
 
 
@@ -151,7 +151,7 @@ KERNELS = {
         "merged": apply_merged,
         "real": apply_real,
     },
-    "csr": {"base": sm._apply_csr, "unsorted": apply_csr_unsorted},
+    "csr": {"base": sm._apply_csr, "sorted": apply_csr_sorted},
 }[options.matvec]
 
 
@@ -224,7 +224,8 @@ for log2 in options.log2_sizes:
         sm._SPARSE_APPLY[arm] = kernel
         solve = jax.jit(lambda *a: sm._run_sparse.__wrapped__(*a), static_argnums=(3, 4, 5))
         key = (chunk, variant)
-        lowered[key] = solve.lower(h, states_u, operator, size, False, arm).as_text()
+        # The traced jaxpr keeps every platform branch, which lowering for one backend drops.
+        lowered[key] = str(solve.trace(h, states_u, operator, size, False, arm).jaxpr)
         matvec = jax.jit(kernel)
         calls[key] = [functools.partial(solve, h, states_u, operator, size, False, arm)]
         calls[key] += [functools.partial(matvec, vec, *operator) for vec in vecs]
