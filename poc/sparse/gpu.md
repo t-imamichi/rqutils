@@ -215,17 +215,43 @@ median whole `sqd` call in s and the ratio to `"indices"`:
 - Every eigenvalue agrees with `"indices"` to 7.1e-15. A `cuda_timer` "Delay kernel timed out" line is an
   XLA autotuner warning; its row's numbers are in line with the rest.
 
+### A sixth run, with the shipped dense diagonals and the device sort
+
+After `472e731`: `"indices"`/`"onthefly"` sum each group's diagonal over a fixed trip count
+(`e349e43`, `poc/dense-tune.md` §4), and `"pairs"` sorts by `i` on the device (`472e731`,
+`poc/sparse/pairs-sort.md`). `--patterns type1 type2 --arms indices tables pairs --log2-sizes 20 21 22`,
+median whole call in s, the run above in brackets:
+
+| pattern | N | `"indices"` | `"tables"` | `"pairs"` |
+| --- | --- | --- | --- | --- |
+| `type1` | `2^20` | 0.586 (2.533) | 0.566 | **0.344** (0.434) |
+| `type1` | `2^21` | 1.394 (5.164) | 1.383 | **0.764** (0.894) |
+| `type1` | `2^22` | 2.752 (9.400) | 2.655 | **2.549** (2.786) |
+| `type2` | `2^20` | 1.666 (6.339) | 1.654 | **1.343** (1.539) |
+| `type2` | `2^21` | 3.069 (9.939) | 3.088 | **2.451** (2.808) |
+| `type2` | `2^22` | 5.271 (15.617) | 5.097 | **2.959** (3.897) |
+
+- **`"indices"` now matches `"tables"`**: 2.96–4.32× its previous per-iteration time, and 0.97–1.01× `"tables"`'
+  speed end to end (21.84 against 21.07 ms per iteration at `type1` `2^22`) at 0.42–0.48× its
+  peak memory (1.79 against 3.76 GiB).
+- **`"pairs"` is fastest in all six cells**, 1.09–1.32× its previous call, its build 1.7–2.4× faster
+  (`type2` `2^22`: 1.631 → 0.674 s), and 1.08–1.82× `"indices"` at 0.54–0.67× its memory.
+- **The device sort costs `"pairs"` peak memory on `type2`**: +11–18% (`2^22`: 1.43 → 1.62 GiB) from the
+  concatenation and its sorted copy on the device; `type1` is flat.
+- Every eigenvalue agrees with `"indices"` to 3.6e-15.
+
 ## 9. What it means
 
 Before `0d25235`, `"pairs"` led the sparse kernels to `2^19` and lost past it (0.49× at `type1` `2^22`),
-and "keep `"indices"`" followed; both were the per-step carry split, and that advice is retracted. With
-the tuned kernels (§8), on one GH200:
+and "keep `"indices"`" followed; both were the per-step carry split, and that advice is retracted. So is
+§8's first "`"tables"` under a mesh": with the fixed-trip diagonals `"indices"` matches it at half the
+memory. On one GH200 now:
 
 | setting | kernel | measured |
 | --- | --- | --- |
-| one GPU | `"pairs"` | 3.37–5.84× `"indices"` end to end, fastest in 5 of 6, at 0.53–0.64× its memory and 0.22–0.31× `"tables"`' |
-| under a mesh | `"tables"` | 3.12–4.50×; the sparse kernels raise there; its multi-GPU solve is unmeasured |
-| any | not `"csr"`/`"ell"` | both behind `"pairs"` at about its memory |
+| one GPU | `"pairs"` | 1.08–1.82× `"indices"` end to end, fastest in all six cells, at 0.54–0.67× its memory |
+| under a mesh | `"indices"` | 0.97–1.01× `"tables"`' speed at 0.42–0.48× its memory; the sparse kernels raise there; multi-GPU unmeasured |
+| any | not `"csr"`/`"ell"`/`"tables"` | none ahead of `"pairs"` or `"indices"` at their memory |
 
 `"indices"` stays the library default: that is a CPU choice, and switching per backend is a separate
 decision.
@@ -252,7 +278,7 @@ decision.
    sort. A stable sort on the device is 1.12–1.50× per `"pairs"` call (`poc/sparse/pairs-sort.md`),
    unshipped; dropping the sort loses. For `"ell"`, batch its factor calls.
 9. **`"ell"`'s compile cost** (§7's first calls), and whether the persistent compile cache recovers it.
-10. **`"tables"` on a multi-GPU mesh**, the setting §9 recommends it for.
+10. **`"indices"` on a multi-GPU mesh**, the setting §9 recommends it for.
 
 ## 11. The script
 

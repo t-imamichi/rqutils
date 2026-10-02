@@ -45,7 +45,13 @@ operator. On a CPU the device arm is XLA's CPU sort, slower than `counting` in a
 build at `2^12`–`2^14`), so the change belongs behind the GPU backend, beside `_GPU_PAIRS_CHUNK`. `"csr"`'s
 and `"ell"`'s two-direction sorts are the same shape of work and unmeasured.
 
-Open: the device sort for `"csr"`/`"ell"`, and its cost on a CPU at real sizes.
+**Shipped, and measured in the library** (`poc/sparse/gpu.md` §8's sixth run): `"pairs"` is 1.09–1.32×
+its previous whole call, its build 1.7–2.4× faster. One cost the A/B above did not report: **peak memory
+on `type2` rises 11–18%** (`2^22`: 1.43 → 1.62 GiB), the concatenation and its sorted copy living on the
+device; `type1` is flat.
+
+Open: the device sort for `"csr"`/`"ell"`, its cost on a CPU at real sizes, and sorting in place to give
+back the `type2` peak.
 
 ## 4. The script
 

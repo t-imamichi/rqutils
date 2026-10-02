@@ -94,8 +94,10 @@ Every arm's eigenvalue agrees with the reference to 7.9e-16, and its iteration c
   the largest. **`unique-exact`**, the same unscanned and each group sized to its own count, removes the
   padding (300 against 304 MiB) and is **2.26× `base@2^19` at `2^22`** (6.57 against 14.85 ms per
   iteration; 1-D 3.07×) but 0.67× at `2^20` (2.39 against 1.60 ms): 122 scatter launches on groups of ~69k
-  pairs at `2^20` against ~162k at `2^22`. A switch on group size is the shape; its threshold, `type2`
-  and the per-group compile cost are unmeasured.
+  pairs at `2^20` against ~162k at `2^22`. **There is no clean switch point**: against `base@2^19`,
+  `type1` reads 0.67× / 1.07× / 2.26× over `2^20`–`2^22` and `type2` the reverse, 1.63× / 1.73× / 0.78×,
+  so neither the size nor the mean group size (`type1` wins at ~162k pairs a group, `type2` loses at
+  ~244k) separates them. The mechanism is unknown; not shipped.
 
 ### `"ell"`: chunk size and width grid
 
@@ -119,13 +121,14 @@ At `type1` `2^22` the best arm's 14.7 ms per iteration is below `"tables"`' 21.0
 (`poc/sparse/gpu.md` §7). With the single host search (`b38d48b`), a `"pairs"` call would land near
 `"tables"`' 2.65 s at about a quarter of its memory — a projection from the solve stage, not a whole
 call. The GPU-only chunk ships at `2^19`; `merged`, `sorted` and `real` are not worth building.
-`unique-exact` (no padding) is 2.26× at `2^22` and 0.67× at `2^20`, so it wants a size switch. `"ell"`'s GPU
+`unique-exact` (no padding) wins and loses non-monotonically with size across `type1`/`type2`, with
+no switch point found, so it is not shipped. `"ell"`'s GPU
 setting is `2^17` and the ×2 grid, worth shipping once its build's factor calls are batched.
 
 ## 5. Open
 
-1. **`unique-exact`'s switch point**: `type2`, sizes between `2^20` and `2^22`, and its first-call
-   compile cost (one shape per group).
+1. **Why `unique-exact` wins where it does**: a profile of `type2` `2^22` against `type1` `2^22` would
+   show whether the scatter, the launch count or the group sizes' spread decides it.
 2. **`"ell"`'s factor calls batched**, and its GPU chunk and grid in the library.
 3. **The whole `"pairs"` call** — measured since: `poc/sparse/gpu.md` §8.
 

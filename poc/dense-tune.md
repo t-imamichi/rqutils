@@ -93,13 +93,16 @@ solve iteration, 3/3 each:
 | `type2` | 1.66× (72.91 against 120.81 ms) | 1.76× (347.25 against 611.49 ms) |
 
 In that run the reference's `1-D`/`(2, N)` columns time the replica's old kernel, not the library's, so
-only `solve` compares the two. The GPU run of the shipped form is §5's.
+only `solve` compares the two. **On the GH200** (`poc/sparse/gpu.md` §8's sixth run), the shipped
+`"indices"` is 2.96–4.32× its previous per-iteration time over `type1`/`type2` `2^20`–`2^22`, matching
+`"tables"` at under half its memory; `"onthefly"` at `type1` `2^22` is 1.31× the old kernel (217.60
+against 284.78 ms per iteration, 5/5).
 
 ## 5. Open
 
-1. **The shipped form on the GH200**, and a fixture with many distinct term counts (molecular-like,
-   `poc/sparse/pairs.py general`), where one scan per count could grow large.
-2. **`"onthefly"`** at `2^22` on the GPU, and on CPU, with `id-static` (1.45× at `2^20` on the GH200).
+1. **A fixture with many distinct term counts** (molecular-like, `poc/sparse/pairs.py general`), where
+   one scan per count could grow large; the shipped form is measured on the GH200 since (§4).
+2. **`"onthefly"` on CPU** with the shipped form (1.45× at `2^20` and 1.31× at `2^22` on the GH200).
 3. **`unroll` with bounded temp**: `unroll=2` already holds ~1 GB at `2^22`; anything above 1 trades
    memory for speed.
 

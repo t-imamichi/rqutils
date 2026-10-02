@@ -2353,6 +2353,12 @@ bit-identical; dropping the sort loses at `2^22`. One unscanned, unpadded group 
 `unique_indices` is 2.26× `base@2^19` at `2^22` but 0.67× at `2^20`. The device sort ships (GPU only); the
 atomic-free scatter does not. `poc/sparse/pairs-sort.md` §2, `poc/sparse/pairs-tune.md` §3
 
+### sqd on a GPU with the shipped diagonals and sort: `"indices"` matches `"tables"` at half the memory (2026-10-02)
+
+GH200, `type1`/`type2` `2^20`–`2^22`: `"indices"` 2.96–4.32× its previous iteration, 0.97–1.01× `"tables"`'
+speed at 0.42–0.48× its memory, so a mesh wants `"indices"`; `"pairs"` fastest in all six, 1.08–1.82×
+`"indices"`, its device sort +11–18% peak on `type2`. `unique-exact` has no switch point; not shipped. `poc/sparse/gpu.md` §8, §9
+
 ### sqd sparse kernels: a state-major `(N, 2)` gather layout loses on CPU (2026-10-01)
 
 M1, n=60 `type1`, `2^17`/`2^19`: gathering from `(N, 2)` instead of `(2, N)` is 0.83–0.87× on the matvec
