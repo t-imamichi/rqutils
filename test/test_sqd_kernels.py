@@ -947,6 +947,24 @@ class TestSparseKernels:
         assert all(a.shape[-1] == 64 for a in operator[1:]), [a.shape for a in operator[1:]]
         assert_matches_indices(_SPARSE_APPLY[matvec], operator, h, states_u, len(states), rng)
 
+    @pytest.mark.parametrize("kind", ["real", "mixed"])
+    def test_device_sort_matches_counting_sort(self, kind, monkeypatch):
+        """A GPU sorts ``"pairs"`` by ``i`` on the device (1.12-1.50x per call on a GH200,
+        ``poc/sparse/pairs-sort.md``); the arrays must be the counting sort's, bit for bit.
+        """
+        import rqutils.sqd._sparse as sparse_module
+
+        strings, coeffs, states = sparse_fixture(kind, np.random.default_rng(20261003))
+        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        _, counting = sparse_operator_of(h, states, 32, Matvec.PAIRS)
+        monkeypatch.setattr(sparse_module, "_on_gpu", lambda: True)
+        monkeypatch.setattr(sparse_module, "_chunk", lambda matvec: _CHUNK)  # same shapes as on CPU
+        _, device = sparse_operator_of(h, states, 32, Matvec.PAIRS)
+        i = np.asarray(counting[1]).ravel()
+        assert np.count_nonzero(np.diff(i[i != np.asarray(counting[2]).ravel()]) == 0), "repeated i"
+        for a, b in zip(device, counting, strict=True):
+            assert a.dtype == b.dtype and np.array_equal(np.asarray(a), np.asarray(b))
+
     def test_entry_count_guard(self):
         """Raises before allocating: the passing side is every sparse solve in this file."""
         with pytest.raises(ValueError, match="2147483648 entries"):

@@ -24,9 +24,29 @@ _CHUNK = 1 << 15
 _GPU_PAIRS_CHUNK = 1 << 19
 
 
+def _on_gpu() -> bool:
+    """Whether the default backend is a GPU, which the sparse builds tune for."""
+    return jax.default_backend() == "gpu"
+
+
 def _chunk(matvec: Matvec) -> int:
     """Entries per scanned chunk for ``matvec`` on the default backend."""
-    return _GPU_PAIRS_CHUNK if matvec == "pairs" and jax.default_backend() == "gpu" else _CHUNK
+    return _GPU_PAIRS_CHUNK if matvec == "pairs" and _on_gpu() else _CHUNK
+
+
+def _pairs_sorted_on_device(
+    pairs: dict[int, tuple[np.ndarray, np.ndarray]], groups: range, alloc: Callable
+) -> list[jax.Array]:
+    """``_sort_by_target(both=False)``'s arrays by a stable device sort of the groups' concatenation.
+
+    Bit-identical to the counting sort; on a GH200 it is 1.12-1.50x per ``"pairs"`` build-plus-solve,
+    the host sort being half the build there (``poc/sparse/pairs-sort.md``).
+    """
+    i, j = (jnp.asarray(np.concatenate([pairs[g][k] for g in groups])) for k in (0, 1))
+    grp = jnp.asarray(np.repeat(np.asarray(groups, np.int32), [len(pairs[g][0]) for g in groups]))
+    order = jnp.argsort(i, stable=True)
+    padded = (jnp.asarray(a) for a in alloc(i.shape[0]))
+    return [p.at[: i.shape[0]].set(a[order]) for p, a in zip(padded, (i, j, grp), strict=True)]
 
 
 def _size_class(chunks: int) -> int:
@@ -368,7 +388,10 @@ def _sparse_operator(
     if matvec == "pairs":
         # Sorted by i across groups, so out[i] and vec[i] are local (NOTES.md, "sqd sparse kernels:
         # pairs sorted by i").
-        host = _sort_by_target(pairs, list(groups), size, alloc, both=False)[0]
+        if _on_gpu():
+            host = _pairs_sorted_on_device(pairs, groups, alloc)
+        else:
+            host = _sort_by_target(pairs, list(groups), size, alloc, both=False)[0]
         return (d0, *on_device(host, c))
 
     real = np.isreal(coeffs).all(axis=1)

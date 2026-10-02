@@ -2,7 +2,8 @@
 
 `poc/sparse/pairs_sort.py` (§4) at `ef00e77`, one NVIDIA GH200 120GB, 2026-10-02, `"pairs"` at the GPU chunk
 `2^19`. Fixture as `poc/sparse/gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`)
-and `type2` (`J = 120`), Hamming-shell subspaces around both Néel states. Nothing here is in the library.
+and `type2` (`J = 120`), Hamming-shell subspaces around both Néel states. The device sort is in the
+library since, for `"pairs"` on a GPU (`_pairs_sorted_on_device`).
 
 ## 1. The question
 

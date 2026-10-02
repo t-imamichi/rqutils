@@ -2350,7 +2350,8 @@ search"; `"ell"`'s adds 2,049 factor calls (31%). `get_xsource` on the device is
 
 GH200: a stable `jnp.argsort` for the cross-group sort is 1.12–1.50× per build-plus-solve, the operator
 bit-identical; dropping the sort loses at `2^22`. One unscanned, unpadded group per scatter with
-`unique_indices` is 2.26× `base@2^19` at `2^22` but 0.67× at `2^20`. Both unshipped. `poc/sparse/pairs-sort.md` §2, `poc/sparse/pairs-tune.md` §3
+`unique_indices` is 2.26× `base@2^19` at `2^22` but 0.67× at `2^20`. The device sort ships (GPU only); the
+atomic-free scatter does not. `poc/sparse/pairs-sort.md` §2, `poc/sparse/pairs-tune.md` §3
 
 ### sqd sparse kernels: a state-major `(N, 2)` gather layout loses on CPU (2026-10-01)
 

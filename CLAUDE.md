@@ -340,7 +340,7 @@ imaginary parts; don't merge them** — XLA's GPU scatter would split the whole 
 (`poc/sparse/split.md`). That branch also drops `indices_are_sorted`, which slows the GPU scatter 2–3×
 (`poc/sparse/pairs-tune.md`). The sparse kernels' entry counts depend on the data, so `sqd()` builds them
 **host-side before the jitted solve** (`"pairs"` in `2^19`-entry chunks on a GPU, `_GPU_PAIRS_CHUNK`, else
-`2^15`), rounding chunk and piece counts to `m·2^k` (8 ≤ m < 16) so the solve
+`2^15`, and on a GPU its sort by `i` done on the device), rounding chunk and piece counts to `m·2^k` (8 ≤ m < 16) so the solve
 recompiles per size class — `"ell"` keys on every (width, piece class) pair, so it recompiles more often
 than `"csr"`, and each of its bucket scans adds compile memory (fixed in N). They are `sqd`-only (`run_sqd`
 and `apply_h` reject them), **single-device** (they raise under a mesh), and their residual check runs
