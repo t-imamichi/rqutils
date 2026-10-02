@@ -15,7 +15,7 @@ from numpy.typing import DTypeLike
 
 from rqutils.ground_locg import _check_prefilter, ground_locg, residual_floor
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd._dense import _apply_buckets, _apply_h_kernel, _pack_scanned
+from rqutils.sqd._dense import _apply_buckets, _apply_h_kernel, _bucket_args, _pack_scanned
 from rqutils.sqd._diagonal import get_diagonal
 from rqutils.sqd._states import StateList, _is_filler, get_xsource, uniquify_states
 
@@ -279,19 +279,15 @@ def run_sqd(
     apply = functools.partial(_apply_parts, matvec=matvec)
     args = (scanned, None if matvec == "tables" else states_u)
     d0 = None
-    if matvec != "tables" and (counts := hamiltonian.term_counts) is not None:
+    sources = hamiltonian.x if groups is None else groups[0][0]
+    if (
+        matvec != "tables"
+        and (bucketed := _bucket_args(hamiltonian, sources, states_u)) is not None
+    ):
         # Fixed-trip diagonals bucketed by term count, the identity's cached: 3.2-4.5x on a GPU,
         # 1.8-1.9x on CPU (poc/dense-tune.md). The residual check keeps _apply_parts.
-        x, z, c = hamiltonian.arrays
-        first = int(hamiltonian.identity_first)
-        if first:
-            d0 = get_diagonal(z[0], c[0], states_u)
-        buckets = []
-        for k in sorted(set(counts[first:])):
-            idx = np.array([g for g in range(first, len(counts)) if counts[g] == k], np.int32)
-            buckets.append((idx, z[idx, :k], c[idx, :k]))
         apply = functools.partial(_apply_buckets, matvec=matvec)
-        args = (tuple(buckets), x if groups is None else groups[0][0], states_u, d0)
+        args, d0 = bucketed, bucketed[3]
 
     def diag0():
         if matvec == "tables":

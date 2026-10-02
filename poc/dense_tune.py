@@ -48,7 +48,7 @@ import rqutils.sqd._solve as solve_mod
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import Matvec, get_diagonal, get_xsource, uniquify_states
 from rqutils.sqd._core import _sqd_inputs
-from rqutils.sqd._dense import _apply_buckets, _pack_scanned, apply_xgrp
+from rqutils.sqd._dense import _apply_buckets, _bucket_args, _pack_scanned, apply_xgrp
 from rqutils.sqd._diagonal import _z_parity
 from rqutils.sqd._solve import _group_parts, _solve, run_sqd
 
@@ -143,19 +143,12 @@ def prepare(h, states_p, states_size, matvec, variant, kmax):
 
 @functools.partial(jax.jit, static_argnums=(2, 3))
 def library_args(h, states_p, states_size, matvec):
-    """``run_sqd``'s arguments for ``_apply_buckets``, so the reference's matvec is the library's."""
+    """``run_sqd``'s arguments for ``_apply_buckets`` through the library's ``_bucket_args``."""
     states_u = uniquify_states(states_p, states_size)
-    x, z, c = h.arrays
+    x = h.x
     if matvec != "onthefly":
         x = jax.lax.scan(lambda _, xg: (None, get_xsource(xg, states_u)), None, x)[1]
-    first = int(h.identity_first)
-    d0 = get_diagonal(z[0], c[0], states_u) if first else None
-    counts = h.term_counts
-    buckets = []
-    for k in sorted(set(counts[first:])):
-        idx = np.array([g for g in range(first, len(counts)) if counts[g] == k], np.int32)
-        buckets.append((idx, z[idx, :k], c[idx, :k]))
-    return tuple(buckets), x, states_u, d0
+    return _bucket_args(h, x, states_u)
 
 
 @functools.partial(jax.jit, static_argnums=(2, 3, 4, 5, 6))

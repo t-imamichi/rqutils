@@ -310,3 +310,21 @@ def _apply_buckets(
     for bucket in buckets:
         out = jax.lax.scan(fn, out, bucket)[0]
     return out
+
+
+def _bucket_args(hamiltonian: Any, sources: jax.Array, states: StateList) -> tuple | None:
+    """:func:`_apply_buckets`' ``(buckets, sources, states, d0)``, or ``None`` without ``term_counts``.
+
+    ``hamiltonian`` is a :class:`~rqutils.paulis.symplectic.PauliSumXZ`; one bucket per distinct term
+    count of the groups after a leading identity, whose diagonal is ``d0``.
+    """
+    if (counts := hamiltonian.term_counts) is None:
+        return None
+    _, z, c = hamiltonian.arrays
+    first = int(hamiltonian.identity_first)
+    d0 = get_diagonal(z[0], c[0], states) if first else None
+    buckets = []
+    for k in sorted(set(counts[first:])):
+        idx = np.array([g for g in range(first, len(counts)) if counts[g] == k], np.int32)
+        buckets.append((idx, z[idx, :k], c[idx, :k]))
+    return tuple(buckets), sources, states, d0
