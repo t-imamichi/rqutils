@@ -15,6 +15,7 @@ from conftest import (
     apply_h_inputs,
     apply_h_kwargs,
     eigval_of,
+    lowest_projected,
     mixed_real_complex,
     pack_padded,
     real_pauli_strings,
@@ -952,6 +953,50 @@ class TestSparseKernels:
             _padded(2**31, 0)
 
 
+class TestBucketedDiagonals:
+    """``"indices"``/``"onthefly"`` sum each group's diagonal over its own term count, the identity's cached.
+
+    ``get_diagonal``'s ``while_loop`` synced with the host per term on a GPU: the fixed-trip form is
+    3.2-4.5x per iteration on a GH200 and 1.8-1.9x on CPU (``poc/dense-tune.md``). The fixture mixes
+    one- and two-term groups (a uniform X field), as ``type2``/``type3`` do, against a dense oracle.
+    """
+
+    STRINGS = (
+        *("I" * k + p + "I" * (4 - k) for k in range(5) for p in ("XX", "YY", "ZZ")),
+        *("I" * k + "X" + "I" * (5 - k) for k in range(6)),
+        "YIIIII",
+        "IIIIIY",
+    )
+
+    @pytest.mark.parametrize("matvec", [Matvec.INDICES, Matvec.ONTHEFLY])
+    @pytest.mark.parametrize("with_identity", [True, False])
+    def test_energy_matches_dense(self, matvec, with_identity):
+        strings = [s for s in self.STRINGS if with_identity or "Z" not in s]
+        coeffs = np.random.default_rng(20261002).normal(size=len(strings))
+        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        assert h.identity_first == with_identity
+        assert h.term_counts is not None
+        assert len(set(h.term_counts[int(with_identity) :])) > 1, "groups must differ in term count"
+        states = unique_states(40, 6, np.random.default_rng(3))
+        want = lowest_projected(strings, coeffs, states)
+        assert eigval_of(strings, coeffs, states, matvec=matvec) == pytest.approx(want, abs=1e-10)
+
+    @pytest.mark.parametrize("matvec", [Matvec.INDICES, Matvec.ONTHEFLY])
+    def test_solve_traces_no_diagonal_while_loop(self, matvec):
+        """With the counts known the matvec has no ``while``; cleared, ``get_diagonal``'s comes back."""
+        coeffs = np.random.default_rng(1).normal(size=len(self.STRINGS))
+        h = PauliSumXZ.from_paulisum((self.STRINGS, coeffs.tolist()))
+        states_p = pack_padded(unique_states(40, 6, np.random.default_rng(3)))
+
+        def whiles(ham):  # every traced while, nested jaxprs walked rather than printed once
+            return count_primitive(
+                run_sqd.trace(ham, states_p, 64, False, matvec).jaxpr.jaxpr, "while"
+            )
+
+        unknown = dataclasses.replace(h, term_counts=None)
+        assert whiles(h) < whiles(unknown), (whiles(h), whiles(unknown))
+
+
 class TestComplexScanCarry:
     """On CUDA no sparse kernel scans over a ``complex128`` carry; elsewhere every one does.
 
@@ -983,6 +1028,19 @@ class TestComplexScanCarry:
                 assert len(scans) == 1, f"{key}: {len(scans)} scans"
                 # The body emits no ys, so a scan's outputs are its carry.
                 assert [v.aval.dtype for v in scans[0].outvars] == want[key], key
+
+
+def count_primitive(jaxpr, name):
+    """How many ``name`` equations ``jaxpr`` holds, every nested jaxpr walked at each of its uses."""
+    total = 0
+    for eqn in jaxpr.eqns:
+        total += eqn.primitive.name == name
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, tuple) else (param,):
+                inner = getattr(sub, "jaxpr", sub)
+                if hasattr(inner, "eqns"):
+                    total += count_primitive(inner, name)
+    return total
 
 
 def scatter_hints(jaxpr):

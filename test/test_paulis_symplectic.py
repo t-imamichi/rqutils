@@ -599,6 +599,24 @@ class TestRealGroupsFirst:
         assert hamiltonian.num_real_groups == hamiltonian.c.shape[0]
 
 
+class TestTermCounts:
+    """``term_counts`` and ``identity_first`` are what the fixed-trip diagonal kernel trusts.
+
+    A count one short drops a group's last Z term from every matvec, and a false ``identity_first``
+    applies group 0's diagonal to ``vec`` itself; both are checked against the arrays they summarize.
+    """
+
+    @pytest.mark.parametrize("with_identity", [True, False])
+    def test_from_paulisum_fills_both(self, with_identity):
+        strings = ["XXIII", "YYIII", "IXIII", "IYIII", "IIXZI", "IIYZI", "IIZYI"]
+        if with_identity:
+            strings += ["ZZIII", "IIIZZ", "ZIIII"]
+        h = PauliSumXZ.from_paulisum((strings, np.linspace(0.3, 1.1, len(strings))))
+        assert h.term_counts == tuple(int(k) for k in np.count_nonzero(np.asarray(h.c), axis=1))
+        assert h.identity_first == (not np.asarray(h.x[0]).any()) == with_identity
+        assert sorted(set(h.term_counts)) != [h.term_counts[0]], "the fixture must mix term counts"
+
+
 class TestBinaryStateValidation:
     """``pack_states`` must reject non-binary input rather than silently collapsing it.
 

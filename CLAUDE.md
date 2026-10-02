@@ -296,6 +296,11 @@ ingest). Terms are grouped by unique X signature, Z groups zero-padded to a rect
   `TABLES` splits: `INDICES` measured 0.92× on one Hamiltonian (`poc/real-groups.md` §6). Never reorder
   groups after construction: a complex group inside that prefix loses its imaginary part silently. `0`,
   the default, promises nothing.
+- **`term_counts` and `identity_first` are static too**, filled by `from_paulisum`: each group's Z-term
+  count and whether group 0 is the identity. `run_sqd`'s `"indices"`/`"onthefly"` trust them to sum
+  each diagonal over a fixed trip count, bucketed by count, the identity's cached once per solve —
+  `get_diagonal`'s `while_loop` synced with the host per term on a GPU (`poc/dense-tune.md`). Reordering
+  groups breaks these as well; `None` (built by hand) falls back to the `while_loop`.
 
 ### `sqd/` — sample-based quantum diagonalization
 

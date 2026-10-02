@@ -13,7 +13,9 @@ read and written once per group. Arms are ``--matvecs`` × ``--variants`` × ``-
 
 ``unroll`` lets XLA fuse consecutive groups' updates, reading and writing ``out`` once per ``unroll``
 groups. Each arm replicates ``run_sqd``'s single-device assembly around the library's ``_solve``; the
-reference is ``run_sqd`` itself, and ``plain`` at ``unroll=1`` must match its iteration count. Arms are
+reference is ``run_sqd`` itself. Before the library adopted ``id-static`` (bucketed by term count, so
+without ``kmax`` padding), ``plain`` at ``unroll=1`` matched it exactly; since, ``plain`` is the old
+kernel, and summation order can shift its iteration count. Arms are
 warm and interleaved; ``solve`` is per iteration, its setup inside (as ``run_sqd``'s); ``1-D`` and
 ``(2, N)`` are the kernel alone, setup outside; ``temp`` is the ``(2, N)`` kernel's
 ``temp_size_in_bytes``. Eigenvalues must agree to ``1e-12`` relative, traced solves be pairwise distinct.
@@ -239,7 +241,6 @@ for log2 in options.log2_sizes:
                     times[arm][k].append(timed(calls[arm][k])[0])
                 eig[arm].append(float(result.eigval))
                 iters[arm].add(ITERATIONS[-1])
-        assert iters[("plain", 1)] == iters[("ref", 1)] if ("plain", 1) in arms else True, iters
         base = eig[("ref", 1)][0]
         for arm in arms:
             diff = max(abs(e - base) for e in eig[arm]) / abs(base)

@@ -122,6 +122,11 @@ class PauliSumXZ:
         num_real_groups: How many leading X groups have real coefficients, static under JAX
             transforms. :meth:`from_paulisum` orders those groups first, so a complex ``c`` can
             still be read as float64 over ``c[:num_real_groups]``. ``0`` promises nothing.
+        term_counts: Each X group's number of Z terms, static under JAX transforms; its row of ``c``
+            is nonzero exactly there. Lets a kernel sum a group's diagonal over a fixed trip count.
+            ``None`` (built by hand) promises nothing.
+        identity_first: Whether group 0 is the identity X signature, static under JAX transforms.
+            :meth:`from_paulisum` puts it there whenever one exists.
     """
 
     x: np.ndarray[tuple[int, int], np.dtype[np.uint8]]
@@ -129,6 +134,8 @@ class PauliSumXZ:
     c: np.ndarray[tuple[int, int], np.dtype[np.inexact]]
     num_qubits: int = field(metadata={"static": True})
     num_real_groups: int = field(default=0, metadata={"static": True})
+    term_counts: tuple[int, ...] | None = field(default=None, metadata={"static": True})
+    identity_first: bool = field(default=False, metadata={"static": True})
 
     @staticmethod
     def pack_states(
@@ -322,11 +329,21 @@ class PauliSumXZ:
         if np.all(real):
             phcoeffs = phcoeffs.real
 
+        identity = not np.any(xsignatures[0])
+        counts = tuple(int(k) for k in np.count_nonzero(phcoeffs, axis=1))
         # The pad bit is unconditional and the X side reuses pack_states: one alignment code path
         # (NOTES.md, "paulis.symplectic: the pad bit is unconditional").
         xsignatures = cls.pack_states(xsignatures)
         zsignatures = np.packbits(np.pad(zsignatures, {2: (1, 0)}), axis=-1)
-        return cls(xsignatures, zsignatures, phcoeffs, num_qubits, int(np.count_nonzero(real)))
+        return cls(
+            xsignatures,
+            zsignatures,
+            phcoeffs,
+            num_qubits,
+            int(np.count_nonzero(real)),
+            counts,
+            identity,
+        )
 
     @property
     def arrays(self) -> "PackedArrays":

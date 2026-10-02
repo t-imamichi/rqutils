@@ -2337,7 +2337,8 @@ it everywhere (CPU keeps it); `float64` factors 0.37–0.94×. `poc/sparse/pairs
 
 Replacing `get_diagonal`'s `while_loop` (a host sync per term on a GPU) with a fixed `kmax`-term sum, the
 identity group's diagonal cached once per solve: GH200 3.26–4.44× per iteration, M1 1.75–1.94×, temp
-68 → 12 MiB; the identity cache alone 1.23–1.27×. `unroll` adds speed at ~1–3 GB temp. Unshipped. `poc/dense-tune.md` §2–§4
+68 → 12 MiB; the identity cache alone 1.23–1.27×. Shipped bucketed by term count (no padding): 1.66–1.96×
+per CPU iteration, `type1`/`type2`. `unroll` adds speed at ~1–3 GB temp. `poc/dense-tune.md` §2–§4
 
 ### sqd sparse builds on a GPU host: half search, half sort; the device search loses (2026-10-02)
 

@@ -3,7 +3,8 @@
 `poc/dense_tune.py` (§6) at `1e6fbfc`, 2026-10-02: one NVIDIA GH200 120GB for §2, one Apple M1 (8 cores,
 16 GiB) for §3. Fixture as `poc/sparse/gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1`
 (`J = 62`, `complex128`, `kmax = 2` over the non-identity groups), Hamming-shell subspaces around both
-Néel states. Nothing here is in the library.
+Néel states. `id-static` is in the library since §4's A/B, bucketed by term count rather than padded to
+`kmax`; the other levers are not.
 
 ## 1. The levers
 
@@ -78,10 +79,26 @@ for `"indices"` and `"onthefly"`. One guard: the fixed loop pads every group to 
 Hamiltonian with one many-term group would pay `kmax` passes for every group; `type1` has `kmax = 2`. A
 threshold, with the `while_loop` kept above it, is unmeasured and needs a large-`kmax` fixture.
 
+**Shipped, bucketed by term count.** `type2`/`type3`'s uniform X field gives one-term groups beside the
+two-term bonds, so padding every group to `kmax` would cost 31–33% extra passes (`type1`/`type4`
+1.0–3.3%, n = 30–100). The library instead scans the non-identity groups in one bucket per distinct term
+count, each summed over its own count: no padding, two scans for XXZ. `PauliSumXZ` carries the counts and
+whether group 0 is the identity as static fields; built by hand, without them, `run_sqd` keeps the
+`while_loop`. On the M1, against the old kernel (`--variants plain`, whose ratio is old over new), per
+solve iteration, 3/3 each:
+
+| pattern | `2^17` | `2^19` |
+| --- | --- | --- |
+| `type1` | 1.67× (51.50 against 86.05 ms) | 1.96× (229.39 against 449.89 ms) |
+| `type2` | 1.66× (72.91 against 120.81 ms) | 1.76× (347.25 against 611.49 ms) |
+
+In that run the reference's `1-D`/`(2, N)` columns time the replica's old kernel, not the library's, so
+only `solve` compares the two. The GPU run of the shipped form is §5's.
+
 ## 5. Open
 
-1. **The `kmax` threshold**, on a molecular-like fixture with many Z terms per group
-   (`poc/sparse/pairs.py general`).
+1. **The shipped form on the GH200**, and a fixture with many distinct term counts (molecular-like,
+   `poc/sparse/pairs.py general`), where one scan per count could grow large.
 2. **`"onthefly"`** at `2^22` on the GPU, and on CPU, with `id-static` (1.45× at `2^20` on the GH200).
 3. **`unroll` with bounded temp**: `unroll=2` already holds ~1 GB at `2^22`; anything above 1 trades
    memory for speed.

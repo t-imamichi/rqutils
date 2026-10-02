@@ -9,7 +9,7 @@ import numpy as np
 from jax.sharding import PartitionSpec, get_abstract_mesh
 from numpy.typing import NDArray
 
-from rqutils.sqd._diagonal import get_diagonal
+from rqutils.sqd._diagonal import _z_parity, get_diagonal
 from rqutils.sqd._states import StateList, get_xsource
 
 # Dtype kind per `apply_h` keyword: `u` packed bytes, `i` positions (-1 = absent), `fc` float or
@@ -281,3 +281,33 @@ def _apply_h_kernel(
         return out + apply_xgrp(xsource, diagonal, vec), None
 
     return jax.lax.scan(fn, jnp.zeros_like(vec) if init is None else init, scanned)[0]
+
+
+def _apply_buckets(
+    vec: jax.Array,
+    buckets: tuple[tuple[jax.Array, jax.Array, jax.Array], ...],
+    sources: jax.Array,
+    states: StateList,
+    d0: jax.Array | None,
+    *,
+    matvec: str,
+) -> jax.Array:
+    """:math:`Hv` with each X group's diagonal summed over a fixed trip count, its group's term count.
+
+    ``d0`` is the identity group's diagonal, computed once per solve; ``buckets`` are ``(group, z, c)``
+    per distinct term count, ``z`` and ``c`` cut to it, and ``sources`` the ``(J, N)`` source table
+    (``"indices"``) or the X signatures (``"onthefly"``), read by group. ``get_diagonal``'s
+    ``while_loop`` syncs with the host per term on a GPU (``poc/dense-tune.md``).
+    """
+    out = jnp.zeros_like(vec) if d0 is None else d0 * vec
+    for bucket in buckets:
+        terms = bucket[1].shape[1]
+
+        def fn(out, val, terms=terms):
+            group, z, c = val
+            xsource = sources[group] if matvec == "indices" else get_xsource(sources[group], states)
+            diagonal = sum(c[t] * (1.0 - 2.0 * _z_parity(states, z[t])) for t in range(terms))
+            return out + apply_xgrp(xsource, diagonal, vec), None
+
+        out = jax.lax.scan(fn, out, bucket)[0]
+    return out
