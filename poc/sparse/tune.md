@@ -115,6 +115,20 @@ Each cell is `2^20` / `2^22`. **`"ell"` wants `2^17` and the ×2 grid on the GPU
 the tuned `"pairs"`' per iteration at `2^22` (9.92 against 14.84 ms), at +14% operator; its build
 (`poc/sparse/gpu.md` §8, 31% in 2,049 factor calls) still undoes that end to end.
 
+**`type2`** (`--pattern type2 --chunks 15 17`, at `4317d25`): `2^17` with the ×2 grid is again best, 2.34× /
+2.67× the shipped `"ell"` at `2^20` / `2^22` (4.93 / 19.85 ms per iteration, 5/5), operator 1,002 MiB at
+`2^22`. Against the tuned `"pairs"` per iteration, tuned `"ell"` reads:
+
+| pattern | `2^20` | `2^22` |
+| --- | --- | --- |
+| `type1` | **0.28×** (5.64 against 1.60 ms) | 1.50× (9.92 against 14.84 ms) |
+| `type2` | 1.25× (4.93 against 6.17 ms) | **0.70×** (19.85 against 13.80 ms) |
+
+Two wins and two losses with no pattern in size or fixture, always at more operator memory (+36% at
+`type2` `2^22`, 1,002 against 736 MiB) and before its 4.8 s build. **`"ell"` is not on the GPU's Pareto
+front even tuned**, and on CPU it is a near-tie with `"pairs"` (1.08× per iteration at `2^19`, heavier
+build); `"csr"` is dominated on both. Both are removed from the library and kept in `poc/` (§4).
+
 ## 4. What it means
 
 At `type1` `2^22` the best arm's 14.7 ms per iteration is below `"tables"`' 21.06
@@ -129,7 +143,8 @@ setting is `2^17` and the ×2 grid, worth shipping once its build's factor calls
 
 1. **Why `unique-exact` wins where it does**: a profile of `type2` `2^22` against `type1` `2^22` would
    show whether the scatter, the launch count or the group sizes' spread decides it.
-2. **`"ell"`'s factor calls batched**, and its GPU chunk and grid in the library.
+2. **`"ell"`'s factor calls batched and a device sort for it** -- moot in the library since `"ell"` left it;
+   `poc/` keeps the kernel if a fixture ever puts it ahead.
 3. **The whole `"pairs"` call** — measured since: `poc/sparse/gpu.md` §8.
 
 ## 6. The script

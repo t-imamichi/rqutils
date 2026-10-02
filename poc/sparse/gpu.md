@@ -251,7 +251,7 @@ memory. On one GH200 now:
 | --- | --- | --- |
 | one GPU | `"pairs"` | 1.08–1.82× `"indices"` end to end, fastest in all six cells, at 0.54–0.67× its memory |
 | under a mesh | `"indices"` | 0.97–1.01× `"tables"`' speed at 0.42–0.48× its memory; the sparse kernels raise there; multi-GPU unmeasured |
-| any | not `"csr"`/`"ell"`/`"tables"` | none ahead of `"pairs"` or `"indices"` at their memory |
+| any | not `"tables"`; `"csr"`/`"ell"` removed | none ahead of `"pairs"` or `"indices"` at their memory; `"ell"` tuned wins 2 of 4 cells per iteration against `"pairs"`, at more memory (`poc/sparse/tune.md` §3) |
 
 `"indices"` stays the library default: that is a CPU choice, and switching per backend is a separate
 decision.

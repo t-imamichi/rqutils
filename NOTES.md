@@ -2359,6 +2359,12 @@ GH200, `type1`/`type2` `2^20`–`2^22`: `"indices"` 2.96–4.32× its previous i
 speed at 0.42–0.48× its memory, so a mesh wants `"indices"`; `"pairs"` fastest in all six, 1.08–1.82×
 `"indices"`, its device sort +11–18% peak on `type2`. `unique-exact` has no switch point; not shipped. `poc/sparse/gpu.md` §8, §9
 
+### sqd sparse kernels: `"csr"` and `"ell"` leave the library, `"pairs"` stays (2026-10-02)
+
+GH200 tuned (`2^17`, ×2 grid), `"ell"` against `"pairs"` per iteration is 0.28×/1.50× (`type1` `2^20`/`2^22`)
+and 1.25×/0.70× (`type2`), always at more memory and a 4.8 s build; on CPU a near-tie. `"csr"` is dominated
+on both backends. Both are removed from `Matvec`; their builders and kernels live on in `poc/`. `poc/sparse/tune.md` §3
+
 ### sqd sparse kernels: a state-major `(N, 2)` gather layout loses on CPU (2026-10-01)
 
 M1, n=60 `type1`, `2^17`/`2^19`: gathering from `(N, 2)` instead of `(2, N)` is 0.83–0.87× on the matvec
