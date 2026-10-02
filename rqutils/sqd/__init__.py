@@ -134,9 +134,14 @@ for now, and ``poc/sparse/pairs.md`` has the measurements.
 
 **The source-index setup dominates the solve, so this is not a symmetric memory-for-speed dial:**
 ``Matvec.ONTHEFLY`` pays the :math:`J`-fold :func:`get_xsource` search once per matvec rather than
-once per solve. Prefer ``Matvec.INDICES`` or ``Matvec.TABLES`` unless the memory genuinely will
-not fit (``NOTES.md``, "``sqd``: ``get_xsource`` setup dominates a solve";
+once per solve. On CPU, prefer ``Matvec.INDICES`` or ``Matvec.TABLES`` unless the memory genuinely
+will not fit (``NOTES.md``, "``sqd``: ``get_xsource`` setup dominates a solve";
 ``markdown/scaling-pocs.md``).
+
+**On a GPU the ranking differs** (``poc/sparse/gpu.md``, section 9): ``Matvec.PAIRS`` is the fastest
+single-device kernel, 1.1--1.8x ``Matvec.INDICES`` end to end at about 0.6x its memory, while
+``Matvec.INDICES`` matches ``Matvec.TABLES`` at under half its memory -- so under a mesh, where the
+sparse kernels are unavailable, it is the one to use.
 
 Distributed arrays and scaling limits
 =====================================
