@@ -1,9 +1,9 @@
 # Dense kernels: `"tables"` diagonals as codes, and z = 0 terms folded out of `"indices"`
 
-`poc/dense_codes.py` (§6) at `c0061df`, one Apple M1 (8 cores, 16 GiB), 2026-10-03. Fixture as
+`poc/dense_codes.py` (§7) at `c0061df`, one Apple M1 (8 cores, 16 GiB), 2026-10-03; the GH200 in §5. Fixture as
 `poc/dense-tune.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`) and `type2`
 (`J = 120`), both `complex128`, Hamming-shell subspaces around both Néel states. `fold` is in the library
-since (§5, item 4); `codes` is not.
+since (§6, item 4); `codes` is not.
 
 ## 1. The levers
 
@@ -61,23 +61,54 @@ survives. The gain scales with the folded share: half of `type1`'s terms, two-th
 `codes` halves the solve's temp and cuts the operator 12.13 → 5.13 B/slot for 16–20% per iteration.
 Against `fold`, not `"tables"`, it is still 1.45× (`type1`) and 1.05× (`type2`) faster for +0.87–0.99
 B/slot. So with codes, `"indices"` is nearly dominated on time and memory together, as the checkpoint
-guessed. That holds at `2^14` only.
+guessed. That holds at `2^14` on CPU only; on the GH200 the fold alone puts `"indices"` ahead (§5).
 
-## 5. Open
+## 5. On the GH200
+
+One NVIDIA GH200 120GB, 2026-10-03, the script at `81406ee` (both arms, the library before the fold),
+`--log2-sizes 20 22 --rounds 5`. Per solve iteration against `run_sqd`, every ratio 5/5 unless marked:
+
+| arm | `type1` `2^20` | `type1` `2^22` | `type2` `2^20` | `type2` `2^22` |
+| --- | --- | --- | --- | --- |
+| `"indices"` | 6.05 ms | 21.93 ms | 9.96 ms | 40.01 ms |
+| **`fold`** | **1.13×** | **1.13×** | **1.14×** | **1.18×** |
+| `"tables"` | 5.66 ms | 19.97 ms | 9.61 ms | 38.19 ms |
+| `codes` | 0.95× | 0.88× | 0.97× | 0.90× |
+| `codes`, 1-D matvec | 1.11× | 1.19× | 1.13× | 1.13× |
+| `codes`, `(2, N)` matvec | 1.15× | 1.03× (3/5) | 1.09× | 1.02× |
+| `codes` temp, MiB | 929 → 487 | 3716 → 1944 | 1617 → 761 | 6468 → 3044 |
+
+Iteration counts match in every cell, and every eigenvalue is within 1.3e-16. `fold` matches bit for bit
+at `type2`, and differs by ≤ 3.3e-16 at `type1`, as on CPU (§2). `codes` is bit-identical throughout; it
+has at most 11 distinct values per group.
+
+Two things differ from the CPU:
+
+- **With the fold, `"indices"` is faster than `"tables"`** per iteration: 19.42 against 19.97 ms
+  (`type1` `2^22`) and 34.01 against 38.19 ms (`type2` `2^22`), at 0.41–0.47× its temp. On a GPU,
+  `"tables"` is now dominated on time and memory together.
+- **`codes`' matvec wins at both widths here** (1.02–1.19×), unlike §3's CPU `(2, N)` loss, yet the
+  solve loses. The per-iteration time includes the setup, so the likely cost is the encode, a
+  `jnp.unique` sort per group. At `type1` `2^22` the gap is 2.75 ms × 126 iterations ≈ 0.35 s per solve.
+  That is inferred from the columns; the encode has not been timed on its own.
+
+## 6. Open
 
 1. **Sizes `2^17`–`2^19`.** The defaults were cut to `2^14` for wall time. Only the one `2^17` `type1`
    barrier figure in §2 exists past that, and the ratios may move with `N`.
-2. **The GPU.** `"indices"` on a GH200 already matches `"tables"` (`poc/sparse/gpu.md` §9), so `fold`
-   could put it ahead, and `codes`' bandwidth saving is what a GPU rewards.
-3. **Why `codes`' `(2, N)` matvec loses** (§3), before deciding on it.
+2. **The GPU: measured (§5).** `fold` is 1.13–1.18×, and `"indices"` now beats `"tables"` there.
+3. **`codes`' cost.** On CPU it is the `(2, N)` matvec (§3); on the GH200 it is presumably the encode
+   (§5). Time the encode alone, then try a cheaper one than a sort, since a group has ≤ 11 values. If
+   `codes` then wins on a GPU, it is half of `"tables"`' memory for free, though §5 makes `"indices"`
+   the better baseline.
 4. **`fold` in the library: done.** `from_paulisum` moves each group's Z-free term first and flags it
    in the static `PauliSumXZ.zfree_first`; `_bucket_args` folds it into a per-group `const`. Re-run
    after the change, the script's reference (now the library) matches the `fold` arm bit for bit at
    0.97–1.01×: 6.20 ms (`type1`) and 8.80 ms (`type2`) per iteration, against §2's 7.80 and 13.19.
    It covers `"onthefly"` too, still unmeasured there. The script no longer carries the `fold` arm
-   (§6).
+   (§7).
 
-## 6. The script
+## 7. The script
 
 `poc/dense_codes.py`, its argparse checked against this section:
 

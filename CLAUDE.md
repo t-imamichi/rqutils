@@ -302,8 +302,8 @@ ingest). Terms are grouped by unique X signature, Z groups zero-padded to a rect
   `get_diagonal`'s `while_loop` synced with the host per term on a GPU (`poc/dense-tune.md`). Reordering
   groups breaks these as well. Both are required: there is no `while_loop` fallback.
 - **`zfree_first`** (static, required) flags groups whose term 0 has no Z part;
-  `from_paulisum` moves that term first. Those kernels fold it into a constant (1.28–1.50×,
-  `poc/dense-codes.md`). A flag on a term with a Z part is a wrong diagonal, not a slowdown.
+  `from_paulisum` moves that term first. Those kernels fold it into a constant (1.28–1.50× CPU,
+  1.13–1.18× GH200, `poc/dense-codes.md`). A flag on a term with a Z part is a wrong diagonal, not a slowdown.
 
 ### `sqd/` — sample-based quantum diagonalization
 
