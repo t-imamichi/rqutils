@@ -1,6 +1,7 @@
 # `"pairs"` without its exact-zero entries, and with coded factors
 
-`poc/sparse/prune.py` (§7) at `0c137dd` plus the change, one Apple M1 (8 cores, 16 GiB), 2026-10-02.
+`poc/sparse/prune.py` (§8) at `0c137dd` plus the change, one Apple M1 (8 cores, 16 GiB), 2026-10-02;
+the GH200 in §6.
 Fixture as `poc/sparse/gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`) and
 `type2` (`J = 120`), Hamming-shell subspaces around both Néel states. In the library since, as
 `_drop_zeros`; the factor codes (§4) are not.
@@ -73,15 +74,41 @@ work stays. Not bit-identical, unlike the expectation going in: dropping entries
 and a chunk adds all its `out[i]` updates before its `out[j]`, so a row's terms are summed in another
 order. The iteration counts match exactly.
 
-## 6. Open
+## 6. On the GPU: the padding all on one row
 
-1. **The GPU**, where the scatter dominates the matvec (`poc/sparse/split.md` §4): the gain should be
-   nearer the entry ratio. `uv run python poc/sparse/prune.py --log2-sizes 20 22`.
-2. **Factor codes on the GPU** (§4): `uv run python poc/sparse/prune.py --log2-sizes 20 22`; ship them if
-   they speed the scatter. A cheaper table than `jnp.unique`'s sort would help the build either way.
+One NVIDIA GH200 120GB, 2026-10-03, at `c0061df` (before the fix below), 5 rounds; per solve against `all`:
+
+| pattern, N | stored pairs | operator | `nonzero` | `codes` | iterations |
+| --- | --- | --- | --- | --- | --- |
+| `type1` `2^20` | 4,182,753 → 339,727 | 112.0 → 28.0 MiB | **0.38×** | 0.39× | 93 → 92–93 |
+| `type1` `2^22` | 9,909,391 → 1,912,744 | 304.0 → 112.0 MiB | 2.45× | 2.50× | 126 → 126–127 |
+| `type2` `2^20` | 8,165,072 → 4,322,046 | 208.0 → 124.0 MiB | **0.73×** | 0.76× | 165 = 165 |
+| `type2` `2^22` | 29,095,965 → 21,099,318 | 736.0 → 592.0 MiB | **0.32×** | 0.34× | 129 = 129 |
+
+Eigenvalues within 3.6e-15. Fewer entries ran *slower* in three of four cells. The suspect is the
+padding. `_drop_zeros` re-padded with `i = j = size - 1`, so every padding entry's two scatter-adds hit
+the same `out[size - 1]`. A GPU serializes atomics on one address; a CPU loop does not care. Rounding to
+`2^19`-entry chunks and a size class leaves ~185k such entries at `type1` `2^20` and ~2.0M at `type2`
+`2^22` (against `all`'s ~11k and ~264k). That
+matches the losses. This is a count, not a profile.
+
+The fix puts padding entry `k` on row `k mod size`, still with equal endpoints and a zero factor, so it
+adds `0` to a distinct row. Values are unchanged up to the sign of a zero. On the M1 at `2^17`, 3 rounds,
+it is harmless: `nonzero` 1.73× `type1` and 1.39× `type2` against `all`, eigenvalue diffs 5.3e-15 and
+7.1e-15 as in §3. Shipped; the GPU side is unconfirmed (§7).
+
+`codes` tracks `nonzero` within 6% on the GPU as on the CPU (§4): it trims memory, not time.
+
+## 7. Open
+
+1. **Re-run on the GH200 with the distinct-row padding** (§6), which decides whether the hypothesis
+   holds: `uv run python poc/sparse/prune.py --log2-sizes 20 22`. If `nonzero` still loses, profile
+   the scatter before anything else.
+2. **Factor codes**: 1.02–1.06× `nonzero` on the GPU before the fix (§6). Revisit after item 1, when the
+   scatter is no longer dominated by the padding.
 3. **The first-build compile**: a jitted `_drop_zeros` keyed on the size class would compile once per class.
 
-## 7. The script
+## 8. The script
 
 `poc/sparse/prune.py`, its argparse checked against this section:
 
@@ -95,4 +122,5 @@ order. The iteration counts match exactly.
 One host search serves every arm; each build runs twice, the second timed. Eigenvalues must agree to
 `1e-12`, and `codes` must equal `nonzero` bit for bit on CPU only: a GPU's atomic scatter-add
 sums in no fixed order, which tripped that check on the GH200's first run. Runs here: two arms at the default (5 rounds), then
-`--rounds 3` (§3's build column), then all three arms at `--rounds 3`, with the `encode` described in §4.
+`--rounds 3` (§3's build column), then all three arms at `--rounds 3`, with the `encode` described in §4. §6: `--log2-sizes 20 22` on the
+GH200, then `--log2-sizes 17 --rounds 3` on the M1 after the padding fix.

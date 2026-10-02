@@ -243,7 +243,9 @@ def _drop_zeros(
     length = _size_class(-(-count // chunk)) * chunk
     (idx,) = jnp.nonzero(keep, size=length, fill_value=0)
     live = jnp.arange(length) < count
-    t, s = (jnp.where(live, a.ravel()[idx], size - 1).reshape(-1, chunk) for a in (t, s))
+    # Padding on distinct rows: one shared row serialized a GPU's atomic adds (poc/sparse/prune.md §6).
+    pad = jnp.arange(length, dtype=t.dtype) % size
+    t, s = (jnp.where(live, a.ravel()[idx], pad).reshape(-1, chunk) for a in (t, s))
     return t, s, jnp.where(live, d.ravel()[idx], 0).reshape(-1, chunk)
 
 
