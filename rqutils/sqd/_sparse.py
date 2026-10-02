@@ -201,16 +201,13 @@ def _sparse_residual(
     return jnp.linalg.norm(ax - eigval * eigvec), jnp.linalg.norm(ax)
 
 
-def _padded(count: int, fill: int, chunk: int | None = None) -> np.ndarray:
-    """A flat int32 array of ``count`` entries rounded up to whole chunks of a size class, all ``fill``.
-
-    ``chunk`` defaults to ``_CHUNK``.
+def _padded(count: int, fill: int, chunk: int) -> np.ndarray:
+    """A flat int32 array of ``count`` entries rounded up to whole ``chunk``s of a size class, all ``fill``.
 
     Raises:
         ValueError: See :func:`_check_entries`.
     """
     _check_entries(count)
-    chunk = chunk or _CHUNK
     return np.full(_size_class(-(-count // chunk)) * chunk, fill, dtype=np.int32)
 
 

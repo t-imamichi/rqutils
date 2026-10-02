@@ -968,7 +968,7 @@ class TestSparseKernels:
     def test_entry_count_guard(self):
         """Raises before allocating: the passing side is every sparse solve in this file."""
         with pytest.raises(ValueError, match="2147483648 entries"):
-            _padded(2**31, 0)
+            _padded(2**31, 0, _CHUNK)
 
 
 class TestBucketedDiagonals:

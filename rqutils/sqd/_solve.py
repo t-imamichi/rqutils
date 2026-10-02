@@ -296,9 +296,7 @@ def run_sqd(
     def diag0():
         if matvec == "tables":
             return diagonals[0][0]
-        if d0 is not None:
-            return d0
-        return get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u)
+        return d0 if d0 is not None else get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u)
 
     return _solve(
         hamiltonian,

@@ -224,7 +224,7 @@ def real_operator(h, states_u, pairs):
     pairs = dict(pairs)
 
     def alloc(count):
-        return [sm._padded(count, f) for f in (size - 1, size - 1, 0)]
+        return [sm._padded(count, f, sm._CHUNK) for f in (size - 1, size - 1, 0)]
 
     arrays = [d0]
     for subset, c_set in (

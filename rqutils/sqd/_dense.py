@@ -300,14 +300,13 @@ def _apply_buckets(
     ``while_loop`` syncs with the host per term on a GPU (``poc/dense-tune.md``).
     """
     out = jnp.zeros_like(vec) if d0 is None else d0 * vec
+
+    def fn(out, val):
+        group, z, c = val  # z is (terms, B) per step: a static trip count
+        xsource = sources[group] if matvec == "indices" else get_xsource(sources[group], states)
+        diagonal = sum(c[t] * (1.0 - 2.0 * _z_parity(states, z[t])) for t in range(z.shape[0]))
+        return out + apply_xgrp(xsource, diagonal, vec), None
+
     for bucket in buckets:
-        terms = bucket[1].shape[1]
-
-        def fn(out, val, terms=terms):
-            group, z, c = val
-            xsource = sources[group] if matvec == "indices" else get_xsource(sources[group], states)
-            diagonal = sum(c[t] * (1.0 - 2.0 * _z_parity(states, z[t])) for t in range(terms))
-            return out + apply_xgrp(xsource, diagonal, vec), None
-
         out = jax.lax.scan(fn, out, bucket)[0]
     return out
