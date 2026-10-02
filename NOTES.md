@@ -2359,6 +2359,12 @@ GH200, `type1`/`type2` `2^20`–`2^22`: `"indices"` 2.96–4.32× its previous i
 speed at 0.42–0.48× its memory, so a mesh wants `"indices"`; `"pairs"` fastest in all six, 1.08–1.82×
 `"indices"`, its device sort +11–18% peak on `type2`. `unique-exact` has no switch point; not shipped. `poc/sparse/gpu.md` §8, §9
 
+### sqd `"pairs"`: exact-zero entries dropped, 1.18–1.59× per solve on CPU (2026-10-02)
+
+XX+YY hops cancel on aligned spins, so 86% of `type1`'s searched pairs and 32% of `type2`'s had a zero
+factor. Dropping them after the factor pass (`_drop_zeros`) cuts the operator 23–64% at identical iteration
+counts, eigenvalues within 7.1e-15 (not bit-identical: chunk boundaries move). M1 only. `poc/sparse/prune.md` §3
+
 ### sqd sparse kernels: `"csr"` and `"ell"` leave the library, `"pairs"` stays (2026-10-02)
 
 GH200 tuned (`2^17`, ×2 grid), `"ell"` against `"pairs"` per iteration is 0.28×/1.50× (`type1` `2^20`/`2^22`)

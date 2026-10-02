@@ -230,6 +230,23 @@ def _entry_factors(
     return jax.lax.map(one, (target, source, group))
 
 
+def _drop_zeros(
+    t: jax.Array, s: jax.Array, d: jax.Array, chunk: int, size: int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``(t, s, d)`` without the entries whose factor is exactly zero, order kept, re-padded to a size class.
+
+    XX+YY hops cancel on aligned spins: 86% of spinchain's ``type1`` pairs, 32% of ``type2``'s
+    (``poc/sparse/prune.md``). The check reads the unfiltered ``pairs``, so it vouches for this filter.
+    """
+    keep = (d != 0).ravel()
+    count = int(keep.sum())
+    length = _size_class(-(-count // chunk)) * chunk
+    (idx,) = jnp.nonzero(keep, size=length, fill_value=0)
+    live = jnp.arange(length) < count
+    t, s = (jnp.where(live, a.ravel()[idx], size - 1).reshape(-1, chunk) for a in (t, s))
+    return t, s, jnp.where(live, d.ravel()[idx], 0).reshape(-1, chunk)
+
+
 def _sparse_operator(
     hamiltonian: PauliSumXZ,
     states_u: StateList,
@@ -239,7 +256,8 @@ def _sparse_operator(
 
     Each transition once, sorted by ``i`` across groups so ``out[i]`` and ``vec[i]`` are local
     (``NOTES.md``, "sqd sparse kernels: pairs sorted by i"); padding entries have equal endpoints and a
-    zero factor. ``pairs`` is :func:`_group_pairs`' output, searched here when not given.
+    zero factor, and so does no stored pair (:func:`_drop_zeros`). ``pairs`` is :func:`_group_pairs`'
+    output, searched here when not given.
 
     Raises:
         ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_check_entries`.
@@ -257,7 +275,7 @@ def _sparse_operator(
         return [_padded(count, f, chunk) for f in (size - 1, size - 1, 0)]
 
     t, s, g = (a.reshape(-1, chunk) for a in _pairs_sorted_on_device(pairs, groups, alloc))
-    return d0, t, s, _entry_factors(t, s, g, z, c, states_u, kmax)
+    return d0, *_drop_zeros(t, s, _entry_factors(t, s, g, z, c, states_u, kmax), chunk, size)
 
 
 def _scan_add(
