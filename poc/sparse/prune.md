@@ -42,22 +42,29 @@ at a new size pays 0.15–0.36 s more, compiling the filter's eager ops; warm it
 
 ## 4. Factor codes
 
-The `codes` arm stores each factor as a `uint8` index into the operator's distinct values (4–5 here,
-§1), `d` 16 → 1 B per pair, read back as `table[code]` in the scan; the table is built on the host with
-`np.unique`. Against `nonzero`, 3 rounds, bit-identical eigenvalue and eigenvector:
+The `codes` arm stores each factor as an index into the operator's distinct values (4–5 here, §1), read
+back as `table[code]` in the scan. One path for every Hamiltonian: `jnp.unique` builds the table, the
+code is the narrowest unsigned type that fits (`np.min_scalar_type`: `uint8` here, so `d` 16 → 1 B per
+pair), and the table is padded to 256 entries, or a size class above, so the solve compiles per class
+rather than per count. Past ~256 distinct values the worst case is a 4 B code plus a 16 B table entry
+per factor, about 1.25× today's bytes. Against `nonzero`, 3 rounds, bit-identical eigenvalue and
+eigenvector:
 
 | pattern, N | operator | per solve | build, warm |
 | --- | --- | --- | --- |
-| `type1` `2^17` | 3.5 → 2.6 MiB | 0.99× (0.653 against 0.649 s) | 19 → 22 ms |
-| `type1` `2^19` | 12.5 → 9.7 MiB | 1.01× | 86 → 93 ms |
-| `type2` `2^17` | 13.2 → 6.2 MiB | 1.00× | 48 → 69 ms |
-| `type2` `2^19` | 62.0 → 28.3 MiB | 0.99× | 217 → 319 ms |
+| `type1` `2^17` | 3.5 → 2.6 MiB | 1.00× (0.652 against 0.651 s) | 19 → 28 ms |
+| `type1` `2^19` | 12.5 → 9.7 MiB | 1.00× | 85 → 107 ms |
+| `type2` `2^17` | 13.2 → 6.2 MiB | 1.01× | 49 → 109 ms |
+| `type2` `2^19` | 62.0 → 28.3 MiB | 1.01× | 219 → 544 ms |
+
+The build's extra is `jnp.unique`'s complex sort; a host `np.unique`, as a first version of the arm
+did, cost 22–102 ms instead of 9–325 ms.
 
 A memory lever only on CPU: −22% of the operator where `d0` and the indices dominate (`type1`), −54%
 where the factors do (`type2`), at no solve cost. At `2^15` it read 0.77× in one round, unconfirmed.
-Not shipped: a second operator layout, with a fallback past 256 distinct values (random coefficients
-give up to `J·2^K`), for no CPU speed — the GPU, where a pair's 24 bytes feed a bandwidth-bound scatter,
-is what would decide it.
+Not shipped, for no CPU speed: the GPU, where a pair's 24 bytes feed a bandwidth-bound scatter, is what
+would decide it. In the library it would be the arm's `encode` (4 lines) after `_drop_zeros` and one
+`table[code]` line in `_apply_pairs`.
 
 ## 5. What it means
 
@@ -71,7 +78,7 @@ order. The iteration counts match exactly.
 1. **The GPU**, where the scatter dominates the matvec (`poc/sparse/split.md` §4): the gain should be
    nearer the entry ratio. `uv run python poc/sparse/prune.py --log2-sizes 20 22`.
 2. **Factor codes on the GPU** (§4): `uv run python poc/sparse/prune.py --log2-sizes 20 22`; ship them if
-   they speed the scatter, with a `uint16` code covering every Hamiltonian here.
+   they speed the scatter. A cheaper table than `jnp.unique`'s sort would help the build either way.
 3. **The first-build compile**: a jitted `_drop_zeros` keyed on the size class would compile once per class.
 
 ## 7. The script
@@ -87,4 +94,4 @@ order. The iteration counts match exactly.
 
 One host search serves every arm; each build runs twice, the second timed. Eigenvalues must agree to
 `1e-12`, and `codes` must equal `nonzero` bit for bit. Runs here: two arms at the default (5 rounds), then
-`--rounds 3` (§3's build column), then all three arms at `--rounds 3` (§4).
+`--rounds 3` (§3's build column), then all three arms at `--rounds 3`, with the `encode` described in §4.

@@ -60,11 +60,16 @@ ARMS = {
 
 
 def encode(operator):
-    """``(d0, i, j, code, table)``: each factor a ``uint8`` index into its distinct values."""
+    """``(d0, i, j, code, table)``: each factor an index into its distinct values, ``d == table[code]``.
+
+    The code is the narrowest unsigned type that fits, so there is no fallback; the table is padded to
+    256, or a size class above that, so its shape changes with the class rather than the count.
+    """
     d0, t, s, d = operator
-    table, code = np.unique(np.asarray(d), return_inverse=True)
-    assert len(table) <= 256, f"{len(table)} distinct factors do not fit a uint8"
-    return d0, t, s, jnp.asarray(code.reshape(d.shape).astype(np.uint8)), jnp.asarray(table)
+    table, code = jnp.unique(d, return_inverse=True)
+    width = max(256, sm._size_class(len(table)))
+    code = code.reshape(d.shape).astype(np.min_scalar_type(len(table) - 1))
+    return d0, t, s, code, jnp.pad(table, (0, width - len(table)))
 
 
 def apply_codes(vec, d0, pi, pj, code, table):

@@ -2364,7 +2364,7 @@ speed at 0.42–0.48× its memory, so a mesh wants `"indices"`; `"pairs"` fastes
 XX+YY hops cancel on aligned spins, so 86% of `type1`'s searched pairs and 32% of `type2`'s had a zero
 factor. Dropping them after the factor pass (`_drop_zeros`) cuts the operator 23–64% at identical iteration
 counts, eigenvalues within 7.1e-15 (not bit-identical: chunk boundaries move). M1 only. Coding the 4–5
-distinct factors as `uint8` saves another 22–54% of the operator at 0.99–1.01×, unshipped. `poc/sparse/prune.md` §3, §4
+distinct factors as `uint8` saves another 22–54% of the operator at 1.00–1.01×, unshipped. `poc/sparse/prune.md` §3, §4
 
 ### sqd sparse kernels: `"csr"` and `"ell"` leave the library, `"pairs"` stays (2026-10-02)
 
