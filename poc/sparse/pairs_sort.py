@@ -85,7 +85,7 @@ def build(h, states_u, pairs, how):
     """``_sparse_operator``'s ``"pairs"`` branch with the cross-group order chosen by ``how``."""
     size, chunk = states_u.shape[0], sm._chunk()
     z, c = jnp.asarray(h.z), jnp.asarray(h.c)
-    first = int(0 not in pairs)
+    first = int(h.identity_first)
     d0 = get_diagonal(z[0], c[0], states_u) if first else jnp.zeros(size, c.dtype)
     groups = range(first, h.x.shape[0])
     coeffs = np.asarray(h.c)

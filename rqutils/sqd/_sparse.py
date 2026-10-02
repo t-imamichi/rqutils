@@ -1,7 +1,4 @@
-"""The sparse kernel, ``"pairs"``: host-side construction and the solve.
-
-``"csr"`` and ``"ell"`` were removed for it (``poc/sparse/tune.md`` §3); ``poc/sparse/legacy.py`` keeps them.
-"""
+"""The sparse kernel, ``"pairs"``: host-side construction and the solve."""
 
 import functools
 import logging
@@ -27,14 +24,9 @@ _CHUNK = 1 << 15
 _GPU_PAIRS_CHUNK = 1 << 19
 
 
-def _on_gpu() -> bool:
-    """Whether the default backend is a GPU, which the sparse builds tune for."""
-    return jax.default_backend() == "gpu"
-
-
 def _chunk() -> int:
     """Entries per scanned chunk on the default backend."""
-    return _GPU_PAIRS_CHUNK if _on_gpu() else _CHUNK
+    return _GPU_PAIRS_CHUNK if jax.default_backend() == "gpu" else _CHUNK
 
 
 def _pairs_sorted_on_device(
@@ -45,12 +37,15 @@ def _pairs_sorted_on_device(
     Stable, so a row's pairs keep group order. 1.12-1.50x per build-plus-solve over a host counting sort
     on a GH200, 0.98-0.99x on an M1 (``poc/sparse/pairs-sort.md``).
     """
-    empty = np.empty(0, np.int32)  # no group but the identity: one chunk of padding
-    i, j = (jnp.asarray(np.concatenate([empty, *(pairs[g][k] for g in groups)])) for k in (0, 1))
-    grp = jnp.asarray(np.repeat(np.asarray(groups, np.int32), [len(pairs[g][0]) for g in groups]))
+    sizes = [len(pairs[g][0]) for g in groups]
+    i, j, grp = alloc(count := sum(sizes))
+    for k, out in enumerate((i, j)):  # the empty array: no group but the identity
+        np.concatenate([np.empty(0, np.int32), *(pairs[g][k] for g in groups)], out=out[:count])
+    grp[:count] = np.repeat(np.asarray(groups, np.int32), sizes)
+    # Padding's i is size - 1, above every pair's i < j, so it sorts last.
+    i, j, grp = map(jnp.asarray, (i, j, grp))
     order = jnp.argsort(i, stable=True)
-    padded = (jnp.asarray(a) for a in alloc(i.shape[0]))
-    return [p.at[: i.shape[0]].set(a[order]) for p, a in zip(padded, (i, j, grp), strict=True)]
+    return [i[order], j[order], grp[order]]
 
 
 def _size_class(chunks: int) -> int:

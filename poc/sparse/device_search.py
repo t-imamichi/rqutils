@@ -89,7 +89,7 @@ for pattern in options.patterns:
         states = hamming_shells(options.num_qubits, 1 << log2, np.random.default_rng(0))
         h, states_p, size = _sqd_inputs(ham, states, None, False, Matvec.PAIRS, 0.0, None, (32, 2))
         states_u = jax.block_until_ready(uniquify_states(states_p, size))
-        first = int(not np.asarray(h.x[0]).any())
+        first = int(h.identity_first)
         x = jax.numpy.asarray(np.asarray(h.x)[first:])  # every group but a leading identity
         ref = host(x, states_u)
         for name, fn in ARMS.items():

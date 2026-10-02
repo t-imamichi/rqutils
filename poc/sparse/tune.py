@@ -216,7 +216,7 @@ def real_operator(h, states_u, pairs):
     """``(d0, ri, rj, rd, qi, qj, qd)``: ``"pairs"``' layout per coefficient set, as ``"csr"`` splits."""
     size = states_u.shape[0]
     z, c = jnp.asarray(h.z), jnp.asarray(h.c)
-    first = int(0 not in pairs)
+    first = int(h.identity_first)
     d0 = get_diagonal(z[0], c[0], states_u) if first else jnp.zeros(size, c.dtype)
     groups = range(first, h.x.shape[0])
     coeffs = np.asarray(h.c)
@@ -242,7 +242,7 @@ def unique_operator(h, states_u, pairs):
     """``(d0, i, j, d)`` with one X group per row, padded to the largest with distinct out-of-bounds indices."""
     size = states_u.shape[0]
     z, c = jnp.asarray(h.z), jnp.asarray(h.c)
-    first = int(0 not in pairs)
+    first = int(h.identity_first)
     d0 = get_diagonal(z[0], c[0], states_u) if first else jnp.zeros(size, c.dtype)
     groups = sorted(pairs)
     coeffs = np.asarray(h.c)

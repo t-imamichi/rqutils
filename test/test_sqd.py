@@ -1015,8 +1015,7 @@ class TestSparseEigenpairCheck:
     It must still compute the true ``Hv``; that it catches a wrong pair is in :class:`TestEigenpairCheck`.
     """
 
-    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
-    def test_a_genuine_pair_passes_with_the_true_hv(self, matvec):
+    def test_a_genuine_pair_passes_with_the_true_hv(self):
         from rqutils.paulis.symplectic import PauliSumXZ
 
         rng = np.random.default_rng(3)

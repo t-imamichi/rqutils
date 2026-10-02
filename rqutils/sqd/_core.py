@@ -16,7 +16,6 @@ from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd._diagonal import get_diagonal
 from rqutils.sqd._solve import (
     _RESIDUAL_SLACK,
-    _SPARSE_MATVECS,
     Matvec,
     SqdResult,
     _check_matvec,
@@ -269,7 +268,7 @@ def _sqd_inputs(
 ) -> tuple[PauliSumXZ, StateList, int]:
     """Validate :func:`sqd`'s arguments; return the Hamiltonian, padded packed states, ``states_size``."""
     _check_matvec(matvec)
-    if matvec in _SPARSE_MATVECS and not get_abstract_mesh().empty:
+    if matvec is Matvec.PAIRS and not get_abstract_mesh().empty:
         raise ValueError(
             f"matvec=Matvec.{matvec.name} is single-device for now; call sqd outside the mesh "
             "context, or use Matvec.ONTHEFLY, INDICES or TABLES for a sharded solve"
@@ -323,7 +322,7 @@ def _solve_sqd(
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
     tols = {"maxiter": maxiter, "atol": atol, "rtol": rtol, "prefilter": prefilter}
-    if matvec in _SPARSE_MATVECS:
+    if matvec is Matvec.PAIRS:
         # run_sqd is jitted and the entry counts are data-dependent, so the operator is built here.
         states_u = uniquify_states(states_p, states_size)
         pairs = _group_pairs(hamiltonian, states_u)  # one search, for the build and the check

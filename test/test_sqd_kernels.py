@@ -11,7 +11,6 @@ import numpy as np
 import pytest
 from conftest import (
     DENSE_MATVECS,
-    SPARSE_MATVECS,
     apply_h_inputs,
     apply_h_kwargs,
     eigval_of,
@@ -832,10 +831,9 @@ class TestSparseKernels:
 
     KINDS = ("real", "mixed", "none_real", "identity_only")
 
-    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
     @pytest.mark.parametrize("kind", KINDS)
     @pytest.mark.parametrize("states_size", [20, 32])
-    def test_product_matches_indices(self, kind, matvec, states_size):
+    def test_product_matches_indices(self, kind, states_size):
         rng = np.random.default_rng(20260926)
         strings, coeffs, states = sparse_fixture(kind, rng)
         assert len(states) == 20, (
@@ -855,13 +853,14 @@ class TestSparseKernels:
             assert all(a.shape == (1, _CHUNK) for a in operator[1:]), "zero entries is one chunk"
         assert_matches_indices(_apply_pairs, operator, h, states_u, len(states), rng)
 
-    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
     @pytest.mark.parametrize("kind", KINDS)
-    def test_sqd_energy_matches_indices(self, kind, matvec):
+    def test_sqd_energy_matches_indices(self, kind):
         """Energies only: another summation order shifts the trajectory, so iteration counts differ."""
         strings, coeffs, states = sparse_fixture(kind, np.random.default_rng(20260926))
         want = eigval_of(strings, coeffs, states, matvec=Matvec.INDICES)
-        assert eigval_of(strings, coeffs, states, matvec=matvec) == pytest.approx(want, abs=1e-10)
+        assert eigval_of(strings, coeffs, states, matvec=Matvec.PAIRS) == pytest.approx(
+            want, abs=1e-10
+        )
 
     def test_size_class_rounding(self):
         """Exact below 16, then ``m * 2**k`` with ``8 <= m < 16``: waste under 12.5%, at least 1."""
@@ -873,19 +872,18 @@ class TestSparseKernels:
             assert chunks <= size < chunks * 1.125 + 1
             assert size < 16 or 8 <= size >> shift < 16
 
-    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
-    def test_one_shape_class_compiles_once(self, matvec, monkeypatch):
+    def test_one_shape_class_compiles_once(self, monkeypatch):
         """Two subspaces with different entry counts but equal operator shapes share the solve."""
         import rqutils.sqd._sparse as sparse_module
 
         monkeypatch.setattr(sparse_module, "_CHUNK", 16)  # so "pairs" spans several chunks too
-        strings, coeffs, states = ell_fixture(np.random.default_rng(20260927))
+        strings, coeffs, states = skewed_degree_fixture(np.random.default_rng(20260927))
         h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        states_size = 64  # ell_fixture has 43 states
+        states_size = 64  # skewed_degree_fixture has 43 states
         by_shapes = {}
         for keep in range(20, len(states) + 1):
             _, operator = sparse_operator_of(h, states[:keep], states_size)
-            entries = sum(int(np.count_nonzero(np.asarray(f))) for f in operator[3::3])
+            entries = sum(int(np.count_nonzero(np.asarray(f))) for f in operator[3])
             shapes = tuple(a.shape for a in operator)
             by_shapes.setdefault(shapes, {}).setdefault(entries, states[:keep])
         shared = next(shapes for shapes, rows in by_shapes.items() if len(rows) >= 2)
@@ -895,7 +893,7 @@ class TestSparseKernels:
 
         def compiles(rows):
             before = sparse_module._run_sparse._cache_size()
-            sqd(h, rows, states_size=states_size, return_eigvec=False, matvec=matvec)
+            sqd(h, rows, states_size=states_size, return_eigvec=False, matvec=Matvec.PAIRS)
             return sparse_module._run_sparse._cache_size() - before
 
         compiles(first)
@@ -987,9 +985,8 @@ class TestComplexScanCarry:
     iteration), so ``jax.lax.platform_dependent`` picks; this checks both branches as traced.
     """
 
-    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
     @pytest.mark.parametrize("batch", [(), (2,)])
-    def test_carry_per_platform(self, matvec, batch):
+    def test_carry_per_platform(self, batch):
         strings, coeffs, states = sparse_fixture("mixed", np.random.default_rng(20261001))
         h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_u, operator = sparse_operator_of(h, states, 32)
@@ -1046,9 +1043,8 @@ class TestNoSortedHint:
     (``poc/sparse/tune.md``); a real and a complex carry both checked, every platform branch walked.
     """
 
-    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
     @pytest.mark.parametrize("kind", ["mixed", "real"])
-    def test_no_scatter_is_marked_sorted(self, matvec, kind):
+    def test_no_scatter_is_marked_sorted(self, kind):
         strings, coeffs, states = sparse_fixture(kind, np.random.default_rng(20261002))
         h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
         states_u, operator = sparse_operator_of(h, states, 32)
@@ -1058,7 +1054,7 @@ class TestNoSortedHint:
         assert hints and not any(hints), hints
 
 
-def ell_fixture(rng):
+def skewed_degree_fixture(rng):
     """``(strings, coeffs, states)`` whose row degrees vary widely, so operator shapes vary with the subspace.
 
     Every single flip and nearest-neighbour double flip on 8 qubits, odd sites as ``Y`` (complex
@@ -1146,7 +1142,7 @@ class TestPairsOrder:
         states_u, (_, pi, pj, _) = sparse_operator_of(h, states, 32)
         i, j = (np.asarray(a).ravel() for a in (pi, pj))
         real = i < j  # padding entries have i == j
-        offdiag = int(not np.asarray(h.x[0]).any())  # as the build: skip an identity group
+        offdiag = int(h.identity_first)  # as the build: skip an identity group
         gi, gj = (np.concatenate(a) for a in zip(*_search_pairs(h.x[offdiag:], states_u)))
         assert np.any(np.diff(gi) < 0), "the group-by-group order must not already be sorted"
         assert np.all(np.diff(i[real]) >= 0), "pairs must be sorted by i"
