@@ -11,7 +11,8 @@ splits into ``build`` (``uniquify_states`` + the host-built operator), ``solve``
 ``poc/real_groups.py``), and ``per_iter`` the solve time over it -- ``indices``' includes its setup.
 
 Each arm runs in its own subprocess: ``peak_bytes_in_use`` is a process-wide high-water mark with no reset,
-so a shared process would report the largest arm's peak for every later one. The parent is pinned to CPU
+so a shared process would report the largest arm's peak for every later one. The CPU backend has no
+``memory_stats``, so there ``peak`` is the child's RSS high-water mark, Python and JAX included. The parent is pinned to CPU
 so it holds no GPU memory (nor XLA's preallocation) while a child runs.
 
 Run: uv run python poc/sparse/gpu.py [--patterns type1 type2] [--log2-sizes 17 19 21]
@@ -21,6 +22,7 @@ Run: uv run python poc/sparse/gpu.py [--patterns type1 type2] [--log2-sizes 17 1
 import argparse
 import json
 import os
+import resource
 import subprocess
 import sys
 import time
@@ -126,6 +128,9 @@ def solve(pattern, log2, arm):
         "times": times,
         "stages": {k: float(np.median([st[k] for st in stages])) for k in (stages or [{}])[0]},
         "peak": stats.get("peak_bytes_in_use"),
+        # The CPU backend reports no memory_stats; the child's RSS high-water mark, bytes on macOS.
+        "rss": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        * (1 if sys.platform == "darwin" else 1024),
         "iters": ITERATIONS[-1],
         "iter_counts": sorted(set(ITERATIONS)),
     }
@@ -159,7 +164,9 @@ for pattern in options.patterns:
             eigval, times = r["eigval"], r["times"]
             ref = eigval if arm == "indices" else ref
             delta = "" if oracle is None else f"  d_oracle={eigval - oracle:+.2e}"
-            peak = "n/a" if r["peak"] is None else f"{r['peak'] / 2**30:.2f} GiB"
+            peak = (
+                f"{r['peak'] / 2**30:.2f} GiB" if r["peak"] else f"rss {r['rss'] / 2**30:.2f} GiB"
+            )
             solve_s = r["stages"].get("solve", float(np.median(times)))
             if len(r["iter_counts"]) > 1:
                 print(f"  WARNING: {arm} iteration counts differ across runs: {r['iter_counts']}")
