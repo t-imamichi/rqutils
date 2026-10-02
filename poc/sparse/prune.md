@@ -1,9 +1,9 @@
-# `"pairs"` without its exact-zero entries
+# `"pairs"` without its exact-zero entries, and with coded factors
 
-`poc/sparse/prune.py` (§5) at `0c137dd` plus the change, one Apple M1 (8 cores, 16 GiB), 2026-10-02.
+`poc/sparse/prune.py` (§7) at `0c137dd` plus the change, one Apple M1 (8 cores, 16 GiB), 2026-10-02.
 Fixture as `poc/sparse/gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`) and
 `type2` (`J = 120`), Hamming-shell subspaces around both Néel states. In the library since, as
-`_drop_zeros`.
+`_drop_zeros`; the factor codes (§4) are not.
 
 ## 1. The zeros
 
@@ -40,21 +40,41 @@ The solve's temp (18 / 72 MiB) is unchanged: it is the solver's vectors, not the
 at a new size pays 0.15–0.36 s more, compiling the filter's eager ops; warm it is 2–53 ms, against
 0.35–1.46 s saved per solve.
 
-## 4. What it means
+## 4. Factor codes
+
+The `codes` arm stores each factor as a `uint8` index into the operator's distinct values (4–5 here,
+§1), `d` 16 → 1 B per pair, read back as `table[code]` in the scan; the table is built on the host with
+`np.unique`. Against `nonzero`, 3 rounds, bit-identical eigenvalue and eigenvector:
+
+| pattern, N | operator | per solve | build, warm |
+| --- | --- | --- | --- |
+| `type1` `2^17` | 3.5 → 2.6 MiB | 0.99× (0.653 against 0.649 s) | 19 → 22 ms |
+| `type1` `2^19` | 12.5 → 9.7 MiB | 1.01× | 86 → 93 ms |
+| `type2` `2^17` | 13.2 → 6.2 MiB | 1.00× | 48 → 69 ms |
+| `type2` `2^19` | 62.0 → 28.3 MiB | 0.99× | 217 → 319 ms |
+
+A memory lever only on CPU: −22% of the operator where `d0` and the indices dominate (`type1`), −54%
+where the factors do (`type2`), at no solve cost. At `2^15` it read 0.77× in one round, unconfirmed.
+Not shipped: a second operator layout, with a fallback past 256 distinct values (random coefficients
+give up to `J·2^K`), for no CPU speed — the GPU, where a pair's 24 bytes feed a bandwidth-bound scatter,
+is what would decide it.
+
+## 5. What it means
 
 The time falls less than the entries (7× fewer at `type1` for 1.6×) because the solve's `O(N)` vector
 work stays. Not bit-identical, unlike the expectation going in: dropping entries moves chunk boundaries,
 and a chunk adds all its `out[i]` updates before its `out[j]`, so a row's terms are summed in another
 order. The iteration counts match exactly.
 
-## 5. Open
+## 6. Open
 
 1. **The GPU**, where the scatter dominates the matvec (`poc/sparse/split.md` §4): the gain should be
    nearer the entry ratio. `uv run python poc/sparse/prune.py --log2-sizes 20 22`.
-2. **Factor codes**: the 4–5 distinct values fit a `uint8` index into a table, `d` 16 → 1 B per pair.
+2. **Factor codes on the GPU** (§4): `uv run python poc/sparse/prune.py --log2-sizes 20 22`; ship them if
+   they speed the scatter, with a `uint16` code covering every Hamiltonian here.
 3. **The first-build compile**: a jitted `_drop_zeros` keyed on the size class would compile once per class.
 
-## 6. The script
+## 7. The script
 
 `poc/sparse/prune.py`, its argparse checked against this section:
 
@@ -65,5 +85,6 @@ order. The iteration counts match exactly.
 | `--log2-sizes` | `17 19` | subspace sizes `2^k` |
 | `--rounds` | `5` | interleaved solves per arm after one warm-up |
 
-One host search serves both arms; each build runs twice, the second timed. Eigenvalues must agree to
-`1e-12`. Runs here: the default (5 rounds) and `--rounds 3`, whose build column is §3's.
+One host search serves every arm; each build runs twice, the second timed. Eigenvalues must agree to
+`1e-12`, and `codes` must equal `nonzero` bit for bit. Runs here: two arms at the default (5 rounds), then
+`--rounds 3` (§3's build column), then all three arms at `--rounds 3` (§4).

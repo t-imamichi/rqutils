@@ -4,12 +4,14 @@ Fixture as ``poc/sparse/gpu.py``: spinchain's open-XXZ ``xxz`` with Hamming-shel
 ``_drop_zeros`` out, ``nonzero`` is the library; one host search serves both. Each arm warms up once, then
 ``--rounds`` interleaved solves. The eigenvalues must agree to ``1e-12``, not bit for bit: dropping
 entries moves chunk boundaries, and a chunk adds its ``out[i]`` updates before its ``out[j]``, so a row's
-sum is reordered. ``iters`` is LOBPCG's count, by a host callback as ``poc/sparse/gpu.py``.
+sum is reordered. ``codes`` is ``nonzero`` with each factor a ``uint8`` index into a table of the distinct
+values, and must match it bit for bit. ``iters`` is LOBPCG's count, by a host callback as ``poc/sparse/gpu.py``.
 
 Run: uv run python poc/sparse/prune.py [--patterns type1 type2] [--log2-sizes 17 19] [--rounds 5]
 """
 
 import argparse
+import logging
 import os
 import sys
 import time
@@ -18,6 +20,7 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 
+import jax.numpy as jnp
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # poc/
@@ -49,22 +52,73 @@ def counted_ground_locg(*args, **kwargs):
 
 solve_mod.ground_locg = counted_ground_locg  # ty: ignore[invalid-assignment]
 library_drop = sm._drop_zeros
-ARMS = {"all": lambda t, s, d, chunk, size: (t, s, d), "nonzero": library_drop}
+ARMS = {
+    "all": lambda t, s, d, chunk, size: (t, s, d),
+    "nonzero": library_drop,
+    "codes": library_drop,
+}
+
+
+def encode(operator):
+    """``(d0, i, j, code, table)``: each factor a ``uint8`` index into its distinct values."""
+    d0, t, s, d = operator
+    table, code = np.unique(np.asarray(d), return_inverse=True)
+    assert len(table) <= 256, f"{len(table)} distinct factors do not fit a uint8"
+    return d0, t, s, jnp.asarray(code.reshape(d.shape).astype(np.uint8)), jnp.asarray(table)
+
+
+def apply_codes(vec, d0, pi, pj, code, table):
+    """``sm._apply_pairs`` with ``d = table[code]``."""
+    sharding = jax.typeof(vec).sharding
+
+    def updates(chunk):
+        i, j, k = chunk
+        di = table[k]
+        return [
+            (i, di * vec.at[..., j].get(out_sharding=sharding)),
+            (j, jnp.conj(di) * vec.at[..., i].get(out_sharding=sharding)),
+        ]
+
+    return sm._scan_add(updates, d0 * vec, (pi, pj, code))
+
+
+@jax.jit(static_argnames=["states_size", "return_eigvec"])
+def run_codes(hamiltonian, states_u, operator, states_size, return_eigvec):
+    return sm._solve(
+        hamiltonian,
+        states_u,
+        apply_codes,
+        operator,
+        lambda: operator[0],
+        None,
+        None,
+        return_eigvec=return_eigvec,
+        maxiter=1000,
+        atol=0.0,
+        rtol=None,
+        prefilter=(32, 2),
+        log_level=logging.INFO,
+        check_residual=False,
+    )
+
+
+RUN = {"all": sm._run_sparse, "nonzero": sm._run_sparse, "codes": run_codes}
 
 
 def build(h, states_u, pairs, arm):
     sm._drop_zeros = ARMS[arm]  # ty: ignore[invalid-assignment]
     try:
         t0 = time.perf_counter()
-        operator = jax.block_until_ready(sm._sparse_operator(h, states_u, pairs))
+        operator = sm._sparse_operator(h, states_u, pairs)
+        operator = jax.block_until_ready(encode(operator) if arm == "codes" else operator)
         return operator, time.perf_counter() - t0
     finally:
         sm._drop_zeros = library_drop
 
 
-def solve(h, states_u, operator, size):
+def solve(h, states_u, operator, size, arm):
     t0 = time.perf_counter()
-    result = jax.block_until_ready(sm._run_sparse(h, states_u, operator, size, True))
+    result = jax.block_until_ready(RUN[arm](h, states_u, operator, size, True))
     jax.effects_barrier()
     return result, time.perf_counter() - t0, ITERATIONS[-1]
 
@@ -85,19 +139,27 @@ for pattern in options.patterns:
         for arm in ARMS:
             build(h, states_u, pairs, arm)  # compile the build's eager ops, so it times warm
             ops[arm], builds[arm] = build(h, states_u, pairs, arm)
-            results[arm] = solve(h, states_u, ops[arm], size)[0]  # warm-up
+            results[arm] = solve(h, states_u, ops[arm], size, arm)[0]  # warm-up
         for _ in range(options.rounds):
             for arm in ARMS:
-                _, elapsed, count = solve(h, states_u, ops[arm], size)
+                _, elapsed, count = solve(h, states_u, ops[arm], size, arm)
                 times.setdefault(arm, []).append(elapsed)
                 iters.setdefault(arm, set()).add(count)
         ref = results["all"]
+        same = all(
+            np.array_equal(
+                np.asarray(getattr(results["codes"], f)), np.asarray(getattr(results["nonzero"], f))
+            )
+            for f in ("eigval", "eigvec")
+        )
+        assert same, "codes must match nonzero bit for bit"
         for arm in ARMS:
             op, r = ops[arm], results[arm]
             diff = float(r.eigval) - float(ref.eigval)
             assert abs(diff) <= 1e-12, f"{arm} differs from all: {r.eigval} against {ref.eigval}"
             temp = (
-                sm._run_sparse.lower(h, states_u, op, size, True)
+                RUN[arm]
+                .lower(h, states_u, op, size, True)
                 .compile()
                 .memory_analysis()
                 .temp_size_in_bytes
