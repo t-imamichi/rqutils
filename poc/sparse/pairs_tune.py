@@ -13,6 +13,8 @@ kernel a fraction of the GPU. Arms are every ``--chunks`` × ``--variants``:
 - ``unique``: one X group per scan step, both scatters ``unique_indices=True`` -- a group's pairs are a
   perfect matching (asserted), so no atomics are needed; padding takes distinct out-of-bounds indices,
   dropped. It ignores ``--chunks`` (run once, at the first) and pays the padding to the largest group.
+- ``unique-exact``: ``unique`` without that padding -- no scan, a Python loop over groups, each sized to
+  its own pair count rounded to ``_size_class``; more compiled shapes, no padding to the largest group.
 
 ``--matvec csr`` runs ``"csr"`` instead, with ``base`` (the library, which since this ran drops
 ``indices_are_sorted`` on CUDA) and ``sorted`` (the hint forced back, as the library had it).
@@ -56,7 +58,7 @@ from rqutils.sqd import Matvec, get_diagonal, uniquify_states
 from rqutils.sqd._core import _sqd_inputs
 
 VARIANTS = {
-    "pairs": ("base", "sorted", "merged", "real", "unique"),
+    "pairs": ("base", "sorted", "merged", "real", "unique", "unique-exact"),
     "csr": ("base", "sorted"),
     "ell": ("base", "grid1.5", "grid2"),
 }
@@ -168,6 +170,33 @@ def apply_unique(vec, d0, pi, pj, d):
     return scan_add(updates, d0 * vec, (pi, pj, d))
 
 
+def apply_unique_exact(vec, d0, *sets):
+    """``apply_unique`` over per-group ``(i, j, d)`` sets, unrolled in Python rather than scanned."""
+    unique = {"unique_indices": True, "mode": "drop"}
+
+    def run(parts):
+        for k in range(0, len(sets), 3):
+            i, j, d = sets[k : k + 3]
+            vj, vi = (vec.at[..., n].get(mode="fill", fill_value=0) for n in (j, i))
+            for index, value in ((i, d * vj), (j, jnp.conj(d) * vi)):
+                values = (value.real, value.imag) if len(parts) == 2 else (value,)
+                parts = tuple(
+                    p.at[..., index].add(v, **unique) for p, v in zip(parts, values, strict=True)
+                )
+        return parts
+
+    def default(out):
+        return run((out,))[0]
+
+    def cuda(out):
+        if not jnp.iscomplexobj(out):
+            return run((out,))[0]
+        re, im = run((out.real, out.imag))
+        return jax.lax.complex(re, im)
+
+    return jax.lax.platform_dependent(d0 * vec, default=default, cuda=cuda)
+
+
 KERNELS = {
     "pairs": {
         "base": sm._apply_pairs,
@@ -175,6 +204,7 @@ KERNELS = {
         "merged": apply_merged,
         "real": apply_real,
         "unique": apply_unique,
+        "unique-exact": apply_unique_exact,
     },
     "csr": {"base": sm._apply_csr, "sorted": apply_csr_sorted},
     "ell": dict.fromkeys(VARIANTS["ell"], sm._apply_ell),  # one kernel; the grid is the build's
@@ -233,6 +263,17 @@ def unique_operator(h, states_u, pairs):
     return d0, jnp.asarray(t), jnp.asarray(s), d
 
 
+def unique_exact_operator(h, states_u, pairs):
+    """``(d0, i_g, j_g, d_g, ...)``: ``unique_operator``'s rows, each cut to its own size class."""
+    d0, t, s, d = unique_operator(h, states_u, pairs)
+    counts = [len(pairs[g][0]) for g in sorted(pairs)]
+    arrays = [d0]
+    for row, n in enumerate(counts):
+        m = min(max(1, sm._size_class(n)), t.shape[1])  # the padding past n is out of bounds
+        arrays += [t[row, :m], s[row, :m], d[row, :m]]
+    return tuple(arrays)
+
+
 def width_grid(factor):
     """``_ELL_WIDTHS``' construction for another ratio, kept below ``2^31``."""
     steps = int(np.log(2**31) / np.log(factor))
@@ -254,7 +295,7 @@ arms = [
     (c, v)
     for c in options.chunks
     for v in options.variants
-    if v != "unique" or c == options.chunks[0]
+    if not v.startswith("unique") or c == options.chunks[0]
 ]
 ref = (15, "base")
 if ref not in arms:
@@ -286,6 +327,8 @@ for log2 in options.log2_sizes:
             operator = jax.block_until_ready(real_operator(h, states_u, pairs))
         elif variant == "unique":
             operator = jax.block_until_ready(unique_operator(h, states_u, pairs))
+        elif variant == "unique-exact":
+            operator = jax.block_until_ready(unique_exact_operator(h, states_u, pairs))
         else:
             operator = jax.block_until_ready(sm._sparse_operator(h, states_u, arm, pairs))
         kernel = KERNELS[variant]
@@ -298,7 +341,8 @@ for log2 in options.log2_sizes:
         calls[key] = [functools.partial(solve, h, states_u, operator, size, False, arm)]
         calls[key] += [functools.partial(matvec, vec, *operator) for vec in vecs]
         temp = matvec.lower(vecs[1], *operator).compile().memory_analysis().temp_size_in_bytes
-        steps = sum(a.shape[0] for a in operator[1::3])
+        # A 1-D set is one unscanned group (unique-exact); a 2-D one scans its leading axis.
+        steps = sum(a.shape[0] if a.ndim == 2 else 1 for a in operator[1::3])
         info[key] = (sum(a.nbytes for a in operator) / 2**20, temp / 2**20, steps)
         for call in calls[key]:
             call()  # compile
