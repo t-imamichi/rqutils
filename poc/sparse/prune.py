@@ -5,7 +5,8 @@ Fixture as ``poc/sparse/gpu.py``: spinchain's open-XXZ ``xxz`` with Hamming-shel
 ``--rounds`` interleaved solves. The eigenvalues must agree to ``1e-12``, not bit for bit: dropping
 entries moves chunk boundaries, and a chunk adds its ``out[i]`` updates before its ``out[j]``, so a row's
 sum is reordered. ``codes`` is ``nonzero`` with each factor a ``uint8`` index into a table of the distinct
-values, and must match it bit for bit. ``iters`` is LOBPCG's count, by a host callback as ``poc/sparse/gpu.py``.
+values, and must match it bit for bit on CPU; a GPU's atomic scatter-add has no fixed order, so
+there it only meets the ``1e-12``. ``iters`` is LOBPCG's count, by a host callback as ``poc/sparse/gpu.py``.
 
 Run: uv run python poc/sparse/prune.py [--patterns type1 type2] [--log2-sizes 17 19] [--rounds 5]
 """
@@ -157,7 +158,8 @@ for pattern in options.patterns:
             )
             for f in ("eigval", "eigvec")
         )
-        assert same, "codes must match nonzero bit for bit"
+        # Atomic scatter-adds on a GPU sum in no fixed order, so only the CPU is bit-reproducible.
+        assert same or jax.default_backend() != "cpu", "codes must match nonzero bit for bit"
         for arm in ARMS:
             op, r = ops[arm], results[arm]
             diff = float(r.eigval) - float(ref.eigval)

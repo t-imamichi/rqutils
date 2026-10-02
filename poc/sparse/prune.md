@@ -93,5 +93,6 @@ order. The iteration counts match exactly.
 | `--rounds` | `5` | interleaved solves per arm after one warm-up |
 
 One host search serves every arm; each build runs twice, the second timed. Eigenvalues must agree to
-`1e-12`, and `codes` must equal `nonzero` bit for bit. Runs here: two arms at the default (5 rounds), then
+`1e-12`, and `codes` must equal `nonzero` bit for bit on CPU only: a GPU's atomic scatter-add
+sums in no fixed order, which tripped that check on the GH200's first run. Runs here: two arms at the default (5 rounds), then
 `--rounds 3` (§3's build column), then all three arms at `--rounds 3`, with the `encode` described in §4.
