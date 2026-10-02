@@ -2371,7 +2371,8 @@ pending. `uint8` factor codes: −22–54% operator at 1.00–1.06×, unshipped.
 
 M1, `2^14`: summing each group's z = 0 terms into a constant is 1.28× (`type1`) / 1.50× (`type2`) per
 iteration at equal memory. `"tables"` diagonals as `uint8` codes cut the operator 12.13 → 5.13 B/slot and
-temp ~0.5× for 0.80–0.84× (lost in the `(2, N)` matvec), bit-identical. Neither shipped. `poc/dense-codes.md` §2–§4
+temp ~0.5× for 0.80–0.84× (lost in the `(2, N)` matvec), bit-identical. The fold shipped (`zfree_first`);
+the codes did not. `poc/dense-codes.md` §2–§5
 
 ### sqd sparse kernels: `"csr"` and `"ell"` leave the library, `"pairs"` stays (2026-10-02)
 

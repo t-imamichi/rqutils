@@ -2,8 +2,8 @@
 
 `poc/dense_codes.py` (§6) at `c0061df`, one Apple M1 (8 cores, 16 GiB), 2026-10-03. Fixture as
 `poc/dense-tune.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`) and `type2`
-(`J = 120`), both `complex128`, Hamming-shell subspaces around both Néel states. Neither lever is in the
-library.
+(`J = 120`), both `complex128`, Hamming-shell subspaces around both Néel states. `fold` is in the library
+since (§5, item 4); `codes` is not.
 
 ## 1. The levers
 
@@ -70,8 +70,11 @@ guessed. That holds at `2^14` only.
 2. **The GPU.** `"indices"` on a GH200 already matches `"tables"` (`poc/sparse/gpu.md` §9), so `fold`
    could put it ahead, and `codes`' bandwidth saving is what a GPU rewards.
 3. **Why `codes`' `(2, N)` matvec loses** (§3), before deciding on it.
-4. **`fold` in the library:** a constant per group in `_bucket_args`, `const +` in `_apply_buckets`.
-   Also applies to `"onthefly"` (`--matvecs onthefly`), unmeasured.
+4. **`fold` in the library: done.** `from_paulisum` moves each group's Z-free term first and flags it
+   in the static `PauliSumXZ.zfree_first`; `_bucket_args` folds it into a per-group `const`. Re-run
+   after the change, the script's reference (now the library) matches the `fold` arm bit for bit at
+   0.97–1.01×: 6.20 ms (`type1`) and 8.80 ms (`type2`) per iteration, against §2's 7.80 and 13.19.
+   It covers `"onthefly"` too, still unmeasured there (`--matvecs onthefly`).
 
 ## 6. The script
 

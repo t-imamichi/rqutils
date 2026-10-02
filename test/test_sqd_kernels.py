@@ -23,7 +23,7 @@ from conftest import (
 
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import Matvec, apply_h, get_xsource, hproj, run_sqd, sqd, uniquify_states
-from rqutils.sqd._dense import _pack_scanned
+from rqutils.sqd._dense import _bucket_args, _pack_scanned
 from rqutils.sqd._solve import _group_parts
 from rqutils.sqd._sparse import (
     _CHUNK,
@@ -974,6 +974,25 @@ class TestBucketedDiagonals:
         states = unique_states(40, 6, np.random.default_rng(3))
         want = lowest_projected(strings, coeffs, states)
         assert eigval_of(strings, coeffs, states, matvec=matvec) == pytest.approx(want, abs=1e-10)
+
+    @pytest.mark.parametrize("matvec", [Matvec.INDICES, Matvec.ONTHEFLY])
+    def test_zfree_terms_fold_into_a_constant(self, matvec):
+        """Each hop's ``XX`` leaves the parity loop for a constant, even listed after its ``YY``.
+
+        1.28-1.50x per iteration on CPU (``poc/dense-codes.md``); without the fold every term stays.
+        """
+        from qiskit.quantum_info import SparsePauliOp
+
+        # Each YY before its XX; YIYIII is a group with no Z-free term to fold.
+        strings = sorted([*self.STRINGS, "YIYIII"], key=lambda s: "Y" not in s)
+        coeffs = np.random.default_rng(20261003).normal(size=len(strings))
+        h = PauliSumXZ.from_paulisum(SparsePauliOp(strings, coeffs))
+        states = unique_states(40, 6, np.random.default_rng(3))
+        buckets = _bucket_args(h, h.x, uniquify_states(pack_padded(states), 64))[0]
+        kept = sum(len(b[0]) * b[2].shape[1] for b in buckets)
+        assert kept == sum(h.term_counts[1:]) - 11, "5 XX hops and 6 X fields fold"
+        got = float(sqd(h, states, return_eigvec=False, matvec=matvec))
+        assert got == pytest.approx(lowest_projected(strings, coeffs, states), abs=1e-10)
 
     @pytest.mark.parametrize("matvec", [Matvec.INDICES, Matvec.ONTHEFLY])
     def test_solve_traces_no_diagonal_while_loop(self, matvec):

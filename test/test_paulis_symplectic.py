@@ -616,6 +616,21 @@ class TestTermCounts:
         assert h.identity_first == (not np.asarray(h.x[0]).any()) == with_identity
         assert sorted(set(h.term_counts)) != [h.term_counts[0]], "the fixture must mix term counts"
 
+    def test_zfree_first_names_exactly_the_leading_z_free_terms(self):
+        """A flag on a term with a Z part would fold its coefficient in as a constant, a wrong diagonal.
+
+        Qiskit input keeps the caller's order, so ``YY`` listed before ``XX`` exercises the reorder.
+        """
+        from qiskit.quantum_info import SparsePauliOp
+
+        strings = ["YYIII", "XXIII", "IZIII", "IIYZI", "IIXII", "IIIZZ", "IIIII", "YIYII"]
+        h = PauliSumXZ.from_paulisum(SparsePauliOp(strings, np.linspace(0.3, 1.1, len(strings))))
+        z = np.asarray(h.z)
+        zfree = [[not z[g, t].any() for t in range(k)] for g, k in enumerate(h.term_counts)]
+        assert h.zfree_first == tuple(bool(row) and row[0] for row in zfree)
+        assert not any(any(row[1:]) for row in zfree), "a Z-free term was left behind position 0"
+        assert sum(h.zfree_first) == 3, "the identity, XX and IIXII groups, not YIYII's"
+
 
 class TestBinaryStateValidation:
     """``pack_states`` must reject non-binary input rather than silently collapsing it.
