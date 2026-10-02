@@ -47,7 +47,7 @@ Per solve iteration against `run_sqd`, every ratio won 5/5; `temp` is the `(2, N
   `id-static` and 2.7–2.9 GB for `"tables"`, against megabytes. For kernels chosen for their memory that
   is the wrong trade as shipped.
 - **`id-static` makes `"indices"` competitive**: 23.52 ms per iteration at `2^22` against `"tables"`'
-  20.39 and the tuned `"pairs"`' 14.84 (`poc/sparse/pairs-tune.md` §3), at `"indices"`' memory plus one
+  20.39 and the tuned `"pairs"`' 14.84 (`poc/sparse/tune.md` §3), at `"indices"`' memory plus one
   vector; 11.62 ms with `unroll=4`'s gigabyte.
 - **A second run** (`--matvecs indices onthefly --variants plain id-static --unrolls 1 2`) reproduces
   `"indices"`' `id-static` at `unroll=1` (4.50× / 3.24×, temp 3 / 12 MiB); `unroll=2` reaches 6.74× /

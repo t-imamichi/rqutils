@@ -1,6 +1,6 @@
-# Four `"pairs"` levers on a GPU
+# Tuning the sparse kernels on a GPU: `"pairs"`' four levers, `"csr"`'s hint, `"ell"`'s chunk and grid
 
-`poc/sparse/pairs_tune.py` (§6) at `909ebf5` (§2) and `1443f48` (§3's sweep and `"csr"` run), one NVIDIA
+`poc/sparse/tune.py` (§6) at `909ebf5` (§2) and `1443f48` (§3's sweep and `"csr"` run), one NVIDIA
 GH200 120GB, 2026-10-02, and at `1e6fbfc` (§3's `unique` and `"ell"` runs); §3's CPU sweep at `a1fcde3` on
 one Apple M1 (8 cores, 16 GiB). Fixture as
 `poc/sparse/gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`, `complex128`),
@@ -134,7 +134,7 @@ setting is `2^17` and the ×2 grid, worth shipping once its build's factor calls
 
 ## 6. The script
 
-`poc/sparse/pairs_tune.py`, its argparse checked against this section:
+`poc/sparse/tune.py`, its argparse checked against this section:
 
 | flag | default | meaning |
 | --- | --- | --- |

@@ -75,7 +75,7 @@ def scan_add(updates, out, xs, ordered=False):
     """``sparse_mod._scan_add`` on a state-major ``out``: ``updates`` index its leading axis.
 
     The same platform rule as the library: on CUDA a complex carry is split into real and imaginary
-    parts and the sorted hint dropped (``poc/sparse/split.md``, ``poc/sparse/pairs-tune.md``), else
+    parts and the sorted hint dropped (``poc/sparse/split.md``, ``poc/sparse/tune.md``), else
     the GPU arm would measure that defect rather than the layout.
     """
 

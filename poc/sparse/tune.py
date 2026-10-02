@@ -1,4 +1,4 @@
-"""A/B of four ``"pairs"`` levers on a GPU: chunk size, a sorted ``i`` scatter, one merged scatter, real factors.
+"""A/B of sparse-kernel levers on a GPU: ``"pairs"``' chunk, sort hint, merged scatter, real factors and atomics.
 
 After ``0d25235`` a GH200 ``"pairs"`` matvec is 84-89% scatters (``poc/sparse/split.md`` §4), stepping
 ``_CHUNK = 32768`` entries at a time: 320 steps and 1603 launches per call at ``type2`` ``2^22``, each
@@ -28,7 +28,7 @@ pairwise distinct as traced. Arms are warm and interleaved; ``solve`` is per ite
 iteration counts); eigenvalues must agree to ``1e-12`` relative. ``op`` is the operator's device bytes,
 ``temp`` XLA's ``temp_size_in_bytes`` for the ``(2, N)`` matvec. Fixture as ``poc/sparse/gpu.py``.
 
-Run: uv run python poc/sparse/pairs_tune.py [--log2-sizes 20 22] [--chunks 15 17 19]
+Run: uv run python poc/sparse/tune.py [--log2-sizes 20 22] [--chunks 15 17 19]
      [--variants base sorted merged real] [--rounds 5] [--matvec csr|ell]
 """
 

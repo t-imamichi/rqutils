@@ -2331,7 +2331,7 @@ previous call, 0.53–0.64× `"indices"`' memory. Its host build (42%; half sear
 GH200, `type1` `2^20`/`2^22`: `_CHUNK` `2^15` → `2^19` is 2.71×/1.37× per iteration at +8 MiB temp, the
 plateau's edge, so it ships as `_GPU_PAIRS_CHUNK` (GPU, `"pairs"`; `2^15` is the CPU's own optimum). Merging ties;
 `indices_are_sorted` on `out[i]` is 0.37–0.64×, and dropping it from `"csr"` is 2.12–3.24×, so CUDA now drops
-it everywhere (CPU keeps it); `float64` factors 0.37–0.94×. `poc/sparse/pairs-tune.md` §2, §3
+it everywhere (CPU keeps it); `float64` factors 0.37–0.94×. `poc/sparse/tune.md` §2, §3
 
 ### sqd dense kernels: a fixed-trip diagonal loop is 3.3–4.4× `"indices"` on a GPU, 1.8–1.9× on CPU (2026-10-02)
 
@@ -2344,14 +2344,14 @@ per CPU iteration, `type1`/`type2`. `unroll` adds speed at ~1–3 GB temp. `poc/
 
 GH200, `2^20`/`2^22`: a `"pairs"` build is search 35–49% and the cross-group sort 48–63%, not "nearly all
 search"; `"ell"`'s adds 2,049 factor calls (31%). `get_xsource` on the device is 0.57–0.91× the host search.
-`"ell"` wants chunk `2^17` and a ×2 grid there (1.24–1.74×); `(N, 2)` vectors lose on GPU too. `poc/sparse/gpu.md` §8, `poc/sparse/pairs-tune.md` §3
+`"ell"` wants chunk `2^17` and a ×2 grid there (1.24–1.74×); `(N, 2)` vectors lose on GPU too. `poc/sparse/gpu.md` §8, `poc/sparse/tune.md` §3
 
 ### sqd `"pairs"` on a GPU: sort on the device, and scatter without atomics past `2^21` (2026-10-02)
 
 GH200: a stable `jnp.argsort` for the cross-group sort is 1.12–1.50× per build-plus-solve, the operator
 bit-identical; dropping the sort loses at `2^22`. One unscanned, unpadded group per scatter with
 `unique_indices` is 2.26× `base@2^19` at `2^22` but 0.67× at `2^20`. The device sort ships (GPU only); the
-atomic-free scatter does not. `poc/sparse/pairs-sort.md` §2, `poc/sparse/pairs-tune.md` §3
+atomic-free scatter does not. `poc/sparse/pairs-sort.md` §2, `poc/sparse/tune.md` §3
 
 ### sqd on a GPU with the shipped diagonals and sort: `"indices"` matches `"tables"` at half the memory (2026-10-02)
 

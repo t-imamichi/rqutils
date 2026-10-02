@@ -20,7 +20,7 @@ from rqutils.sqd._states import _MAX_STATES, StateList, _is_filler
 #: Entries per scanned chunk, so the sparse kernels' temporaries are ``O(chunk)`` (``poc/sparse/pairs.md``).
 _CHUNK = 1 << 15
 #: ``"pairs"``' chunk on a GPU, which ``_CHUNK`` under-fills: 2.71x/1.37x per iteration on a GH200 at
-#: ``2^20``/``2^22``, the smallest size on the plateau, +8 MiB temp (``poc/sparse/pairs-tune.md``).
+#: ``2^20``/``2^22``, the smallest size on the plateau, +8 MiB temp (``poc/sparse/tune.md``).
 _GPU_PAIRS_CHUNK = 1 << 19
 
 
@@ -419,7 +419,7 @@ def _scan_add(
     On CUDA a complex ``out`` is carried as its real and imaginary parts: XLA's GPU scatter otherwise
     splits the carry itself, a full pass over ``out`` per scan step. Elsewhere that costs 0.68-0.90x
     and an extra ``out`` of temp, so the carry stays complex (``poc/sparse/split.md``). CUDA also drops
-    ``ordered``, which slows its scatter 2.1-3.2x on ``"csr"`` (``poc/sparse/pairs-tune.md``).
+    ``ordered``, which slows its scatter 2.1-3.2x on ``"csr"`` (``poc/sparse/tune.md``).
     """
 
     def scan(parts, ordered):
