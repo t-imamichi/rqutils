@@ -1295,7 +1295,7 @@ read ~129 times per solve. **Do not split both axes** (41×), and expect **one c
 ### Sparse transition pairs beat every cache level on memory *and* speed (2026-09-25, prototype)
 
 Item 8 of the 2026-09-25 ideas doc, on branch `sparse-pairs`. **Every table, fixture and caveat is in
-`poc/sparse-pairs.md`** (from `poc/sparse_pairs.py`); this is the verdict. At `(1, *)` only 8--22% of the
+`poc/sparse/pairs.md`** (from `poc/sparse/pairs.py`); this is the verdict. At `(1, *)` only 8--22% of the
 `4·J` B/slot source cache is real transitions on spinchain's open XXZ; storing each XOR pair once, with its
 diagonal computed once (`H_ji = conj(H_ij)` exactly per X signature), measured on CPU against `(1, 0)`:
 **P0** 4.4--5.3× faster whole solves at −52--63% memory, **−43% setup-inclusive peak** at `2^21`; **C2R**
@@ -1306,7 +1306,7 @@ the cache thins to 1.20--1.51×. Two measured lessons: the speedup shrinks with 
 not threads** (CSR order recovers it), and the setup peak needed a **counting sort** by target, per-group
 construction and no duplicate transients. **Shipped 2026-09-26 as `sqd(matvec="pairs"|"csr")`**,
 single-device: warm `sqd` at n=60 `type1` `2^17` takes 1.26 s / 1.63 s against `"indices"`' 6.25 s
-(`poc/sparse-pairs.md` §9). **Its successor is ELLC (2026-09-27):** rows bucketed by degree rounded to a
+(`poc/sparse/pairs.md` §9). **Its successor is ELLC (2026-09-27):** rows bucketed by degree rounded to a
 ×1.25 grid, a gather-reduce per row instead of a scatter per entry — 2.0–2.4× C2R per whole solve at a
 smaller operator, peak 1.3× C2R's from compiling 19 bucket scans (§10). **Shipped beside `"csr"` as
 `sqd(matvec="ell")`** (§9). Open: GPU timing, sharding, a pruned recovery subspace.
@@ -1341,7 +1341,7 @@ saved one compile in nine calls. No committed script reproduces these numbers.
 (`_group_pairs`) and the check rebuilds each group's sources from those pairs (`_pair_xsources`: both
 directions per pair, own rows for an identity group), at ~8 B/pair of host memory kept through the solve.
 Build plus check 1.41–1.53× on an M1 (n=60 `type1`/`type2`, `2^20`/`2^21`, `"pairs"` and `"ell"`, 5/5
-rounds each), residual bit-identical; ≤ the 0.58 s check on the GH200 (`poc/sparse-gpu.md` §7), unmeasured
+rounds each), residual bit-identical; ≤ the 0.58 s check on the GH200 (`poc/sparse/gpu.md` §7), unmeasured
 there. No committed script reproduces these numbers.
 
 ### sqd sparse kernels: pairs sorted by i (2026-09-28)
@@ -2306,52 +2306,52 @@ device). `poc/prefilter-gpu.md` §7, §9.
 
 GH200, n=60, pre-`0d25235` kernels: `"pairs"` led the sparse kernels, 2.6–9.3× `"indices"` through `2^19`,
 gone by `2^21` and 0.49× at `2^22`, at −39% memory. Both per-state steps, read as L2, were the per-step
-complex-carry split that `0d25235` fixes; "keep `"indices"`" is retracted. `poc/sparse-gpu.md` §3, `poc/sparse-split.md` §4
+complex-carry split that `0d25235` fixes; "keep `"indices"`" is retracted. `poc/sparse/gpu.md` §3, `poc/sparse/split.md` §4
 
 ### sqd dense kernels on a GPU: `"indices"` is three quarters diagonal recompute, `"tables"` 2.9–5.6× its matvec (2026-10-02)
 
 GH200 profile, `type1` `2^20`/`2^22`: no carry split in the dense kernels (they never scatter). `"indices"`
 spends ~75% recomputing diagonals (179 term-passes, 241 host syncs per matvec); `"tables"` drops it, its
-`(2, N)` matvec matching the fixed `"pairs"` at `2^22` — the mesh candidate, unmeasured in solves. `poc/sparse-gpu.md` §6
+`(2, N)` matvec matching the fixed `"pairs"` at `2^22` — the mesh candidate, unmeasured in solves. `poc/sparse/gpu.md` §6
 
 ### sqd on a GPU after the carry fix: `"tables"` fastest end to end, `"pairs"` the memory option (2026-10-02)
 
 GH200, `type1`/`type2` `2^20`–`2^22`, one process: `"tables"` 3.05–4.54× `"indices"` per whole `sqd` call at
 ~2.2× its memory, fastest in 5 of 6; `"pairs"` 2.44–3.94× at ~0.55×. `"ell"` loses to host build (44% at
-`2^22`) and compile (0.84× `"indices"` cold). Superseded for `"pairs"` by the tuned run below. `poc/sparse-gpu.md` §7
+`2^22`) and compile (0.84× `"indices"` cold). Superseded for `"pairs"` by the tuned run below. `poc/sparse/gpu.md` §7
 
 ### sqd on a GPU with the tuned sparse kernels: `"pairs"` fastest end to end (2026-10-02)
 
 GH200, after the single search, the `2^19` chunk and the dropped hint: `"pairs"` 3.37–5.84× `"indices"`
 per whole call, fastest in 5 of 6 (`"tables"` +7% at `type1` `2^22`, at 3.9× the memory), 1.35–1.68× its
-previous call, 0.53–0.64× `"indices"`' memory. Its host build (42%, nearly all search) is the next lever. `poc/sparse-gpu.md` §8, §9
+previous call, 0.53–0.64× `"indices"`' memory. Its host build (42%, nearly all search) is the next lever. `poc/sparse/gpu.md` §8, §9
 
 ### sqd sparse kernels on a GPU: `"pairs"` wants bigger chunks, and a sorted-scatter hint slows it (2026-10-02)
 
 GH200, `type1` `2^20`/`2^22`: `_CHUNK` `2^15` → `2^19` is 2.71×/1.37× per iteration at +8 MiB temp, the
 plateau's edge, so it ships as `_GPU_PAIRS_CHUNK` (GPU, `"pairs"`; `2^15` is the CPU's own optimum). Merging ties;
 `indices_are_sorted` on `out[i]` is 0.37–0.64×, and dropping it from `"csr"` is 2.12–3.24×, so CUDA now drops
-it everywhere (CPU keeps it); `float64` factors 0.37–0.94×. `poc/sparse-pairs-tune.md` §2, §3
+it everywhere (CPU keeps it); `float64` factors 0.37–0.94×. `poc/sparse/pairs-tune.md` §2, §3
 
 ### sqd sparse kernels: a state-major `(N, 2)` gather layout loses on CPU (2026-10-01)
 
 M1, n=60 `type1`, `2^17`/`2^19`: gathering from `(N, 2)` instead of `(2, N)` is 0.83–0.87× on the matvec
 and 0.95–0.98× per solve iteration for all three sparse kernels, flat in N, bit-identical matvecs. A first
-run's solve figures were void: a second `jax.jit` of one function reused the first's trace. `poc/sparse-layout.md` §2, §4
+run's solve figures were void: a second `jax.jit` of one function reused the first's trace. `poc/sparse/layout.md` §2, §4
 
 ### sqd sparse kernels: a tiled `"pairs"` order is 1.08× per iteration on CPU (2026-10-01)
 
 M1, n=60 `type1`, `2^17`/`2^19`: sorting pairs by `(i >> 12, j >> 12, i)` is 1.08× per solve iteration
 (10/10 rounds), almost all from the 1-D matvec (1.20–1.27×; `(2, N)` 1.03–1.05×), at unchanged memory.
 GH200: 1.00× before the carry fix (`0d25235`), 1.01–1.03× after (10/10); skipping the cross-group sort
-loses there (0.95–0.98×), so it stays. Not shipped: the gain is below a `lexsort`'s build cost. `poc/sparse-tiles.md` §2, §3
+loses there (0.95–0.98×), so it stays. Not shipped: the gain is below a `lexsort`'s build cost. `poc/sparse/tiles.md` §2, §3
 
 ### sqd sparse kernels on a GPU: the cliff is XLA splitting the complex scan carry every step (2026-10-01)
 
 GH200 profile: 72–88% of a `"pairs"` matvec from `2^20` is `wrapped_real`/`imag`/`complex`, a full pass
 over the complex carry per scan step, so cost is `O(N × steps)`. `_scan_add` now carries real and
 imaginary parts on CUDA only: GH200 2.5–17.9× per iteration, no temp cost, every sparse kernel past
-`"indices"` (cross-run); ungated, CPU ran 0.68–0.90× with +1 `out`, hence the gate. `poc/sparse-split.md` §1, §3, §4
+`"indices"` (cross-run); ungated, CPU ran 0.68–0.90× with +1 `out`, hence the gate. `poc/sparse/split.md` §1, §3, §4
 
 ## Warm starts, collectives and the eigenpair check (2026-09)
 

@@ -1,18 +1,18 @@
 """A/B: the sparse kernels' scan carrying ``out`` as real and imaginary parts, against one complex carry.
 
-``poc/sparse_profile.py`` on the GH200 put 75-88% of a ``"pairs"`` matvec from ``2^20`` in three kernels
+``poc/sparse/kernel_profile.py`` on the GH200 put 75-88% of a ``"pairs"`` matvec from ``2^20`` in three kernels
 (``wrapped_real``/``wrapped_imag``/``wrapped_complex``) run once per scan step: XLA's GPU scatter splits
 a ``complex128`` carry and rejoins it every step, a full pass over ``out`` each. ``split`` is the library
 kernel, whose ``_scan_add`` carries the two parts itself; ``complex`` is the previous kernel, copied
 verbatim below. The split is CUDA-only (``jax.lax.platform_dependent``), so on CPU the two arms run the
-same carry and must agree bit for bit and time alike (``poc/sparse-split.md``).
+same carry and must agree bit for bit and time alike (``poc/sparse/split.md``).
 
 Each arm gets a function of its own to jit (``_SPARSE_APPLY`` is read at trace time, and a second jit of
 one function reuses the first's trace), and the lowered solves are asserted to differ. Arms are warm and
 interleaved; ``solve`` is per iteration, since GPU scatter order makes iteration counts vary. ``temp`` is
-XLA's ``temp_size_in_bytes`` for the ``(2, N)`` matvec. Fixture as ``poc/sparse_gpu.py``.
+XLA's ``temp_size_in_bytes`` for the ``(2, N)`` matvec. Fixture as ``poc/sparse/gpu.py``.
 
-Run: uv run python poc/sparse_split.py [--log2-sizes 20 21 22] [--arms pairs csr ell] [--rounds 5]
+Run: uv run python poc/sparse/split.py [--log2-sizes 20 21 22] [--arms pairs csr ell] [--rounds 5]
 """
 
 import argparse
@@ -29,7 +29,9 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)  # poc/, for its fixtures
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 
 import rqutils.sqd._solve as solve_mod

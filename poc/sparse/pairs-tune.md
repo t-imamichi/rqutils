@@ -1,14 +1,14 @@
 # Four `"pairs"` levers on a GPU
 
-`poc/sparse_pairs_tune.py` (§6) at `909ebf5` (§2) and `1443f48` (§3's sweep and `"csr"` run), one NVIDIA
+`poc/sparse/pairs_tune.py` (§6) at `909ebf5` (§2) and `1443f48` (§3's sweep and `"csr"` run), one NVIDIA
 GH200 120GB, 2026-10-02; §3's CPU sweep at `a1fcde3` on one Apple M1 (8 cores, 16 GiB). Fixture as
-`poc/sparse-gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`, `complex128`),
+`poc/sparse/gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`, `complex128`),
 Hamming-shell subspaces around both Néel states. Two results are in the library since: the chunk size,
 as `_GPU_PAIRS_CHUNK`, and dropping the sorted hint on CUDA (§3); the other levers are not.
 
 ## 1. The levers
 
-After `0d25235` a GH200 `"pairs"` matvec is 84–89% scatters (`poc/sparse-split.md` §4), stepped
+After `0d25235` a GH200 `"pairs"` matvec is 84–89% scatters (`poc/sparse/split.md` §4), stepped
 `_CHUNK = 32768` entries at a time: 128 steps at `2^20` and 320 at `2^22`, each kernel a fraction of the
 GPU. Four levers, crossed with chunk sizes `2^15`, `2^17` and `2^19`:
 
@@ -70,7 +70,7 @@ Every arm's eigenvalue agrees with the reference to 7.9e-16, and its iteration c
 - **The sorted hint is a large slowdown**: 0.37–0.64× per iteration, 0.23–0.41× on the `(2, N)` matvec.
   On the GPU, XLA's scatter with `indices_are_sorted=True` is the slower one. The library's `"csr"`
   passes that flag, and `"csr"` is the slowest sparse kernel on the GH200 (58.00 ms per iteration
-  against `"pairs"`' 20.35 at `type2` `2^22`, `poc/sparse-split.md` §4). **Confirmed** with
+  against `"pairs"`' 20.35 at `type2` `2^22`, `poc/sparse/split.md` §4). **Confirmed** with
   `--matvec csr --chunks 15 19`, `type1`, per iteration against the shipped `"csr"`:
 
   | `"csr"` arm | `2^20` | `2^22` |
@@ -90,7 +90,7 @@ Every arm's eigenvalue agrees with the reference to 7.9e-16, and its iteration c
 ## 4. What it means
 
 At `type1` `2^22` the best arm's 14.7 ms per iteration is below `"tables"`' 21.06
-(`poc/sparse-gpu.md` §7). With the single host search (`b38d48b`), a `"pairs"` call would land near
+(`poc/sparse/gpu.md` §7). With the single host search (`b38d48b`), a `"pairs"` call would land near
 `"tables"`' 2.65 s at about a quarter of its memory — a projection from the solve stage, not a whole
 call. The GPU-only chunk ships at `2^19`; `merged`, `sorted` and `real` are not worth building.
 
@@ -98,11 +98,11 @@ call. The GPU-only chunk ships at `2^19`; `merged`, `sorted` and `real` are not 
 
 1. **`"ell"` at a larger chunk** on the GPU; the script has no `ell` mode.
 2. **The whole `"pairs"` call** against `"tables"` with the chunk and the single search (§4's projection):
-   `poc/sparse_gpu.py --arms indices tables pairs --log2-sizes 20 21 22`.
+   `poc/sparse/gpu.py --arms indices tables pairs --log2-sizes 20 21 22`.
 
 ## 6. The script
 
-`poc/sparse_pairs_tune.py`, its argparse checked against this section:
+`poc/sparse/pairs_tune.py`, its argparse checked against this section:
 
 | flag | default | meaning |
 | --- | --- | --- |

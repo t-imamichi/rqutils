@@ -125,12 +125,12 @@ cheaper option in memory too.
   the all-real groups and ``complex128`` for the rest.
 - ``Matvec.ELL``: the same transitions and split, with rows bucketed by degree rounded up on a
   :math:`\times 1.25` grid into dense ``(rows, width)`` blocks, so each row is one gathered sum rather
-  than a scatter per entry (``poc/sparse-pairs.md``, section 10).
+  than a scatter per entry (``poc/sparse/pairs.md``, section 10).
 
 The other dense storage combinations are dominated on both memory and time (``NOTES.md``). The last
 three store only the transitions that land inside the subspace, where the source indices mostly hold
 the ``-1`` absent marker; :func:`sqd` builds them host-side before the solve, they are single-device
-for now, and ``poc/sparse-pairs.md`` has the measurements.
+for now, and ``poc/sparse/pairs.md`` has the measurements.
 
 **The source-index setup dominates the solve, so this is not a symmetric memory-for-speed dial:**
 ``Matvec.ONTHEFLY`` pays the :math:`J`-fold :func:`get_xsource` search once per matvec rather than

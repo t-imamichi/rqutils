@@ -5,12 +5,12 @@
 front for the gathers and scatters, so the batch's values share a cache line (or GPU sector), and moves
 it back after. ``row`` is the shipped kernel. Both arms are warm and interleaved, one round each. The
 matvecs agree bit for bit, but fused into the solve the iteration count can differ, so ``solve`` is per
-iteration and the eigenvalues must agree to ``1e-12`` relative (``poc/sparse-layout.md``).
+iteration and the eigenvalues must agree to ``1e-12`` relative (``poc/sparse/layout.md``).
 
-Fixture as ``poc/sparse_gpu.py``. ``solve`` is ``_run_sparse`` alone; ``matvec`` the jitted kernel on a
+Fixture as ``poc/sparse/gpu.py``. ``solve`` is ``_run_sparse`` alone; ``matvec`` the jitted kernel on a
 ``(2, N)`` complex vector passed as an argument.
 
-Run: uv run python poc/sparse_layout.py [--log2-sizes 17 19] [--arms pairs ell] [--rounds 5]
+Run: uv run python poc/sparse/layout.py [--log2-sizes 17 19] [--arms pairs ell] [--rounds 5]
 """
 
 import argparse
@@ -27,7 +27,9 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)  # poc/, for its fixtures
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 
 import rqutils.sqd._solve as solve_mod

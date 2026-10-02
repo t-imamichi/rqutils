@@ -17,10 +17,10 @@ from rqutils.sqd._diagonal import _z_parity, get_diagonal
 from rqutils.sqd._solve import _SOLVE_STATIC, Matvec, SqdResult, _solve
 from rqutils.sqd._states import _MAX_STATES, StateList, _is_filler
 
-#: Entries per scanned chunk, so the sparse kernels' temporaries are ``O(chunk)`` (``poc/sparse-pairs.md``).
+#: Entries per scanned chunk, so the sparse kernels' temporaries are ``O(chunk)`` (``poc/sparse/pairs.md``).
 _CHUNK = 1 << 15
 #: ``"pairs"``' chunk on a GPU, which ``_CHUNK`` under-fills: 2.71x/1.37x per iteration on a GH200 at
-#: ``2^20``/``2^22``, the smallest size on the plateau, +8 MiB temp (``poc/sparse-pairs-tune.md``).
+#: ``2^20``/``2^22``, the smallest size on the plateau, +8 MiB temp (``poc/sparse/pairs-tune.md``).
 _GPU_PAIRS_CHUNK = 1 << 19
 
 
@@ -216,7 +216,7 @@ def _entry_factors(
 
 
 #: ``"ell"``'s row widths, a x1.25 geometric grid: few buckets (each its own compiled scan) at a few
-#: percent padding (``poc/sparse-pairs.md``, section 10).
+#: percent padding (``poc/sparse/pairs.md``, section 10).
 _ELL_WIDTHS = np.unique(np.ceil(1.25 ** np.arange(100)).astype(np.int64))
 
 
@@ -256,7 +256,7 @@ def _sort_by_target(
     With ``both=False``, each pair once as ``(i, j)``, sorted by ``i``: ``"pairs"``' layout.
 
     ``alloc`` returns arrays for ``(target, source, group)`` or ``(source, group)``. A row occurs at
-    most once per group, so each group's fill is conflict-free (``poc/sparse-pairs.md``, section 2);
+    most once per group, so each group's fill is conflict-free (``poc/sparse/pairs.md``, section 2);
     each group is popped from ``pairs`` once written. Returns the arrays and each row's end offset.
     """
     directions = 2 if both else 1
@@ -395,8 +395,8 @@ def _scan_add(
 
     On CUDA a complex ``out`` is carried as its real and imaginary parts: XLA's GPU scatter otherwise
     splits the carry itself, a full pass over ``out`` per scan step. Elsewhere that costs 0.68-0.90x
-    and an extra ``out`` of temp, so the carry stays complex (``poc/sparse-split.md``). CUDA also drops
-    ``ordered``, which slows its scatter 2.1-3.2x on ``"csr"`` (``poc/sparse-pairs-tune.md``).
+    and an extra ``out`` of temp, so the carry stays complex (``poc/sparse/split.md``). CUDA also drops
+    ``ordered``, which slows its scatter 2.1-3.2x on ``"csr"`` (``poc/sparse/pairs-tune.md``).
     """
 
     def scan(parts, ordered):

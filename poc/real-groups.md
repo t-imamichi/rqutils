@@ -98,7 +98,7 @@ Converged warm `sqd` solves, min of 2 per process, three interleaved rounds. Bot
 The first write-up reported only `type2`, and so overstated the result.
 
 Converged solves also mislead a second way. The new group order puts unsplit `type1` on the known
-105-iteration trajectory (`poc/sparse-pairs.md` §10), against dev's and split's 96. The fixed costs are
+105-iteration trajectory (`poc/sparse/pairs.md` §10), against dev's and split's 96. The fixed costs are
 then divided over different counts: the prefilter's 66 matvecs, the source-index precompute and the
 residual check. So ms/iter flatters the arm that iterates longer:
 

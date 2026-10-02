@@ -1,6 +1,6 @@
 """Per-kernel time of one ``sqd`` matvec, from a ``jax.profiler`` trace: where the GPU time goes.
 
-``poc/sparse-tiles.md`` §3 found the GH200's ``"pairs"`` cost insensitive to entry order, so the cost is
+``poc/sparse/tiles.md`` §3 found the GH200's ``"pairs"`` cost insensitive to entry order, so the cost is
 not locality; this splits it by XLA kernel (gather, scatter, the ``scan``'s per-step work) at each size,
 for a 1-D and a ``(2, N)`` vector. ``--matvec`` picks the kernel, its arrays built as the solve builds
 them (``_sparse_operator``, or ``run_sqd``'s parts for the dense three). Per size it prints the scan-step
@@ -8,9 +8,9 @@ or X-group counts, then per shape the device time per call, kernel launches per 
 kernels by time.
 
 Device events are read from the trace's ``/device:`` processes; on a CPU-only run there are none, so it
-falls back to host XLA ops (a smoke test, not a measurement). Fixture as ``poc/sparse_gpu.py``.
+falls back to host XLA ops (a smoke test, not a measurement). Fixture as ``poc/sparse/gpu.py``.
 
-Run: uv run python poc/sparse_profile.py [--matvec indices] [--log2-sizes 19 20 21 22] [--calls 10]
+Run: uv run python poc/sparse/kernel_profile.py [--matvec indices] [--log2-sizes 19 20 21 22] [--calls 10]
 """
 
 import argparse
@@ -30,7 +30,9 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)  # poc/, for its fixtures
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 
 from rqutils.paulis.symplectic import PauliSumXZ

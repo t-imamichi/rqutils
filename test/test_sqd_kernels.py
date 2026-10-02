@@ -919,7 +919,7 @@ class TestSparseKernels:
 
     def test_gpu_pairs_chunk(self, monkeypatch):
         """``"pairs"`` alone steps ``_GPU_PAIRS_CHUNK`` entries on a GPU: ``_CHUNK`` under-filled a GH200
-        (2.71x/1.37x per iteration at ``2^20``/``2^22``, ``poc/sparse-pairs-tune.md``), while ``"csr"``,
+        (2.71x/1.37x per iteration at ``2^20``/``2^22``, ``poc/sparse/pairs-tune.md``), while ``"csr"``,
         ``"ell"`` and the CPU are unmeasured or chose ``_CHUNK``.
         """
         import rqutils.sqd._sparse as sparse_module
@@ -957,7 +957,7 @@ class TestComplexScanCarry:
 
     XLA's GPU scatter splits a complex carry into real and imaginary parts and rejoins it at every scan
     step, a full pass over ``out`` each: 75-88% of a GH200 ``"pairs"`` matvec from ``2^20``, the cliff
-    ``poc/sparse-gpu.md`` section 3 read as L2. On CPU the split is the slower one (0.68-0.90x per
+    ``poc/sparse/gpu.md`` section 3 read as L2. On CPU the split is the slower one (0.68-0.90x per
     iteration), so ``jax.lax.platform_dependent`` picks; this checks both branches as traced.
     """
 
@@ -1003,7 +1003,7 @@ class TestSortedHintPerPlatform:
     """On CUDA no sparse scatter carries ``indices_are_sorted``; elsewhere ``"csr"``'s still do.
 
     The hint slowed XLA's GPU scatter: ``"csr"`` ran 2.12-3.24x per iteration on a GH200 without it, and
-    ``"pairs"`` 0.37-0.64x with it on ``out[i]`` (``poc/sparse-pairs-tune.md``). Unmeasured elsewhere, so
+    ``"pairs"`` 0.37-0.64x with it on ``out[i]`` (``poc/sparse/pairs-tune.md``). Unmeasured elsewhere, so
     the CPU keeps it; a real carry takes the same switch.
     """
 

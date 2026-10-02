@@ -2,7 +2,7 @@
 
 Item 8 of `markdown/improvement-ideas-2026-09-25.md`, prototyped on branch `sparse-pairs`, one laptop CPU
 (10 cores, 64 GiB), 2026-09-25/26. Nothing here is in the library yet. The GPU is the open question.
-Every number below comes from `poc/sparse_pairs.py` (§8).
+Every number below comes from `poc/sparse/pairs.py` (§8).
 
 ## The idea
 
@@ -223,7 +223,7 @@ Hamming shells. Shell `h` for `type1`/`type2` is read off `type4`/`type3`, which
 
 ## 7. Open before a library version
 
-1. **GPU timing — measured** for the shipped kernels against `"indices"`: `poc/sparse-gpu.md`.
+1. **GPU timing — measured** for the shipped kernels against `"indices"`: `poc/sparse/gpu.md`.
 2. **Sharding.** A pair's endpoints can sit on different devices; CSR needs its sources gathered.
 3. **API — done.** P2 and C2R ship as `sqd(matvec="pairs")` and `sqd(matvec="csr")` (§9); P0 and C0i16
    were not shipped.
@@ -234,7 +234,7 @@ Hamming shells. Shell `h` for `type1`/`type2` is read off `type4`/`type3`, which
 6. **What to try on the GPU, from the literature (2026-09-27).**
    - *Scan-step size first.* A `2^15`-entry step means ~6,000 steps per matvec at N = 2·10⁷; at ~10 µs of
      launch cost each that is ~60 ms against ~5 ms of memory traffic (an estimate). **Measured**
-     (`poc/sparse-pairs-tune.md` §3): `"pairs"` plateaus at `2^19` on the GH200 and ships it there;
+     (`poc/sparse/pairs-tune.md` §3): `"pairs"` plateaus at `2^19` on the GH200 and ships it there;
      `2^15` is the CPU's optimum. `"ell"` and a whole bucket with no scan are unswept.
    - *`"ell"`'s row write:* each row is in one bucket, so `.at[rows].set(val, unique_indices=True,
      indices_are_sorted=True)` can replace the `add` and avoid atomics.
@@ -258,7 +258,7 @@ Hamming shells. Shell `h` for `type1`/`type2` is read off `type4`/`type3`, which
 
 ## 8. The script
 
-Everything above is `poc/sparse_pairs.py`, every arm built by one function (`operators`):
+Everything above is `poc/sparse/pairs.py`, every arm built by one function (`operators`):
 
 | subcommand | what it measures |
 | --- | --- |

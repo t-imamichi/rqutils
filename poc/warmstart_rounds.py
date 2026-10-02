@@ -3,7 +3,7 @@
 `poc/warmstart.py` could not judge any warm start: on its fixtures the previous eigenvector was ~99% of the
 next answer, so even the rejected zero-padded start won 19/19 (`markdown/skqd-warmstart-negative-result.md`).
 Here the subspace grows the way spinchain's recovery grows one -- ranked `|<c|H|v>|` expansion, doubling
-per round (`sparse_pairs.recovery_subspace`) -- and the ground energy moves every round, so new states
+per round (`sparse.pairs.recovery_subspace`) -- and the ground energy moves every round, so new states
 carry real weight. The write-up is `poc/warmstart-rounds.md`.
 
 Arms, each driving `ground_locg` as `run_sqd` does (batched, `Σ|c|` bound) at every prefilter setting:
@@ -34,7 +34,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 from eigenpair_check_scale import hamming_shells, patterns, xxz
-from sparse_pairs import recovery_scores, run_sqd_vinit, term_masks, to_codes
+from sparse.pairs import recovery_scores, run_sqd_vinit, term_masks, to_codes
 
 from rqutils.ground_locg import ground_locg
 from rqutils.paulis.symplectic import PauliSumXZ

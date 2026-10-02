@@ -1,16 +1,16 @@
 """Where a sparse kernel's host build goes: search, sort, factors and the rest, per ``--matvec``.
 
 On the GH200 ``"ell"``'s build is 4.77 s of an 11.86 s ``type2`` ``2^22`` call against ``"pairs"``' 1.63
-(``poc/sparse-gpu.md`` §8), and on an M1 the search is ~60% of it, the two-direction sort ~20% and the
+(``poc/sparse/gpu.md`` §8), and on an M1 the search is ~60% of it, the two-direction sort ~20% and the
 factors 6-8%. ``"ell"``'s ``_flat_factors`` calls ``_entry_factors`` once per ``_CHUNK``-entry chunk,
 ~1,900 device calls there, each with its own copies and launch: cheap on CPU, maybe not on a GPU.
 
 Each stage is timed by wrapping the module function with a sync, so a stage includes its device work;
 ``factors`` is ``_flat_factors`` for ``"ell"`` and ``_entry_factors`` otherwise, with its device-call
 count. ``rest`` is the build minus the named stages (bucket assembly, padding, copies). One warm-up build,
-then the median of ``--repeats``. Fixture as ``poc/sparse_gpu.py``.
+then the median of ``--repeats``. Fixture as ``poc/sparse/gpu.py``.
 
-Run: uv run python poc/sparse_build.py [--matvec ell pairs] [--patterns type1 type2] [--log2-sizes 20 22]
+Run: uv run python poc/sparse/build.py [--matvec ell pairs] [--patterns type1 type2] [--log2-sizes 20 22]
 """
 
 import argparse
@@ -26,7 +26,9 @@ jax.config.update("jax_enable_x64", True)
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)  # poc/, for its fixtures
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 
 import rqutils.sqd._sparse as sm

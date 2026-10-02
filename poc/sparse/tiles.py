@@ -12,9 +12,9 @@ Only the data order changes: one compiled solve serves every arm. ``matvec`` is 
 1-D). Each arm holds the same entries as ``i`` (asserted), its solve is timed per iteration (scatter
 order changes rounding, so iteration counts can differ), arms are warm and interleaved, and eigenvalues
 must agree to ``1e-12`` relative.
-Fixture as ``poc/sparse_gpu.py``.
+Fixture as ``poc/sparse/gpu.py``.
 
-Run: uv run python poc/sparse_tiles.py [--log2-sizes 17 19] [--tiles 12 14 16] [--rounds 5]
+Run: uv run python poc/sparse/tiles.py [--log2-sizes 17 19] [--tiles 12 14 16] [--rounds 5]
 """
 
 import argparse
@@ -31,7 +31,9 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)  # poc/, for its fixtures
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 
 import rqutils.sqd._solve as solve_mod

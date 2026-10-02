@@ -1,7 +1,7 @@
 # A state-major gather layout for the sparse kernels
 
-`poc/sparse_layout.py` (§6), one Apple M1 (8 cores, 16 GiB), CPU only, 2026-10-01. Fixture as
-`poc/sparse-gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`, `complex128`),
+`poc/sparse/layout.py` (§6), one Apple M1 (8 cores, 16 GiB), CPU only, 2026-10-01. Fixture as
+`poc/sparse/gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`, `complex128`),
 Hamming-shell subspaces around both Néel states. Nothing here is in the library.
 
 ## 1. The idea
@@ -11,7 +11,7 @@ Hamming-shell subspaces around both Néel states. Nothing here is in the library
 two cache lines (or GPU sectors), each half used. Moving the state axis first, `(N, 2)`, puts both values
 in one 32 B run. The `col` arm does that inside each kernel — `moveaxis` in, the same scans on the
 state-major array, `moveaxis` out — and `row` is the shipped kernel. It was the first lever proposed for
-`poc/sparse-gpu.md` §3's L2 cliff, tried on CPU first because a 64 B line holds the pair the same way.
+`poc/sparse/gpu.md` §3's L2 cliff, tried on CPU first because a 64 B line holds the pair the same way.
 
 ## 2. Results
 
@@ -57,16 +57,16 @@ the two lowered solves differ.
 Open:
 
 1. **The GPU**, which is where §1 aimed: a 32 B sector holds exactly the `(N, 2)` pair, and
-   `poc/sparse-gpu.md` §3's cliff is bandwidth-shaped where this CPU's is not. No CPU evidence now
-   favours it; `poc/sparse-gpu.md` §10.4's tiled order (pairs sorted by `(i >> s, j >> s, i)`) ranks first.
-   Run: `uv run python poc/sparse_layout.py --log2-sizes 19 20 21` on the GPU host.
+   `poc/sparse/gpu.md` §3's cliff is bandwidth-shaped where this CPU's is not. No CPU evidence now
+   favours it; `poc/sparse/gpu.md` §10.4's tiled order (pairs sorted by `(i >> s, j >> s, i)`) ranks first.
+   Run: `uv run python poc/sparse/layout.py --log2-sizes 19 20 21` on the GPU host.
 2. **A layout carried through the solver**, so no matvec transposes: `ground_locg` would hold `(N, 2)`
    throughout. Untried; it is the only form in which the transpose cost could vanish.
 3. **`2^20` and up on CPU**, and `"indices"`, which gathers from the same `(2, N)` layout.
 
 ## 6. The script
 
-`poc/sparse_layout.py`, its argparse checked against this section:
+`poc/sparse/layout.py`, its argparse checked against this section:
 
 | flag | default | meaning |
 | --- | --- | --- |
@@ -77,6 +77,6 @@ Open:
 | `--rounds` | `5` | interleaved `row`/`col` rounds after one warm-up each |
 
 `solve` is `_run_sparse` with `return_eigvec=False`, its time divided by that solve's iteration count
-(captured by wrapping `ground_locg` with a host callback, as `poc/sparse_gpu.py`); `matvec` is the bare
+(captured by wrapping `ground_locg` with a host callback, as `poc/sparse/gpu.py`); `matvec` is the bare
 kernel jitted on a fixed `(2, N)` random vector passed as an argument. The host build is outside both.
 Runs here: the default sweep.

@@ -1,6 +1,6 @@
 """A/B of four ``"pairs"`` levers on a GPU: chunk size, a sorted ``i`` scatter, one merged scatter, real factors.
 
-After ``0d25235`` a GH200 ``"pairs"`` matvec is 84-89% scatters (``poc/sparse-split.md`` §4), stepping
+After ``0d25235`` a GH200 ``"pairs"`` matvec is 84-89% scatters (``poc/sparse/split.md`` §4), stepping
 ``_CHUNK = 32768`` entries at a time: 320 steps and 1603 launches per call at ``type2`` ``2^22``, each
 kernel a fraction of the GPU. Arms are every ``--chunks`` × ``--variants``:
 
@@ -21,9 +21,9 @@ this ran, ``_GPU_PAIRS_CHUNK``), for either ``--matvec``. Every arm keeps the li
 split (``_scan_add``'s rule), gets a function of its own to jit, and the solves are asserted
 pairwise distinct as traced. Arms are warm and interleaved; ``solve`` is per iteration (GPU scatter order varies
 iteration counts); eigenvalues must agree to ``1e-12`` relative. ``op`` is the operator's device bytes,
-``temp`` XLA's ``temp_size_in_bytes`` for the ``(2, N)`` matvec. Fixture as ``poc/sparse_gpu.py``.
+``temp`` XLA's ``temp_size_in_bytes`` for the ``(2, N)`` matvec. Fixture as ``poc/sparse/gpu.py``.
 
-Run: uv run python poc/sparse_pairs_tune.py [--log2-sizes 20 22] [--chunks 15 17 19]
+Run: uv run python poc/sparse/pairs_tune.py [--log2-sizes 20 22] [--chunks 15 17 19]
      [--variants base sorted merged real] [--rounds 5] [--matvec csr|ell]
 """
 
@@ -41,7 +41,9 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)  # poc/, for its fixtures
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 
 import rqutils.sqd._solve as solve_mod

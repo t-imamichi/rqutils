@@ -40,7 +40,7 @@ the diagonal**. Two ways to make it cheaper were tried:
 
    Either way, `(1 − 2·(P & 1)) @ c` finishes the diagonal.
 
-The fixtures are spinchain's open XXZ at n=60 on Hamming-shell subspaces (`poc/sparse_pairs.py`'s
+The fixtures are spinchain's open XXZ at n=60 on Hamming-shell subspaces (`poc/sparse/pairs.py`'s
 `spinchain_problem`), where B=8:
 
 | fixture | groups J | real terms ΣK | identity group K | other groups K |
@@ -125,11 +125,11 @@ Nothing in this scales in their favour, and `type2`'s many small groups make it 
    - The question is whether XLA lowers `jnp.dot(int8, int8, preferred_element_type=int32)` to an INT8
      tensor-core GEMM through cuBLASLt, fast enough to recover the 7–9× the CPU form loses.
    - It needs K padded to a multiple of 4: the identity group's 59 to 60 or 64.
-   - Run `poc/parity_xor.py onepass` beside `poc/sparse-pairs.md` §7 item 6.
+   - Run `poc/parity_xor.py onepass` beside `poc/sparse/pairs.md` §7 item 6.
    - It only matters for sharded `INDICES` runs, since single-device runs have `ELL`.
 2. **A Hamiltonian with large-K non-identity groups.** Here only the identity group has more than two
    terms. A fixture where many groups carry tens of Z terms would test the one-pass premise where it is
-   strongest. That is molecular-like JW, which is `poc/sparse_pairs.py general`'s second fixture.
+   strongest. That is molecular-like JW, which is `poc/sparse/pairs.py general`'s second fixture.
 
 ## 5. The script
 

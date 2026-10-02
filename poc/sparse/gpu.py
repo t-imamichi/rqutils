@@ -1,7 +1,7 @@
 """The sparse matvec kernels (``Matvec.PAIRS``/``CSR``/``ELL``) through ``sqd`` on one GPU.
 
-``poc/sparse-pairs.md`` was measured on a laptop CPU; the GPU is its open question. Fixture: spinchain's
-open-XXZ ``xxz`` with Hamming-shell subspaces, as ``poc/sparse_pairs.py``, over every ``--patterns``. Each
+``poc/sparse/pairs.md`` was measured on a laptop CPU; the GPU is its open question. Fixture: spinchain's
+open-XXZ ``xxz`` with Hamming-shell subspaces, as ``poc/sparse/pairs.py``, over every ``--patterns``. Each
 arm runs one warm-up solve (compile) then ``--repeats`` timed solves; every eigenvalue is checked against
 ``Matvec.INDICES``, and against a host ``hproj`` + ``eigsh`` oracle up to ``--oracle-log2``.
 
@@ -14,7 +14,7 @@ Each arm runs in its own subprocess: ``peak_bytes_in_use`` is a process-wide hig
 so a shared process would report the largest arm's peak for every later one. The parent is pinned to CPU
 so it holds no GPU memory (nor XLA's preallocation) while a child runs.
 
-Run: uv run python poc/sparse_gpu.py [--patterns type1 type2] [--log2-sizes 17 19 21]
+Run: uv run python poc/sparse/gpu.py [--patterns type1 type2] [--log2-sizes 17 19 21]
      [--arms indices pairs csr ell] [--device 0]
 """
 
@@ -51,7 +51,9 @@ jax.config.update("jax_enable_x64", True)
 import numpy as np
 from scipy.sparse.linalg import eigsh
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)  # poc/, for its fixtures
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 
 import rqutils.sqd._solve as solve_mod
