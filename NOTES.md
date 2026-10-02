@@ -2318,7 +2318,13 @@ spends ~75% recomputing diagonals (179 term-passes, 241 host syncs per matvec); 
 
 GH200, `type1`/`type2` `2^20`–`2^22`, one process: `"tables"` 3.05–4.54× `"indices"` per whole `sqd` call at
 ~2.2× its memory, fastest in 5 of 6; `"pairs"` 2.44–3.94× at ~0.55×. `"ell"` loses to host build (44% at
-`2^22`) and compile (0.84× `"indices"` cold). `"indices"` stays the CPU-chosen default. `poc/sparse-gpu.md` §7, §8
+`2^22`) and compile (0.84× `"indices"` cold). Superseded for `"pairs"` by the tuned run below. `poc/sparse-gpu.md` §7
+
+### sqd on a GPU with the tuned sparse kernels: `"pairs"` fastest end to end (2026-10-02)
+
+GH200, after the single search, the `2^19` chunk and the dropped hint: `"pairs"` 3.37–5.84× `"indices"`
+per whole call, fastest in 5 of 6 (`"tables"` +7% at `type1` `2^22`, at 3.9× the memory), 1.35–1.68× its
+previous call, 0.53–0.64× `"indices"`' memory. Its host build (42%, nearly all search) is the next lever. `poc/sparse-gpu.md` §8, §9
 
 ### sqd sparse kernels on a GPU: `"pairs"` wants bigger chunks, and a sorted-scatter hint slows it (2026-10-02)
 

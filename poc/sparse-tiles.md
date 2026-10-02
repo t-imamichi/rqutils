@@ -10,7 +10,7 @@ Hamming-shell subspaces around both Néel states. Nothing here is in the library
 `"pairs"` stores each transition once as `(i, j, d)`, sorted by `i` across groups since `d84c4a3`, so
 `vec[i]`/`out[i]` stream while `vec[j]`/`out[j]` land anywhere in the vector. Sorting by
 `(i >> s, j >> s, i)` instead makes consecutive chunks touch one `2^s`-state slice of each side. It was
-`poc/sparse-gpu.md` §9.4's blocked-matvec lever for the L2 cliff. Only the data order changes, so one
+`poc/sparse-gpu.md` §10.4's blocked-matvec lever for the L2 cliff. Only the data order changes, so one
 compiled solve serves every arm. Arms:
 
 - `i`: shipped.
