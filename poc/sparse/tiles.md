@@ -102,8 +102,9 @@ fixed kernel (the script calls the library's):
 - **Skipping the cross-group sort loses in the solve**: `group` is 0.95–0.98× per iteration and 0.91× on
   the `(2, N)` matvec at `2^21`. "It stays", first concluded here, weighed that against the sort's ~9–14%
   of an *M1* build (§4); on the GH200's host the sort is 48–63% of the build (`poc/sparse/gpu.md` §8),
-  about 1.0 s against ~0.1 s of solve at `type2` `2^22`, so the verdict is open, pending
-  `poc/sparse/pairs_sort.py`'s whole-call measurement.
+  about 1.0 s against ~0.1 s of solve at `type2` `2^22`. Measured whole (`poc/sparse/pairs-sort.md`),
+  dropping the sort still loses at `2^22` (0.95–0.98× per call, the solve 0.64–0.85×), and a stable sort
+  **on the device** wins, 1.12–1.50×: the sort stays, moved to the GPU.
 - Eigenvalues agree to 5.3e-16; iteration counts vary by ±1, as before.
 
 ## 4. What it costs

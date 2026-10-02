@@ -249,7 +249,8 @@ decision.
    `CUDA_ERROR_NO_DEVICE` — undiagnosed; the likeliest cause is `--device` overriding a scheduler's
    `CUDA_VISIBLE_DEVICES`.
 8. **The sparse kernels' host build** (§8), 42% of a `"pairs"` call at `type2` `2^22`, half of it the
-   sort: drop it or make it faster (`poc/sparse/pairs_sort.py`); for `"ell"`, batch its factor calls.
+   sort. A stable sort on the device is 1.12–1.50× per `"pairs"` call (`poc/sparse/pairs-sort.md`),
+   unshipped; dropping the sort loses. For `"ell"`, batch its factor calls.
 9. **`"ell"`'s compile cost** (§7's first calls), and whether the persistent compile cache recovers it.
 10. **`"tables"` on a multi-GPU mesh**, the setting §9 recommends it for.
 

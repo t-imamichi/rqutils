@@ -91,7 +91,11 @@ Every arm's eigenvalue agrees with the reference to 7.9e-16, and its iteration c
   group per scan step with `unique_indices=True`, since a group's pairs are a perfect matching. 0.50× at
   `2^20` (3.19 against 1.60 ms per iteration, 61 steps against 8) and **1.76× at `2^22`** (8.42 against
   14.84 ms; 1-D matvec 2.44×), at a 73% larger operator (526 against 304 MiB) from padding every group to
-  the largest. `unique-exact`, the same unscanned and per-group sized, is unrun on the GPU (§5).
+  the largest. **`unique-exact`**, the same unscanned and each group sized to its own count, removes the
+  padding (300 against 304 MiB) and is **2.26× `base@2^19` at `2^22`** (6.57 against 14.85 ms per
+  iteration; 1-D 3.07×) but 0.67× at `2^20` (2.39 against 1.60 ms): 122 scatter launches on groups of ~69k
+  pairs at `2^20` against ~162k at `2^22`. A switch on group size is the shape; its threshold, `type2`
+  and the per-group compile cost are unmeasured.
 
 ### `"ell"`: chunk size and width grid
 
@@ -115,12 +119,13 @@ At `type1` `2^22` the best arm's 14.7 ms per iteration is below `"tables"`' 21.0
 (`poc/sparse/gpu.md` §7). With the single host search (`b38d48b`), a `"pairs"` call would land near
 `"tables"`' 2.65 s at about a quarter of its memory — a projection from the solve stage, not a whole
 call. The GPU-only chunk ships at `2^19`; `merged`, `sorted` and `real` are not worth building.
-`unique` wins only where groups are large, at a padding cost `unique-exact` may remove. `"ell"`'s GPU
+`unique-exact` (no padding) is 2.26× at `2^22` and 0.67× at `2^20`, so it wants a size switch. `"ell"`'s GPU
 setting is `2^17` and the ×2 grid, worth shipping once its build's factor calls are batched.
 
 ## 5. Open
 
-1. **`unique-exact` on the GPU**: `--chunks 19 --variants base unique unique-exact`.
+1. **`unique-exact`'s switch point**: `type2`, sizes between `2^20` and `2^22`, and its first-call
+   compile cost (one shape per group).
 2. **`"ell"`'s factor calls batched**, and its GPU chunk and grid in the library.
 3. **The whole `"pairs"` call** — measured since: `poc/sparse/gpu.md` §8.
 

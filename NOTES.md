@@ -2345,6 +2345,12 @@ GH200, `2^20`/`2^22`: a `"pairs"` build is search 35–49% and the cross-group s
 search"; `"ell"`'s adds 2,049 factor calls (31%). `get_xsource` on the device is 0.57–0.91× the host search.
 `"ell"` wants chunk `2^17` and a ×2 grid there (1.24–1.74×); `(N, 2)` vectors lose on GPU too. `poc/sparse/gpu.md` §8, `poc/sparse/pairs-tune.md` §3
 
+### sqd `"pairs"` on a GPU: sort on the device, and scatter without atomics past `2^21` (2026-10-02)
+
+GH200: a stable `jnp.argsort` for the cross-group sort is 1.12–1.50× per build-plus-solve, the operator
+bit-identical; dropping the sort loses at `2^22`. One unscanned, unpadded group per scatter with
+`unique_indices` is 2.26× `base@2^19` at `2^22` but 0.67× at `2^20`. Both unshipped. `poc/sparse/pairs-sort.md` §2, `poc/sparse/pairs-tune.md` §3
+
 ### sqd sparse kernels: a state-major `(N, 2)` gather layout loses on CPU (2026-10-01)
 
 M1, n=60 `type1`, `2^17`/`2^19`: gathering from `(N, 2)` instead of `(2, N)` is 0.83–0.87× on the matvec

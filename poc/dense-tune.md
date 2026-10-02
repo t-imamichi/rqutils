@@ -48,6 +48,11 @@ Per solve iteration against `run_sqd`, every ratio won 5/5; `temp` is the `(2, N
 - **`id-static` makes `"indices"` competitive**: 23.52 ms per iteration at `2^22` against `"tables"`'
   20.39 and the tuned `"pairs"`' 14.84 (`poc/sparse/pairs-tune.md` §3), at `"indices"`' memory plus one
   vector; 11.62 ms with `unroll=4`'s gigabyte.
+- **A second run** (`--matvecs indices onthefly --variants plain id-static --unrolls 1 2`) reproduces
+  `"indices"`' `id-static` at `unroll=1` (4.50× / 3.24×, temp 3 / 12 MiB); `unroll=2` reaches 6.74× /
+  5.15× at 984 MiB of temp at `2^22`, no cheap middle. **`"onthefly"`** gains 1.45× with `id-static`
+  at `2^20` (1.54× at `unroll=2`), its per-matvec search diluting it; its `2^22` was cut by the job's
+  walltime.
 - Iterations match `run_sqd` in every arm; eigenvalues agree exactly.
 
 ## 3. On CPU
@@ -77,8 +82,9 @@ threshold, with the `while_loop` kept above it, is unmeasured and needs a large-
 
 1. **The `kmax` threshold**, on a molecular-like fixture with many Z terms per group
    (`poc/sparse/pairs.py general`).
-2. **`"onthefly"`** on either backend with `id-static`.
-3. **`unroll` with bounded temp**: whether a smaller unroll (2) keeps the speed without the gigabytes.
+2. **`"onthefly"`** at `2^22` on the GPU, and on CPU, with `id-static` (1.45× at `2^20` on the GH200).
+3. **`unroll` with bounded temp**: `unroll=2` already holds ~1 GB at `2^22`; anything above 1 trades
+   memory for speed.
 
 ## 6. The script
 
@@ -96,6 +102,7 @@ threshold, with the `while_loop` kept above it, is unmeasured and needs a large-
 
 `solve` includes the setup, as `run_sqd`'s; `1-D` and `(2, N)` are the kernel alone. Traced solves are
 asserted pairwise distinct and products equal to `run_sqd`'s to `1e-12`. Runs here: `--log2-sizes 20 22
---unrolls 1 4 8` on the GH200; on the M1, `--log2-sizes 17 19 --matvecs indices onthefly --unrolls 1`
+--unrolls 1 4 8` and `--matvecs indices onthefly --variants plain id-static --unrolls 1 2` on the
+GH200; on the M1, `--log2-sizes 17 19 --matvecs indices onthefly --unrolls 1`
 (stalled), then `--log2-sizes 17 --variants id-static --unrolls 1 --rounds 3` and `--log2-sizes 19
 --variants id id-static --unrolls 1 --rounds 3`, all `--matvecs indices` for the last two.
