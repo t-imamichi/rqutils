@@ -947,24 +947,6 @@ class TestSparseKernels:
         assert all(a.shape[-1] == 64 for a in operator[1:]), [a.shape for a in operator[1:]]
         assert_matches_indices(_SPARSE_APPLY[matvec], operator, h, states_u, len(states), rng)
 
-    @pytest.mark.parametrize("kind", ["real", "mixed"])
-    def test_device_sort_matches_counting_sort(self, kind, monkeypatch):
-        """A GPU sorts ``"pairs"`` by ``i`` on the device (1.12-1.50x per call on a GH200,
-        ``poc/sparse/pairs-sort.md``); the arrays must be the counting sort's, bit for bit.
-        """
-        import rqutils.sqd._sparse as sparse_module
-
-        strings, coeffs, states = sparse_fixture(kind, np.random.default_rng(20261003))
-        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        _, counting = sparse_operator_of(h, states, 32, Matvec.PAIRS)
-        monkeypatch.setattr(sparse_module, "_on_gpu", lambda: True)
-        monkeypatch.setattr(sparse_module, "_chunk", lambda matvec: _CHUNK)  # same shapes as on CPU
-        _, device = sparse_operator_of(h, states, 32, Matvec.PAIRS)
-        i = np.asarray(counting[1]).ravel()
-        assert np.count_nonzero(np.diff(i[i != np.asarray(counting[2]).ravel()]) == 0), "repeated i"
-        for a, b in zip(device, counting, strict=True):
-            assert a.dtype == b.dtype and np.array_equal(np.asarray(a), np.asarray(b))
-
     def test_entry_count_guard(self):
         """Raises before allocating: the passing side is every sparse solve in this file."""
         with pytest.raises(ValueError, match="2147483648 entries"):
@@ -1001,7 +983,10 @@ class TestBucketedDiagonals:
 
     @pytest.mark.parametrize("matvec", [Matvec.INDICES, Matvec.ONTHEFLY])
     def test_solve_traces_no_diagonal_while_loop(self, matvec):
-        """With the counts known the matvec has no ``while``; cleared, ``get_diagonal``'s comes back."""
+        """The matvec holds no ``while``: the solve's two are ``ground_locg``'s and the identity's diagonal.
+
+        The ``while_loop`` kernel this replaced traced 10 here.
+        """
         coeffs = np.random.default_rng(1).normal(size=len(self.STRINGS))
         h = PauliSumXZ.from_paulisum((self.STRINGS, coeffs.tolist()))
         states_p = pack_padded(unique_states(40, 6, np.random.default_rng(3)))
@@ -1011,8 +996,8 @@ class TestBucketedDiagonals:
                 run_sqd.trace(ham, states_p, 64, False, matvec).jaxpr.jaxpr, "while"
             )
 
-        unknown = dataclasses.replace(h, term_counts=None)
-        assert whiles(h) < whiles(unknown), (whiles(h), whiles(unknown))
+        assert h.identity_first
+        assert whiles(h) == 2, whiles(h)
 
 
 class TestComplexScanCarry:
@@ -1075,31 +1060,24 @@ def scatter_hints(jaxpr):
     return hints
 
 
-class TestSortedHintPerPlatform:
-    """On CUDA no sparse scatter carries ``indices_are_sorted``; elsewhere ``"csr"``'s still do.
+class TestNoSortedHint:
+    """No sparse scatter carries ``indices_are_sorted``, on any platform.
 
-    The hint slowed XLA's GPU scatter: ``"csr"`` ran 2.12-3.24x per iteration on a GH200 without it, and
-    ``"pairs"`` 0.37-0.64x with it on ``out[i]`` (``poc/sparse/tune.md``). Unmeasured elsewhere, so
-    the CPU keeps it; a real carry takes the same switch.
+    The hint slowed XLA's GPU scatter (``"csr"`` 2.12-3.24x per iteration on a GH200 without it,
+    ``"pairs"`` 0.37-0.64x with it on ``out[i]``) and bought a CPU nothing, 1.00x on an M1
+    (``poc/sparse/tune.md``); a real and a complex carry both checked, every platform branch walked.
     """
 
+    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
     @pytest.mark.parametrize("kind", ["mixed", "real"])
-    def test_csr_hint_per_platform(self, kind):
+    def test_no_scatter_is_marked_sorted(self, matvec, kind):
         strings, coeffs, states = sparse_fixture(kind, np.random.default_rng(20261002))
         h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        states_u, operator = sparse_operator_of(h, states, 32, Matvec.CSR)
+        states_u, operator = sparse_operator_of(h, states, 32, matvec)
         dtype = jnp.complex128 if np.iscomplexobj(np.asarray(h.c)) else jnp.float64
-        vec = jnp.ones(states_u.shape[0], dtype)
-        jaxpr = jax.make_jaxpr(_SPARSE_APPLY[Matvec.CSR])(vec, *operator)
-        switches = [e for e in jaxpr.eqns if "branches_platforms" in e.params]
-        assert switches, "each scan must choose its hint per platform"
-        for eqn in switches:
-            for branch, key in zip(
-                eqn.params["branches"], eqn.params["branches_platforms"], strict=True
-            ):
-                hints = scatter_hints(branch.jaxpr)
-                assert hints, f"{key}: no scatter"
-                assert set(hints) == ({False} if key == ("cuda",) else {True}), (key, hints)
+        jaxpr = jax.make_jaxpr(_SPARSE_APPLY[matvec])(jnp.ones(states_u.shape[0], dtype), *operator)
+        hints = scatter_hints(jaxpr.jaxpr)
+        assert hints and not any(hints), hints
 
 
 def ell_fixture(rng):

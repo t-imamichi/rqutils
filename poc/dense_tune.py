@@ -228,7 +228,7 @@ for log2 in options.log2_sizes:
                     dense_solve.trace(h, states_p, size, matvec, variant, unroll, kmax).jaxpr
                 )
                 prep = (variant, kmax if variant == "id-static" else 0)
-            if variant == "ref" and matvec != "tables" and h.term_counts is not None:
+            if variant == "ref" and matvec != "tables":
                 args = library_args(h, states_p, size, matvec)
                 mv = jax.jit(functools.partial(_apply_buckets, matvec=matvec))
             else:

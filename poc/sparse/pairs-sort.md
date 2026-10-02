@@ -1,6 +1,6 @@
 # `"pairs"`' cross-group sort on a GPU host
 
-`poc/sparse/pairs_sort.py` (§4) at `ef00e77`, one NVIDIA GH200 120GB, 2026-10-02, `"pairs"` at the GPU chunk
+`poc/sparse/pairs_sort.py` (§4) at `ef00e77`, one NVIDIA GH200 120GB, 2026-10-02 (§3's CPU figures on an Apple M1 at `8c5269a`), `"pairs"` at the GPU chunk
 `2^19`. Fixture as `poc/sparse/gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`)
 and `type2` (`J = 120`), Hamming-shell subspaces around both Néel states. The device sort is in the
 library since, for `"pairs"` on a GPU (`_pairs_sorted_on_device`).
@@ -41,11 +41,12 @@ Build plus solve, against `counting`, all 5/5:
 ## 3. What it means
 
 **The sort stays, done on the device**: 1.12–1.50× per `"pairs"` build-plus-solve on the GH200, bit-identical
-operator. On a CPU the device arm is XLA's CPU sort, slower than `counting` in a smoke run (0.67× on the
-build at `2^12`–`2^14`), so the change belongs behind the GPU backend, beside `_GPU_PAIRS_CHUNK`. `"csr"`'s
-and `"ell"`'s two-direction sorts are the same shape of work and unmeasured.
+operator. On a CPU the device arm is XLA's CPU sort: its build is 0.57–0.87× `counting`'s on an M1, but
+the build is 1–2% of the call there, so the whole call is 0.98–0.99× (`type1`/`type2` `2^19`/`2^20`, 3
+rounds), and dropping the sort 0.56–0.80×. Small enough that the library sorts on the device on every
+backend, one path. `"csr"`'s and `"ell"`'s two-direction sorts are the same shape of work and unmeasured.
 
-**Shipped, and measured in the library** (`poc/sparse/gpu.md` §8's sixth run): `"pairs"` is 1.09–1.32×
+**Shipped, on every backend, and measured in the library** (`poc/sparse/gpu.md` §8's sixth run): `"pairs"` is 1.09–1.32×
 its previous whole call, its build 1.7–2.4× faster. One cost the A/B above did not report: **peak memory
 on `type2` rises 11–18%** (`2^22`: 1.43 → 1.62 GiB), the concatenation and its sorted copy living on the
 device; `type1` is flat.

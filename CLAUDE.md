@@ -300,7 +300,7 @@ ingest). Terms are grouped by unique X signature, Z groups zero-padded to a rect
   count and whether group 0 is the identity. `run_sqd`'s `"indices"`/`"onthefly"` trust them to sum
   each diagonal over a fixed trip count, bucketed by count, the identity's cached once per solve —
   `get_diagonal`'s `while_loop` synced with the host per term on a GPU (`poc/dense-tune.md`). Reordering
-  groups breaks these as well; `None` (built by hand) falls back to the `while_loop`.
+  groups breaks these as well. Both are required: there is no `while_loop` fallback.
 
 ### `sqd/` — sample-based quantum diagonalization
 
@@ -337,10 +337,10 @@ factor), `"csr"` (both directions by target row, `float64` factors where a group
 CPU the fastest, ~2× `"csr"` per solve). **On CUDA `_scan_add` carries a complex `out` as real and
 imaginary parts; don't merge them** — XLA's GPU scatter would split the whole carry every scan step,
 2.5–17.9× per iteration. The split loses on CPU, so `platform_dependent` keeps it CUDA-only
-(`poc/sparse/split.md`). That branch also drops `indices_are_sorted`, which slows the GPU scatter 2–3×
-(`poc/sparse/tune.md`). The sparse kernels' entry counts depend on the data, so `sqd()` builds them
+(`poc/sparse/split.md`). No sparse scatter is marked `indices_are_sorted`: it slows a GPU scatter 2–3×
+and buys a CPU nothing (`poc/sparse/tune.md`). The sparse kernels' entry counts depend on the data, so `sqd()` builds them
 **host-side before the jitted solve** (`"pairs"` in `2^19`-entry chunks on a GPU, `_GPU_PAIRS_CHUNK`, else
-`2^15`, and on a GPU its sort by `i` done on the device), rounding chunk and piece counts to `m·2^k` (8 ≤ m < 16) so the solve
+`2^15`, its sort by `i` done on the device), rounding chunk and piece counts to `m·2^k` (8 ≤ m < 16) so the solve
 recompiles per size class — `"ell"` keys on every (width, piece class) pair, so it recompiles more often
 than `"csr"`, and each of its bucket scans adds compile memory (fixed in N). They are `sqd`-only (`run_sqd`
 and `apply_h` reject them), **single-device** (they raise under a mesh), and their residual check runs

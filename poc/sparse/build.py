@@ -66,6 +66,7 @@ def timed(name, fn):
 
 sm._search_pairs = timed("search", sm._search_pairs)
 sm._sort_by_target = timed("sort", sm._sort_by_target)
+sm._pairs_sorted_on_device = timed("sort", sm._pairs_sorted_on_device)
 sm._flat_factors = timed("flat", sm._flat_factors)
 # Inside _flat_factors for "ell", so only its call count is reported there.
 sm._entry_factors = timed("entry", sm._entry_factors)

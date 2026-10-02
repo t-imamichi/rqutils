@@ -59,7 +59,7 @@ from rqutils.sqd._core import _sqd_inputs
 
 VARIANTS = {
     "pairs": ("base", "sorted", "merged", "real", "unique", "unique-exact"),
-    "csr": ("base", "sorted"),
+    "csr": ("base", "sorted", "unsorted"),
     "ell": ("base", "grid1.5", "grid2"),
 }
 parser = argparse.ArgumentParser()
@@ -148,6 +148,19 @@ def apply_real(vec, d0, *sets):
     return out
 
 
+def apply_csr_unsorted(vec, d0, *entries):
+    """``"csr"`` with the sorted hint dropped on every platform, the CPU included."""
+
+    def updates(chunk):
+        ti, si, di = chunk
+        return [(ti, di * vec[..., si], {})]
+
+    out = d0 * vec
+    for k in range(0, len(entries), 3):
+        out = scan_add(updates, out, entries[k : k + 3])
+    return out
+
+
 def apply_csr_sorted(vec, d0, *entries):
     def updates(chunk):
         ti, si, di = chunk
@@ -206,7 +219,7 @@ KERNELS = {
         "unique": apply_unique,
         "unique-exact": apply_unique_exact,
     },
-    "csr": {"base": sm._apply_csr, "sorted": apply_csr_sorted},
+    "csr": {"base": sm._apply_csr, "sorted": apply_csr_sorted, "unsorted": apply_csr_unsorted},
     "ell": dict.fromkeys(VARIANTS["ell"], sm._apply_ell),  # one kernel; the grid is the build's
 }[options.matvec]
 
@@ -231,8 +244,8 @@ def real_operator(h, states_u, pairs):
         ([g for g in groups if real[g]], c.real),
         ([g for g in groups if not real[g]], c),
     ):
-        host = sm._sort_by_target(pairs, subset, size, alloc, both=False)[0]
-        t, s, g = (jnp.asarray(a.reshape(-1, sm._CHUNK)) for a in host)
+        host = sm._pairs_sorted_on_device(pairs, subset, alloc)
+        t, s, g = (a.reshape(-1, sm._CHUNK) for a in host)
         arrays += [t, s, sm._entry_factors(t, s, g, z, c_set, states_u, kmax)]
     return tuple(arrays)
 

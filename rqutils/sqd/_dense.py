@@ -312,14 +312,13 @@ def _apply_buckets(
     return out
 
 
-def _bucket_args(hamiltonian: Any, sources: jax.Array, states: StateList) -> tuple | None:
-    """:func:`_apply_buckets`' ``(buckets, sources, states, d0)``, or ``None`` without ``term_counts``.
+def _bucket_args(hamiltonian: Any, sources: jax.Array, states: StateList) -> tuple:
+    """:func:`_apply_buckets`' ``(buckets, sources, states, d0)``.
 
     ``hamiltonian`` is a :class:`~rqutils.paulis.symplectic.PauliSumXZ`; one bucket per distinct term
     count of the groups after a leading identity, whose diagonal is ``d0``.
     """
-    if (counts := hamiltonian.term_counts) is None:
-        return None
+    counts = hamiltonian.term_counts
     _, z, c = hamiltonian.arrays
     first = int(hamiltonian.identity_first)
     d0 = get_diagonal(z[0], c[0], states) if first else None

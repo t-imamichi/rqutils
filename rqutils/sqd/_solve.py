@@ -279,15 +279,14 @@ def run_sqd(
     apply = functools.partial(_apply_parts, matvec=matvec)
     args = (scanned, None if matvec == "tables" else states_u)
     d0 = None
-    sources = hamiltonian.x if groups is None else groups[0][0]
-    if (
-        matvec != "tables"
-        and (bucketed := _bucket_args(hamiltonian, sources, states_u)) is not None
-    ):
+    if matvec != "tables":
         # Fixed-trip diagonals bucketed by term count, the identity's cached: 3.2-4.5x on a GPU,
         # 1.8-1.9x on CPU (poc/dense-tune.md). The residual check keeps _apply_parts.
         apply = functools.partial(_apply_buckets, matvec=matvec)
-        args, d0 = bucketed, bucketed[3]
+        args = _bucket_args(
+            hamiltonian, hamiltonian.x if groups is None else groups[0][0], states_u
+        )
+        d0 = args[3]
 
     def diag0():
         if matvec == "tables":

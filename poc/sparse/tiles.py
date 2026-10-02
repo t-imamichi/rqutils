@@ -65,22 +65,23 @@ def counted_ground_locg(*args, **kwargs):
 solve_mod.ground_locg = counted_ground_locg  # ty: ignore[invalid-assignment]
 
 ORDER = None  # a callable (i, j, g) -> permutation, or None for the shipped order
-_sort_by_target = sparse_mod._sort_by_target
+_pairs_sorted_on_device = sparse_mod._pairs_sorted_on_device
 
 
-def reordered_sort_by_target(pairs, subset, size, alloc, both=True):
-    """``_sort_by_target``, then ``"pairs"``' real entries permuted by ``ORDER``; padding stays last."""
-    out, end = _sort_by_target(pairs, subset, size, alloc, both)
-    if not both and ORDER is not None:
-        i, j, g = out
-        real = int(np.count_nonzero(i != j))  # padding has i == j, and sorts last
-        perm = ORDER(i[:real], j[:real], g[:real])
-        for array in out:
-            array[:real] = array[:real][perm]
-    return out, end
+def reordered_pairs(pairs, groups, alloc):
+    """``_pairs_sorted_on_device``, then the real entries permuted by ``ORDER``; padding stays last."""
+    out = _pairs_sorted_on_device(pairs, groups, alloc)
+    if ORDER is None:
+        return out
+    i, j, g = (np.array(a) for a in out)
+    real = int(np.count_nonzero(i != j))  # padding has i == j, and sorts last
+    perm = ORDER(i[:real], j[:real], g[:real])
+    for array in (i, j, g):
+        array[:real] = array[:real][perm]
+    return [i, j, g]
 
 
-sparse_mod._sort_by_target = reordered_sort_by_target  # ty: ignore[invalid-assignment]
+sparse_mod._pairs_sorted_on_device = reordered_pairs  # ty: ignore[invalid-assignment]
 
 
 def tile_order(shift, i, j, g):

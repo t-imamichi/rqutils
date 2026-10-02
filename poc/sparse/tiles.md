@@ -148,7 +148,7 @@ over 14M+ entries could cost back. Not worth shipping without a linear tile sort
 | `--tiles` | `12 14 16` | the `s` of each `tileS` arm; `i` and `group` always run |
 | `--rounds` | `5` | interleaved rounds after one warm-up per arm |
 
-It wraps `_sort_by_target` on the host and permutes `"pairs"`' real entries (padding, `i == j`, stays
+It wraps `"pairs"`' sort (`_sort_by_target` when these ran, `_pairs_sorted_on_device` since) and permutes its real entries (padding, `i == j`, stays
 last), then builds each arm's operator through `_sparse_operator` itself. `solve` is `_run_sparse` with
 `return_eigvec=False`, divided by that solve's iteration count, captured by wrapping `ground_locg` with a
 host callback as `poc/sparse/gpu.py` does. Runs here: the default sweep on CPU, twice (§2 is the

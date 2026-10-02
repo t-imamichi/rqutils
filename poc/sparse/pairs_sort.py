@@ -4,7 +4,8 @@ On the GH200 the sort is 48-63% of a ``"pairs"`` build (``poc/sparse/build.py``)
 ``type2`` ``2^22`` call, while dropping it cost only 2-5% of the solve (``poc/sparse/tiles.md`` §3).
 Arms, each from one shared host search and through the same padding and device factors as the library:
 
-- ``counting``: the library's ``_sort_by_target(both=False)``.
+- ``counting``: the library's former host counting sort, copied here as ``counting_sort``; the library
+  sorts on the device since.
 - ``none``: no cross-group sort, the groups concatenated (each already ascending in ``i``).
 - ``argsort``: a stable ``np.argsort`` of the concatenation by ``i``, on the host.
 - ``device``: the same with a stable ``jnp.argsort`` on the device, the arrays permuted there.
@@ -65,6 +66,21 @@ solve_mod.ground_locg = counted_ground_locg  # ty: ignore[invalid-assignment]
 ARM = Matvec.PAIRS
 
 
+def counting_sort(pairs, groups, size, alloc):
+    """``(i, j, group)`` counting-sorted by ``i`` across groups, as ``_sort_by_target`` once did."""
+    end = np.zeros(size + 1, np.int64)
+    for g in groups:
+        end[pairs[g][0] + 1] += 1
+    np.cumsum(end, out=end)
+    out = alloc(int(end[-1]))
+    for g in groups:
+        i, j = pairs[g]
+        pos = end[i]
+        out[0][pos], out[1][pos], out[2][pos] = i, j, g
+        end[i] += 1
+    return out
+
+
 def build(h, states_u, pairs, how):
     """``_sparse_operator``'s ``"pairs"`` branch with the cross-group order chosen by ``how``."""
     size, chunk = states_u.shape[0], sm._chunk(ARM)
@@ -79,10 +95,7 @@ def build(h, states_u, pairs, how):
         return [sm._padded(count, f, chunk) for f in (size - 1, size - 1, 0)]
 
     if how == "counting":
-        t, s, g = (
-            jnp.asarray(a)
-            for a in sm._sort_by_target(dict(pairs), list(groups), size, alloc, both=False)[0]
-        )
+        t, s, g = (jnp.asarray(a) for a in counting_sort(pairs, groups, size, alloc))
     else:
         i = np.concatenate([pairs[k][0] for k in groups])
         j = np.concatenate([pairs[k][1] for k in groups])

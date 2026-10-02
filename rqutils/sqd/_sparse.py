@@ -37,12 +37,13 @@ def _chunk(matvec: Matvec) -> int:
 def _pairs_sorted_on_device(
     pairs: dict[int, tuple[np.ndarray, np.ndarray]], groups: range, alloc: Callable
 ) -> list[jax.Array]:
-    """``_sort_by_target(both=False)``'s arrays by a stable device sort of the groups' concatenation.
+    """``"pairs"``' ``(i, j, group)``, each pair once, stably sorted by ``i`` on the device.
 
-    Bit-identical to the counting sort; on a GH200 it is 1.12-1.50x per ``"pairs"`` build-plus-solve,
-    the host sort being half the build there (``poc/sparse/pairs-sort.md``).
+    Stable, so a row's pairs keep group order. 1.12-1.50x per build-plus-solve over a host counting sort
+    on a GH200, 0.98-0.99x on an M1 (``poc/sparse/pairs-sort.md``).
     """
-    i, j = (jnp.asarray(np.concatenate([pairs[g][k] for g in groups])) for k in (0, 1))
+    empty = np.empty(0, np.int32)  # no group but the identity: one chunk of padding
+    i, j = (jnp.asarray(np.concatenate([empty, *(pairs[g][k] for g in groups)])) for k in (0, 1))
     grp = jnp.asarray(np.repeat(np.asarray(groups, np.int32), [len(pairs[g][0]) for g in groups]))
     order = jnp.argsort(i, stable=True)
     padded = (jnp.asarray(a) for a in alloc(i.shape[0]))
@@ -154,8 +155,7 @@ def _group_pairs(
     hamiltonian: PauliSumXZ, states_u: StateList
 ) -> dict[int, tuple[np.ndarray, np.ndarray]]:
     """:func:`_search_pairs` keyed by group, for every group but a leading identity."""
-    first = int(np.all(np.asarray(hamiltonian.x[0]) == 0))
-    groups = range(first, hamiltonian.x.shape[0])
+    groups = range(int(hamiltonian.identity_first), hamiltonian.x.shape[0])
     return dict(
         zip(groups, _search_pairs(np.asarray(hamiltonian.x)[groups], states_u), strict=True)
     )
@@ -166,14 +166,14 @@ def _pair_xsources(
 ) -> Iterator[np.ndarray]:
     """:func:`_host_sources`' sources per X signature, rebuilt from ``pairs`` rather than searched.
 
-    XOR is an involution, so ``(i, j)`` gives both ``xsource[i] = j`` and ``xsource[j] = i``; an
-    identity group maps each real row to itself.
+    XOR is an involution, so ``(i, j)`` gives both ``xsource[i] = j`` and ``xsource[j] = i``; the
+    identity group, the one :func:`_group_pairs` skips, maps each real row to itself.
     """
     size = states_u.shape[0]
     real = size - int(np.count_nonzero(_is_filler(np.asarray(states_u))))
-    for g, xg in enumerate(np.asarray(x)):
+    for g in range(len(x)):
         xsource = np.full(size, -1, np.int32)
-        if not xg.any():
+        if g not in pairs:
             xsource[:real] = np.arange(real, dtype=np.int32)
         else:
             i, j = pairs[g]
@@ -266,26 +266,22 @@ def _sort_by_target(
     subset: list[int],
     size: int,
     alloc: Callable[[int], list[np.ndarray]],
-    both: bool = True,
 ) -> tuple[list[np.ndarray], np.ndarray]:
-    """Counting-sort ``subset``'s transitions by target into ``alloc(count)``, both directions by default.
-
-    With ``both=False``, each pair once as ``(i, j)``, sorted by ``i``: ``"pairs"``' layout.
+    """Counting-sort ``subset``'s transitions, both directions, by target into ``alloc(count)``.
 
     ``alloc`` returns arrays for ``(target, source, group)`` or ``(source, group)``. A row occurs at
     most once per group, so each group's fill is conflict-free (``poc/sparse/pairs.md``, section 2);
     each group is popped from ``pairs`` once written. Returns the arrays and each row's end offset.
     """
-    directions = 2 if both else 1
     end = np.zeros(size + 1, np.int64)
     for g in subset:
-        for rows in pairs[g][:directions]:
+        for rows in pairs[g]:
             end[rows + 1] += 1
     np.cumsum(end, out=end)
     out = alloc(int(end[-1]))
     for g in subset:
         i, j = pairs.pop(g)
-        for target, source in ((i, j), (j, i))[:directions]:
+        for target, source in ((i, j), (j, i)):
             pos = end[target]
             for array, value in zip(out, (target, source, g)[-len(out) :]):
                 array[pos] = value
@@ -368,7 +364,7 @@ def _sparse_operator(
     z, c = jnp.asarray(hamiltonian.z), jnp.asarray(hamiltonian.c)
     # A copy: _sort_by_target pops each group as it writes it.
     pairs = dict(_group_pairs(hamiltonian, states_u) if pairs is None else pairs)
-    first = int(0 not in pairs)  # _group_pairs skips a leading identity group
+    first = int(hamiltonian.identity_first)
     d0 = get_diagonal(z[0], c[0], states_u) if first else jnp.zeros(size, c.dtype)
     groups = range(first, hamiltonian.x.shape[0])
     coeffs = np.asarray(hamiltonian.c)
@@ -385,11 +381,7 @@ def _sparse_operator(
     if matvec == "pairs":
         # Sorted by i across groups, so out[i] and vec[i] are local (NOTES.md, "sqd sparse kernels:
         # pairs sorted by i").
-        if _on_gpu():
-            host = _pairs_sorted_on_device(pairs, groups, alloc)
-        else:
-            host = _sort_by_target(pairs, list(groups), size, alloc, both=False)[0]
-        return (d0, *on_device(host, c))
+        return (d0, *on_device(_pairs_sorted_on_device(pairs, groups, alloc), c))
 
     real = np.isreal(coeffs).all(axis=1)
     arrays = [d0]
@@ -409,38 +401,35 @@ def _scan_add(
     updates: Callable[[tuple[jax.Array, ...]], list[tuple[jax.Array, jax.Array]]],
     out: jax.Array,
     xs: tuple[jax.Array, ...],
-    ordered: bool = False,
 ) -> jax.Array:
     """``out`` after a scan adding each chunk's ``updates`` -- ``(index, value)`` -- into it.
 
     On CUDA a complex ``out`` is carried as its real and imaginary parts: XLA's GPU scatter otherwise
     splits the carry itself, a full pass over ``out`` per scan step. Elsewhere that costs 0.68-0.90x
-    and an extra ``out`` of temp, so the carry stays complex (``poc/sparse/split.md``). CUDA also drops
-    ``ordered``, which slows its scatter 2.1-3.2x on ``"csr"`` (``poc/sparse/tune.md``).
+    and an extra ``out`` of temp, so the carry stays complex (``poc/sparse/split.md``). No scatter is
+    marked sorted: that slows a GPU scatter 2.1-3.2x and buys a CPU nothing (``poc/sparse/tune.md``).
     """
 
-    def scan(parts, ordered):
+    def scan(*parts):
         def body(parts, chunk):
             for index, value in updates(chunk):
                 values = (value.real, value.imag) if len(parts) == 2 else (value,)
-                parts = tuple(
-                    p.at[..., index].add(v, indices_are_sorted=ordered)
-                    for p, v in zip(parts, values, strict=True)
-                )
+                parts = tuple(p.at[..., index].add(v) for p, v in zip(parts, values, strict=True))
             return parts, None
 
         return jax.lax.scan(body, parts, xs)[0]
 
-    def default(out):
-        return scan((out,), ordered)[0]
+    def fused(out):
+        return scan(out)[0]
 
-    def cuda(out):
-        if not jnp.iscomplexobj(out):
-            return scan((out,), False)[0]
-        re, im = scan((out.real, out.imag), False)
+    if not jnp.iscomplexobj(out):
+        return fused(out)
+
+    def split(out):
+        re, im = scan(out.real, out.imag)
         return jax.lax.complex(re, im)
 
-    return jax.lax.platform_dependent(out, default=default, cuda=cuda)
+    return jax.lax.platform_dependent(out, default=fused, cuda=split)
 
 
 def _apply_pairs(
@@ -469,7 +458,7 @@ def _apply_csr(vec: jax.Array, d0: jax.Array, *entries: jax.Array) -> jax.Array:
 
     out = d0 * vec
     for k in range(0, len(entries), 3):
-        out = _scan_add(updates, out, entries[k : k + 3], ordered=True)
+        out = _scan_add(updates, out, entries[k : k + 3])
     return out
 
 

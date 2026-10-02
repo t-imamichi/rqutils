@@ -124,7 +124,6 @@ class PauliSumXZ:
             still be read as float64 over ``c[:num_real_groups]``. ``0`` promises nothing.
         term_counts: Each X group's number of Z terms, static under JAX transforms; its row of ``c``
             is nonzero exactly there. Lets a kernel sum a group's diagonal over a fixed trip count.
-            ``None`` (built by hand) promises nothing.
         identity_first: Whether group 0 is the identity X signature, static under JAX transforms.
             :meth:`from_paulisum` puts it there whenever one exists.
     """
@@ -133,9 +132,9 @@ class PauliSumXZ:
     z: np.ndarray[tuple[int, int, int], np.dtype[np.uint8]]
     c: np.ndarray[tuple[int, int], np.dtype[np.inexact]]
     num_qubits: int = field(metadata={"static": True})
+    term_counts: tuple[int, ...] = field(metadata={"static": True})
+    identity_first: bool = field(metadata={"static": True})
     num_real_groups: int = field(default=0, metadata={"static": True})
-    term_counts: tuple[int, ...] | None = field(default=None, metadata={"static": True})
-    identity_first: bool = field(default=False, metadata={"static": True})
 
     @staticmethod
     def pack_states(
@@ -340,9 +339,9 @@ class PauliSumXZ:
             zsignatures,
             phcoeffs,
             num_qubits,
-            int(np.count_nonzero(real)),
-            counts,
-            identity,
+            term_counts=counts,
+            identity_first=identity,
+            num_real_groups=int(np.count_nonzero(real)),
         )
 
     @property

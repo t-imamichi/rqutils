@@ -83,8 +83,8 @@ threshold, with the `while_loop` kept above it, is unmeasured and needs a large-
 two-term bonds, so padding every group to `kmax` would cost 31–33% extra passes (`type1`/`type4`
 1.0–3.3%, n = 30–100). The library instead scans the non-identity groups in one bucket per distinct term
 count, each summed over its own count: no padding, two scans for XXZ. `PauliSumXZ` carries the counts and
-whether group 0 is the identity as static fields; built by hand, without them, `run_sqd` keeps the
-`while_loop`. On the M1, against the old kernel (`--variants plain`, whose ratio is old over new), per
+whether group 0 is the identity as static fields, required since (the `while_loop` fallback is gone).
+On the M1, against the old kernel (`--variants plain`, whose ratio is old over new), per
 solve iteration, 3/3 each:
 
 | pattern | `2^17` | `2^19` |
