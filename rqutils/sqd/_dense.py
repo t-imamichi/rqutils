@@ -323,7 +323,7 @@ def _bucket_args(hamiltonian: Any, sources: jax.Array, states: StateList) -> tup
     ``zfree_first`` group's first term folds into ``const``: 1.28-1.50x on CPU (``poc/dense-codes.md``).
     """
     counts = hamiltonian.term_counts
-    zfree = hamiltonian.zfree_first or (False,) * len(counts)
+    zfree = hamiltonian.zfree_first
     _, z, c = hamiltonian.arrays
     first = int(hamiltonian.identity_first)
     d0 = get_diagonal(z[0], c[0], states) if first else None
@@ -331,8 +331,8 @@ def _bucket_args(hamiltonian: Any, sources: jax.Array, states: StateList) -> tup
     buckets = []
     for k in sorted({counts[g] - zfree[g] for g in groups}):
         idx = np.array([g for g in groups if counts[g] - zfree[g] == k], np.int32)
-        skip = np.array([zfree[g] for g in idx], np.int32)
+        skip = np.asarray(zfree, np.int32)[idx]
         terms = skip[:, None] + np.arange(k, dtype=np.int32)
-        const = jnp.where(skip == 1, c[idx, 0], jnp.zeros_like(c[idx, 0]))
+        const = skip * c[idx, 0]
         buckets.append((idx, const, z[idx[:, None], terms], c[idx[:, None], terms]))
     return tuple(buckets), sources, states, d0

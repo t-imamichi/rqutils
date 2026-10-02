@@ -301,7 +301,7 @@ ingest). Terms are grouped by unique X signature, Z groups zero-padded to a rect
   each diagonal over a fixed trip count, bucketed by count, the identity's cached once per solve —
   `get_diagonal`'s `while_loop` synced with the host per term on a GPU (`poc/dense-tune.md`). Reordering
   groups breaks these as well. Both are required: there is no `while_loop` fallback.
-- **`zfree_first`** (static, default `()`, promising nothing) flags groups whose term 0 has no Z part;
+- **`zfree_first`** (static, required) flags groups whose term 0 has no Z part;
   `from_paulisum` moves that term first. Those kernels fold it into a constant (1.28–1.50×,
   `poc/dense-codes.md`). A flag on a term with a Z part is a wrong diagonal, not a slowdown.
 

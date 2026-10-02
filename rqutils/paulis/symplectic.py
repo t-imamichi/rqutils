@@ -128,7 +128,7 @@ class PauliSumXZ:
             :meth:`from_paulisum` puts it there whenever one exists.
         zfree_first: Per X group, whether its first term has no Z part, static under JAX transforms.
             Such a term's diagonal is the constant ``c[g, 0]``, so a kernel need not compute its
-            parity. :meth:`from_paulisum` moves a group's Z-free term first; ``()`` promises nothing.
+            parity. :meth:`from_paulisum` moves a group's Z-free term first.
     """
 
     x: np.ndarray[tuple[int, int], np.dtype[np.uint8]]
@@ -137,8 +137,8 @@ class PauliSumXZ:
     num_qubits: int = field(metadata={"static": True})
     term_counts: tuple[int, ...] = field(metadata={"static": True})
     identity_first: bool = field(metadata={"static": True})
+    zfree_first: tuple[bool, ...] = field(metadata={"static": True})
     num_real_groups: int = field(default=0, metadata={"static": True})
-    zfree_first: tuple[bool, ...] = field(default=(), metadata={"static": True})
 
     @staticmethod
     def pack_states(

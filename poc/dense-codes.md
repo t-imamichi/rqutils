@@ -74,7 +74,8 @@ guessed. That holds at `2^14` only.
    in the static `PauliSumXZ.zfree_first`; `_bucket_args` folds it into a per-group `const`. Re-run
    after the change, the script's reference (now the library) matches the `fold` arm bit for bit at
    0.97–1.01×: 6.20 ms (`type1`) and 8.80 ms (`type2`) per iteration, against §2's 7.80 and 13.19.
-   It covers `"onthefly"` too, still unmeasured there (`--matvecs onthefly`).
+   It covers `"onthefly"` too, still unmeasured there. The script no longer carries the `fold` arm
+   (§6).
 
 ## 6. The script
 
@@ -85,11 +86,13 @@ guessed. That holds at `2^14` only.
 | `--num-qubits`, `--delta` | `60`, `0.5` | the `xxz` fixture |
 | `--patterns` | `type1 type2` | from `poc/eigenpair_check_scale.patterns` |
 | `--log2-sizes` | `14` | subspace sizes `2^k` |
-| `--matvecs` | `indices tables` | `indices`/`onthefly` run `fold`, `tables` runs `codes` |
 | `--rounds` | `3` | interleaved solves per arm after one warm-up |
 
 Matvecs must agree with the reference to `1e-12` relative, and eigenvalues too. The `bit-identical`
-column compares both matvec widths exactly. Runs here: the defaults (§2), and before the defaults were
-cut, `--patterns type1 --matvecs tables --log2-sizes 14 17 --rounds 3` with the barrier of §3 (its `2^17`
+column compares both matvec widths exactly. It now runs only `codes` against `"tables"`: with `fold` in
+the library, its arm and reference were the same kernel. §2's `fold` rows come from the script at
+`81406ee` (`--matvecs indices tables`, since removed), where the library predates the fold. Runs here:
+the defaults (§2), and before the defaults were cut, `--patterns type1 --matvecs tables --log2-sizes 14
+17 --rounds 3` with the barrier of §3 (its `2^17`
 row is §2's `2^17` figure). No committed script reproduces the barrier arm: it was the one-line
 `jax.lax.optimization_barrier(table[code])` in `codes_kernel`.

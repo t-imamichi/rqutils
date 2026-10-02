@@ -1,22 +1,19 @@
-"""A/B of two dense-kernel memory/compute levers: ``"tables"`` diagonals as codes, ``"indices"`` z = 0 folding.
+"""A/B of ``"tables"`` against ``codes``, its diagonals stored as ``uint8`` codes.
 
-- ``codes``: ``"tables"`` with each group's diagonal stored as a ``uint8`` index into its distinct values,
-  encoded on the device by ``jnp.unique(size=256)`` per group in a scan, so no ``(J, N)`` diagonal is ever
-  live. 1 B/slot instead of 8 (float64) or 16 (complex128); real groups keep a float64 table.
-- ``fold``: ``"indices"``/``"onthefly"`` with each group's z = 0 terms, whose parity is identically 0,
-  summed into one constant per group, so the matvec computes parities for the remaining terms only.
-  Each group's diagonal is bit-identical when its z = 0 terms come first, but bucketing by the remaining
-  count reorders the groups, so the sum over them need not be.
+``codes`` stores each group's diagonal as an index into its distinct values, encoded on the device by
+``jnp.unique(size=256)`` per group in a scan, so no ``(J, N)`` diagonal is ever live: 1 B/slot instead of
+8 (float64) or 16 (complex128); real groups keep a float64 table. The z = 0 ``fold`` arm this script
+also ran is in the library since (``PauliSumXZ.zfree_first``); run it from ``81406ee``, where the
+library predates it.
 
-The reference for each is ``run_sqd`` at the matching ``matvec``. Arms are warm and interleaved; ``solve``
+The reference is ``run_sqd(matvec=Matvec.TABLES)``. Arms are warm and interleaved; ``solve``
 is per iteration with setup inside, as ``run_sqd``'s; ``1-D`` and ``(2, N)`` are the kernel alone; ``temp``
 is the whole solve's ``temp_size_in_bytes``, ``op`` the operator arrays' bytes per ``J x N`` slot.
 Matvecs must agree to ``1e-12`` and eigenvalues to ``1e-12`` relative; ``bit-identical`` reports whether
 both matvec widths match the reference exactly.
 Fixture as ``poc/dense_tune.py``.
 
-Run: uv run python poc/dense_codes.py [--patterns type1 type2] [--log2-sizes 14]
-     [--matvecs indices tables] [--rounds 3]
+Run: uv run python poc/dense_codes.py [--patterns type1 type2] [--log2-sizes 14] [--rounds 3]
 """
 
 import argparse
@@ -41,8 +38,7 @@ import rqutils.sqd._solve as solve_mod
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import Matvec, get_diagonal, get_xsource, uniquify_states
 from rqutils.sqd._core import _sqd_inputs
-from rqutils.sqd._dense import _apply_buckets, _bucket_args, _pack_scanned, apply_xgrp
-from rqutils.sqd._diagonal import _z_parity
+from rqutils.sqd._dense import _pack_scanned, apply_xgrp
 from rqutils.sqd._solve import _apply_parts, _group_parts, _solve, run_sqd
 
 CODES = 256  # uint8
@@ -51,9 +47,6 @@ parser.add_argument("--num-qubits", type=int, default=60)
 parser.add_argument("--delta", type=float, default=0.5)
 parser.add_argument("--patterns", nargs="+", default=["type1", "type2"])
 parser.add_argument("--log2-sizes", type=int, nargs="+", default=[14])
-parser.add_argument(
-    "--matvecs", nargs="+", default=["indices", "tables"], choices=["indices", "tables", "onthefly"]
-)
 parser.add_argument("--rounds", type=int, default=3)
 options = parser.parse_args()
 
@@ -81,46 +74,6 @@ def codes_kernel(vec, parts):
     for part in parts:
         out = jax.lax.scan(fn, out, part)[0]
     return out
-
-
-def fold_kernel(vec, buckets, sources, states, d0, *, matvec):
-    """``_apply_buckets`` with each group's diagonal ``const + sum`` over its z != 0 terms only."""
-    out = d0 * vec
-
-    def fn(out, val):
-        group, const, z, c = val
-        xsource = sources[group] if matvec == "indices" else get_xsource(sources[group], states)
-        diagonal = const + sum(
-            c[t] * (1.0 - 2.0 * _z_parity(states, z[t])) for t in range(z.shape[0])
-        )
-        return out + apply_xgrp(xsource, diagonal, vec), None
-
-    for bucket in buckets:
-        out = jax.lax.scan(fn, out, bucket)[0]
-    return out
-
-
-def fold_buckets(h):
-    """Host-side ``(group, const, z, c)`` per distinct count of z != 0 terms; stats for the header."""
-    z, c = np.asarray(h.z), np.asarray(h.c)
-    rows, first_only = {}, 0
-    for g in range(1, len(h.term_counts)):  # group 0 is the identity, cached as d0
-        k = h.term_counts[g]
-        zero = ~z[g, :k].any(axis=1)
-        first_only += not zero[1:].any()
-        const = c[g, :k][zero].sum() if zero.any() else c.dtype.type(0)
-        rows.setdefault(int((~zero).sum()), []).append((g, const, z[g, :k][~zero], c[g, :k][~zero]))
-    buckets = tuple(
-        tuple(np.array(col) for col in zip(*[(g, k0, zz, cc) for g, k0, zz, cc in members]))
-        for _, members in sorted(rows.items())
-    )
-    terms = sum(h.term_counts[1:])
-    folded = terms - sum(len(b[0]) * b[2].shape[1] for b in buckets)
-    return buckets, folded, terms, first_only
-
-
-def xsources_of(h, states_u):
-    return jax.lax.scan(lambda _, x: (None, get_xsource(x, states_u)), None, h.x)[1]
 
 
 def encode(h, states_u):
@@ -154,28 +107,10 @@ def codes_solve(h, states_p, size):
     return solve_tail(h, states_u, codes_kernel, args, lambda: args[0][0][2][0][args[0][0][1][0]])
 
 
-@functools.partial(jax.jit, static_argnums=(2, 4))
-def fold_args(h, states_p, size, buckets, matvec):
+@functools.partial(jax.jit, static_argnums=(2,))
+def library_args(h, states_p, size):
+    """``run_sqd``'s ``"tables"`` arguments for ``_apply_parts``."""
     states_u = uniquify_states(states_p, size)
-    sources = h.x if matvec == "onthefly" else xsources_of(h, states_u)
-    return states_u, (buckets, sources, states_u, get_diagonal(h.z[0], h.c[0], states_u))
-
-
-@functools.partial(jax.jit, static_argnums=(2, 4))
-def fold_solve(h, states_p, size, buckets, matvec):
-    states_u, args = fold_args(h, states_p, size, buckets, matvec)
-    apply = functools.partial(fold_kernel, matvec=matvec)
-    return solve_tail(h, states_u, apply, args, lambda: args[3])
-
-
-@functools.partial(jax.jit, static_argnums=(2, 3))
-def library_args(h, states_p, size, matvec):
-    """The reference kernel's arguments: ``_bucket_args``, or ``"tables"``' ``(xsources, diagonals)``."""
-    states_u = uniquify_states(states_p, size)
-    if matvec == "onthefly":
-        return _bucket_args(h, h.x, states_u)
-    if matvec == "indices":
-        return _bucket_args(h, xsources_of(h, states_u), states_u)
     scanned = tuple(
         _pack_scanned(
             "tables",
@@ -208,86 +143,70 @@ for pattern in options.patterns:
     ham = PauliSumXZ.from_paulisum(
         xxz(options.num_qubits, options.delta, *patterns(options.num_qubits)[pattern])
     )
-    assert ham.identity_first, "fold caches group 0 as d0"
-    buckets, folded, terms, first_only = fold_buckets(ham)
     num_groups = len(ham.term_counts)
-    print(
-        f"-- {pattern}: J={num_groups}, {ham.c.dtype}, z=0 terms folded {folded}/{terms}, "
-        f"groups bit-identical by order {first_only}/{num_groups - 1}"
-    )
+    print(f"-- {pattern}: J={num_groups}, {ham.c.dtype}")
     for log2 in options.log2_sizes:
         states = hamming_shells(options.num_qubits, 1 << log2, np.random.default_rng(0))
-        for name in options.matvecs:
-            matvec = Matvec(name)
-            h, states_p, size = _sqd_inputs(ham, states, None, False, matvec, 0.0, None, (32, 2))
-            ref_args = library_args(h, states_p, size, name)
-            if name == "tables":
-                states_u, arm_args = codes_args(h, states_p, size)
-                distinct = max(
-                    len(np.unique(row)) for part in arm_args[0] for row in np.asarray(part[2])
-                )
-                assert distinct < CODES, f"{distinct} distinct values overflow uint8"
-                ref_mv = jax.jit(functools.partial(_apply_parts, matvec="tables"))
-                arm_mv = jax.jit(codes_kernel)
-                arm_solve = functools.partial(codes_solve, h, states_p, size)
-                arm = f"codes (<={distinct})"
-            else:
-                states_u, arm_args = fold_args(h, states_p, size, buckets, name)
-                ref_mv = jax.jit(functools.partial(_apply_buckets, matvec=name))
-                arm_mv = jax.jit(functools.partial(fold_kernel, matvec=name))
-                arm_solve = functools.partial(fold_solve, h, states_p, size, buckets, name)
-                arm = "fold"
-            ref_solve = functools.partial(run_sqd, h, states_p, size, False, matvec)
-            vecs = [
-                jax.random.normal(jax.random.key(0), shape, jnp.complex128)
-                for shape in ((size,), (2, size))
-            ]
-            calls = {
-                "ref": [ref_solve] + [functools.partial(ref_mv, v, *ref_args) for v in vecs],
-                arm: [arm_solve] + [functools.partial(arm_mv, v, *arm_args) for v in vecs],
-            }
-            temp = {
-                "ref": run_sqd.lower(h, states_p, size, False, matvec).compile(),
-                arm: (codes_solve.lower(h, states_p, size) if name == "tables"
-                      else fold_solve.lower(h, states_p, size, buckets, name)).compile(),
-            }  # fmt: skip
-            temp = {k: v.memory_analysis().temp_size_in_bytes for k, v in temp.items()}
-            slots = num_groups * size
-            op = {
-                k: operator_bytes(a, states_u.shape) / slots
-                for k, a in (("ref", ref_args), (arm, arm_args))
-            }
-            for fns in calls.values():
-                for call in fns:
-                    call()  # compile
-            ref_out, arm_out = np.asarray(calls["ref"][1]()), np.asarray(calls[arm][1]())
-            identical = all(np.array_equal(calls["ref"][k](), calls[arm][k]()) for k in (1, 2))
-            err = np.abs(ref_out - arm_out).max() / np.abs(ref_out).max()
-            assert err <= 1e-12, (arm, err)
-            times = {k: ([], [], []) for k in calls}
-            eig, iters = {k: [] for k in calls}, {k: set() for k in calls}
-            for _ in range(options.rounds):
-                for key, fns in calls.items():
-                    ITERATIONS.clear()
-                    t, result = timed(fns[0])
-                    times[key][0].append(t / ITERATIONS[-1])
-                    for k in (1, 2):
-                        times[key][k].append(timed(fns[k])[0])
-                    eig[key].append(float(result.eigval))
-                    iters[key].add(ITERATIONS[-1])
-            base = eig["ref"][0]
-            for key in calls:
-                diff = max(abs(e - base) for e in eig[key]) / abs(base)
-                assert diff < 1e-12, (key, eig[key])
-                cols = []
-                for mine, theirs in zip(times[key], times["ref"], strict=True):
-                    med, med0 = statistics.median(mine), statistics.median(theirs)
-                    wins = sum(a < b for a, b in zip(mine, theirs, strict=True))
-                    cols.append(f"{med * 1e3:7.2f} {med0 / med:5.2f}x {wins}/{options.rounds}")
-                label = f"{name}:{key}"
-                same = "-" if key == "ref" else ("yes" if identical else f"no ({err:.1e})")
-                print(
-                    f"{label:17} 2^{log2} | {' | '.join(cols)} | {temp[key] / 2**20:8.1f} |"
-                    f" {op[key]:6.2f} | {sorted(iters[key])} | {same} | {diff:.1e}",
-                    flush=True,
-                )
+        matvec = Matvec.TABLES
+        h, states_p, size = _sqd_inputs(ham, states, None, False, matvec, 0.0, None, (32, 2))
+        ref_args = library_args(h, states_p, size)
+        states_u, arm_args = codes_args(h, states_p, size)
+        distinct = max(len(np.unique(row)) for part in arm_args[0] for row in np.asarray(part[2]))
+        assert distinct < CODES, f"{distinct} distinct values overflow uint8"
+        ref_mv = jax.jit(functools.partial(_apply_parts, matvec="tables"))
+        arm_mv = jax.jit(codes_kernel)
+        arm_solve = functools.partial(codes_solve, h, states_p, size)
+        arm = f"codes (<={distinct})"
+        ref_solve = functools.partial(run_sqd, h, states_p, size, False, matvec)
+        vecs = [
+            jax.random.normal(jax.random.key(0), shape, jnp.complex128)
+            for shape in ((size,), (2, size))
+        ]
+        calls = {
+            "ref": [ref_solve] + [functools.partial(ref_mv, v, *ref_args) for v in vecs],
+            arm: [arm_solve] + [functools.partial(arm_mv, v, *arm_args) for v in vecs],
+        }
+        temp = {
+            "ref": run_sqd.lower(h, states_p, size, False, matvec).compile(),
+            arm: codes_solve.lower(h, states_p, size).compile(),
+        }
+        temp = {k: v.memory_analysis().temp_size_in_bytes for k, v in temp.items()}
+        slots = num_groups * size
+        op = {
+            k: operator_bytes(a, states_u.shape) / slots
+            for k, a in (("ref", ref_args), (arm, arm_args))
+        }
+        for fns in calls.values():
+            for call in fns:
+                call()  # compile
+        ref_out, arm_out = np.asarray(calls["ref"][1]()), np.asarray(calls[arm][1]())
+        identical = all(np.array_equal(calls["ref"][k](), calls[arm][k]()) for k in (1, 2))
+        err = np.abs(ref_out - arm_out).max() / np.abs(ref_out).max()
+        assert err <= 1e-12, (arm, err)
+        times = {k: ([], [], []) for k in calls}
+        eig, iters = {k: [] for k in calls}, {k: set() for k in calls}
+        for _ in range(options.rounds):
+            for key, fns in calls.items():
+                ITERATIONS.clear()
+                t, result = timed(fns[0])
+                times[key][0].append(t / ITERATIONS[-1])
+                for k in (1, 2):
+                    times[key][k].append(timed(fns[k])[0])
+                eig[key].append(float(result.eigval))
+                iters[key].add(ITERATIONS[-1])
+        base = eig["ref"][0]
+        for key in calls:
+            diff = max(abs(e - base) for e in eig[key]) / abs(base)
+            assert diff < 1e-12, (key, eig[key])
+            cols = []
+            for mine, theirs in zip(times[key], times["ref"], strict=True):
+                med, med0 = statistics.median(mine), statistics.median(theirs)
+                wins = sum(a < b for a, b in zip(mine, theirs, strict=True))
+                cols.append(f"{med * 1e3:7.2f} {med0 / med:5.2f}x {wins}/{options.rounds}")
+            label = f"tables:{key}"
+            same = "-" if key == "ref" else ("yes" if identical else f"no ({err:.1e})")
+            print(
+                f"{label:17} 2^{log2} | {' | '.join(cols)} | {temp[key] / 2**20:8.1f} |"
+                f" {op[key]:6.2f} | {sorted(iters[key])} | {same} | {diff:.1e}",
+                flush=True,
+            )
