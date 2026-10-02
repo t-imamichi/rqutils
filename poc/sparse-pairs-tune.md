@@ -110,8 +110,8 @@ call. The GPU-only chunk ships at `2^19`; `merged`, `sorted` and `real` are not 
 | `--pattern` | `type1` | one of `poc/eigenpair_check_scale.patterns` |
 | `--log2-sizes` | `20 22` | subspace sizes `2^k` |
 | `--chunks` | `15 17 19` | log2 of `_CHUNK`, the operator's shapes following it |
-| `--matvec` | `pairs` | `pairs`, or `csr` for §5 item 2 |
-| `--variants` | every one of `--matvec`'s | `base sorted merged real` for `pairs`, `base sorted` for `csr`; each run at every chunk |
+| `--matvec` | `pairs` | `pairs`, `csr`, or `ell` (whose variants are width grids) |
+| `--variants` | every one of `--matvec`'s | `base sorted merged real` for `pairs`, `base sorted` for `csr`, `base grid1.5 grid2` for `ell`; each run at every chunk |
 | `--rounds` | `5` | interleaved rounds after one warm-up per arm |
 
 `base` at `2^15` is the reference and always runs. Each arm compiles its own solve, asserted pairwise

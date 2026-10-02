@@ -13,6 +13,8 @@ kernel a fraction of the GPU. Arms are every ``--chunks`` × ``--variants``:
 
 ``--matvec csr`` runs ``"csr"`` instead, with ``base`` (the library, which since this ran drops
 ``indices_are_sorted`` on CUDA) and ``sorted`` (the hint forced back, as the library had it).
+``--matvec ell`` runs ``"ell"``, whose variants are width grids: ``base`` (the library's ×1.25),
+``grid1.5`` and ``grid2`` — fewer buckets, so fewer scans and compiled shapes, at more padding.
 
 The reference is ``base`` at ``2^15``, the CPU's chunk (the GPU ships ``"pairs"`` at ``2^19`` since
 this ran, ``_GPU_PAIRS_CHUNK``), for either ``--matvec``. Every arm keeps the library's CUDA-only carry
@@ -22,7 +24,7 @@ iteration counts); eigenvalues must agree to ``1e-12`` relative. ``op`` is the o
 ``temp`` XLA's ``temp_size_in_bytes`` for the ``(2, N)`` matvec. Fixture as ``poc/sparse_gpu.py``.
 
 Run: uv run python poc/sparse_pairs_tune.py [--log2-sizes 20 22] [--chunks 15 17 19]
-     [--variants base sorted merged real] [--rounds 5] [--matvec csr --variants base sorted]
+     [--variants base sorted merged real] [--rounds 5] [--matvec csr|ell]
 """
 
 import argparse
@@ -48,7 +50,11 @@ from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import Matvec, get_diagonal, uniquify_states
 from rqutils.sqd._core import _sqd_inputs
 
-VARIANTS = {"pairs": ("base", "sorted", "merged", "real"), "csr": ("base", "sorted")}
+VARIANTS = {
+    "pairs": ("base", "sorted", "merged", "real"),
+    "csr": ("base", "sorted"),
+    "ell": ("base", "grid1.5", "grid2"),
+}
 parser = argparse.ArgumentParser()
 parser.add_argument("--num-qubits", type=int, default=60)
 parser.add_argument("--pattern", default="type1")
@@ -152,6 +158,7 @@ KERNELS = {
         "real": apply_real,
     },
     "csr": {"base": sm._apply_csr, "sorted": apply_csr_sorted},
+    "ell": dict.fromkeys(VARIANTS["ell"], sm._apply_ell),  # one kernel; the grid is the build's
 }[options.matvec]
 
 
@@ -181,6 +188,12 @@ def real_operator(h, states_u, pairs):
     return tuple(arrays)
 
 
+def width_grid(factor):
+    """``_ELL_WIDTHS``' construction for another ratio, kept below ``2^31``."""
+    steps = int(np.log(2**31) / np.log(factor))
+    return np.unique(np.ceil(factor ** np.arange(steps)).astype(np.int64))
+
+
 def timed(fn):
     t0 = time.perf_counter()
     out = jax.block_until_ready(fn())
@@ -191,7 +204,7 @@ ham = PauliSumXZ.from_paulisum(
     xxz(options.num_qubits, options.delta, *patterns(options.num_qubits)[options.pattern])
 )
 arm = Matvec(options.matvec)
-shipped = sm._CHUNK, sm._chunk
+shipped = sm._CHUNK, sm._chunk, sm._ELL_WIDTHS
 arms = [(c, v) for c in options.chunks for v in options.variants]
 ref = (15, "base")
 if ref not in arms:
@@ -216,6 +229,9 @@ for log2 in options.log2_sizes:
         # would take _GPU_PAIRS_CHUNK in every arm.
         sm._CHUNK = 1 << chunk
         sm._chunk = lambda matvec: sm._CHUNK  # ty: ignore[invalid-assignment]
+        sm._ELL_WIDTHS = (
+            width_grid(float(variant[4:])) if variant.startswith("grid") else shipped[2]
+        )
         if variant == "real":
             operator = jax.block_until_ready(real_operator(h, states_u, pairs))
         else:
@@ -234,7 +250,7 @@ for log2 in options.log2_sizes:
         info[key] = (sum(a.nbytes for a in operator) / 2**20, temp / 2**20, steps)
         for call in calls[key]:
             call()  # compile
-    sm._CHUNK, sm._chunk = shipped
+    sm._CHUNK, sm._chunk, sm._ELL_WIDTHS = shipped
     sm._SPARSE_APPLY[arm] = KERNELS["base"]
     assert len(set(lowered.values())) == len(arms), "two arms compiled the same solve"
     products = {key: np.asarray(calls[key][2]()) for key in arms}
