@@ -204,7 +204,14 @@ median whole `sqd` call in s and the ratio to `"indices"`:
 - **`"csr"` is 1.6–2.9× `"indices"`** (its `type1` `2^22` solve per iteration halves, 58 → 27 ms, from the
   dropped hint) and behind `"pairs"` everywhere; **`"ell"` barely moves**, neither change touching it, its
   build up to 40% of a call (4.77 of 11.86 s).
-- **`"pairs"`' host build is its limit now**: 1.63 of 3.90 s at `type2` `2^22` (42%), nearly all search.
+- **`"pairs"`' host build is its limit now**: 1.63 of 3.90 s at `type2` `2^22` (42%). Split by
+  `poc/sparse/build.py` on this GPU's host, it is **half search and half the cross-group sort** (search
+  35–49%, sort 48–63% over `type1`/`type2` `2^20`/`2^22`); "nearly all search", first written here,
+  extrapolated an M1's proportions and is retracted. `"ell"`'s 4.83 s at `type2` `2^22` is search 12%, the
+  two-direction sort 36%, factors 31% (2,049 device calls) and the rest 22%.
+- **Searching on the device does not help**: `poc/sparse/device_search.py`, `get_xsource` per group or in
+  one scan with the sources copied back, is 0.57–0.91× the host search here — this host's search is
+  already fast (0.32–0.56 s at `2^22`).
 - Every eigenvalue agrees with `"indices"` to 7.1e-15. A `cuda_timer` "Delay kernel timed out" line is an
   XLA autotuner warning; its row's numbers are in line with the rest.
 
@@ -241,8 +248,8 @@ decision.
 7. **Only one GPU.** An A100 attempt gave no number: its child processes fell back to CPU on `cuInit(0)`'s
    `CUDA_ERROR_NO_DEVICE` — undiagnosed; the likeliest cause is `--device` overriding a scheduler's
    `CUDA_VISIBLE_DEVICES`.
-8. **The sparse kernels' host build** (§8), 42% of a `"pairs"` call at `type2` `2^22` and nearly all
-   search: the device search on a GPU is the lever.
+8. **The sparse kernels' host build** (§8), 42% of a `"pairs"` call at `type2` `2^22`, half of it the
+   sort: drop it or make it faster (`poc/sparse/pairs_sort.py`); for `"ell"`, batch its factor calls.
 9. **`"ell"`'s compile cost** (§7's first calls), and whether the persistent compile cache recovers it.
 10. **`"tables"` on a multi-GPU mesh**, the setting §9 recommends it for.
 

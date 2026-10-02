@@ -2324,7 +2324,7 @@ GH200, `type1`/`type2` `2^20`–`2^22`, one process: `"tables"` 3.05–4.54× `"
 
 GH200, after the single search, the `2^19` chunk and the dropped hint: `"pairs"` 3.37–5.84× `"indices"`
 per whole call, fastest in 5 of 6 (`"tables"` +7% at `type1` `2^22`, at 3.9× the memory), 1.35–1.68× its
-previous call, 0.53–0.64× `"indices"`' memory. Its host build (42%, nearly all search) is the next lever. `poc/sparse/gpu.md` §8, §9
+previous call, 0.53–0.64× `"indices"`' memory. Its host build (42%; half search, half sort) is the next lever. `poc/sparse/gpu.md` §8, §9
 
 ### sqd sparse kernels on a GPU: `"pairs"` wants bigger chunks, and a sorted-scatter hint slows it (2026-10-02)
 
@@ -2332,6 +2332,18 @@ GH200, `type1` `2^20`/`2^22`: `_CHUNK` `2^15` → `2^19` is 2.71×/1.37× per it
 plateau's edge, so it ships as `_GPU_PAIRS_CHUNK` (GPU, `"pairs"`; `2^15` is the CPU's own optimum). Merging ties;
 `indices_are_sorted` on `out[i]` is 0.37–0.64×, and dropping it from `"csr"` is 2.12–3.24×, so CUDA now drops
 it everywhere (CPU keeps it); `float64` factors 0.37–0.94×. `poc/sparse/pairs-tune.md` §2, §3
+
+### sqd dense kernels: a fixed-trip diagonal loop is 3.3–4.4× `"indices"` on a GPU, 1.8–1.9× on CPU (2026-10-02)
+
+Replacing `get_diagonal`'s `while_loop` (a host sync per term on a GPU) with a fixed `kmax`-term sum, the
+identity group's diagonal cached once per solve: GH200 3.26–4.44× per iteration, M1 1.75–1.94×, temp
+68 → 12 MiB; the identity cache alone 1.23–1.27×. `unroll` adds speed at ~1–3 GB temp. Unshipped. `poc/dense-tune.md` §2–§4
+
+### sqd sparse builds on a GPU host: half search, half sort; the device search loses (2026-10-02)
+
+GH200, `2^20`/`2^22`: a `"pairs"` build is search 35–49% and the cross-group sort 48–63%, not "nearly all
+search"; `"ell"`'s adds 2,049 factor calls (31%). `get_xsource` on the device is 0.57–0.91× the host search.
+`"ell"` wants chunk `2^17` and a ×2 grid there (1.24–1.74×); `(N, 2)` vectors lose on GPU too. `poc/sparse/gpu.md` §8, `poc/sparse/pairs-tune.md` §3
 
 ### sqd sparse kernels: a state-major `(N, 2)` gather layout loses on CPU (2026-10-01)
 

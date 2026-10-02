@@ -59,9 +59,9 @@ Open:
 1. **The GPU**, which is where §1 aimed: a 32 B sector holds exactly the `(N, 2)` pair, and
    `poc/sparse/gpu.md` §3's cliff is bandwidth-shaped where this CPU's is not. No CPU evidence now
    favours it; `poc/sparse/gpu.md` §10.4's tiled order (pairs sorted by `(i >> s, j >> s, i)`) ranks first.
-   Run: `uv run python poc/sparse/layout.py --log2-sizes 19 20 21` on the GPU host.
-   The script's `col` kernels follow the library's CUDA rules since the carry fix (split complex carry,
-   no sorted hint); before, a GPU run would have measured that defect instead of the layout.
+   **Measured, and it loses there too** for `"pairs"` (GH200 at `1e6fbfc`, `--log2-sizes 20 21 22`, the
+   `col` kernels carrying the library's CUDA rules): 0.80–0.91× per iteration, 0.61–0.76× on the matvec;
+   `"csr"` 1.01–1.04× and `"ell"` 1.03–1.04×, too little to build. Closed for the GPU as well.
 2. **A layout carried through the solver**, so no matvec transposes: `ground_locg` would hold `(N, 2)`
    throughout. Untried; it is the only form in which the transpose cost could vanish.
 3. **`2^20` and up on CPU**, and `"indices"`, which gathers from the same `(2, N)` layout.

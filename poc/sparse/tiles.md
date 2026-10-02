@@ -99,8 +99,11 @@ fixed kernel (the script calls the library's):
 - **With the defect gone, order registers.** Every tile won all 5 rounds in every column at both sizes,
   1.01–1.03× per iteration and up to 1.06× on the `(2, N)` matvec, smaller tiles mostly better — the CPU's
   direction (§2) at a third of its size.
-- **Skipping the cross-group sort loses**: `group` is 0.95–0.98× per iteration and 0.91× on the `(2, N)`
-  matvec at `2^21`, while the sort is ~9–14% of a CPU `"pairs"` build (§4). It stays.
+- **Skipping the cross-group sort loses in the solve**: `group` is 0.95–0.98× per iteration and 0.91× on
+  the `(2, N)` matvec at `2^21`. "It stays", first concluded here, weighed that against the sort's ~9–14%
+  of an *M1* build (§4); on the GH200's host the sort is 48–63% of the build (`poc/sparse/gpu.md` §8),
+  about 1.0 s against ~0.1 s of solve at `type2` `2^22`, so the verdict is open, pending
+  `poc/sparse/pairs_sort.py`'s whole-call measurement.
 - Eigenvalues agree to 5.3e-16; iteration counts vary by ±1, as before.
 
 ## 4. What it costs

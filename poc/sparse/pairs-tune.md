@@ -1,7 +1,8 @@
 # Four `"pairs"` levers on a GPU
 
 `poc/sparse/pairs_tune.py` (§6) at `909ebf5` (§2) and `1443f48` (§3's sweep and `"csr"` run), one NVIDIA
-GH200 120GB, 2026-10-02; §3's CPU sweep at `a1fcde3` on one Apple M1 (8 cores, 16 GiB). Fixture as
+GH200 120GB, 2026-10-02, and at `1e6fbfc` (§3's `unique` and `"ell"` runs); §3's CPU sweep at `a1fcde3` on
+one Apple M1 (8 cores, 16 GiB). Fixture as
 `poc/sparse/gpu.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` (`J = 62`, `complex128`),
 Hamming-shell subspaces around both Néel states. Two results are in the library since: the chunk size,
 as `_GPU_PAIRS_CHUNK`, and dropping the sorted hint on CUDA (§3); the other levers are not.
@@ -86,6 +87,27 @@ Every arm's eigenvalue agrees with the reference to 7.9e-16, and its iteration c
   trails `"pairs"`: 24.32 against 14.76 ms per iteration at `2^22`, at 408 against 304 MiB.
 - **`real` costs more than it saves**: −24% to −27% operator memory, at 0.37–0.94× everywhere. Its
   0.37× at chunk `2^19`, `2^20` is unexplained.
+- **Without atomics (`unique`) it is size-dependent** (GH200 at `1e6fbfc`, against `base@2^19`): one X
+  group per scan step with `unique_indices=True`, since a group's pairs are a perfect matching. 0.50× at
+  `2^20` (3.19 against 1.60 ms per iteration, 61 steps against 8) and **1.76× at `2^22`** (8.42 against
+  14.84 ms; 1-D matvec 2.44×), at a 73% larger operator (526 against 304 MiB) from padding every group to
+  the largest. `unique-exact`, the same unscanned and per-group sized, is unrun on the GPU (§5).
+
+### `"ell"`: chunk size and width grid
+
+`--matvec ell --chunks 15 17 19`, GH200 at `1e6fbfc`, per iteration against the shipped `"ell"`
+(`2^15`, ×1.25 grid), all 5/5:
+
+| chunk \ grid | ×1.25 | ×1.5 | ×2 | operator at `2^22` (×1.25 / ×2) |
+| --- | --- | --- | --- | --- |
+| `2^15` | 6.97 / 17.28 ms | 1.00× / 0.96× | 1.09× / 0.93× | 336 / 380 MiB |
+| `2^17` | 1.02× / 1.64× | 1.05× / 1.64× | **1.24× / 1.74×** | 343 / 382 MiB |
+| `2^19` | 0.37× / 1.11× | 0.40× / 1.26× | 0.47× / 1.45× | 395 / 399 MiB |
+
+Each cell is `2^20` / `2^22`. **`"ell"` wants `2^17` and the ×2 grid on the GPU** — not `"pairs"`'
+`2^19`, where its pieces turn mostly to padding at `2^20` (181 against 128 MiB). Tuned, its solve beats
+the tuned `"pairs"`' per iteration at `2^22` (9.92 against 14.84 ms), at +14% operator; its build
+(`poc/sparse/gpu.md` §8, 31% in 2,049 factor calls) still undoes that end to end.
 
 ## 4. What it means
 
@@ -93,12 +115,14 @@ At `type1` `2^22` the best arm's 14.7 ms per iteration is below `"tables"`' 21.0
 (`poc/sparse/gpu.md` §7). With the single host search (`b38d48b`), a `"pairs"` call would land near
 `"tables"`' 2.65 s at about a quarter of its memory — a projection from the solve stage, not a whole
 call. The GPU-only chunk ships at `2^19`; `merged`, `sorted` and `real` are not worth building.
+`unique` wins only where groups are large, at a padding cost `unique-exact` may remove. `"ell"`'s GPU
+setting is `2^17` and the ×2 grid, worth shipping once its build's factor calls are batched.
 
 ## 5. Open
 
-1. **`"ell"` at a larger chunk** on the GPU; the script has no `ell` mode.
-2. **The whole `"pairs"` call** against `"tables"` with the chunk and the single search (§4's projection):
-   `poc/sparse/gpu.py --arms indices tables pairs --log2-sizes 20 21 22`.
+1. **`unique-exact` on the GPU**: `--chunks 19 --variants base unique unique-exact`.
+2. **`"ell"`'s factor calls batched**, and its GPU chunk and grid in the library.
+3. **The whole `"pairs"` call** — measured since: `poc/sparse/gpu.md` §8.
 
 ## 6. The script
 
@@ -119,6 +143,7 @@ distinct, and must match the reference eigenvalue and `(2, N)` product to `1e-12
 serves every arm. It patches both `_CHUNK` and `_chunk`, so a GPU `"pairs"` arm takes its own chunk
 rather than `_GPU_PAIRS_CHUNK`. Runs here: the default sweep on the GH200 (§2), `--chunks 19 20 21
 --variants base` and `--matvec csr --chunks 15 19` there (§3), `--log2-sizes 17 19 --chunks 13 15 17 19
---variants base` on the M1 for both `--matvec` (§3), and CPU smoke runs at `2^12` and `2^19`.
+--variants base` on the M1 for both `--matvec` (§3), `--chunks 19 --variants base unique` and `--matvec ell
+--chunks 15 17 19` on the GH200 at `1e6fbfc` (§3), and CPU smoke runs at `2^12` and `2^19`.
 Since the hint change, `--matvec csr`'s `base` is the library (no hint on CUDA) and `sorted` forces
 it; the run above had `base` with the hint and an `unsorted` arm without.
