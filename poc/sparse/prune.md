@@ -76,37 +76,43 @@ order. The iteration counts match exactly.
 
 ## 6. On the GPU: the padding all on one row
 
-One NVIDIA GH200 120GB, 2026-10-03, at `c0061df` (before the fix below), 5 rounds; per solve against `all`:
+One NVIDIA GH200 120GB, 2026-10-03, 5 rounds, every ratio 5/5 unless below 1. Per solve against `all`, at
+`c0061df` (before the fix below) and at `d0a9997` (after):
 
-| pattern, N | stored pairs | operator | `nonzero` | `codes` | iterations |
-| --- | --- | --- | --- | --- | --- |
-| `type1` `2^20` | 4,182,753 → 339,727 | 112.0 → 28.0 MiB | **0.38×** | 0.39× | 93 → 92–93 |
-| `type1` `2^22` | 9,909,391 → 1,912,744 | 304.0 → 112.0 MiB | 2.45× | 2.50× | 126 → 126–127 |
-| `type2` `2^20` | 8,165,072 → 4,322,046 | 208.0 → 124.0 MiB | **0.73×** | 0.76× | 165 = 165 |
-| `type2` `2^22` | 29,095,965 → 21,099,318 | 736.0 → 592.0 MiB | **0.32×** | 0.34× | 129 = 129 |
+| pattern, N | stored pairs | operator | `nonzero` before | `nonzero` after | fix alone | `codes` after |
+| --- | --- | --- | --- | --- | --- | --- |
+| `type1` `2^20` | 4,182,753 → 339,727 | 112.0 → 28.0 MiB | **0.38×** | 2.28× | **5.96×** | 2.34× |
+| `type1` `2^22` | 9,909,391 → 1,912,744 | 304.0 → 112.0 MiB | 2.45× | 5.46× | **2.25×** | 5.70× |
+| `type2` `2^20` | 8,165,072 → 4,322,046 | 208.0 → 124.0 MiB | **0.73×** | 3.69× | **4.95×** | 3.99× |
+| `type2` `2^22` | 29,095,965 → 21,099,318 | 736.0 → 592.0 MiB | **0.32×** | 1.85× | **5.74×** | 2.02× |
 
-Eigenvalues within 3.6e-15. Fewer entries ran *slower* in three of four cells. The suspect is the
-padding. `_drop_zeros` re-padded with `i = j = size - 1`, so every padding entry's two scatter-adds hit
-the same `out[size - 1]`. A GPU serializes atomics on one address; a CPU loop does not care. Rounding to
-`2^19`-entry chunks and a size class leaves ~185k such entries at `type1` `2^20` and ~2.0M at `type2`
-`2^22` (against `all`'s ~11k and ~264k). That
-matches the losses. This is a count, not a profile.
+"Fix alone" is `nonzero`'s own solve time before over after: 0.405 → 0.068 s, 0.774 → 0.344 s, 1.407 →
+0.284 s and 5.624 → 0.980 s. Iteration counts within one, eigenvalues within 3.6e-15 throughout.
 
-The fix puts padding entry `k` on row `k mod size`, still with equal endpoints and a zero factor, so it
-adds `0` to a distinct row. Values are unchanged up to the sign of a zero. On the M1 at `2^17`, 3 rounds,
-it is harmless: `nonzero` 1.73× `type1` and 1.39× `type2` against `all`, eigenvalue diffs 5.3e-15 and
-7.1e-15 as in §3. Shipped; the GPU side is unconfirmed (§7).
+Before the fix, fewer entries ran *slower* in three of four cells. `_drop_zeros` re-padded with
+`i = j = size - 1`, so every padding entry's two scatter-adds hit the same `out[size - 1]`, and a GPU
+serializes atomics on one address. Rounding to `2^19`-entry chunks and a size class left ~185k such
+entries at `type1` `2^20` and ~2.0M at `type2` `2^22`. The fix puts padding entry `k` on row `k mod size`,
+still with equal endpoints and a zero factor, so it adds `0` to a distinct row; values are unchanged up to
+the sign of a zero. That it recovered 2.25–5.96× confirms the cause, though no profile was taken. On the
+M1 at `2^17` (3 rounds) it is harmless: `nonzero` 1.73× `type1` and 1.39× `type2` against `all`,
+eigenvalue diffs 5.3e-15 and 7.1e-15 as in §3.
 
-`codes` tracks `nonzero` within 6% on the GPU as on the CPU (§4): it trims memory, not time.
+`all`'s own build padding (~11k–264k entries, from `_padded`) still sits on row `size - 1`, since that arm
+skips `_drop_zeros`. So the "after" column overstates what dropping zeros buys by itself; the library
+always drops, so "fix alone" is the figure that describes it.
+
+**`codes` wins on the GPU once the padding is gone**: 1.03–1.09× `nonzero` (2.34/2.28 to 2.02/1.85), for
+−27% (`type1`) to −56% (`type2`) of the operator. Before the fix it was 1.02–1.06×, inside the
+contention's noise; on CPU it is 1.00–1.01× (§4).
 
 ## 7. Open
 
-1. **Re-run on the GH200 with the distinct-row padding** (§6), which decides whether the hypothesis
-   holds: `uv run python poc/sparse/prune.py --log2-sizes 20 22`. If `nonzero` still loses, profile
-   the scatter before anything else.
-2. **Factor codes**: 1.02–1.06× `nonzero` on the GPU before the fix (§6). Revisit after item 1, when the
-   scatter is no longer dominated by the padding.
-3. **The first-build compile**: a jitted `_drop_zeros` keyed on the size class would compile once per class.
+1. **Factor codes in the library** (§4, §6): 1.03–1.09× and up to −56% of the operator on a GH200,
+   bit-identical on CPU. The build's `jnp.unique` sort costs 5–89 ms more than `nonzero`'s (0.024 → 0.029 s
+   at `type1` `2^20`, 0.090 → 0.179 s at `type2` `2^22`), against 2–83 ms saved per solve, so it pays
+   only over a solve or two at the larger sizes, more if one operator serves several. POC-only so far.
+2. **The first-build compile**: a jitted `_drop_zeros` keyed on the size class would compile once per class.
 
 ## 8. The script
 
@@ -123,4 +129,4 @@ One host search serves every arm; each build runs twice, the second timed. Eigen
 `1e-12`, and `codes` must equal `nonzero` bit for bit on CPU only: a GPU's atomic scatter-add
 sums in no fixed order, which tripped that check on the GH200's first run. Runs here: two arms at the default (5 rounds), then
 `--rounds 3` (§3's build column), then all three arms at `--rounds 3`, with the `encode` described in §4. §6: `--log2-sizes 20 22` on the
-GH200, then `--log2-sizes 17 --rounds 3` on the M1 after the padding fix.
+GH200 at `c0061df` and again at `d0a9997`, and `--log2-sizes 17 --rounds 3` on the M1 after the fix.
