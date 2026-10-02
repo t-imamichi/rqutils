@@ -111,7 +111,7 @@ call. The GPU-only chunk ships at `2^19`; `merged`, `sorted` and `real` are not 
 | `--log2-sizes` | `20 22` | subspace sizes `2^k` |
 | `--chunks` | `15 17 19` | log2 of `_CHUNK`, the operator's shapes following it |
 | `--matvec` | `pairs` | `pairs`, `csr`, or `ell` (whose variants are width grids) |
-| `--variants` | every one of `--matvec`'s | `base sorted merged real` for `pairs`, `base sorted` for `csr`, `base grid1.5 grid2` for `ell`; each run at every chunk |
+| `--variants` | every one of `--matvec`'s | `base sorted merged real unique` for `pairs`, `base sorted` for `csr`, `base grid1.5 grid2` for `ell`; each run at every chunk |
 | `--rounds` | `5` | interleaved rounds after one warm-up per arm |
 
 `base` at `2^15` is the reference and always runs. Each arm compiles its own solve, asserted pairwise

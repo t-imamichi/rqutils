@@ -3,7 +3,7 @@
 ``run_sqd`` batches LOBPCG's matvec pair as a ``(2, N)`` array, so each random index in ``"pairs"``,
 ``"csr"`` and ``"ell"`` touches two places ``16·N`` B apart. The ``col`` arm moves the state axis to the
 front for the gathers and scatters, so the batch's values share a cache line (or GPU sector), and moves
-it back after. ``row`` is the shipped kernel. Both arms are warm and interleaved, one round each. The
+it back after. ``row`` is the shipped kernel, and ``col`` keeps its CUDA rules (split complex carry, no sorted hint). Both arms are warm and interleaved, one round each. The
 matvecs agree bit for bit, but fused into the solve the iteration count can differ, so ``solve`` is per
 iteration and the eigenvalues must agree to ``1e-12`` relative (``poc/sparse/layout.md``).
 
@@ -71,40 +71,71 @@ def col(fac, ndim):
     return fac.reshape(fac.shape + (1,) * (ndim - 1))
 
 
+def scan_add(updates, out, xs, ordered=False):
+    """``sparse_mod._scan_add`` on a state-major ``out``: ``updates`` index its leading axis.
+
+    The same platform rule as the library: on CUDA a complex carry is split into real and imaginary
+    parts and the sorted hint dropped (``poc/sparse/split.md``, ``poc/sparse/pairs-tune.md``), else
+    the GPU arm would measure that defect rather than the layout.
+    """
+
+    def scan(parts, ordered):
+        def body(parts, chunk):
+            for index, value in updates(chunk):
+                values = (value.real, value.imag) if len(parts) == 2 else (value,)
+                parts = tuple(
+                    p.at[index].add(v, indices_are_sorted=ordered)
+                    for p, v in zip(parts, values, strict=True)
+                )
+            return parts, None
+
+        return jax.lax.scan(body, parts, xs)[0]
+
+    def default(out):
+        return scan((out,), ordered)[0]
+
+    def cuda(out):
+        if not jnp.iscomplexobj(out):
+            return scan((out,), False)[0]
+        re, im = scan((out.real, out.imag), False)
+        return jax.lax.complex(re, im)
+
+    return jax.lax.platform_dependent(out, default=default, cuda=cuda)
+
+
 def apply_pairs(vec, d0, pi, pj, d):
     v, back = state_major(vec)
 
-    def body(out, chunk):
+    def updates(chunk):
         i, j, di = chunk
-        out = out.at[i].add(col(di, vec.ndim) * v[j])
-        return out.at[j].add(col(jnp.conj(di), vec.ndim) * v[i]), None
+        return [(i, col(di, vec.ndim) * v[j]), (j, col(jnp.conj(di), vec.ndim) * v[i])]
 
-    return back(jax.lax.scan(body, state_major(d0 * vec)[0], (pi, pj, d))[0])
+    return back(scan_add(updates, state_major(d0 * vec)[0], (pi, pj, d)))
 
 
 def apply_csr(vec, d0, *entries):
     v, back = state_major(vec)
 
-    def body(acc, chunk):
+    def updates(chunk):
         ti, si, di = chunk
-        return acc.at[ti].add(col(di, vec.ndim) * v[si], indices_are_sorted=True), None
+        return [(ti, col(di, vec.ndim) * v[si])]
 
     out = state_major(d0 * vec)[0]
     for k in range(0, len(entries), 3):
-        out = jax.lax.scan(body, out, entries[k : k + 3])[0]
+        out = scan_add(updates, out, entries[k : k + 3], ordered=True)
     return back(out)
 
 
 def apply_ell(vec, d0, *buckets):
     v, back = state_major(vec)
 
-    def body(acc, piece):
+    def updates(piece):
         rows, src, fac = piece
-        return acc.at[rows].add(jnp.sum(col(fac, vec.ndim) * v[src], axis=-vec.ndim)), None
+        return [(rows, jnp.sum(col(fac, vec.ndim) * v[src], axis=-vec.ndim))]
 
     out = state_major(d0 * vec)[0]
     for k in range(0, len(buckets), 3):
-        out = jax.lax.scan(body, out, buckets[k : k + 3])[0]
+        out = scan_add(updates, out, buckets[k : k + 3])
     return back(out)
 
 

@@ -10,6 +10,9 @@ kernel a fraction of the GPU. Arms are every ``--chunks`` × ``--variants``:
 - ``merged``: both directions as one scatter of the concatenated indices and values.
 - ``real``: ``"csr"``'s split, real groups' pairs with ``float64`` factors and the rest ``complex128``,
   two scans; the memory lever.
+- ``unique``: one X group per scan step, both scatters ``unique_indices=True`` -- a group's pairs are a
+  perfect matching (asserted), so no atomics are needed; padding takes distinct out-of-bounds indices,
+  dropped. It ignores ``--chunks`` (run once, at the first) and pays the padding to the largest group.
 
 ``--matvec csr`` runs ``"csr"`` instead, with ``base`` (the library, which since this ran drops
 ``indices_are_sorted`` on CUDA) and ``sorted`` (the hint forced back, as the library had it).
@@ -53,7 +56,7 @@ from rqutils.sqd import Matvec, get_diagonal, uniquify_states
 from rqutils.sqd._core import _sqd_inputs
 
 VARIANTS = {
-    "pairs": ("base", "sorted", "merged", "real"),
+    "pairs": ("base", "sorted", "merged", "real", "unique"),
     "csr": ("base", "sorted"),
     "ell": ("base", "grid1.5", "grid2"),
 }
@@ -86,15 +89,14 @@ solve_mod.ground_locg = counted_ground_locg  # ty: ignore[invalid-assignment]
 
 
 def scan_add(updates, out, xs):
-    """``sm._scan_add`` with a sorted flag per update rather than per call."""
+    """``sm._scan_add`` with ``.add`` keywords per update -- ``(index, value, kwargs)`` -- not per call."""
 
     def scan(*parts):
         def body(parts, chunk):
-            for index, value, ordered in updates(chunk):
+            for index, value, kwargs in updates(chunk):
                 values = (value.real, value.imag) if len(parts) == 2 else (value,)
                 parts = tuple(
-                    p.at[..., index].add(v, indices_are_sorted=ordered)
-                    for p, v in zip(parts, values, strict=True)
+                    p.at[..., index].add(v, **kwargs) for p, v in zip(parts, values, strict=True)
                 )
             return parts, None
 
@@ -116,7 +118,10 @@ def scan_add(updates, out, xs):
 def apply_sorted(vec, d0, pi, pj, d):
     def updates(chunk):
         i, j, di = chunk
-        return [(i, di * vec[..., j], True), (j, jnp.conj(di) * vec[..., i], False)]
+        return [
+            (i, di * vec[..., j], {"indices_are_sorted": True}),
+            (j, jnp.conj(di) * vec[..., i], {}),
+        ]
 
     return scan_add(updates, d0 * vec, (pi, pj, d))
 
@@ -125,7 +130,7 @@ def apply_merged(vec, d0, pi, pj, d):
     def updates(chunk):
         i, j, di = chunk
         both = jnp.concatenate([di * vec[..., j], jnp.conj(di) * vec[..., i]], axis=-1)
-        return [(jnp.concatenate([i, j]), both, False)]
+        return [(jnp.concatenate([i, j]), both, {})]
 
     return scan_add(updates, d0 * vec, (pi, pj, d))
 
@@ -144,12 +149,23 @@ def apply_real(vec, d0, *sets):
 def apply_csr_sorted(vec, d0, *entries):
     def updates(chunk):
         ti, si, di = chunk
-        return [(ti, di * vec[..., si], True)]
+        return [(ti, di * vec[..., si], {"indices_are_sorted": True})]
 
     out = d0 * vec
     for k in range(0, len(entries), 3):
         out = scan_add(updates, out, entries[k : k + 3])
     return out
+
+
+def apply_unique(vec, d0, pi, pj, d):
+    unique = {"unique_indices": True, "mode": "drop"}
+
+    def updates(chunk):
+        i, j, di = chunk
+        vj, vi = (vec.at[..., k].get(mode="fill", fill_value=0) for k in (j, i))
+        return [(i, di * vj, unique), (j, jnp.conj(di) * vi, unique)]
+
+    return scan_add(updates, d0 * vec, (pi, pj, d))
 
 
 KERNELS = {
@@ -158,6 +174,7 @@ KERNELS = {
         "sorted": apply_sorted,
         "merged": apply_merged,
         "real": apply_real,
+        "unique": apply_unique,
     },
     "csr": {"base": sm._apply_csr, "sorted": apply_csr_sorted},
     "ell": dict.fromkeys(VARIANTS["ell"], sm._apply_ell),  # one kernel; the grid is the build's
@@ -190,6 +207,32 @@ def real_operator(h, states_u, pairs):
     return tuple(arrays)
 
 
+def unique_operator(h, states_u, pairs):
+    """``(d0, i, j, d)`` with one X group per row, padded to the largest with distinct out-of-bounds indices."""
+    size = states_u.shape[0]
+    z, c = jnp.asarray(h.z), jnp.asarray(h.c)
+    first = int(0 not in pairs)
+    d0 = get_diagonal(z[0], c[0], states_u) if first else jnp.zeros(size, c.dtype)
+    groups = sorted(pairs)
+    coeffs = np.asarray(h.c)
+    kmax = max((int(np.count_nonzero(coeffs[g])) for g in groups), default=1)
+    width = max(1, max((len(pairs[g][0]) for g in groups), default=0))
+    t, s, grp = (np.zeros((len(groups), width), np.int32) for _ in range(3))
+    real = np.zeros((len(groups), width), bool)
+    for row, g in enumerate(groups):
+        i, j = pairs[g]
+        both = np.concatenate([i, j])
+        assert len(np.unique(both)) == len(both), f"group {g} is not a matching"
+        t[row, : len(i)], s[row, : len(i)], grp[row] = i, j, g
+        real[row, : len(i)] = True
+    # Padding is t == s == 0, which _entry_factors zeroes; only then do the indices go out of bounds.
+    d = sm._entry_factors(jnp.asarray(t), jnp.asarray(s), jnp.asarray(grp), z, c, states_u, kmax)
+    lane = np.arange(width, dtype=np.int32)
+    t = np.where(real, t, size + lane)
+    s = np.where(real, s, size + width + lane)
+    return d0, jnp.asarray(t), jnp.asarray(s), d
+
+
 def width_grid(factor):
     """``_ELL_WIDTHS``' construction for another ratio, kept below ``2^31``."""
     steps = int(np.log(2**31) / np.log(factor))
@@ -207,7 +250,12 @@ ham = PauliSumXZ.from_paulisum(
 )
 arm = Matvec(options.matvec)
 shipped = sm._CHUNK, sm._chunk, sm._ELL_WIDTHS
-arms = [(c, v) for c in options.chunks for v in options.variants]
+arms = [
+    (c, v)
+    for c in options.chunks
+    for v in options.variants
+    if v != "unique" or c == options.chunks[0]
+]
 ref = (15, "base")
 if ref not in arms:
     arms.insert(0, ref)
@@ -236,6 +284,8 @@ for log2 in options.log2_sizes:
         )
         if variant == "real":
             operator = jax.block_until_ready(real_operator(h, states_u, pairs))
+        elif variant == "unique":
+            operator = jax.block_until_ready(unique_operator(h, states_u, pairs))
         else:
             operator = jax.block_until_ready(sm._sparse_operator(h, states_u, arm, pairs))
         kernel = KERNELS[variant]
