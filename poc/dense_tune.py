@@ -15,7 +15,8 @@ read and written once per group. Arms are ``--matvecs`` × ``--variants`` × ``-
 groups. Each arm replicates ``run_sqd``'s single-device assembly around the library's ``_solve``; the
 reference is ``run_sqd`` itself. Before the library adopted ``id-static`` (bucketed by term count, so
 without ``kmax`` padding), ``plain`` at ``unroll=1`` matched it exactly; since, ``plain`` is the old
-kernel, and summation order can shift its iteration count. Arms are
+kernel, and summation order can shift its iteration count. The reference's ``1-D`` and ``(2, N)``
+columns time the library's ``_apply_buckets`` on ``run_sqd``'s own arguments (``library_args``). Arms are
 warm and interleaved; ``solve`` is per iteration, its setup inside (as ``run_sqd``'s); ``1-D`` and
 ``(2, N)`` are the kernel alone, setup outside; ``temp`` is the ``(2, N)`` kernel's
 ``temp_size_in_bytes``. Eigenvalues must agree to ``1e-12`` relative, traced solves be pairwise distinct.
@@ -47,7 +48,7 @@ import rqutils.sqd._solve as solve_mod
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import Matvec, get_diagonal, get_xsource, uniquify_states
 from rqutils.sqd._core import _sqd_inputs
-from rqutils.sqd._dense import _pack_scanned, apply_xgrp
+from rqutils.sqd._dense import _apply_buckets, _pack_scanned, apply_xgrp
 from rqutils.sqd._diagonal import _z_parity
 from rqutils.sqd._solve import _group_parts, _solve, run_sqd
 
@@ -140,6 +141,23 @@ def prepare(h, states_p, states_size, matvec, variant, kmax):
     return states_u, (scanned, None if matvec == "tables" else states_u, d0), groups, d0
 
 
+@functools.partial(jax.jit, static_argnums=(2, 3))
+def library_args(h, states_p, states_size, matvec):
+    """``run_sqd``'s arguments for ``_apply_buckets``, so the reference's matvec is the library's."""
+    states_u = uniquify_states(states_p, states_size)
+    x, z, c = h.arrays
+    if matvec != "onthefly":
+        x = jax.lax.scan(lambda _, xg: (None, get_xsource(xg, states_u)), None, x)[1]
+    first = int(h.identity_first)
+    d0 = get_diagonal(z[0], c[0], states_u) if first else None
+    counts = h.term_counts
+    buckets = []
+    for k in sorted(set(counts[first:])):
+        idx = np.array([g for g in range(first, len(counts)) if counts[g] == k], np.int32)
+        buckets.append((idx, z[idx, :k], c[idx, :k]))
+    return tuple(buckets), x, states_u, d0
+
+
 @functools.partial(jax.jit, static_argnums=(2, 3, 4, 5, 6))
 def dense_solve(h, states_p, states_size, matvec, variant, unroll, kmax):
     states_u, args, groups, d0 = prepare(h, states_p, states_size, matvec, variant, kmax)
@@ -217,10 +235,16 @@ for log2 in options.log2_sizes:
                     dense_solve.trace(h, states_p, size, matvec, variant, unroll, kmax).jaxpr
                 )
                 prep = (variant, kmax if variant == "id-static" else 0)
-            _, args, _, _ = jax.jit(prepare, static_argnums=(2, 3, 4, 5))(
-                h, states_p, size, matvec, prep[0], kmax
-            )
-            mv = jax.jit(functools.partial(apply_parts, matvec=matvec, unroll=unroll, kmax=prep[1]))
+            if variant == "ref" and matvec != "tables" and h.term_counts is not None:
+                args = library_args(h, states_p, size, matvec)
+                mv = jax.jit(functools.partial(_apply_buckets, matvec=matvec))
+            else:
+                _, args, _, _ = jax.jit(prepare, static_argnums=(2, 3, 4, 5))(
+                    h, states_p, size, matvec, prep[0], kmax
+                )
+                mv = jax.jit(
+                    functools.partial(apply_parts, matvec=matvec, unroll=unroll, kmax=prep[1])
+                )
             calls[arm] = [solve] + [functools.partial(mv, vec, *args) for vec in vecs]
             temp[arm] = mv.lower(vecs[1], *args).compile().memory_analysis().temp_size_in_bytes
             for call in calls[arm]:
