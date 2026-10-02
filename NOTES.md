@@ -2367,6 +2367,12 @@ counts, eigenvalues within 7.1e-15 (not bit-identical: chunk boundaries move). O
 (0.32–0.73×): its padding all hit one row's atomics. Spread across rows, 2.25–5.96× faster there. `uint8`
 factor codes: −22–56% operator, 1.00–1.01× CPU, 1.03–1.09× GH200, unshipped. `poc/sparse/prune.md` §3, §4, §6
 
+### sqd kernels on one CPU: `"pairs"` beats `"tables"` 3.1–4.0× at less memory (2026-10-03)
+
+M1, `type1`/`type2` at `2^14`/`2^17`, whole `sqd` calls: `"pairs"` 3.9–5.6× `"indices"` and 3.1–4.0×
+`"tables"`, peak RSS within 0.01 GiB of `"indices"`'; `"tables"` 1.23–1.78× `"indices"` at ~2× its memory. So
+`"tables"` only remains for a CPU mesh, unmeasured; coded `"tables"` was dropped. `poc/sparse/gpu.md` §9
+
 ### sqd dense kernels: folding z = 0 terms is 1.28–1.50× `"indices"`; coded diagonals halve `"tables"` at 0.80–0.84× (2026-10-03)
 
 M1, `2^14`: summing each group's z = 0 terms into a constant is 1.28× (`type1`) / 1.50× (`type2`) per

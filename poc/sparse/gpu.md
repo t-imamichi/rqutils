@@ -3,7 +3,7 @@
 `poc/sparse/gpu.py` (§11), one NVIDIA GH200 120GB, 2026-10-01/02: the GPU timing that `poc/sparse/pairs.md` §7
 left open, through the shipped `sqd(matvec=...)` kernels. Fixture as there: spinchain's open-XXZ `xxz` at
 n=60, `δ = 0.5`, Hamming-shell subspaces around both Néel states; `type1` (`J = 62`) and `type2`
-(`J = 120`), both `complex128` (61 of 62 and 118 of 120 groups real). Every timing is a warm median of 3;
+(`J = 120`), both `complex128` (61 of 62 and 118 of 120 groups real). §9 adds an M1 run of the same. Every timing is a warm median of 3;
 every sparse eigenvalue agreed with `"indices"` to 7.1e-15. No size here is at or below `--oracle-log2`,
 so `"indices"` is the only reference. `type3`/`type4` and `type2` at `2^20` are unrun. The `2^22` row,
 and a repeat of `type1` `2^20`/`2^21`, come from a third run at `c63f067`, `"indices"` and `"pairs"` only;
@@ -251,10 +251,31 @@ memory. On one GH200 now:
 | --- | --- | --- |
 | one GPU | `"pairs"` | 1.08–1.82× `"indices"` end to end, fastest in all six cells, at 0.54–0.67× its memory |
 | under a mesh | `"indices"` | 0.97–1.01× `"tables"`' speed at 0.42–0.48× its memory; the sparse kernels raise there; multi-GPU unmeasured |
-| any | not `"tables"`; `"csr"`/`"ell"` removed | none ahead of `"pairs"` or `"indices"` at their memory; `"ell"` tuned wins 2 of 4 cells per iteration against `"pairs"`, at more memory (`poc/sparse/tune.md` §3) |
+| one CPU | `"pairs"` | 3.9–5.6× `"indices"` and 3.1–4.0× `"tables"` per call, peak within 0.01 GiB of `"indices"`' (below) |
+| any | not `"tables"` (a CPU mesh, unmeasured, is the exception); `"csr"`/`"ell"` removed | none ahead of `"pairs"` or `"indices"` at their memory; `"ell"` tuned wins 2 of 4 cells per iteration against `"pairs"`, at more memory (`poc/sparse/tune.md` §3) |
 
-`"indices"` stays the library default: that is a CPU choice, and switching per backend is a separate
-decision.
+**On one CPU** (Apple M1, 2026-10-03, at `906f0f7` plus this script's RSS report: the fold and the padding fix shipped), `--patterns
+type1 type2 --log2-sizes 14 17 --arms indices tables pairs`, median `sqd` call of 3, `"pairs"`' build and
+check included:
+
+| pattern, N | `"indices"` | `"tables"` | `"pairs"` | `"pairs"` vs `"indices"` / `"tables"` | peak RSS over baseline |
+| --- | --- | --- | --- | --- | --- |
+| `type1` `2^14` | 0.578 s | 0.325 s | 0.104 s | 5.6× / 3.1× | all within 0.03 GiB |
+| `type1` `2^17` | 3.791 s | 2.704 s | 0.677 s | 5.6× / 4.0× | 0.10 / 0.17 / 0.08 GiB |
+| `type2` `2^14` | 0.773 s | 0.558 s | 0.180 s | 4.3× / 3.1× | all within 0.03 GiB |
+| `type2` `2^17` | 6.291 s | 5.101 s | 1.633 s | 3.9× / 3.1× | 0.14 / 0.27 / 0.15 GiB |
+
+Every eigenvalue agrees with `"indices"` to 8.9e-15, and with `hproj` + `eigsh` at `2^14`. Memory is the
+child's RSS high-water mark (the CPU backend has no `memory_stats`), from a second run at `--repeats 1`,
+over a ~0.39 GiB Python-and-JAX baseline; at 0.01 GiB resolution `2^14` does not separate the arms.
+`"tables"` is 1.23–1.78× `"indices"` at ~2× its memory, and `"pairs"` beats it 3.1–4.0× at 0.5–0.6× its increment.
+
+So `"tables"` is behind on one device of either kind, and behind `"indices"` on a GPU mesh. Its one
+remaining setting is a **CPU mesh**, inferred from these single-device numbers and unmeasured. This is
+why `markdown/parity-codes-proposal.md` dropped coded `"tables"`.
+
+`"indices"` stays the library default: `"pairs"` is single-device and raises under a mesh, and switching
+the default by setting is a separate decision.
 
 ## 10. Open
 
@@ -295,7 +316,8 @@ decision.
 | `--device` | none | sets `CUDA_VISIBLE_DEVICES` before JAX initializes |
 
 Each `(pattern, size, arm)` runs in a fresh subprocess (a hidden `--child`), because `peak_bytes_in_use` is
-a process-wide high-water mark with no reset; the parent is pinned to CPU, so it holds no GPU memory while a
+a process-wide high-water mark with no reset (on CPU, which has no `memory_stats`, `peak` is the child's
+RSS high-water mark instead, Python and JAX included); the parent is pinned to CPU, so it holds no GPU memory while a
 child runs. A sparse arm replays `sqd._core._solve_sqd`'s sparse branch with a sync between stages:
 **build** is `uniquify_states` plus `_sparse_operator`, **solve** `_run_sparse`, **check**
 `_sparse_residual` plus `_checked_eigval` — private calls that must track `_solve_sqd` if it changes.
