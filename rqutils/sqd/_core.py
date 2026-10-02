@@ -327,9 +327,9 @@ def _solve_sqd(
         # run_sqd is jitted and the entry counts are data-dependent, so the operator is built here.
         states_u = uniquify_states(states_p, states_size)
         pairs = _group_pairs(hamiltonian, states_u)  # one search, for the build and the check
-        operator = _sparse_operator(hamiltonian, states_u, matvec, pairs)
+        operator = _sparse_operator(hamiltonian, states_u, pairs)
         LOG.info("Built the %s operator in %f seconds.", matvec, time.time() - start)
-        result = _run_sparse(hamiltonian, states_u, operator, states_size, True, matvec, **tols)
+        result = _run_sparse(hamiltonian, states_u, operator, states_size, True, **tols)
         del operator  # the check reads none of it
         residual, ax_norm = _sparse_residual(
             hamiltonian, states_u, result.eigval, result.eigvec, pairs

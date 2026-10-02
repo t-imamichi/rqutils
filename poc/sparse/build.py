@@ -2,11 +2,11 @@
 
 On the GH200 ``"ell"``'s build is 4.77 s of an 11.86 s ``type2`` ``2^22`` call against ``"pairs"``' 1.63
 (``poc/sparse/gpu.md`` §8), and on an M1 the search is ~60% of it, the two-direction sort ~20% and the
-factors 6-8%. ``"ell"``'s ``_flat_factors`` calls ``_entry_factors`` once per ``_CHUNK``-entry chunk,
+factors 6-8%. ``"ell"``'s ``legacy.flat_factors`` calls ``_entry_factors`` once per ``_CHUNK``-entry chunk,
 ~1,900 device calls there, each with its own copies and launch: cheap on CPU, maybe not on a GPU.
 
 Each stage is timed by wrapping the module function with a sync, so a stage includes its device work;
-``factors`` is ``_flat_factors`` for ``"ell"`` and ``_entry_factors`` otherwise, with its device-call
+``factors`` is ``legacy.flat_factors`` for ``"ell"`` and ``_entry_factors`` otherwise, with its device-call
 count. ``rest`` is the build minus the named stages (bucket assembly, padding, copies). One warm-up build,
 then the median of ``--repeats``. Fixture as ``poc/sparse/gpu.py``.
 
@@ -29,6 +29,7 @@ import numpy as np
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )  # poc/, for its fixtures
+import legacy  # "csr"/"ell", removed from the library
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 
 import rqutils.sqd._sparse as sm
@@ -65,10 +66,10 @@ def timed(name, fn):
 
 
 sm._search_pairs = timed("search", sm._search_pairs)
-sm._sort_by_target = timed("sort", sm._sort_by_target)
+legacy.sort_by_target = timed("sort", legacy.sort_by_target)
 sm._pairs_sorted_on_device = timed("sort", sm._pairs_sorted_on_device)
-sm._flat_factors = timed("flat", sm._flat_factors)
-# Inside _flat_factors for "ell", so only its call count is reported there.
+legacy.flat_factors = timed("flat", legacy.flat_factors)
+# Inside legacy.flat_factors for "ell", so only its call count is reported there.
 sm._entry_factors = timed("entry", sm._entry_factors)
 
 print(f"{jax.devices()[0].device_kind}, n={options.num_qubits}")
@@ -80,15 +81,17 @@ for pattern in options.patterns:
     for log2 in options.log2_sizes:
         states = hamming_shells(options.num_qubits, 1 << log2, np.random.default_rng(0))
         for name in options.matvec:
-            arm = Matvec(name)
-            h, states_p, size = _sqd_inputs(ham, states, None, False, arm, 0.0, None, (32, 2))
+            arm = name
+            h, states_p, size = _sqd_inputs(
+                ham, states, None, False, Matvec.PAIRS, 0.0, None, (32, 2)
+            )
             states_u = jax.block_until_ready(uniquify_states(states_p, size))
             runs = []
             for _ in range(options.repeats + 1):  # the first is the warm-up
                 TIMES.clear()
                 CALLS.clear()
                 t0 = time.perf_counter()
-                operator = jax.block_until_ready(sm._sparse_operator(h, states_u, arm))
+                operator = jax.block_until_ready(legacy.operator(h, states_u, arm))
                 runs.append((time.perf_counter() - t0, dict(TIMES), dict(CALLS)))
                 del operator
             runs = runs[1:]

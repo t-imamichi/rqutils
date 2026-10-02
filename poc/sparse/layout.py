@@ -30,10 +30,10 @@ import numpy as np
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )  # poc/, for its fixtures
+import legacy  # "csr"/"ell", removed from the library
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 
 import rqutils.sqd._solve as solve_mod
-import rqutils.sqd._sparse as sparse_mod
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import Matvec, uniquify_states
 from rqutils.sqd._core import _sqd_inputs
@@ -139,8 +139,8 @@ def apply_ell(vec, d0, *buckets):
     return back(out)
 
 
-COL = {Matvec.PAIRS: apply_pairs, Matvec.CSR: apply_csr, Matvec.ELL: apply_ell}
-ROW = dict(sparse_mod._SPARSE_APPLY)
+COL = {"pairs": apply_pairs, "csr": apply_csr, "ell": apply_ell}
+ROW = dict(legacy.APPLY)
 
 
 def timed(fn):
@@ -159,25 +159,23 @@ print(
 for log2 in options.log2_sizes:
     states = hamming_shells(options.num_qubits, 1 << log2, np.random.default_rng(0))
     for name in options.arms:
-        arm = Matvec(name)
-        h, states_p, size = _sqd_inputs(ham, states, None, False, arm, 0.0, None, (32, 2))
+        arm = name
+        h, states_p, size = _sqd_inputs(ham, states, None, False, Matvec.PAIRS, 0.0, None, (32, 2))
         states_u = uniquify_states(states_p, size)
-        operator = jax.block_until_ready(sparse_mod._sparse_operator(h, states_u, arm))
+        operator = jax.block_until_ready(legacy.operator(h, states_u, arm))
         vec = jax.random.normal(jax.random.key(0), (2, size), jnp.complex128)
         solves, matvecs, lowered = {}, {}, {}
         for layout, table in (("row", ROW), ("col", COL)):
-            # _SPARSE_APPLY is read at trace time, and a second jit of the same function reuses the
+            # APPLY is read at trace time, and a second jit of the same function reuses the
             # first's trace, so each layout gets a function of its own.
-            sparse_mod._SPARSE_APPLY[arm] = table[arm]
-            solve = jax.jit(
-                lambda *a: sparse_mod._run_sparse.__wrapped__(*a), static_argnums=(3, 4, 5)
-            )
+            legacy.APPLY[arm] = table[arm]
+            solve = jax.jit(lambda *a: legacy.run.__wrapped__(*a), static_argnums=(3, 4, 5))
             solves[layout] = functools.partial(solve, h, states_u, operator, size, False, arm)
             lowered[layout] = solve.lower(h, states_u, operator, size, False, arm).as_text()
             matvecs[layout] = functools.partial(jax.jit(table[arm]), vec, *operator)
             solves[layout]()  # compile
             matvecs[layout]()
-        sparse_mod._SPARSE_APPLY[arm] = ROW[arm]
+        legacy.APPLY[arm] = ROW[arm]
         assert lowered["row"] != lowered["col"], "both solve arms compiled the same kernel"
         ref = np.asarray(matvecs["row"]())
         err = np.abs(np.asarray(matvecs["col"]()) - ref).max() / np.abs(ref).max()

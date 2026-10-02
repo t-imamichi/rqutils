@@ -83,7 +83,7 @@ def counting_sort(pairs, groups, size, alloc):
 
 def build(h, states_u, pairs, how):
     """``_sparse_operator``'s ``"pairs"`` branch with the cross-group order chosen by ``how``."""
-    size, chunk = states_u.shape[0], sm._chunk(ARM)
+    size, chunk = states_u.shape[0], sm._chunk()
     z, c = jnp.asarray(h.z), jnp.asarray(h.c)
     first = int(0 not in pairs)
     d0 = get_diagonal(z[0], c[0], states_u) if first else jnp.zeros(size, c.dtype)
@@ -123,7 +123,7 @@ def timed(fn):
 
 
 HOWS = ("counting", "none", "argsort", "device")
-print(f"{jax.devices()[0].device_kind}, n={options.num_qubits}, chunk={sm._chunk(ARM)}")
+print(f"{jax.devices()[0].device_kind}, n={options.num_qubits}, chunk={sm._chunk()}")
 print(
     "how      pattern N    | build (s) x | solve (s) per iter (ms) x | total (s) x wins | iters | eigval diff"
 )
@@ -151,16 +151,14 @@ for pattern in options.patterns:
         assert np.array_equal(key(ops["none"]), key(ops["counting"])), "none changed the pairs"
         assert not np.array_equal(np.asarray(ops["none"][1]), ref[0]), "none must differ in order"
         for how in HOWS:  # warm: one compiled solve serves every arm
-            jax.block_until_ready(sm._run_sparse(h, states_u, ops[how], size, False, ARM))
+            jax.block_until_ready(sm._run_sparse(h, states_u, ops[how], size, False))
         times = {how: ([], [], []) for how in HOWS}
         eig, iters = {how: [] for how in HOWS}, {how: set() for how in HOWS}
         for _ in range(options.rounds):
             for how in HOWS:
                 b, op = timed(functools.partial(build, h, states_u, pairs, how))
                 ITERATIONS.clear()
-                sv, result = timed(
-                    functools.partial(sm._run_sparse, h, states_u, op, size, False, ARM)
-                )
+                sv, result = timed(functools.partial(sm._run_sparse, h, states_u, op, size, False))
                 times[how][0].append(b)
                 times[how][1].append(sv)
                 times[how][2].append(b + sv)

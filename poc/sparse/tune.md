@@ -81,7 +81,7 @@ Every arm's eigenvalue agrees with the reference to 7.9e-16, and its iteration c
   | no hint, `2^19` | 2.92× | **2.40×** |
   | hint, `2^19` | 1.07× | 1.09× |
 
-  All 5/5; the `(2, N)` matvec gains 3.04–5.04×. On an M1 the hint is neutral (`unsorted` 1.00× per
+  All 5/5; the `(2, N)` matvec gains 3.04–5.04×. On an M1 the hint is neutral (an `unsorted` arm, since removed as `base` dropped the hint, 1.00× per
   iteration at `2^17`/`2^19`), so no sparse scatter carries it on any backend. The larger chunk is mixed for
   `"csr"` without the hint (0.90× at `2^20`, 1.13× at `2^22`), so it keeps `2^15`. Even fixed, `"csr"`
   trails `"pairs"`: 24.32 against 14.76 ms per iteration at `2^22`, at 408 against 304 MiB.

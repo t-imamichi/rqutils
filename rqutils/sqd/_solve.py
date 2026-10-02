@@ -23,7 +23,7 @@ from rqutils.sqd._states import StateList, _is_filler, get_xsource, uniquify_sta
 class Matvec(StrEnum):
     """A :func:`~rqutils.sqd.sqd` matvec kernel, named by what it stores (module documentation).
 
-    Pass a member (``Matvec.ELL``); a plain string is rejected. Members are ``str`` subclasses only so
+    Pass a member (``Matvec.PAIRS``); a plain string is rejected. Members are ``str`` subclasses only so
     that the kernels' internal equality tests stay plain.
     """
 
@@ -31,12 +31,10 @@ class Matvec(StrEnum):
     INDICES = "indices"
     TABLES = "tables"
     PAIRS = "pairs"
-    CSR = "csr"
-    ELL = "ell"
 
 
 #: The kernels whose operator arrays :func:`sqd` builds host-side; single-device for now.
-_SPARSE_MATVECS = (Matvec.PAIRS, Matvec.CSR, Matvec.ELL)
+_SPARSE_MATVECS = (Matvec.PAIRS,)
 
 
 def _check_matvec(matvec: Any) -> None:

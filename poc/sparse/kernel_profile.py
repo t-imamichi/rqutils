@@ -33,15 +33,15 @@ import numpy as np
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )  # poc/, for its fixtures
+import legacy  # "csr"/"ell", removed from the library
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import Matvec, get_xsource, uniquify_states
 from rqutils.sqd._core import _sqd_inputs
-from rqutils.sqd._dense import _pack_scanned
+from rqutils.sqd._dense import _apply_buckets, _bucket_args, _pack_scanned
 from rqutils.sqd._diagonal import get_diagonal
-from rqutils.sqd._solve import _SPARSE_MATVECS, _apply_parts, _group_parts
-from rqutils.sqd._sparse import _SPARSE_APPLY, _sparse_operator
+from rqutils.sqd._solve import _apply_parts, _group_parts
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--num-qubits", type=int, default=60)
@@ -50,7 +50,7 @@ parser.add_argument("--delta", type=float, default=0.5)
 parser.add_argument("--log2-sizes", type=int, nargs="+", default=[19, 20, 21, 22])
 parser.add_argument("--calls", type=int, default=10)
 parser.add_argument("--top", type=int, default=10)
-parser.add_argument("--matvec", default="pairs", choices=[m.value for m in Matvec])
+parser.add_argument("--matvec", default="pairs", choices=[*(m.value for m in Matvec), "csr", "ell"])
 options = parser.parse_args()
 
 
@@ -80,15 +80,21 @@ def kernel_times(trace_dir):
 
 def kernel_of(h, states_u, arm):
     """``(jitted matvec, its arrays, summary)``, the arrays as ``sqd``'s solve builds them."""
-    if arm in _SPARSE_MATVECS:
-        operator = _sparse_operator(h, states_u, arm)
+    if arm in legacy.SPARSE:
+        operator = legacy.operator(h, states_u, arm)
         steps = sum(a.shape[0] for a in operator[1::3])  # each (index, ...) set's chunk count
         return (
-            jax.jit(_SPARSE_APPLY[arm]),
+            jax.jit(legacy.APPLY[arm]),
             operator,
             f"{steps} scan steps of up to {operator[1].shape[-1]}",
         )
-    parts = _group_parts(h) if arm == "tables" else (h.arrays,)
+    if arm != "tables":  # the library's bucketed fixed-trip kernel, as run_sqd builds it
+        x = h.x if arm == "onthefly" else jnp.stack([get_xsource(xg, states_u) for xg in h.x])
+        args = _bucket_args(h, x, states_u)
+        counts = sorted(set(h.term_counts[int(h.identity_first) :]))
+        summary = f"{h.x.shape[0]} X groups, term-count buckets {counts}"
+        return jax.jit(functools.partial(_apply_buckets, matvec=arm)), args, summary
+    parts = _group_parts(h)
     scanned = []
     for x, z, c in parts:
         xs = x if arm == "onthefly" else jnp.stack([get_xsource(xg, states_u) for xg in x])
@@ -105,11 +111,12 @@ def kernel_of(h, states_u, arm):
 ham = PauliSumXZ.from_paulisum(
     xxz(options.num_qubits, options.delta, *patterns(options.num_qubits)[options.pattern])
 )
-arm = Matvec(options.matvec)
+arm = options.matvec
 print(f"{jax.devices()[0].device_kind}, n={options.num_qubits} {options.pattern}, matvec={arm}")
 for log2 in options.log2_sizes:
     states = hamming_shells(options.num_qubits, 1 << log2, np.random.default_rng(0))
-    h, states_p, size = _sqd_inputs(ham, states, None, False, arm, 0.0, None, (32, 2))
+    as_matvec = Matvec.PAIRS if arm in legacy.SPARSE else Matvec(arm)
+    h, states_p, size = _sqd_inputs(ham, states, None, False, as_matvec, 0.0, None, (32, 2))
     matvec, operator, summary = kernel_of(h, uniquify_states(states_p, size), arm)
     jax.block_until_ready(operator)
     print(f"\n2^{log2}: {summary}")

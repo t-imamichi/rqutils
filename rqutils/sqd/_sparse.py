@@ -1,4 +1,7 @@
-"""The sparse kernels, ``"pairs"``, ``"csr"`` and ``"ell"``: host-side construction and the solve."""
+"""The sparse kernel, ``"pairs"``: host-side construction and the solve.
+
+``"csr"`` and ``"ell"`` were removed for it (``poc/sparse/tune.md`` §3); ``poc/sparse/legacy.py`` keeps them.
+"""
 
 import functools
 import logging
@@ -29,9 +32,9 @@ def _on_gpu() -> bool:
     return jax.default_backend() == "gpu"
 
 
-def _chunk(matvec: Matvec) -> int:
-    """Entries per scanned chunk for ``matvec`` on the default backend."""
-    return _GPU_PAIRS_CHUNK if matvec == "pairs" and _on_gpu() else _CHUNK
+def _chunk() -> int:
+    """Entries per scanned chunk on the default backend."""
+    return _GPU_PAIRS_CHUNK if _on_gpu() else _CHUNK
 
 
 def _pairs_sorted_on_device(
@@ -232,169 +235,34 @@ def _entry_factors(
     return jax.lax.map(one, (target, source, group))
 
 
-#: ``"ell"``'s row widths, a x1.25 geometric grid: few buckets (each its own compiled scan) at a few
-#: percent padding (``poc/sparse/pairs.md``, section 10).
-_ELL_WIDTHS = np.unique(np.ceil(1.25 ** np.arange(100)).astype(np.int64))
-
-
-def _flat_factors(
-    t: np.ndarray,
-    s: np.ndarray,
-    g: np.ndarray,
-    z: jax.Array,
-    c: jax.Array,
-    states: StateList,
-    kmax: int,
-) -> jax.Array:
-    """:func:`_entry_factors` over flat host entries, one ``(1, _CHUNK)`` chunk per call.
-
-    A fixed chunk shape, so it compiles once per coefficient dtype rather than per bucket shape.
-    """
-    out = []
-    for k in range(0, len(t), _CHUNK):
-        chunk = [a[k : k + _CHUNK] for a in (t, s, g)]
-        n = len(chunk[0])
-        if n < _CHUNK:
-            chunk = [np.pad(a, (0, _CHUNK - n)) for a in chunk]
-        f = _entry_factors(*(jnp.asarray(a[None]) for a in chunk), z, c, states, kmax)
-        out.append(f[0, :n])
-    return jnp.concatenate(out)
-
-
-def _sort_by_target(
-    pairs: dict[int, tuple[np.ndarray, np.ndarray]],
-    subset: list[int],
-    size: int,
-    alloc: Callable[[int], list[np.ndarray]],
-) -> tuple[list[np.ndarray], np.ndarray]:
-    """Counting-sort ``subset``'s transitions, both directions, by target into ``alloc(count)``.
-
-    ``alloc`` returns arrays for ``(target, source, group)`` or ``(source, group)``. A row occurs at
-    most once per group, so each group's fill is conflict-free (``poc/sparse/pairs.md``, section 2);
-    each group is popped from ``pairs`` once written. Returns the arrays and each row's end offset.
-    """
-    end = np.zeros(size + 1, np.int64)
-    for g in subset:
-        for rows in pairs[g]:
-            end[rows + 1] += 1
-    np.cumsum(end, out=end)
-    out = alloc(int(end[-1]))
-    for g in subset:
-        i, j = pairs.pop(g)
-        for target, source in ((i, j), (j, i)):
-            pos = end[target]
-            for array, value in zip(out, (target, source, g)[-len(out) :]):
-                array[pos] = value
-            end[target] += 1
-    return out, end[:-1]
-
-
-def _ell_buckets(
-    pairs: dict[int, tuple[np.ndarray, np.ndarray]],
-    subset: list[int],
-    size: int,
-    z: jax.Array,
-    c_set: jax.Array,
-    states_u: StateList,
-    kmax: int,
-) -> list[jax.Array]:
-    """``"ell"``'s ``(rows, src, fac)`` per width for one coefficient set; see :func:`_sparse_operator`.
-
-    Raises:
-        ValueError: If the padded slot count reaches :math:`2^{31}` -- see :func:`_check_entries`.
-    """
-    (src, grp), end = _sort_by_target(
-        pairs, subset, size, lambda count: [np.empty(count, np.int32) for _ in range(2)]
-    )
-    deg = np.diff(end, prepend=0)
-    width = np.where(deg > 0, _ELL_WIDTHS[np.searchsorted(_ELL_WIDTHS, deg)], 0)
-    # Rows per piece fixed per width and pieces size-classed, so shapes come from a bounded set.
-    plan = []
-    for w in np.unique(width[width > 0]).tolist():
-        per = max(1, _CHUNK // w)
-        rows = np.flatnonzero(width == w).astype(np.int32)
-        plan.append((w, per, _size_class(-(-len(rows) // per)), rows))
-    del width
-    _check_entries(sum(w * per * pieces for w, per, pieces, _ in plan))
-    pos = (end - deg).astype(np.int32)  # row starts
-    del end
-    buckets = []
-    for w, per, pieces, rows in plan:
-        pad = (0, pieces * per - len(rows))
-        # Padding rows repeat a real row with no entries: a dummy output slot costs two (2, N) copies.
-        r = np.pad(rows, pad, constant_values=rows[0]).reshape(pieces, per)
-        lane = np.arange(w, dtype=np.int32)
-        valid = lane < np.pad(deg[rows], pad).reshape(pieces, per, 1)
-        slot = np.where(valid, pos[r][..., None] + lane, 0)
-        # An empty slot gets source = target, which _entry_factors' t == s rule zeroes.
-        s, g = np.where(valid, src[slot], r[..., None]), grp[slot]
-        del slot
-        fac = _flat_factors(np.repeat(r, w), s.ravel(), g.ravel(), z, c_set, states_u, kmax)
-        del g
-        fac.block_until_ready()  # the host-to-device copies of s are asynchronous
-        s[~valid] = 0
-        del valid
-        buckets += [jnp.asarray(r), jnp.asarray(s), fac.reshape(s.shape)]
-    return buckets
-
-
 def _sparse_operator(
     hamiltonian: PauliSumXZ,
     states_u: StateList,
-    matvec: Matvec,
     pairs: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> tuple[jax.Array, ...]:
-    """Build a sparse ``matvec``'s operator arrays on the host, one X group's search at a time.
+    """Build ``"pairs"``' ``(d0, i, j, d)`` on the host, each entry array ``(chunks, _chunk())``.
 
-    Returns ``(d0, i, j, d)`` for ``"pairs"`` and ``(d0, rt, rs, rd, qt, qs, qd)`` for ``"csr"``, each
-    entry array ``(chunks, _chunk(matvec))``; ``r``/``q`` are the real-coefficient groups (float64 factors)
-    and the rest. Padding entries have equal endpoints and a zero factor.
-
-    ``"ell"`` returns ``d0`` then, per set (real first) and ascending row width ``w``, ``rows``
-    ``(pieces, R)``, ``src`` and ``fac`` ``(pieces, R, w)``, ``R = max(1, _CHUNK // w)``; slots past a
-    row's degree, and padding rows, have source 0 and factor 0.
-
-    ``pairs`` is :func:`_group_pairs`' output, searched here when not given; it is left unconsumed.
+    Each transition once, sorted by ``i`` across groups so ``out[i]`` and ``vec[i]`` are local
+    (``NOTES.md``, "sqd sparse kernels: pairs sorted by i"); padding entries have equal endpoints and a
+    zero factor. ``pairs`` is :func:`_group_pairs`' output, searched here when not given.
 
     Raises:
         ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_check_entries`.
     """
-    size = states_u.shape[0]
-    chunk = _chunk(matvec)
+    size, chunk = states_u.shape[0], _chunk()
     z, c = jnp.asarray(hamiltonian.z), jnp.asarray(hamiltonian.c)
-    # A copy: _sort_by_target pops each group as it writes it.
-    pairs = dict(_group_pairs(hamiltonian, states_u) if pairs is None else pairs)
+    pairs = _group_pairs(hamiltonian, states_u) if pairs is None else pairs
     first = int(hamiltonian.identity_first)
     d0 = get_diagonal(z[0], c[0], states_u) if first else jnp.zeros(size, c.dtype)
     groups = range(first, hamiltonian.x.shape[0])
     coeffs = np.asarray(hamiltonian.c)
     kmax = max((int(np.count_nonzero(coeffs[g])) for g in groups), default=1)
 
-    def on_device(host, c_set):
-        # Pops each host array as it is copied, so no host entry array outlives its device copy.
-        t, s, g = (jnp.asarray(host.pop(0).reshape(-1, chunk)) for _ in range(3))
-        return t, s, _entry_factors(t, s, g, z, c_set, states_u, kmax)
-
     def alloc(count):  # i, j, group
         return [_padded(count, f, chunk) for f in (size - 1, size - 1, 0)]
 
-    if matvec == "pairs":
-        # Sorted by i across groups, so out[i] and vec[i] are local (NOTES.md, "sqd sparse kernels:
-        # pairs sorted by i").
-        return (d0, *on_device(_pairs_sorted_on_device(pairs, groups, alloc), c))
-
-    real = np.isreal(coeffs).all(axis=1)
-    arrays = [d0]
-    for subset, c_set in (
-        ([g for g in groups if real[g]], c.real),
-        ([g for g in groups if not real[g]], c),
-    ):
-        if matvec == "ell":
-            arrays += _ell_buckets(pairs, subset, size, z, c_set, states_u, kmax)
-            continue
-        host = _sort_by_target(pairs, subset, size, alloc)[0]
-        arrays += on_device(host, c_set)
-    return tuple(arrays)
+    t, s, g = (a.reshape(-1, chunk) for a in _pairs_sorted_on_device(pairs, groups, alloc))
+    return d0, t, s, _entry_factors(t, s, g, z, c, states_u, kmax)
 
 
 def _scan_add(
@@ -448,59 +316,27 @@ def _apply_pairs(
     return _scan_add(updates, d0 * vec, (pi, pj, d))
 
 
-def _apply_csr(vec: jax.Array, d0: jax.Array, *entries: jax.Array) -> jax.Array:
-    """``"csr"``: ``d0 * vec``, then ``out[t] += d * vec[s]`` over each target-sorted ``(t, s, d)`` set."""
-    sharding = jax.typeof(vec).sharding
-
-    def updates(chunk):
-        ti, si, di = chunk
-        return [(ti, di * vec.at[..., si].get(out_sharding=sharding))]
-
-    out = d0 * vec
-    for k in range(0, len(entries), 3):
-        out = _scan_add(updates, out, entries[k : k + 3])
-    return out
-
-
-def _apply_ell(vec: jax.Array, d0: jax.Array, *buckets: jax.Array) -> jax.Array:
-    """``"ell"``: ``d0 * vec``, then per ``(rows, src, fac)`` piece ``out[rows] += sum(fac * vec[src])``."""
-    sharding = jax.typeof(vec).sharding
-
-    def updates(piece):
-        rows, src, fac = piece
-        return [(rows, jnp.sum(fac * vec.at[..., src].get(out_sharding=sharding), axis=-1))]
-
-    out = d0 * vec
-    for k in range(0, len(buckets), 3):
-        out = _scan_add(updates, out, buckets[k : k + 3])
-    return out
-
-
-_SPARSE_APPLY = {Matvec.PAIRS: _apply_pairs, Matvec.CSR: _apply_csr, Matvec.ELL: _apply_ell}
-
-
-@jax.jit(static_argnames=_SOLVE_STATIC)
+@jax.jit(static_argnames=[s for s in _SOLVE_STATIC if s != "matvec"])
 def _run_sparse(
     hamiltonian: PauliSumXZ,
     states_u: StateList,
     operator: tuple[jax.Array, ...],
     states_size: int,
     return_eigvec: bool,
-    matvec: Matvec,
     maxiter: int = 1000,
     atol: float = 0.0,
     rtol: float | None = None,
     prefilter: tuple[int, int] | None = (32, 2),
     log_level: int = logging.INFO,
 ) -> SqdResult:
-    """:func:`run_sqd` for the sparse kernels, given :func:`_sparse_operator`'s arrays.
+    """:func:`run_sqd` for ``"pairs"``, given :func:`_sparse_operator`'s arrays.
 
     It runs no residual check: :func:`sqd` checks with :func:`_sparse_residual` after it returns.
     """
     return _solve(
         hamiltonian,
         states_u,
-        _SPARSE_APPLY[matvec],
+        _apply_pairs,
         operator,
         lambda: operator[0],
         None,

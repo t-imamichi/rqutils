@@ -7,7 +7,7 @@ kernel, whose ``_scan_add`` carries the two parts itself; ``complex`` is the pre
 verbatim below. The split is CUDA-only (``jax.lax.platform_dependent``), so on CPU the two arms run the
 same carry and must agree bit for bit and time alike (``poc/sparse/split.md``).
 
-Each arm gets a function of its own to jit (``_SPARSE_APPLY`` is read at trace time, and a second jit of
+Each arm gets a function of its own to jit (``legacy.APPLY`` is read at trace time, and a second jit of
 one function reuses the first's trace), and the lowered solves are asserted to differ. Arms are warm and
 interleaved; ``solve`` is per iteration, since GPU scatter order makes iteration counts vary. ``temp`` is
 XLA's ``temp_size_in_bytes`` for the ``(2, N)`` matvec. Fixture as ``poc/sparse/gpu.py``.
@@ -32,10 +32,10 @@ import numpy as np
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )  # poc/, for its fixtures
+import legacy  # "csr"/"ell", removed from the library
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 
 import rqutils.sqd._solve as solve_mod
-import rqutils.sqd._sparse as sparse_mod
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import Matvec, uniquify_states
 from rqutils.sqd._core import _sqd_inputs
@@ -104,8 +104,8 @@ def apply_ell(vec, d0, *buckets):
 
 
 KERNELS = {
-    "split": dict(sparse_mod._SPARSE_APPLY),
-    "complex": {Matvec.PAIRS: apply_pairs, Matvec.CSR: apply_csr, Matvec.ELL: apply_ell},
+    "split": dict(legacy.APPLY),
+    "complex": {"pairs": apply_pairs, "csr": apply_csr, "ell": apply_ell},
 }
 
 
@@ -126,20 +126,18 @@ print(
 for log2 in options.log2_sizes:
     states = hamming_shells(options.num_qubits, 1 << log2, np.random.default_rng(0))
     for name in options.arms:
-        arm = Matvec(name)
-        h, states_p, size = _sqd_inputs(ham, states, None, False, arm, 0.0, None, (32, 2))
+        arm = name
+        h, states_p, size = _sqd_inputs(ham, states, None, False, Matvec.PAIRS, 0.0, None, (32, 2))
         states_u = uniquify_states(states_p, size)
-        operator = jax.block_until_ready(sparse_mod._sparse_operator(h, states_u, arm))
+        operator = jax.block_until_ready(legacy.operator(h, states_u, arm))
         vecs = [
             jax.random.normal(jax.random.key(0), shape, jnp.complex128)
             for shape in ((size,), (2, size))
         ]
         calls, lowered, temp, products = {}, {}, {}, {}
         for kind, table in KERNELS.items():
-            sparse_mod._SPARSE_APPLY[arm] = table[arm]
-            solve = jax.jit(
-                lambda *a: sparse_mod._run_sparse.__wrapped__(*a), static_argnums=(3, 4, 5)
-            )
+            legacy.APPLY[arm] = table[arm]
+            solve = jax.jit(lambda *a: legacy.run.__wrapped__(*a), static_argnums=(3, 4, 5))
             lowered[kind] = solve.lower(h, states_u, operator, size, False, arm).as_text()
             matvec = jax.jit(table[arm])
             calls[kind] = [functools.partial(solve, h, states_u, operator, size, False, arm)]
@@ -149,7 +147,7 @@ for log2 in options.log2_sizes:
             for call in calls[kind]:
                 call()  # compile
             products[kind] = np.asarray(calls[kind][2]())
-        sparse_mod._SPARSE_APPLY[arm] = KERNELS["split"][arm]
+        legacy.APPLY[arm] = KERNELS["split"][arm]
         assert lowered["split"] != lowered["complex"], "both solve arms compiled the same kernel"
         ref = products["complex"]
         err = np.abs(products["split"] - ref).max() / np.abs(ref).max()

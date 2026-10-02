@@ -129,8 +129,8 @@ for log2 in options.log2_sizes:
     ops, calls = {}, {}
     for name, order in ORDERS.items():
         ORDER = order
-        ops[name] = jax.block_until_ready(sparse_mod._sparse_operator(h, states_u, arm))
-        calls[name] = [functools.partial(solve, h, states_u, ops[name], size, False, arm)]
+        ops[name] = jax.block_until_ready(sparse_mod._sparse_operator(h, states_u))
+        calls[name] = [functools.partial(solve, h, states_u, ops[name], size, False)]
         calls[name] += [functools.partial(matvec, vec, *ops[name]) for vec in vecs]
         for call in calls[name]:
             call()  # warm

@@ -55,13 +55,15 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )  # poc/, for its fixtures
 from eigenpair_check_scale import hamming_shells, patterns, xxz
+from legacy import SPARSE
+from legacy import operator as sparse_build
+from legacy import run as run_sparse
 
 import rqutils.sqd._solve as solve_mod
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import Matvec, hproj, sqd, uniquify_states
 from rqutils.sqd._core import _checked_eigval, _sqd_inputs
-from rqutils.sqd._solve import _SPARSE_MATVECS
-from rqutils.sqd._sparse import _group_pairs, _run_sparse, _sparse_operator, _sparse_residual
+from rqutils.sqd._sparse import _group_pairs, _sparse_residual
 
 n = options.num_qubits
 ITERATIONS = []
@@ -85,13 +87,13 @@ def fixture(pattern, log2):
 
 def staged(ham, states, arm):
     """``(eigval, {stage: seconds})``: ``sqd``'s sparse path at its defaults, synced per stage."""
-    ham, states_p, size = _sqd_inputs(ham, states, None, False, arm, 0.0, None, (32, 2))
+    ham, states_p, size = _sqd_inputs(ham, states, None, False, Matvec.PAIRS, 0.0, None, (32, 2))
     t0 = time.perf_counter()
     states_u = jax.block_until_ready(uniquify_states(states_p, size))
     pairs = _group_pairs(ham, states_u)  # one search for the build and the check, as sqd
-    operator = jax.block_until_ready(_sparse_operator(ham, states_u, arm, pairs))
+    operator = jax.block_until_ready(sparse_build(ham, states_u, arm, pairs))
     t1 = time.perf_counter()
-    result = jax.block_until_ready(_run_sparse(ham, states_u, operator, size, True, arm))
+    result = jax.block_until_ready(run_sparse(ham, states_u, operator, size, True, arm))
     del operator
     t2 = time.perf_counter()
     residual, ax_norm = _sparse_residual(ham, states_u, result.eigval, result.eigvec, pairs)
@@ -103,10 +105,10 @@ def staged(ham, states, arm):
 
 def solve(pattern, log2, arm):
     ham, states = fixture(pattern, log2)
-    if arm in _SPARSE_MATVECS:
+    if arm in SPARSE:  # "csr"/"ell" through poc/sparse/legacy.py, "pairs" through the library
         run = lambda: staged(ham, states, arm)
     else:
-        run = lambda: (sqd(ham, states, return_eigvec=False, matvec=arm), {})
+        run = lambda: (sqd(ham, states, return_eigvec=False, matvec=Matvec(arm)), {})
     t0 = time.perf_counter()
     eigval, _ = run()
     first = time.perf_counter() - t0
@@ -131,11 +133,11 @@ def solve(pattern, log2, arm):
 
 if options.child is not None:
     pattern, log2, arm = options.child
-    print(json.dumps(solve(pattern, int(log2), Matvec(arm))), flush=True)
+    print(json.dumps(solve(pattern, int(log2), arm)), flush=True)
     sys.exit()
 
 # INDICES first: the reference every other arm is checked against
-arms = [Matvec.INDICES] + [Matvec(a) for a in options.arms if a != Matvec.INDICES]
+arms = ["indices"] + [a for a in options.arms if a != "indices"]
 warned = False
 
 for pattern in options.patterns:
@@ -155,7 +157,7 @@ for pattern in options.patterns:
                 print("  WARNING: not a GPU backend; numbers below are not GPU numbers", flush=True)
                 warned = True
             eigval, times = r["eigval"], r["times"]
-            ref = eigval if arm is Matvec.INDICES else ref
+            ref = eigval if arm == "indices" else ref
             delta = "" if oracle is None else f"  d_oracle={eigval - oracle:+.2e}"
             peak = "n/a" if r["peak"] is None else f"{r['peak'] / 2**30:.2f} GiB"
             solve_s = r["stages"].get("solve", float(np.median(times)))

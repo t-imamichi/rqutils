@@ -49,6 +49,7 @@ import numpy as np
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )  # poc/, for its fixtures
+import legacy  # "csr"/"ell", removed from the library
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 
 import rqutils.sqd._solve as solve_mod
@@ -59,7 +60,7 @@ from rqutils.sqd._core import _sqd_inputs
 
 VARIANTS = {
     "pairs": ("base", "sorted", "merged", "real", "unique", "unique-exact"),
-    "csr": ("base", "sorted", "unsorted"),
+    "csr": ("base", "sorted"),
     "ell": ("base", "grid1.5", "grid2"),
 }
 parser = argparse.ArgumentParser()
@@ -148,19 +149,6 @@ def apply_real(vec, d0, *sets):
     return out
 
 
-def apply_csr_unsorted(vec, d0, *entries):
-    """``"csr"`` with the sorted hint dropped on every platform, the CPU included."""
-
-    def updates(chunk):
-        ti, si, di = chunk
-        return [(ti, di * vec[..., si], {})]
-
-    out = d0 * vec
-    for k in range(0, len(entries), 3):
-        out = scan_add(updates, out, entries[k : k + 3])
-    return out
-
-
 def apply_csr_sorted(vec, d0, *entries):
     def updates(chunk):
         ti, si, di = chunk
@@ -219,8 +207,8 @@ KERNELS = {
         "unique": apply_unique,
         "unique-exact": apply_unique_exact,
     },
-    "csr": {"base": sm._apply_csr, "sorted": apply_csr_sorted, "unsorted": apply_csr_unsorted},
-    "ell": dict.fromkeys(VARIANTS["ell"], sm._apply_ell),  # one kernel; the grid is the build's
+    "csr": {"base": legacy.apply_csr, "sorted": apply_csr_sorted},
+    "ell": dict.fromkeys(VARIANTS["ell"], legacy.apply_ell),  # one kernel; the grid is the build's
 }[options.matvec]
 
 
@@ -288,7 +276,7 @@ def unique_exact_operator(h, states_u, pairs):
 
 
 def width_grid(factor):
-    """``_ELL_WIDTHS``' construction for another ratio, kept below ``2^31``."""
+    """``legacy.ELL_WIDTHS``' construction for another ratio, kept below ``2^31``."""
     steps = int(np.log(2**31) / np.log(factor))
     return np.unique(np.ceil(factor ** np.arange(steps)).astype(np.int64))
 
@@ -302,8 +290,8 @@ def timed(fn):
 ham = PauliSumXZ.from_paulisum(
     xxz(options.num_qubits, options.delta, *patterns(options.num_qubits)[options.pattern])
 )
-arm = Matvec(options.matvec)
-shipped = sm._CHUNK, sm._chunk, sm._ELL_WIDTHS
+arm = options.matvec
+shipped = sm._CHUNK, sm._chunk, legacy.ELL_WIDTHS
 arms = [
     (c, v)
     for c in options.chunks
@@ -320,7 +308,7 @@ print(
 )
 for log2 in options.log2_sizes:
     states = hamming_shells(options.num_qubits, 1 << log2, np.random.default_rng(0))
-    h, states_p, size = _sqd_inputs(ham, states, None, False, arm, 0.0, None, (32, 2))
+    h, states_p, size = _sqd_inputs(ham, states, None, False, Matvec.PAIRS, 0.0, None, (32, 2))
     states_u = uniquify_states(states_p, size)
     pairs = sm._group_pairs(h, states_u)  # one search for every arm
     vecs = [
@@ -332,8 +320,8 @@ for log2 in options.log2_sizes:
         # Read at build time, and the operator's shapes follow; _chunk too, or a GPU "pairs" build
         # would take _GPU_PAIRS_CHUNK in every arm.
         sm._CHUNK = 1 << chunk
-        sm._chunk = lambda matvec: sm._CHUNK  # ty: ignore[invalid-assignment]
-        sm._ELL_WIDTHS = (
+        sm._chunk = lambda: sm._CHUNK  # ty: ignore[invalid-assignment]
+        legacy.ELL_WIDTHS = (
             width_grid(float(variant[4:])) if variant.startswith("grid") else shipped[2]
         )
         if variant == "real":
@@ -343,10 +331,10 @@ for log2 in options.log2_sizes:
         elif variant == "unique-exact":
             operator = jax.block_until_ready(unique_exact_operator(h, states_u, pairs))
         else:
-            operator = jax.block_until_ready(sm._sparse_operator(h, states_u, arm, pairs))
+            operator = jax.block_until_ready(legacy.operator(h, states_u, arm, pairs))
         kernel = KERNELS[variant]
-        sm._SPARSE_APPLY[arm] = kernel
-        solve = jax.jit(lambda *a: sm._run_sparse.__wrapped__(*a), static_argnums=(3, 4, 5))
+        legacy.APPLY[arm] = kernel
+        solve = jax.jit(lambda *a: legacy.run.__wrapped__(*a), static_argnums=(3, 4, 5))
         key = (chunk, variant)
         # The traced jaxpr keeps every platform branch, which lowering for one backend drops.
         lowered[key] = str(solve.trace(h, states_u, operator, size, False, arm).jaxpr)
@@ -359,8 +347,8 @@ for log2 in options.log2_sizes:
         info[key] = (sum(a.nbytes for a in operator) / 2**20, temp / 2**20, steps)
         for call in calls[key]:
             call()  # compile
-    sm._CHUNK, sm._chunk, sm._ELL_WIDTHS = shipped
-    sm._SPARSE_APPLY[arm] = KERNELS["base"]
+    sm._CHUNK, sm._chunk, legacy.ELL_WIDTHS = shipped
+    legacy.APPLY[arm] = KERNELS["base"]
     assert len(set(lowered.values())) == len(arms), "two arms compiled the same solve"
     products = {key: np.asarray(calls[key][2]()) for key in arms}
     times = {key: ([], [], []) for key in arms}
