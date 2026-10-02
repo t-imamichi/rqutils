@@ -2366,6 +2366,12 @@ factor. Dropping them after the factor pass (`_drop_zeros`) cuts the operator 23
 counts, eigenvalues within 7.1e-15 (not bit-identical: chunk boundaries move). M1 only. Coding the 4–5
 distinct factors as `uint8` saves another 22–54% of the operator at 1.00–1.01×, unshipped. `poc/sparse/prune.md` §3, §4
 
+### sqd dense kernels: folding z = 0 terms is 1.28–1.50× `"indices"`; coded diagonals halve `"tables"` at 0.80–0.84× (2026-10-03)
+
+M1, `2^14`: summing each group's z = 0 terms into a constant is 1.28× (`type1`) / 1.50× (`type2`) per
+iteration at equal memory. `"tables"` diagonals as `uint8` codes cut the operator 12.13 → 5.13 B/slot and
+temp ~0.5× for 0.80–0.84× (lost in the `(2, N)` matvec), bit-identical. Neither shipped. `poc/dense-codes.md` §2–§4
+
 ### sqd sparse kernels: `"csr"` and `"ell"` leave the library, `"pairs"` stays (2026-10-02)
 
 GH200 tuned (`2^17`, ×2 grid), `"ell"` against `"pairs"` per iteration is 0.28×/1.50× (`type1` `2^20`/`2^22`)
