@@ -68,8 +68,20 @@ Per solve iteration against `run_sqd`, every ratio won 5/5; `temp` is the `(2, N
 
 `2^17` comes from two runs: `id` from the first, `id-static` from a rerun, each against its own
 `run_sqd`. The first run stalled after printing its third row with no error, and was stopped; the cause
-is unexplained, and `"onthefly"`, also in it, is unmeasured on CPU. The 1-D matvec gains 2.88–3.25×.
-Iterations and eigenvalues match `run_sqd`.
+is unexplained. The 1-D matvec gains 2.88–3.25×. Iterations and eigenvalues match `run_sqd`.
+
+**`"onthefly"`, shipped form against the old kernel** (2026-10-05, at `3b50443`, `--matvecs onthefly
+--variants plain --unrolls 1 --rounds 3`, `plain` being the old `while_loop` kernel), per solve iteration,
+the shipped form winning 3/3 in every cell:
+
+| pattern | `2^14` | `2^17` | temp at `2^17` |
+| --- | --- | --- | --- |
+| `type1` | 1.13× (62.94 against 71.03 ms) | 1.12× (427.24 against 477.66 ms) | 5.1 against 7.0 MiB |
+| `type2` | 1.09× (122.87 against 133.61 ms) | 1.10× (857.23 against 945.06 ms) | 5.1 against 7.0 MiB |
+
+Far below `"indices"`' 1.66–1.96× (§4), since here the `J`-fold search each matvec dominates
+(`NOTES.md`, "`sqd`: `get_xsource` setup dominates a solve"), and close to the GH200's 1.31–1.45×
+only in direction. `type1` `2^17` took 96 iterations against 105, so compare per iteration.
 
 ## 4. What it means
 
@@ -102,7 +114,7 @@ against 284.78 ms per iteration, 5/5).
 
 1. **A fixture with many distinct term counts** (molecular-like, `poc/sparse/pairs.py general`), where
    one scan per count could grow large; the shipped form is measured on the GH200 since (§4).
-2. **`"onthefly"` on CPU** with the shipped form (1.45× at `2^20` and 1.31× at `2^22` on the GH200).
+2. **`"onthefly"` on CPU: done** (§3), 1.09–1.13× per iteration, against 1.31–1.45× on the GH200.
 3. **`unroll` with bounded temp**: `unroll=2` already holds ~1 GB at `2^22`; anything above 1 trades
    memory for speed.
 
@@ -125,4 +137,6 @@ asserted pairwise distinct and products equal to `run_sqd`'s to `1e-12`. Runs he
 --unrolls 1 4 8` and `--matvecs indices onthefly --variants plain id-static --unrolls 1 2` on the
 GH200; on the M1, `--log2-sizes 17 19 --matvecs indices onthefly --unrolls 1`
 (stalled), then `--log2-sizes 17 --variants id-static --unrolls 1 --rounds 3` and `--log2-sizes 19
---variants id id-static --unrolls 1 --rounds 3`, all `--matvecs indices` for the last two.
+--variants id id-static --unrolls 1 --rounds 3`, all `--matvecs indices` for the last two; and
+`--log2-sizes 14 17 --matvecs onthefly --variants plain --unrolls 1 --rounds 3` at `--pattern type1` and
+`type2` (as two runs for `type1`, `2^14` first).
