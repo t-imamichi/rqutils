@@ -20,6 +20,7 @@ CPU, 1.1–1.8× on one GPU, `poc/sparse/gpu.md` §9) but raises under a mesh, s
 §3 is the exact, low-risk step: the same collective `"indices"` pays, so the single-device kernel advantage
 should carry over. §6 is the only design that removes the `N`-length gathered vector *and* the all-gather;
 it works best on local Hamiltonians and degrades to §3's cost on molecular ones.
+§9 predicts the winner: per-device bucketed ELL (§3.1) on one node, §6 across nodes.
 
 ## 2. Today's sharded `"indices"`, the baseline
 
@@ -167,3 +168,45 @@ inexactness (`CLAUDE.md`, "Reusing `Ax` to cut `body()`'s 3 matvecs to 2").
    that shrinks the gathered vector, and only step 1 can say whether its balance holds.
 3. **Molecules.** §6 helps local Hamiltonians most; if molecular `J` is the target, §4.1's recomputed
    factors may matter more than any partition.
+
+## 9. Prediction: the fastest sparse mesh matvec
+
+*Predicted, not measured.* **Row-sharded ELL, bucketed within each device's rows (§3.1), with one
+all-gather per matvec, on one node; across many nodes the all-gather becomes the cost, and §6's partition
+takes over for local Hamiltonians.**
+
+**Why ELL over directed pairs.**
+
+- **`"pairs"`' single-device edge over `"ell"` is gone under a mesh.** It stores each transition once and
+  writes both ends, half ELL's both-directions entries; under a mesh every target-ordered design stores both
+  directions, §3's directed pairs included, so the entry counts are equal.
+- **ELL needs no scatter.** By target row it is `out[i] = Σ_w d[w,i]·v[j[w,i]]`, gathers and a reduction
+  along the width, no atomics. `"pairs"`' GPU trouble was its scatter: atomics serialized by padding on one
+  row (0.32–0.73×, `poc/sparse/prune.md` §6), nondeterministic iteration counts (`poc/sparse/gpu.md` §5),
+  the carry split (`poc/sparse/split.md`). Directed pairs keep a scatter-add, or need a sorted segment sum.
+- **The single-device data already leans this way.** With twice the entries, the tuned `"ell"` beat
+  `"pairs"` per iteration in two of four GH200 cells, 1.50× at `type1` `2^22` and 1.25× at `type2` `2^20`
+  (*measured*, `poc/sparse/tune.md` §3). With the doubling taken out of the comparison, it should match or
+  beat directed pairs in most cells.
+- **Bucketed rather than plain**, because after zero-drop the row widths of a Hamming-shell XXZ subspace
+  vary, and plain ELL pads every row to the global maximum.
+
+**When communication takes over** (*estimated* arithmetic). At `N = 2^24` one `complex128` vector is
+256 MB.
+
+- **Within a node**, NVLink at hundreds of GB/s: ~0.3–1 ms per all-gather, under a matvec's local compute
+  at that size, so the local kernel decides and ELL wins.
+- **Across nodes**, InfiniBand at ~25–50 GB/s: ~5–10 ms per vector, matching or exceeding the compute,
+  with per-device memory capped by the full gathered vector. There §6's `ppermute` pattern should win by
+  about its traffic cut (~10× at `P = 64` on XXZ, §6), if its balance holds; on molecular `H` it falls back
+  to the all-gather and ELL's local kernel decides again.
+- **On a CPU mesh** ELL's regular gathers vectorize well: close to directed pairs, possibly still behind
+  `"tables"`, which gathers no factors.
+
+**What would prove it wrong.**
+
+- **The row-width spread** (§7 step 1): heavy-tailed widths make ELL lose to padding even bucketed, and
+  directed pairs win.
+- **XLA's lowering of the width reduction on a GPU** may not fuse as well as the scatter path; the
+  single-device `"ell"`'s 4.8 s build hints at compile cost.
+- **§6's balance on physical subspaces** decides whether the multi-node case ever leaves the all-gather.
