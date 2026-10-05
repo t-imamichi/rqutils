@@ -12,6 +12,7 @@ CPU, 1.1–1.8× on one GPU, `poc/sparse/gpu.md` §9) but raises under a mesh, s
 | design | per-matvec communication | per-device memory | locality needed |
 | --- | --- | --- | --- |
 | §3 row-owned directed pairs | one all-gather, as `"indices"` | ~2× symmetric pairs / `P` | none |
+| §3.1 the same as plain or bucketed ELL | same | §3 plus per-row padding | none |
 | §4 its two dials | same | less (recomputed factors, hybrid) | §4.2 only |
 | §5 push matvec | one `all_to_all` of hit values | no `N`-length buffer | none |
 | §6 GF(2)-linear partition (randomized) | one `ppermute` per distinct offset | ~`(1 + c·log2 P)·N/P` values | yes, gains on local `H` |
@@ -50,6 +51,28 @@ device), and every device materializes the full gathered `vec` (`16·N` B per ve
 
 An alternative, symmetric storage with a `psum_scatter` of a full-length partial `out`, halves the entries
 but doubles the communication and adds an `N`-length buffer. Not proposed.
+
+### 3.1 The removed `"csr"` and `"ell"` already had §3's layout
+
+Both stored entries by target row, both directions, so every update lands in an owned row: §3's layout,
+which `"pairs"` must be converted to. Neither was ever mesh-capable (`dev-0.2.4` raised "single-device for
+now" for all three sparse kernels), and single-device they lost to `"pairs"` (*measured*,
+`poc/sparse/tune.md` §3): `"csr"` dominated on both backends (58.00 against 20.35 ms per GH200 iteration,
+`type2` `2^22`, with its sorted hint; still dominated without it); `"ell"` was mixed on a GH200 (0.28×/1.50× `"pairs"` per iteration at `type1` `2^20`/`2^22`,
+1.25×/0.70× at `type2`) at more memory and a 4.8 s build, a near-tie on CPU. So the case for them under a
+mesh is structural, not speed. Three target-ordered variants, each built from today's `"pairs"` build
+(zero-drop, device sort) rather than from `poc/sparse/legacy.py`:
+
+| variant | shape per device | padding | multi-process count exchange |
+| --- | --- | --- | --- |
+| directed pairs (§3), CSR-like | ragged, padded to the largest device's size class | per device | yes |
+| plain ELL | `(width, N/P)`, sharded on `N` with `P('x')` like `"indices"`' table | per row, to the global max width | no |
+| ELL bucketed per device | each device's rows bucketed by width, scattered back locally | per bucket | yes, per bucket |
+
+Plain ELL is the simplest to shard: a fixed shape, so no device needs its own count. Its cost is per-row
+padding, and the tuned `"ell"`'s fix, bucketing rows by width, reorders rows across the whole vector and
+breaks row ownership; under a mesh it must bucket within each device's row block instead. Which variant
+wins depends on the row-width spread, which §7 step 1 also measures.
 
 ## 4. Exact: two dials on §3
 
@@ -125,6 +148,10 @@ inexactness (`CLAUDE.md`, "Reusing `Ax` to cut `body()`'s 3 matvecs to 2").
    §4.2's same-device fraction under a range split, and §6's search: imbalance, same-device fraction,
    distinct `Δ`, receive volume against an all-gather. Gate: §6 at imbalance ≤ 1.25 and ≥ 2× less receive
    volume on XXZ, else build §3 alone.
+
+   For §3.1, the same build also reports the per-row width spread: stored entries against plain ELL's
+   `width · N`, and against per-device buckets. Build §3 as plain ELL if its padding is ≤ 1.25× the
+   directed entries, otherwise as directed pairs.
 2. **§3, or §6 if step 1 passes**, in the library behind a `test/sharded/*.py` case on virtual CPU devices:
    values against single-device `"pairs"`, the sharding *spec* asserted, and the collective count from
    `.lower(...).compile().as_text()`. Correctness only: virtual-device timings are meaningless.
