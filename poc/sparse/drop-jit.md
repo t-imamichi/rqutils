@@ -68,5 +68,6 @@ trade. On a GH200 the gain is larger (§3). A persistent cache at its default th
 ## 6. The script
 
 `poc/sparse/drop_jit.py`, against its argparse: `--num-qubits` (60), `--delta` (0.5), `--patterns`
-(`type1 type2`), `--log2-sizes` (`17 19`; the table used `14 17`), `--rounds` (5), `--cache-min-secs` (off; §4 used `0` and `1.0`). Each cell runs two child
-processes (`--child`, internal). The eager arm is a copy of the pre-change `_drop_zeros`.
+(`type1 type2`), `--log2-sizes` (`17 19`; §2 and §4 used `14 17`, §3 `20 22`), `--rounds` (5),
+`--cache-min-secs` (off; §4 used `0` and `1.0`). Each cell runs one child process per arm (`--child`,
+internal), two with the cache. The eager arm is a copy of the pre-change `_drop_zeros`.
