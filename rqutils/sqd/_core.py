@@ -23,7 +23,13 @@ from rqutils.sqd._solve import (
     _residual_floor_of,
     run_sqd,
 )
-from rqutils.sqd._sparse import _group_pairs, _run_sparse, _sparse_operator, _sparse_residual
+from rqutils.sqd._sparse import (
+    _group_pairs,
+    _mesh_operator,
+    _run_sparse,
+    _sparse_operator,
+    _sparse_residual,
+)
 from rqutils.sqd._states import (
     _MAX_STATES,
     StateList,
@@ -191,7 +197,9 @@ def sqd(
 
             A sparse ``matvec`` is built on the host before the solve (logged as its own phase),
             its array shapes rounded up to size classes so the solve recompiles per class rather
-            than per subspace. Single-device only for now.
+            than per subspace. Under a mesh ``Matvec.PAIRS`` runs term-parallel: each device applies a
+            share of the X groups to the all-gathered vector, and one reduce-scatter sums them.
+            Every process builds the whole operator on the host.
         prefilter: ``(degree, cycles)`` Chebyshev prefilter, forwarded verbatim to
             :func:`rqutils.ground_locg.ground_locg` (see there) and validated by
             :func:`rqutils.ground_locg._check_prefilter`. Static; ``None`` disables it and restores
@@ -238,8 +246,7 @@ def sqd(
             **while** ``rtol`` is zero; or if ``rtol`` is at least 0.5, where any vector would report
             convergence.
 
-            If a sparse ``matvec`` is used under a mesh, or its operator reaches :math:`2^{31}`
-            entries.
+            If a sparse ``matvec``'s operator reaches :math:`2^{31}` entries.
         TypeError: If ``matvec`` is not a :class:`Matvec` member, a plain string included; if
             ``prefilter`` is neither None nor a ``(degree, cycles)`` pair of ints; or if ``atol`` is
             not a real number, or ``rtol`` neither None nor one.
@@ -268,11 +275,6 @@ def _sqd_inputs(
 ) -> tuple[PauliSumXZ, StateList, int]:
     """Validate :func:`sqd`'s arguments; return the Hamiltonian, padded packed states, ``states_size``."""
     _check_matvec(matvec)
-    if matvec is Matvec.PAIRS and not get_abstract_mesh().empty:
-        raise ValueError(
-            f"matvec=Matvec.{matvec.name} is single-device for now; call sqd outside the mesh "
-            "context, or use Matvec.ONTHEFLY, INDICES or TABLES for a sharded solve"
-        )
     _check_prefilter(prefilter)
     if states_size is None:
         # Next power of two: growing distinct sizes are the normal SQD pattern, so O(log N) retraces
@@ -326,7 +328,12 @@ def _solve_sqd(
         # run_sqd is jitted and the entry counts are data-dependent, so the operator is built here.
         states_u = uniquify_states(states_p, states_size)
         pairs = _group_pairs(hamiltonian, states_u)  # one search, for the build and the check
-        operator = _sparse_operator(hamiltonian, states_u, pairs)
+        mesh = jax.sharding.get_mesh()
+        operator = (
+            _sparse_operator(hamiltonian, states_u, pairs)
+            if mesh.empty
+            else _mesh_operator(hamiltonian, states_u, pairs, mesh)
+        )
         LOG.info("Built the %s operator in %f seconds.", matvec, time.time() - start)
         result = _run_sparse(hamiltonian, states_u, operator, states_size, True, **tols)
         del operator  # the check reads none of it

@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from common import emit, mesh
-from conftest import DENSE_MATVECS
+from conftest import MATVECS
 from jax.sharding import PartitionSpec
 
 import rqutils.sqd as sqd_module
@@ -20,8 +20,6 @@ from rqutils.sqd._states import _pad_states
 NUM_QUBITS, NUM_STATES, NUM_TERMS, STATES_SIZE = 8, 37, 5, 64
 PREFILTER = (16, 2)
 MESH_SIZES = (1, 2, 4)
-# pairs/csr are single-device and raise under a mesh (sparse_mesh.py), so they are excluded here.
-DENSE = DENSE_MATVECS
 
 
 def main() -> None:
@@ -42,11 +40,11 @@ def main() -> None:
             )
         )
 
-    single = {name: solve(name) for name in DENSE}
+    single = {name: solve(name) for name in MATVECS}
     sharded = {}
     for num_devices in MESH_SIZES:
         with jax.set_mesh(mesh(num_devices)):
-            sharded[num_devices] = {name: solve(name) for name in DENSE}
+            sharded[num_devices] = {name: solve(name) for name in MATVECS}
     emit({"single": single, "sharded": sharded, "specs": prefilter_specs(strings, coeffs, states)})
 
 

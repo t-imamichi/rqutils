@@ -4,12 +4,13 @@ import functools
 import logging
 import os
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec, get_abstract_mesh
 
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd._dense import _apply_h_kernel, _pack_scanned
@@ -30,7 +31,7 @@ def _chunk() -> int:
 
 
 def _pairs_sorted_on_device(
-    pairs: dict[int, tuple[np.ndarray, np.ndarray]], groups: range, alloc: Callable
+    pairs: dict[int, tuple[np.ndarray, np.ndarray]], groups: Sequence[int], alloc: Callable
 ) -> list[jax.Array]:
     """``"pairs"``' ``(i, j, group)``, each pair once, stably sorted by ``i`` on the device.
 
@@ -259,13 +260,15 @@ def _sparse_operator(
     hamiltonian: PauliSumXZ,
     states_u: StateList,
     pairs: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
+    groups: Sequence[int] | None = None,
 ) -> tuple[jax.Array, ...]:
     """Build ``"pairs"``' ``(d0, i, j, d)`` on the host, each entry array ``(chunks, _chunk())``.
 
     Each transition once, sorted by ``i`` across groups so ``out[i]`` and ``vec[i]`` are local
     (``NOTES.md``, "sqd sparse kernels: pairs sorted by i"); padding entries have equal endpoints and a
     zero factor, and so does no stored pair (:func:`_drop_zeros`). ``pairs`` is :func:`_group_pairs`'
-    output, searched here when not given.
+    output, searched here when not given; ``groups`` restricts the entries to those X groups (all but a
+    leading identity by default).
 
     Raises:
         ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_check_entries`.
@@ -275,7 +278,7 @@ def _sparse_operator(
     pairs = _group_pairs(hamiltonian, states_u) if pairs is None else pairs
     first = int(hamiltonian.identity_first)
     d0 = get_diagonal(z[0], c[0], states_u) if first else jnp.zeros(size, c.dtype)
-    groups = range(first, hamiltonian.x.shape[0])
+    groups = range(first, hamiltonian.x.shape[0]) if groups is None else groups
     coeffs = np.asarray(hamiltonian.c)
     kmax = max((int(np.count_nonzero(coeffs[g])) for g in groups), default=1)
 
@@ -284,6 +287,48 @@ def _sparse_operator(
 
     t, s, g = (a.reshape(-1, chunk) for a in _pairs_sorted_on_device(pairs, groups, alloc))
     return d0, *_drop_zeros(t, s, _entry_factors(t, s, g, z, c, states_u, kmax), chunk, size)
+
+
+def _mesh_operator(
+    hamiltonian: PauliSumXZ,
+    states_u: StateList,
+    pairs: dict[int, tuple[np.ndarray, np.ndarray]],
+    mesh: jax.sharding.Mesh,
+) -> tuple[jax.Array, ...]:
+    """Term-parallel ``"pairs"``: whole X groups packed onto the devices by entry count.
+
+    Each device's entries are :func:`_sparse_operator` on its groups, padded to the longest device's chunk
+    count, stacked ``(devices, chunks, chunk)`` and partitioned on the device axis; ``d0`` is partitioned
+    as ``vec`` is (``markdown/pairs-mesh-proposal.md`` §4.1).
+    """
+    size, chunk = states_u.shape[0], _chunk()
+    owned: list[list[int]] = [[] for _ in range(mesh.size)]
+    loads = [0] * mesh.size
+    for g in sorted(pairs, key=lambda g: -len(pairs[g][0])):  # greedy: largest group first
+        p = loads.index(min(loads))
+        owned[p].append(g)
+        loads[p] += len(pairs[g][0])
+    parts = [_sparse_operator(hamiltonian, states_u, pairs, sorted(g)) for g in owned]
+    length = max(p[1].shape[0] for p in parts)
+    pad = np.arange(length * chunk, dtype=np.int32).reshape(length, chunk) % size
+
+    def padded(a, fill):  # equal endpoints on distinct rows and a zero factor, as _drop_zeros pads
+        a = np.asarray(a)
+        return np.concatenate([a, fill[: length - a.shape[0]].astype(a.dtype)])
+
+    stacked = [
+        np.stack([padded(p[k], pad if k < 3 else 0 * pad) for p in parts]) for k in (1, 2, 3)
+    ]
+
+    # From host arrays every process holds, so each process places only its own shards.
+    def place(a, *spec):
+        return jax.make_array_from_callback(
+            a.shape,
+            NamedSharding(mesh, PartitionSpec(mesh.axis_names, *spec)),
+            lambda index: a[index],
+        )
+
+    return place(np.asarray(parts[0][0])), *(place(a, None, None) for a in stacked)
 
 
 def _scan_add(
@@ -324,7 +369,33 @@ def _scan_add(
 def _apply_pairs(
     vec: jax.Array, d0: jax.Array, pi: jax.Array, pj: jax.Array, d: jax.Array
 ) -> jax.Array:
-    """``"pairs"``: ``d0 * vec``, then per pair ``out[i] += d * vec[j]`` and ``out[j] += conj(d) * vec[i]``."""
+    """``"pairs"``: ``d0 * vec``, then per pair ``out[i] += d * vec[j]`` and ``out[j] += conj(d) * vec[i]``.
+
+    Given :func:`_mesh_operator`'s ``(devices, chunks, chunk)`` entries, each device applies its own X
+    groups to the all-gathered ``vec`` and one reduce-scatter sums the devices' full-length results.
+    """
+    if pi.ndim == 2:
+        return _pairs_scan(vec, d0 * vec, pi, pj, d)
+    axis = get_abstract_mesh().axis_names
+    spec = PartitionSpec(*[None] * (vec.ndim - 1), axis)
+
+    def local(vec, d0, pi, pj, d):
+        full = jax.lax.all_gather(vec, axis, axis=vec.ndim - 1, tiled=True)
+        out = _pairs_scan(full, jnp.zeros_like(full), pi[0], pj[0], d[0])
+        return (
+            jax.lax.psum_scatter(out, axis, scatter_dimension=vec.ndim - 1, tiled=True) + d0 * vec
+        )
+
+    entries = PartitionSpec(axis, None, None)
+    return jax.shard_map(
+        local, in_specs=(spec, PartitionSpec(axis), entries, entries, entries), out_specs=spec
+    )(vec, d0, pi, pj, d)
+
+
+def _pairs_scan(
+    vec: jax.Array, out: jax.Array, pi: jax.Array, pj: jax.Array, d: jax.Array
+) -> jax.Array:
+    """``out`` plus, per pair, ``d * vec[j]`` at ``i`` and ``conj(d) * vec[i]`` at ``j``."""
     sharding = jax.typeof(vec).sharding
 
     def updates(chunk):
@@ -334,7 +405,7 @@ def _apply_pairs(
             (j, jnp.conj(di) * vec.at[..., i].get(out_sharding=sharding)),
         ]
 
-    return _scan_add(updates, d0 * vec, (pi, pj, d))
+    return _scan_add(updates, out, (pi, pj, d))
 
 
 @jax.jit(static_argnames=[s for s in _SOLVE_STATIC if s != "matvec"])
@@ -350,10 +421,14 @@ def _run_sparse(
     prefilter: tuple[int, int] | None = (32, 2),
     log_level: int = logging.INFO,
 ) -> SqdResult:
-    """:func:`run_sqd` for ``"pairs"``, given :func:`_sparse_operator`'s arrays.
+    """:func:`run_sqd` for ``"pairs"``, given :func:`_sparse_operator`'s or :func:`_mesh_operator`'s arrays.
 
     It runs no residual check: :func:`sqd` checks with :func:`_sparse_residual` after it returns.
     """
+    sharding = None
+    if not (mesh := get_abstract_mesh()).empty:
+        sharding = PartitionSpec(mesh.axis_names)
+        states_u = jax.reshard(states_u, sharding)  # as run_sqd's, once nothing searches it
     return _solve(
         hamiltonian,
         states_u,
@@ -361,7 +436,7 @@ def _run_sparse(
         operator,
         lambda: operator[0],
         None,
-        None,
+        sharding,
         return_eigvec=return_eigvec,
         maxiter=maxiter,
         atol=atol,

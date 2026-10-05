@@ -2383,6 +2383,12 @@ iteration at equal memory. `"tables"` diagonals as `uint8` codes cut the operato
 temp ~0.5× for 0.80–0.84× (lost in the `(2, N)` matvec), bit-identical. GH200 `2^20`–`2^22`: fold 1.13–1.18×,
 putting `"indices"` ahead of `"tables"`; codes 0.88–0.97×. The fold shipped (`zfree_first`). `poc/dense-codes.md` §2–§6
 
+### sqd `"pairs"` under a mesh: term-parallel, one all-gather and one reduce-scatter (2026-10-06)
+
+Built, correctness only (4 virtual CPU devices): whole X groups packed per device, eigenvalues within 1e-12 of
+single-device, the batched product within 1.8e-15, entries `P('x', None, None)`; every process builds the whole
+host operator, so multi-process and real-device timing are unrun. `markdown/pairs-mesh-proposal.md` §4.1, §8
+
 ### sqd `"pairs"`: `_drop_zeros` jitted, 3.4–3.8× its first call on CPU (2026-10-05)
 
 M1, `type1`/`type2` `2^14`/`2^17`, fresh process per arm: the filter's first call 325–484 → 92–140 ms,

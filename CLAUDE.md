@@ -345,7 +345,9 @@ scatter would split the whole carry every scan step, 2.5–17.9× per iteration.
 (in `2^19`-entry chunks on a GPU, `_GPU_PAIRS_CHUNK`, else `2^15`, its sort by `i` done on the device),
 rounding the chunk count to `m·2^k` (8 ≤ m < 16) so the solve recompiles per size class. Entries with an exactly-zero factor are dropped (`_drop_zeros`; XX+YY hops cancel on aligned
 spins, 86% of `type1`'s pairs), so the check must keep reading the unfiltered `pairs`. It is
-`sqd`-only (`run_sqd` and `apply_h` reject it), **single-device** (it raises under a mesh), and its
+`sqd`-only (`run_sqd` and `apply_h` reject it), **term-parallel under a mesh** (`_mesh_operator`: whole X
+groups packed per device, one all-gather and one reduce-scatter per matvec; every process still builds the
+whole host operator, so multi-process is unrun), and its
 residual check runs on the host after the solve, from the build's searched pairs and recomputed
 diagonals (`_sparse_residual`), so it reads none of its cached data. Measurements: `poc/sparse/pairs.md` §9–§10. Before
 2026-09-26 this was `cache_level=(source_indices, diagonals)`, the three being `(0, 0)`, `(1, 0)` and

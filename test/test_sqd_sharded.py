@@ -9,11 +9,7 @@ import textwrap
 import jax
 import numpy as np
 import pytest
-from conftest import (
-    DENSE_MATVECS,
-    SPARSE_MATVECS,
-    run_sharded_child,
-)
+from conftest import MATVECS, run_sharded_child
 
 from rqutils.sqd._solve import _host_scalar
 
@@ -42,7 +38,7 @@ class TestShardedSqd:
     def test_every_matvec_agrees_sharded_and_single_device(self):
         got = run_sharded_child("sqd_grid")
         for devices in ("1", "2", "4"):
-            for matvec in DENSE_MATVECS:  # pairs/csr reject a mesh: TestShardedSparseRejects
+            for matvec in MATVECS:
                 single, sharded = got["single"][matvec], got["sharded"][devices][matvec]
                 assert single == pytest.approx(sharded, abs=1e-12), (
                     f"devices={devices} matvec={matvec}: sharded {sharded} vs single {single}"
@@ -309,17 +305,44 @@ class TestShardedDiagonals:
                 assert bad_value == 0, f"{case}: {bad_value} outputs differ from single-device"
 
 
-class TestShardedSparseRejects:
-    """The sparse kernels are single-device for now, so a live mesh must raise, not half-work.
+class TestShardedPairs:
+    """Term-parallel ``"pairs"``: whole X groups packed onto devices, all-gather in, reduce-scatter out.
 
-    A pair's endpoints can sit on different devices and CSR needs its sources gathered
-    (``poc/sparse/pairs.md``, section 7); until that is built the dense kernels are the sharded path.
+    ``markdown/pairs-mesh-proposal.md`` section 4.1. Real and complex fixtures with 40 terms, so every
+    device owns groups at 2 and 4 devices; ``sqd``'s residual check runs on each sharded solve.
     """
 
-    def test_a_scoped_mesh_raises_and_leaving_it_works(self):
-        got = run_sharded_child("sparse_mesh")
-        assert sorted(got["scoped"]) == sorted(SPARSE_MATVECS), got["scoped"]
-        for name, message in got["scoped"].items():
-            assert "single-device" in message, f"{name} under a mesh: {message!r}"
-        for name, eigval in got["after"].items():
-            assert eigval == pytest.approx(got["dense"], abs=1e-12), (name, eigval, got["dense"])
+    def test_sharded_pairs_matches_single_device_and_dense(self):
+        got = run_sharded_child("pairs_mesh")
+        for label, case in got.items():
+            assert case["groups"] > 4, f"{label}: {case['groups']} X groups cannot fill 4 devices"
+            assert case["single"] == pytest.approx(case["dense"], abs=1e-10), label
+            for devices, cell in case["devices"].items():
+                where = f"{label}/{devices}"
+                assert cell["eigval"] == pytest.approx(case["single"], abs=1e-12), where
+                assert cell["product_diff"] < 1e-12, (where, cell["product_diff"])
+
+    def test_entries_are_partitioned_not_replicated(self):
+        """A replicated operator agrees in value, so the spec and per-device contents are asserted."""
+        got = run_sharded_child("pairs_mesh")
+        for label, case in got.items():
+            for devices, cell in case["devices"].items():
+                where = f"{label}/{devices}"
+                assert cell["specs"] == ["P('x',)", *["P('x', None, None)"] * 3], (
+                    where,
+                    cell["specs"],
+                )
+                assert cell["product_spec"] == "P(None, 'x')", (where, cell["product_spec"])
+                assert cell["shards"] == int(devices), where
+                assert min(cell["entries_per_device"]) > 0, (where, cell["entries_per_device"])
+                assert cell["same_entries"], (
+                    f"{where}: the devices' entries are not the flat operator's"
+                )
+
+    def test_one_all_gather_and_one_reduce_scatter_per_batched_matvec(self):
+        got = run_sharded_child("pairs_mesh")
+        expected = {"all-gather": 1, "reduce-scatter": 1, "all-reduce": 0, "all-to-all": 0}
+        for label, case in got.items():
+            for devices, cell in case["devices"].items():
+                counts = {k: cell["collectives"][k] for k in expected}
+                assert counts == expected, (f"{label}/{devices}", cell["collectives"])

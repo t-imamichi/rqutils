@@ -429,9 +429,11 @@ re-ran it and both tables reproduced exactly.
 
 ## 8. Plan, with a gate at each step
 
-1. **Rank 1 on virtual CPU devices** (me): a `test/sharded/*.py` case against single-device `"pairs"`, the
-   sharding *spec* asserted, the iteration count asserted equal, and the collective count from
-   `.lower(...).compile().as_text()`. Correctness only: virtual-device timings are meaningless. Then
+1. **Rank 1 on virtual CPU devices** (me) — **done 2026-10-06**: `_mesh_operator` and the `shard_map` branch of
+   `_apply_pairs` (`rqutils/sqd/_sparse.py`), `test/sharded/pairs_mesh.py` (`TestShardedPairs`) and `"pairs"` in
+   `sqd_grid.py`. Eigenvalues within 1e-12 of single-device, the batched product within 1.8e-15, entries
+   `P('x', None, None)`, exactly one all-gather and one reduce-scatter. Not done: the iteration count, which
+   `sqd` does not return. Each process still builds the whole host operator. Then
    **multi-GPU** (you): whole `sqd` calls against `"indices"` under the same mesh, and a multi-process run,
    since virtual devices cannot reach the non-addressable-shard class of errors (`CLAUDE.md`, "Sharding
    tests"). Gate: ≥ `"indices"`' speed at ≤ its per-device memory. If it passes and one node is the target,
