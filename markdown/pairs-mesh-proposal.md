@@ -22,6 +22,7 @@ should carry over. §6 is the only design that removes the `N`-length gathered v
 it works best on local Hamiltonians and degrades to §3's cost on molecular ones.
 §9 predicts the winner: per-device bucketed ELL (§3.1) on one node, §6 across nodes.
 §10 makes that ELL shardable and lean: a random hash of the state key, optionally with recomputed factors.
+§11 tries two layouts that split each state at a qubit cut: both fail on spinchain, one fits molecules.
 
 ## 2. Today's sharded `"indices"`, the baseline
 
@@ -276,3 +277,66 @@ pattern while each node runs the fast all-gather plus hashed ELLC.
 **Pick**: §10.1 as the first mesh kernel, §10.2 as its memory dial. It reuses a measured fastest format
 and a measured balanced hash, and needs no scatter. **What could kill it**: per-bucket padding under one
 shared shape, the §7 step 1 measurement above.
+
+## 11. Splitting each state at a qubit cut
+
+Two layouts unlike §3–§10, both from cutting each bitstring into a left and a right half, `s = (a, b)`.
+Measured host-only on spinchain's subspaces (`poc/split_layouts.py`, §11.3); neither works there, and the
+first fits molecules.
+
+### 11.1 The vector as a matrix over `(left, right)`, the molecular track
+
+Require the subspace to be a full product `S_L × S_R`; then `vec` is a dense matrix `V[a, b]` and the
+operator factors.
+
+- **X flips act on each axis separately.** `X^x`, `x = (x_L, x_R)`, is a row map `π_L` on `S_L` composed
+  with a column map `π_R` on `S_R`. The searches run over ~`√N` entries rather than `N`, and all `J` maps
+  take `J·(|S_L| + |S_R|)·4` B: small enough to store, so no per-matvec search at all.
+- **Diagonals are rank-`K` outer products.** `(-1)^{z·s} = (-1)^{z_L·a}·(-1)^{z_R·b}`, so a Z term's
+  diagonal is `u ⊗ w`, two vectors of ~`√N`. Nothing of size `N` is stored but `V`.
+- **The matvec**, per group: a row gather of `V`, a column gather, a multiply by `Σ_k c_k u_k w_kᵀ`. Coalesced,
+  regular gathers along one axis, which suits a GPU; groups sharing an `x_L` share the row gather.
+- **Under a mesh**, `V` sharded by rows: column work is local, row maps need other devices' rows. The simplest
+  form all-gathers `V` once per matvec, `"indices"`' communication, with the operator's memory near zero.
+
+**Spinchain: dead** (*measured*). The product of halves is far larger than the subspace:
+
+| N | cut 30 | cut 20 |
+| --- | --- | --- |
+| `2^14` | 376× | 282× |
+| `2^17` | 1156× | 815× |
+| `2^20` | 3893× | 2415× |
+
+**Chemistry SQD: native.** qiskit-addon-sqd already forms the subspace as `S_α × S_β` from the unique α and
+β strings, and Jordan–Wigner puts the α and β blocks on separate qubit halves. It is the string-driven
+σ-vector of FCI codes (Knowles–Handy; Olsen et al.): the search shrinks from `N` to ~`√N` per spin sector,
+and index memory from `J·N` to `J·√N`, the molecular `J` problem `rqutils/sqd/__init__.py` documents.
+**Caveat**: αβ two-body terms carry ~`n_α²` distinct `x_α`, so moving rows per pattern costs
+~`n_α²·N/P` (*estimated*), which loses to one all-gather unless `P` is large; hence the all-gather form.
+It needs the subspace as `(S_α, S_β)` rather than a state list, an API addition. Unmeasured on a molecule.
+
+### 11.2 Ownership by a random hash of the left half, rejected
+
+The aim: randomization for balance and locality together. Every group flipping only right-half qubits
+stays on its device (2/3 of the bonds at cut 20), with no linearity constraint like §6's. **Dead beyond
+`P = 4`** (*measured*): states near Néel share a few left halves, one alone owning 3–27% of the subspace.
+Largest device load over the mean, `2^17` and `2^20`:
+
+| | `P = 4` | `P = 16` | `P = 64` |
+| --- | --- | --- | --- |
+| cut 30 | 1.05–1.14× | 1.38–1.83× | 3.11–4.22× |
+| cut 20 | 1.24–1.50× | 2.46–2.71× | 7.95–8.39× |
+| cut 10 | 1.77–1.96× | 4.22–4.68× | 15.51–17.19× |
+
+Splitting a heavy left half by a few right-half bits rebalances, but every group flipping those bits then
+crosses devices, giving the locality back. The concentration near Néel that kills both §11.1 and §11.2 on
+spinchain is the one that makes a range split fail (`poc/partition-states.md` §4), so §10.1 and §6 stay the
+spinchain candidates.
+
+### 11.3 The script
+
+`poc/split_layouts.py`, host-only, against its argparse: `--num-qubits` (60), `--product-sizes` (`14 17 20`)
+and `--product-cuts` (`30 20`) for §11.1, `--hash-sizes` (`17 20`), `--hash-cuts` (`30 20 10`) and
+`--devices` (`4 16 64`) for §11.2. The left half is a state's first `cut` columns; the hash is a random
+salt per distinct left half, drawn in loop order from one seeded generator, so a run reproduces the tables.
+Run at `49366a5` on an Apple M1, 2026-10-05, with the defaults.
