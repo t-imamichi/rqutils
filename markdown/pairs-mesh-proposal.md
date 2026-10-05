@@ -1,305 +1,227 @@
 # Proposal: `"pairs"` under a mesh
 
 Status: **for review**, 2026-10-05. Nothing here is built. Figures marked *measured* come from the cited
-write-ups; everything marked *estimated* is arithmetic on those, not a run.
+write-ups or from `poc/split_layouts.py` (§7); everything marked *estimated* is arithmetic on those, not a
+run.
 
-## 1. Summary
+## 1. Summary, and the algorithms ranked
 
 `Matvec.PAIRS` is the fastest single-device kernel on both backends (*measured*: 3.9–5.6× `"indices"` on one
 CPU, 1.1–1.8× on one GPU, `poc/sparse/gpu.md` §9) but raises under a mesh, so a sharded solve falls back to
-`"indices"`. Two families of design would lift that, in order of effort:
+`"indices"`. Every candidate, ranked by recommendation (simplicity first, then predicted speed and memory):
 
-| design | per-matvec communication | per-device memory | locality needed |
-| --- | --- | --- | --- |
-| §3 row-owned directed pairs | one all-gather, as `"indices"` | ~2× symmetric pairs / `P` | none |
-| §3.1 the same as plain or bucketed ELL | same | §3 plus per-row padding | none |
-| §4 its two dials | same | less (recomputed factors, hybrid) | §4.2 only |
-| §5 push matvec | one `all_to_all` of hit values | no `N`-length buffer | none |
-| §6 GF(2)-linear partition (randomized) | one `ppermute` per distinct offset | ~`(1 + c·log2 P)·N/P` values | yes, gains on local `H` |
+| rank | algorithm | §   | communication per matvec | operator per device | new code | for |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | term-parallel `"pairs"` | 4.1 | all-gather + reduce-scatter (~2×) | symmetric pairs / `P` | `shard_map` wrapper, group packing | first step, one node |
+| 2 | hashed ELLC | 4.2 | one all-gather | ELLC / `P`, ~`√count` padding | row hash, per-device buckets | fastest predicted, one node |
+| 3 | hashed ELLC, recomputed factors | 4.3 | one all-gather | ~22–70 B/slot (*estimated*) | rank 2 + popcount factors | memory dial for 2 |
+| 4 | row-owned directed pairs / plain ELL | 4.4 | one all-gather | ~2× symmetric pairs / `P` | owner bucketing | fallback for 2 |
+| 5 | group-major directed lists | 4.5 | one all-gather | ~2× symmetric pairs / `P` | per-group lists | fallback if 2's compile hurts |
+| 6 | GF(2)-linear partition | 4.6 | one `ppermute` per distinct offset | ~`(1 + c·log2 P)·N/P` values | partition search, layout permutation | many nodes, local `H` |
+| 7 | linear partition across nodes, hashed ELLC within | 4.7 | `ppermute` between nodes, all-gather within | as 2 | 2 + 6 | many nodes |
+| 8 | push matvec | 4.8 | one `all_to_all` of hit values | no `N`-length buffer | routed exchange | memory first, needs partitioned `states` |
+| 9 | product `S_α × S_β` layout | 4.9 | one all-gather of `V` | near zero | new input form | molecules only |
+| 10 | hybrid symmetric/directed storage | 4.10 | one all-gather | up to half of rank 4's doubling | locality split | only if locality exists |
 
-§3 is the exact, low-risk step: the same collective `"indices"` pays, so the single-device kernel advantage
-should carry over. §6 is the only design that removes the `N`-length gathered vector *and* the all-gather;
-it works best on local Hamiltonians and degrades to §3's cost on molecular ones.
-§9 predicts the winner: per-device bucketed ELL (§3.1) on one node, §6 across nodes.
-§10 makes that ELL shardable and lean: a random hash of the state key, optionally with recomputed factors.
-§11 tries two layouts that split each state at a qubit cut: both fail on spinchain, one fits molecules.
+Rejected, with the measurement or reason, in §5. **The recommendation**: build rank 1 first; it reuses
+today's kernel unchanged and answers whether `"pairs"` beats `"indices"` on a real multi-GPU mesh before any
+new layout is built. Then rank 2, predicted fastest on one node (§6), with rank 3 as its memory dial. Ranks
+6–7 matter only once an all-gather across nodes is the cost; rank 9 is a separate molecular track.
 
 ## 2. Today's sharded `"indices"`, the baseline
 
 Each device owns a block of rows of `out`, matching `vec`'s `P('x')` blocks, and holds the `J × N/P`
 source indices of those rows. A batched matvec does one all-gather of `vec` (`test/sharded/batch_matvec.py`
 pins the count), then a local gather-multiply-add per X group. `states` stays replicated (`13·N` B per
-device), and every device materializes the full gathered `vec` (`16·N` B per vector).
+device), and every device materializes the full gathered `vec` (`16·N` B per vector). It needs nothing to
+run under a mesh; every candidate below is measured against it.
 
-## 3. Exact: row-owned directed pairs
+## 3. What single-device measurement already settled
+
+- **`"csr"` and `"ell"`, removed in `dev-0.2.5`, already stored by target row, both directions**, the layout
+  ranks 2–5 need, which `"pairs"` must be converted to. Neither was ever mesh-capable (`dev-0.2.4` raised
+  "single-device for now" for all three sparse kernels), and single-device they lost to `"pairs"`
+  (*measured*, `poc/sparse/tune.md` §3): `"csr"` dominated on both backends (58.00 against 20.35 ms per GH200
+  iteration, `type2` `2^22`, with its sorted hint; still dominated without it); `"ell"` was mixed on a GH200
+  (0.28×/1.50× `"pairs"` per iteration at `type1` `2^20`/`2^22`, 1.25×/0.70× at `type2`) at more memory and a
+  4.8 s build, a near-tie on CPU. So their case under a mesh is structural, not speed; any variant below is
+  built from today's `"pairs"` build (zero-drop, device sort), not from `poc/sparse/legacy.py`.
+- **Row degrees are heavy-tailed** (`poc/sparse/pairs.md` §4, §7 item 6, §10, *measured*): mean 3.7–11.6
+  entries against a maximum of 60–117. So **HYB loses** (42–78% of entries spill into its CSR overflow) and a
+  windowed `segment_sum` is 1.7–1.9× slower than C2R. **ELLC**, rows bucketed by degree on a ×1.25 grid, 14–19
+  buckets at 2–7.7% padding, is 1.5–2.3× C2R per matvec on CPU.
+- **A whole-key hash balances XXZ subspaces** at 1.03–1.11× (`poc/partition-states.md` §3–§4, *measured*);
+  prefix hashing and range splits do not.
+
+## 4. The algorithms, in rank order
+
+### 4.1 Term-parallel `"pairs"` (rank 1)
+
+Split the Hamiltonian, not the rows: `H = d0 + Σ_p H_p`, device `p` owning a subset of whole X groups.
+
+- **Build.** Assign groups to devices by greedy bin packing on their entry counts. Each device runs today's
+  `_sparse_operator`, unchanged, on its sub-Hamiltonian, its chunk count padded to the largest device's size
+  class (`_size_class`) so the shapes agree. Multi-process is natural: each process builds only its own
+  groups, and no rank holds the whole operator.
+- **Matvec.** All-gather `vec` (as `"indices"`); each device runs today's `_apply_pairs` on its entries into
+  a full-length local accumulator, both scatter directions, device sort and zero-drop unchanged; one
+  `psum_scatter` sums the accumulators and leaves each device its `P('x')` row block; `d0 * vec` is
+  elementwise and shards for free.
+- **Cost.** Two collectives per matvec (~2× `"indices"`' traffic), and two `N`-length buffers per device
+  (gathered `vec`, accumulator) against `"indices"`' one; the operator per device is the smallest of any
+  candidate, symmetric pairs divided by `P`.
+- **Estimated.** Within a node, NVLink at hundreds of GB/s, the extra reduce-scatter is ~0.3–1 ms per vector
+  at `N = 2^24`, so most of single-device `"pairs"`' 1.1–1.8× over `"indices"` should survive.
+- **Where it loses.** Many nodes, where both collectives grow with `N` and two full vectors per device cap
+  memory (ranks 6–8). And `P` approaching `J`, where a few groups dominate the entry count; splitting a large
+  group's chunks across devices fixes that, since chunks are independent.
+
+An earlier draft dismissed this form ("halves the entries but doubles the communication and adds an
+`N`-length buffer"). Those costs stand; it ranks first for simplicity, not for the least traffic.
+
+### 4.2 Hashed ELLC (rank 2)
+
+- **The constraint.** An SPMD program has one shape on every device, so each degree bucket must be padded
+  to the largest device's count. Today's lex-ordered row blocks have correlated degree histograms
+  (inner-shell states, nearly full, sit apart from outer-shell ones), so padding each bucket to the worst
+  device could cost a lot.
+- **The randomized fix.** Assign each state to a device by a random hash of its whole key (§3). Each
+  device's histogram then concentrates on the global one, and padding a bucket to the largest device costs
+  ~`√count` rows (*estimated*, balls in bins).
+- **Matvec.** One all-gather of `vec`, as `"indices"`, then per bucket a gather, a multiply and a reduction
+  along the width, `out[i] = Σ_w d[w,i]·v[j[w,i]]`, written by `.at[rows].set(..., unique_indices=True)`: each
+  row is in exactly one bucket, so there are no atomics and no scatter-add.
+- **Cost.** States are laid out in hash order, so `sqd` un-permutes `eigvec` and the basis on return and the
+  initial vector's filler mask follows the permutation. Locality is lost, which the all-gather never used.
+  Single-device ELLC's 19 scans cost ~+209 MiB of compile memory.
+- **Why it is predicted fastest on one node**: §6.
+
+### 4.3 Hashed ELLC with recomputed factors (rank 3)
+
+Store `(j, group)` per entry (5–6 B) rather than `(j, d)` (20 B), and compute `d` from the local `states[i]`'s
+Z parities by popcount, the way `"indices"` computes its diagonal but only on hits: the sparse twin of the
+`"tables"`/`"indices"` trade. Past the cache the matvec is bandwidth-bound, so trading bytes for ALU work
+should pay on a GPU; XXZ has at most 2 Z terms per group. *Estimated* from the measured mean degrees:
+~22–70 B/slot, against `"indices"`' `4·J` = 248–480 B/slot, 4–10× less than the format a mesh uses today.
+It is `"indices"` with the misses removed: `"indices"` stores a `-1` and computes a diagonal for every
+`(group, state)` slot, hit or not. It reads only the device's own rows of `states`, so the matvec needs no
+replicated `states`. Applies equally to rank 4 (`(j, group)` ~6 B against `(i, j, d)` 24 B).
+
+### 4.4 Row-owned directed pairs, or plain ELL (rank 4)
 
 - **Storage.** Device `p` stores `(i_local, j, d)` for every transition whose row `i` it owns, **both
-  directions** of each symmetric pair. Every update then lands in an owned row: no cross-device reduction,
+  directions** of each symmetric pair, so every update lands in an owned row: no cross-device reduction,
   `out` stays `P('x')`.
-- **Matvec.** All-gather `vec` (as `"indices"`), then today's chunked gather and scatter-add, locally. The
-  per-entry arithmetic is unchanged: the single-device kernel already applies two updates per stored pair.
+- **Matvec.** All-gather `vec`, then today's chunked gather and scatter-add, locally. The per-entry
+  arithmetic is unchanged: the single-device kernel already applies two updates per stored pair.
 - **Build.** From the symmetric pairs the build already makes, emit both directions, bucket by owner
-  `i // (N/P)`, and pad each device's list to the largest one's size class (`_size_class`). Multi-process:
-  each process builds only its own rows against the replicated `states`, as `"indices"`' setup does; the
-  padded shape needs one unconditional host exchange of the counts at build time (never inside a branch,
-  `CLAUDE.md` "A collective inside a conditional deadlocks").
-- **Memory, estimated.** Doubling the entries turns the measured ~0.6× of `"indices"` (one GPU) into ~1.2×
-  on `type1`; on a low-hit-rate sampled subspace it stays below `"indices"`, which stores a slot for every
+  `i // (N/P)`, and pad each device's list to the largest one's size class. Multi-process: each process
+  builds only its own rows against the replicated `states`, as `"indices"`' setup does; the padded shape
+  needs one unconditional host exchange of the counts at build time (never inside a branch, `CLAUDE.md` "A
+  collective inside a conditional deadlocks").
+- **Memory, estimated.** Doubling the entries turns the measured ~0.6× of `"indices"` (one GPU) into ~1.2× on
+  `type1`; on a low-hit-rate sampled subspace it stays below `"indices"`, which stores a slot for every
   `(group, state)` whether it hits or not.
-- **Risk.** Hit rates differ by row block, so entry counts are uneven and padding is paid in memory and
-  time. Unmeasured; §7 step 1 measures it.
-- **Code.** The matvec is `_apply_pairs` on local shards plus the all-gather; new code is the owner
-  bucketing and lifting the mesh guard. The residual check (`_sparse_residual`) stays independent of the
-  operator, as now.
+- **Risk.** Hit rates differ by row block, so entry counts are uneven and padding is paid in memory and time.
+- **Code.** `_apply_pairs` on local shards plus the all-gather; the residual check (`_sparse_residual`) stays
+  independent of the operator.
 
-An alternative, symmetric storage with a `psum_scatter` of a full-length partial `out`, halves the entries
-but doubles the communication and adds an `N`-length buffer. Not proposed.
-
-### 3.1 The removed `"csr"` and `"ell"` already had §3's layout
-
-Both stored entries by target row, both directions, so every update lands in an owned row: §3's layout,
-which `"pairs"` must be converted to. Neither was ever mesh-capable (`dev-0.2.4` raised "single-device for
-now" for all three sparse kernels), and single-device they lost to `"pairs"` (*measured*,
-`poc/sparse/tune.md` §3): `"csr"` dominated on both backends (58.00 against 20.35 ms per GH200 iteration,
-`type2` `2^22`, with its sorted hint; still dominated without it); `"ell"` was mixed on a GH200 (0.28×/1.50× `"pairs"` per iteration at `type1` `2^20`/`2^22`,
-1.25×/0.70× at `type2`) at more memory and a 4.8 s build, a near-tie on CPU. So the case for them under a
-mesh is structural, not speed. Three target-ordered variants, each built from today's `"pairs"` build
-(zero-drop, device sort) rather than from `poc/sparse/legacy.py`:
+Three target-ordered shapes for it:
 
 | variant | shape per device | padding | multi-process count exchange |
 | --- | --- | --- | --- |
-| directed pairs (§3), CSR-like | ragged, padded to the largest device's size class | per device | yes |
+| directed pairs, CSR-like | ragged, padded to the largest device's size class | per device | yes |
 | plain ELL | `(width, N/P)`, sharded on `N` with `P('x')` like `"indices"`' table | per row, to the global max width | no |
 | ELL bucketed per device | each device's rows bucketed by width, scattered back locally | per bucket | yes, per bucket |
 
 Plain ELL is the simplest to shard: a fixed shape, so no device needs its own count. Its cost is per-row
 padding, and the tuned `"ell"`'s fix, bucketing rows by width, reorders rows across the whole vector and
-breaks row ownership; under a mesh it must bucket within each device's row block instead. Which variant
-wins depends on the row-width spread, which §7 step 1 also measures.
+breaks row ownership; under a mesh it must bucket within each device's row block instead (which is rank 2,
+with a hash for balance).
 
-## 4. Exact: two dials on §3
+### 4.5 Group-major directed lists (rank 5)
 
-1. **Recomputed factors.** Store `(j, group)` (~6 B) rather than `(i, j, d)` (24 B) and compute `d` from
-   `states[i]`'s Z parities, the way `"indices"` computes its diagonal, but only on hits: the sparse twin of
-   the `"tables"`/`"indices"` trade. It reads only the device's own rows of `states`, so the matvec needs no
-   replicated `states`.
-2. **Hybrid storage.** Keep a pair symmetric when both endpoints live on one device, directed only when it
-   crosses. Recovers up to half of §3's doubling with no reduce-scatter. The saving depends on locality, and
-   range-split locality is hop-dependent on XXZ (`poc/partition-states.md` §4), so measure before building.
+One X group is a perfect matching (a state occurs in at most one pair per group, `poc/sparse/pairs.md` §7
+item 6), so store each group's directed entries per device and let each group's scatter declare
+`unique_indices=True`: no atomics. Under rank 2's hash each group's per-device count is balls in bins, so
+padding is small. The cost is `J` scans per matvec, and single-device the atomic-free scatter was mixed
+(2.26× at `2^22`, 0.67× at `2^20`, *measured*, `poc/sparse/tune.md` §3). The fallback if rank 2's bucket
+compile cost hurts.
 
-## 5. Exact: a push matvec
+### 4.6 GF(2)-linear partition, picked by randomized search (rank 6)
 
-The owner of `v_j` sends `d·v_j` to the owner of `i`, one `all_to_all` with counts fixed at build time; the
-pair list is exactly that send list. Already identified as the per-matvec exchange the partitioned-`states`
-line lacks (`poc/partition-states.md` §12 item 5, after Westerhout and Chamberlain, arXiv:2308.16712). It
-drops the `N`-length gathered vector from every device, a cost `"indices"` pays too, but moves
-~`J·h/P` of the all-gather's bytes (2–12× *more* at `P = 4`, *estimated* there), so it wins on memory
-before traffic. Needs a real interconnect to judge and builds on the partitioned-`states` work.
-
-## 6. Randomized: a GF(2)-linear partition, picked by search
-
-**The partition.** Choose a sparse binary matrix `A` with `r = log2 P` rows and give state `s` to device
-`A·s` (mod 2). Linearity gives, for an X group with signature `x`,
+**The partition.** Choose a sparse binary matrix `A` with `r = log2 P` rows and give state `s` to device `A·s`
+(mod 2). Linearity gives, for an X group with signature `x`,
 
     owner(s ⊕ x) = A·s ⊕ A·x = owner(s) ⊕ Δ_x,   Δ_x = A·x fixed per group
 
 so every transition of a group shifts the device by the same `Δ_x`, whatever the state:
 
-- **Groups with `Δ_x = 0` never communicate**, and their pairs can stay symmetric (§4.2 for free).
-- **Every other group is a fixed device permutation**: device `d` only exchanges with `d ⊕ Δ_x`. A matvec
-  is one `ppermute` per distinct `Δ`, at most `P − 1` and usually far fewer, instead of an all-gather.
+- **Groups with `Δ_x = 0` never communicate**, and their pairs can stay symmetric (rank 10 for free).
+- **Every other group is a fixed device permutation**: device `d` only exchanges with `d ⊕ Δ_x`. A matvec is
+  one `ppermute` per distinct `Δ`, at most `P − 1` and usually far fewer, instead of an all-gather.
 - **Each device receives only the sources its cross pairs read**, not the whole of `vec`.
 
 **Why a search.** Two goals conflict. Fewer crossings wants `A·x = 0` for the heavily hit groups, but zero
-crossings means `A·s` is constant on each connected block of `H`: under XXZ's bond hops the only such row
-is the all-ones parity, and a fixed-magnetization subspace puts every state on one device. Balance wants
-`A·s` spread evenly, and physical subspaces are correlated (near Néel, bits `k` and `m` are tied by the
-parity of `k − m`, so naive few-qubit rows give lopsided devices). So sample many sparse candidates (rows of
-weight 1–4 on well-separated qubits) and score each on the actual data, host-side numpy:
+crossings means `A·s` is constant on each connected block of `H`: under XXZ's bond hops the only such row is
+the all-ones parity, and a fixed-magnetization subspace puts every state on one device. Balance wants `A·s`
+spread evenly, and physical subspaces are correlated (near Néel, bits `k` and `m` are tied by the parity of
+`k − m`, so naive few-qubit rows give lopsided devices). So sample many sparse candidates (rows of weight 1–4
+on well-separated qubits) and score each on the actual data, host-side numpy:
 
 - crossing weight `Σ_g hits_g · [A·x_g ≠ 0]`;
 - imbalance, the largest device count over the mean;
 - the number of distinct `Δ`, i.e. neighbours per device.
 
-Keep the Pareto-best. If no choice balances, hash to `2^r'` buckets with `r' > log2 P` and pack buckets
-onto devices greedily: groups that stay inside a bucket still need no communication.
+Keep the Pareto-best. If no choice balances, hash to `2^r'` buckets with `r' > log2 P` and pack buckets onto
+devices greedily: groups that stay inside a bucket still need no communication.
 
 **Estimated, not measured.**
 
 - XXZ at `n = 60`: a single-qubit row crosses only the bonds and fields touching that qubit, ~3 groups. At
   `P = 64` (6 rows) a few percent of groups cross, each device talks to ~6 neighbours (a hypercube), and
-  receives ~`6N/P` values against the all-gather's `63N/P`: ~10× less traffic and per-device memory, with
-  no `N`-length vector anywhere. Balance is the open risk.
-- Molecular JW: a sparse row has odd overlap with about half of the many-orbital X signatures, so most
-  groups cross and the cost falls back to about §3's. The win is for local Hamiltonians.
+  receives ~`6N/P` values against the all-gather's `63N/P`: ~10× less traffic and per-device memory, with no
+  `N`-length vector anywhere. Balance is the open risk.
+- Molecular JW: a sparse row has odd overlap with about half of the many-orbital X signatures, so most groups
+  cross and the cost falls back to about rank 4's. The win is for local Hamiltonians.
 
 **What it costs the library.** States are laid out by owner, not in global lex order: the build's
 `get_xsource` search still runs on the replicated sorted `states`, only the matvec layout changes.
-`ground_locg` takes only inner products, so a permuted order is fine; `sqd` must un-permute `eigvec` and
-the basis before returning them, and the initial vector's filler mask must follow the permutation. Device
-blocks are padded to the largest, so imbalance is paid directly.
+`ground_locg` takes only inner products, so a permuted order is fine; `sqd` must un-permute `eigvec` and the
+basis before returning them, and the initial vector's filler mask must follow the permutation. Device blocks
+are padded to the largest, so imbalance is paid directly.
 
-**Rejected: randomizing the matvec itself** (sampled entries, sketches). `sqd` needs an exact matvec: its
-convergence at `rtol ≈ 4·eps` and the independent residual recomputed after every solve
-(`EigenpairCheckError`) would both break, as the closed `Ax`-reuse investigation showed for a far milder
-inexactness (`CLAUDE.md`, "Reusing `Ax` to cut `body()`'s 3 matvecs to 2").
+### 4.7 Linear partition across nodes, hashed ELLC within (rank 7)
 
-## 7. Plan, with a gate at each step
-
-1. **Host-only POC** (me, CPU, no library change): from today's `"pairs"` build on XXZ `type1`/`type2` at
-   `n = 60` and molecular-like `n = 14–20`, for `P ∈ {4, 16, 64}`, report §3's per-device entry imbalance,
-   §4.2's same-device fraction under a range split, and §6's search: imbalance, same-device fraction,
-   distinct `Δ`, receive volume against an all-gather. Gate: §6 at imbalance ≤ 1.25 and ≥ 2× less receive
-   volume on XXZ, else build §3 alone.
-
-   For §3.1, the same build also reports the per-row width spread: stored entries against plain ELL's
-   `width · N`, and against per-device buckets. Build §3 as plain ELL if its padding is ≤ 1.25× the
-   directed entries, otherwise as directed pairs.
-
-   For §10, it also reports ELLC's per-bucket padding when every device must hold one shape, under a
-   random whole-key hash against today's lex-ordered row blocks, and §10.2's bytes per slot.
-2. **§3, or §6 if step 1 passes**, in the library behind a `test/sharded/*.py` case on virtual CPU devices:
-   values against single-device `"pairs"`, the sharding *spec* asserted, and the collective count from
-   `.lower(...).compile().as_text()`. Correctness only: virtual-device timings are meaningless.
-3. **Multi-GPU** (you): whole `sqd` calls against `"indices"` under the same mesh. Gate: ≥ `"indices"`' speed
-   at ≤ its per-device memory. A multi-process run is required too, since virtual devices cannot reach the
-   non-addressable-shard class of errors (`CLAUDE.md`, "Sharding tests").
-
-## 8. Decisions for you
-
-1. **Is a sharded `"pairs"` worth a new layout contract?** §6 changes the state order seen by the solver,
-   and §3 lifts `"pairs"`' single-device restriction that `CLAUDE.md` and the docs state.
-2. **§3 first, or straight to step 1's POC?** §3 is safe but buys no communication; §6 is the only design
-   that shrinks the gathered vector, and only step 1 can say whether its balance holds.
-3. **Molecules.** §6 helps local Hamiltonians most; if molecular `J` is the target, §4.1's recomputed
-   factors may matter more than any partition.
-
-## 9. Prediction: the fastest sparse mesh matvec
-
-*Predicted, not measured.* **Row-sharded ELL, bucketed within each device's rows (§3.1), with one
-all-gather per matvec, on one node; across many nodes the all-gather becomes the cost, and §6's partition
-takes over for local Hamiltonians.**
-
-**Why ELL over directed pairs.**
-
-- **`"pairs"`' single-device edge over `"ell"` is gone under a mesh.** It stores each transition once and
-  writes both ends, half ELL's both-directions entries; under a mesh every target-ordered design stores both
-  directions, §3's directed pairs included, so the entry counts are equal.
-- **ELL needs no scatter.** By target row it is `out[i] = Σ_w d[w,i]·v[j[w,i]]`, gathers and a reduction
-  along the width, no atomics. `"pairs"`' GPU trouble was its scatter: atomics serialized by padding on one
-  row (0.32–0.73×, `poc/sparse/prune.md` §6), nondeterministic iteration counts (`poc/sparse/gpu.md` §5),
-  the carry split (`poc/sparse/split.md`). Directed pairs keep a scatter-add, or need a sorted segment sum.
-- **The single-device data already leans this way.** With twice the entries, the tuned `"ell"` beat
-  `"pairs"` per iteration in two of four GH200 cells, 1.50× at `type1` `2^22` and 1.25× at `type2` `2^20`
-  (*measured*, `poc/sparse/tune.md` §3). With the doubling taken out of the comparison, it should match or
-  beat directed pairs in most cells.
-- **Bucketed rather than plain**, because after zero-drop the row widths of a Hamming-shell XXZ subspace
-  vary, and plain ELL pads every row to the global maximum.
-
-**When communication takes over** (*estimated* arithmetic). At `N = 2^24` one `complex128` vector is
-256 MB.
-
-- **Within a node**, NVLink at hundreds of GB/s: ~0.3–1 ms per all-gather, under a matvec's local compute
-  at that size, so the local kernel decides and ELL wins.
-- **Across nodes**, InfiniBand at ~25–50 GB/s: ~5–10 ms per vector, matching or exceeding the compute,
-  with per-device memory capped by the full gathered vector. There §6's `ppermute` pattern should win by
-  about its traffic cut (~10× at `P = 64` on XXZ, §6), if its balance holds; on molecular `H` it falls back
-  to the all-gather and ELL's local kernel decides again.
-- **On a CPU mesh** ELL's regular gathers vectorize well: close to directed pairs, possibly still behind
-  `"tables"`, which gathers no factors.
-
-**What would prove it wrong.**
-
-- **The row-width spread** (§7 step 1): heavy-tailed widths make ELL lose to padding even bucketed, and
-  directed pairs win.
-- **XLA's lowering of the width reduction on a GPU** may not fuse as well as the scatter path; the
-  single-device `"ell"`'s 4.8 s build hints at compile cost.
-- **§6's balance on physical subspaces** decides whether the multi-node case ever leaves the all-gather.
-
-## 10. Fast, simple ELL and CSR variants, with a randomized layout
-
-What single-device measurement already settled (`poc/sparse/pairs.md` §4, §7 item 6, §10, *measured*): row
-degrees are heavy-tailed (mean 3.7–11.6 entries against a maximum of 60–117), so **HYB loses** (42–78% of
-entries spill into its CSR overflow) and a windowed `segment_sum` is 1.7–1.9× slower than C2R. **ELLC**,
-rows bucketed by degree on a ×1.25 grid, 14–19 buckets at 2–7.7% padding, is 1.5–2.3× C2R per matvec on CPU.
-The variants below keep ELLC's speed across devices; simplest first.
-
-### 10.1 Hashed ELLC
-
-- **The constraint.** An SPMD program has one shape on every device, so each degree bucket must be
-  padded to the largest device's count. Today's lex-ordered row blocks have correlated degree histograms
-  (inner-shell states, nearly full, sit apart from outer-shell ones), so padding each bucket to the worst
-  device could cost a lot.
-- **The randomized fix.** Assign each state to a device by a random hash of its whole key, the hashing
-  `poc/partition-states.md` §3 measured at 1.03–1.11× balance on XXZ. Each device's histogram then
-  concentrates on the global one, and padding a bucket to the largest device costs ~`√count` rows
-  (*estimated*, balls in bins).
-- **Matvec.** One all-gather of `vec`, as `"indices"`, then per bucket a gather, a multiply and a reduction
-  along the width, written by `.at[rows].set(..., unique_indices=True)`: each row is in exactly one bucket,
-  so there are no atomics and no scatter-add.
-- **Cost.** States are laid out in hash order, so `sqd` un-permutes `eigvec` and the basis on return, as in
-  §6. Locality is lost, which the all-gather never used.
-
-### 10.2 Hashed ELLC with recomputed factors
-
-Store `(j, group)` per entry (5–6 B) rather than `(j, d)` (20 B), and compute `d` from the local
-`states[i]`'s Z parities by popcount (§4.1 in ELL form). Past the cache the matvec is bandwidth-bound, so
-trading bytes for ALU work should pay on a GPU; XXZ has at most 2 Z terms per group. *Estimated* from the
-measured mean degrees: ~22–70 B/slot, against `"indices"`' `4·J` = 248–480 B/slot, 4–10× less than the
-format a mesh uses today. It is `"indices"` with the misses removed: `"indices"` stores a `-1` and computes a
-diagonal for every `(group, state)` slot, hit or not.
-
-### 10.3 Group-major directed lists, the simplest CSR-like form
-
-One X group is a perfect matching (a state occurs in at most one pair per group, `poc/sparse/pairs.md`
-§7 item 6), so store each group's directed entries per device and let each group's scatter declare
-`unique_indices=True`: no atomics. Under §10.1's hash each group's per-device count is balls in bins, so
-padding is small. The cost is `J` scans per matvec, and single-device the atomic-free scatter was mixed
-(2.26× at `2^22`, 0.67× at `2^20`, *measured*, `poc/sparse/tune.md` §3). The fallback if ELLC's bucket
-compile cost hurts: single-device its 19 scans cost ~+209 MiB of compile memory.
-
-### 10.4 Combined with §6 across nodes
-
-§10.1's random hash balances and §6's linear hash keeps locality; they conflict. Layer them: §6's `A·s`
-picks the node and a random hash the device within it, so inter-node traffic follows the `ppermute`
+Rank 2's random hash balances and rank 6's linear hash keeps locality; they conflict. Layer them: rank 6's
+`A·s` picks the node and a random hash the device within it, so inter-node traffic follows the `ppermute`
 pattern while each node runs the fast all-gather plus hashed ELLC.
 
-### 10.5 Not worth it
+### 4.8 Push matvec (rank 8)
 
-- **HYB and a windowed `segment_sum`**: lost single-device (above).
-- **`float64` factors for real groups**: −25–30% operator for 0.37–0.94× speed (`poc/sparse/tune.md` §3);
-  §10.2 saves more.
-- **Delta-encoded `j − i`**: a high-bit flip moves an index by up to half of `N`
-  (`markdown/spinchain/rqutils-multiobs-response.md` §2), so deltas do not fit a narrow type.
-- **A sampled degree histogram for the bucket grid**: speeds only the build, and ELLC's fixed ×1.25 grid
-  needs none.
+The owner of `v_j` sends `d·v_j` to the owner of `i`, one `all_to_all` with counts fixed at build time; the
+pair list is exactly that send list. Already identified as the per-matvec exchange the partitioned-`states`
+line lacks (`poc/partition-states.md` §12 item 5, after Westerhout and Chamberlain, arXiv:2308.16712). It
+drops the `N`-length gathered vector from every device, a cost `"indices"` pays too, but moves ~`J·h/P` of
+the all-gather's bytes (2–12× *more* at `P = 4`, *estimated* there), so it wins on memory before traffic.
+Needs a real interconnect to judge and builds on the partitioned-`states` work.
 
-**Pick**: §10.1 as the first mesh kernel, §10.2 as its memory dial. It reuses a measured fastest format
-and a measured balanced hash, and needs no scatter. **What could kill it**: per-bucket padding under one
-shared shape, the §7 step 1 measurement above.
+### 4.9 The product `S_α × S_β` layout, molecules only (rank 9)
 
-## 11. Splitting each state at a qubit cut
+Cut each bitstring into a left and a right half, `s = (a, b)`, and require the subspace to be a full product
+`S_L × S_R`; then `vec` is a dense matrix `V[a, b]` and the operator factors.
 
-Two layouts unlike §3–§10, both from cutting each bitstring into a left and a right half, `s = (a, b)`.
-Measured host-only on spinchain's subspaces (`poc/split_layouts.py`, §11.3); neither works there, and the
-first fits molecules.
-
-### 11.1 The vector as a matrix over `(left, right)`, the molecular track
-
-Require the subspace to be a full product `S_L × S_R`; then `vec` is a dense matrix `V[a, b]` and the
-operator factors.
-
-- **X flips act on each axis separately.** `X^x`, `x = (x_L, x_R)`, is a row map `π_L` on `S_L` composed
-  with a column map `π_R` on `S_R`. The searches run over ~`√N` entries rather than `N`, and all `J` maps
-  take `J·(|S_L| + |S_R|)·4` B: small enough to store, so no per-matvec search at all.
-- **Diagonals are rank-`K` outer products.** `(-1)^{z·s} = (-1)^{z_L·a}·(-1)^{z_R·b}`, so a Z term's
-  diagonal is `u ⊗ w`, two vectors of ~`√N`. Nothing of size `N` is stored but `V`.
+- **X flips act on each axis separately.** `X^x`, `x = (x_L, x_R)`, is a row map `π_L` on `S_L` composed with
+  a column map `π_R` on `S_R`. The searches run over ~`√N` entries rather than `N`, and all `J` maps take
+  `J·(|S_L| + |S_R|)·4` B: small enough to store, so no per-matvec search at all.
+- **Diagonals are rank-`K` outer products.** `(-1)^{z·s} = (-1)^{z_L·a}·(-1)^{z_R·b}`, so a Z term's diagonal
+  is `u ⊗ w`, two vectors of ~`√N`. Nothing of size `N` is stored but `V`.
 - **The matvec**, per group: a row gather of `V`, a column gather, a multiply by `Σ_k c_k u_k w_kᵀ`. Coalesced,
   regular gathers along one axis, which suits a GPU; groups sharing an `x_L` share the row gather.
 - **Under a mesh**, `V` sharded by rows: column work is local, row maps need other devices' rows. The simplest
   form all-gathers `V` once per matvec, `"indices"`' communication, with the operator's memory near zero.
 
-**Spinchain: dead** (*measured*). The product of halves is far larger than the subspace:
+**Spinchain: dead** (*measured*, §7). The product of halves is far larger than the subspace:
 
 | N | cut 30 | cut 20 |
 | --- | --- | --- |
@@ -307,36 +229,132 @@ operator factors.
 | `2^17` | 1156× | 815× |
 | `2^20` | 3893× | 2415× |
 
-**Chemistry SQD: native.** qiskit-addon-sqd already forms the subspace as `S_α × S_β` from the unique α and
-β strings, and Jordan–Wigner puts the α and β blocks on separate qubit halves. It is the string-driven
-σ-vector of FCI codes (Knowles–Handy; Olsen et al.): the search shrinks from `N` to ~`√N` per spin sector,
-and index memory from `J·N` to `J·√N`, the molecular `J` problem `rqutils/sqd/__init__.py` documents.
-**Caveat**: αβ two-body terms carry ~`n_α²` distinct `x_α`, so moving rows per pattern costs
-~`n_α²·N/P` (*estimated*), which loses to one all-gather unless `P` is large; hence the all-gather form.
-It needs the subspace as `(S_α, S_β)` rather than a state list, an API addition. Unmeasured on a molecule.
+**Chemistry SQD: native.** qiskit-addon-sqd already forms the subspace as `S_α × S_β` from the unique α and β
+strings, and Jordan–Wigner puts the α and β blocks on separate qubit halves. It is the string-driven σ-vector
+of FCI codes (Knowles–Handy; Olsen et al.): the search shrinks from `N` to ~`√N` per spin sector, and index
+memory from `J·N` to `J·√N`, the molecular `J` problem `rqutils/sqd/__init__.py` documents. **Caveat**: αβ
+two-body terms carry ~`n_α²` distinct `x_α`, so moving rows per pattern costs ~`n_α²·N/P` (*estimated*), which
+loses to one all-gather unless `P` is large; hence the all-gather form. It needs the subspace as
+`(S_α, S_β)` rather than a state list, an API addition. Unmeasured on a molecule.
 
-### 11.2 Ownership by a random hash of the left half, rejected
+### 4.10 Hybrid symmetric/directed storage (rank 10)
 
-The aim: randomization for balance and locality together. Every group flipping only right-half qubits
-stays on its device (2/3 of the bonds at cut 20), with no linearity constraint like §6's. **Dead beyond
-`P = 4`** (*measured*): states near Néel share a few left halves, one alone owning 3–27% of the subspace.
-Largest device load over the mean, `2^17` and `2^20`:
+Keep a pair symmetric when both endpoints live on one device, directed only when it crosses: recovers up to
+half of rank 4's doubling with no reduce-scatter. The saving depends on locality, and range-split locality is
+hop-dependent on XXZ (`poc/partition-states.md` §4), and a random hash (rank 2) has none; it comes free only
+under rank 6. Measure before building.
 
-| | `P = 4` | `P = 16` | `P = 64` |
-| --- | --- | --- | --- |
-| cut 30 | 1.05–1.14× | 1.38–1.83× | 3.11–4.22× |
-| cut 20 | 1.24–1.50× | 2.46–2.71× | 7.95–8.39× |
-| cut 10 | 1.77–1.96× | 4.22–4.68× | 15.51–17.19× |
+## 5. Rejected
 
-Splitting a heavy left half by a few right-half bits rebalances, but every group flipping those bits then
-crosses devices, giving the locality back. The concentration near Néel that kills both §11.1 and §11.2 on
-spinchain is the one that makes a range split fail (`poc/partition-states.md` §4), so §10.1 and §6 stay the
-spinchain candidates.
+- **Ownership by a random hash of the left half** (*measured*, §7). The aim was randomization for balance and
+  locality together: every group flipping only right-half qubits stays on its device (2/3 of the bonds at
+  cut 20), with no linearity constraint like rank 6's. **Dead beyond `P = 4`**: states near Néel share a few
+  left halves, one alone owning 3–27% of the subspace. Largest device load over the mean, `2^17` and `2^20`:
 
-### 11.3 The script
+  | | `P = 4` | `P = 16` | `P = 64` |
+  | --- | --- | --- | --- |
+  | cut 30 | 1.05–1.14× | 1.38–1.83× | 3.11–4.22× |
+  | cut 20 | 1.24–1.50× | 2.46–2.71× | 7.95–8.39× |
+  | cut 10 | 1.77–1.96× | 4.22–4.68× | 15.51–17.19× |
+
+  Splitting a heavy left half by a few right-half bits rebalances, but every group flipping those bits then
+  crosses devices, giving the locality back. The concentration near Néel that kills this and rank 9 on
+  spinchain is the one that makes a range split fail (`poc/partition-states.md` §4), so ranks 2 and 6 stay the
+  spinchain candidates.
+- **Randomizing the matvec itself** (sampled entries, sketches). `sqd` needs an exact matvec: its convergence
+  at `rtol ≈ 4·eps` and the independent residual recomputed after every solve (`EigenpairCheckError`) would
+  both break, as the closed `Ax`-reuse investigation showed for a far milder inexactness (`CLAUDE.md`,
+  "Reusing `Ax` to cut `body()`'s 3 matvecs to 2").
+- **HYB and a windowed `segment_sum`**: lost single-device (§3).
+- **`float64` factors for real groups**: −25–30% operator for 0.37–0.94× speed (`poc/sparse/tune.md` §3);
+  rank 3 saves more.
+- **Delta-encoded `j − i`**: a high-bit flip moves an index by up to half of `N`
+  (`markdown/spinchain/rqutils-multiobs-response.md` §2), so deltas do not fit a narrow type.
+- **A sampled degree histogram for the bucket grid**: speeds only the build, and ELLC's fixed ×1.25 grid needs
+  none.
+
+## 6. Prediction: the fastest sparse mesh matvec
+
+*Predicted, not measured.* **Row-sharded ELL, bucketed within each device's rows and balanced by a random
+hash (rank 2), with one all-gather per matvec, on one node; across many nodes the all-gather becomes the
+cost, and rank 6's partition takes over for local Hamiltonians.**
+
+**Why ELL over directed pairs.**
+
+- **`"pairs"`' single-device edge over `"ell"` is gone under a row-owned mesh layout.** It stores each
+  transition once and writes both ends, half ELL's both-directions entries; under a mesh every
+  target-ordered design stores both directions, rank 4's directed pairs included, so the entry counts are
+  equal. (Rank 1 keeps the symmetric half by paying a reduce-scatter instead.)
+- **ELL needs no scatter.** By target row it is gathers and a reduction along the width, no atomics.
+  `"pairs"`' GPU trouble was its scatter: atomics serialized by padding on one row (0.32–0.73×,
+  `poc/sparse/prune.md` §6), nondeterministic iteration counts (`poc/sparse/gpu.md` §5), the carry split
+  (`poc/sparse/split.md`). Directed pairs keep a scatter-add, or need a sorted segment sum.
+- **The single-device data already leans this way.** With twice the entries, the tuned `"ell"` beat `"pairs"`
+  per iteration in two of four GH200 cells, 1.50× at `type1` `2^22` and 1.25× at `type2` `2^20` (*measured*,
+  `poc/sparse/tune.md` §3). With the doubling taken out of the comparison, it should match or beat directed
+  pairs in most cells.
+- **Bucketed rather than plain**, because after zero-drop the row widths of a Hamming-shell XXZ subspace
+  vary, and plain ELL pads every row to the global maximum.
+
+**When communication takes over** (*estimated* arithmetic). At `N = 2^24` one `complex128` vector is 256 MB.
+
+- **Within a node**, NVLink at hundreds of GB/s: ~0.3–1 ms per all-gather, under a matvec's local compute at
+  that size, so the local kernel decides and ELL wins.
+- **Across nodes**, InfiniBand at ~25–50 GB/s: ~5–10 ms per vector, matching or exceeding the compute, with
+  per-device memory capped by the full gathered vector. There rank 6's `ppermute` pattern should win by about
+  its traffic cut (~10× at `P = 64` on XXZ), if its balance holds; on molecular `H` it falls back to the
+  all-gather and ELL's local kernel decides again.
+- **On a CPU mesh** ELL's regular gathers vectorize well: close to directed pairs, possibly still behind
+  `"tables"`, which gathers no factors.
+
+**What would prove it wrong.**
+
+- **The row-width spread** (§8 step 2): heavy-tailed widths make ELL lose to padding even bucketed, and
+  directed pairs win.
+- **Per-bucket padding under one shared shape**, if the random hash concentrates less than balls in bins.
+- **XLA's lowering of the width reduction on a GPU** may not fuse as well as the scatter path; the
+  single-device `"ell"`'s 4.8 s build hints at compile cost.
+- **Rank 6's balance on physical subspaces** decides whether the multi-node case ever leaves the all-gather.
+
+## 7. The script behind §4.9 and §5
 
 `poc/split_layouts.py`, host-only, against its argparse: `--num-qubits` (60), `--product-sizes` (`14 17 20`)
-and `--product-cuts` (`30 20`) for §11.1, `--hash-sizes` (`17 20`), `--hash-cuts` (`30 20 10`) and
-`--devices` (`4 16 64`) for §11.2. The left half is a state's first `cut` columns; the hash is a random
-salt per distinct left half, drawn in loop order from one seeded generator, so a run reproduces the tables.
-Run at `49366a5` on an Apple M1, 2026-10-05, with the defaults.
+and `--product-cuts` (`30 20`) for §4.9, `--hash-sizes` (`17 20`), `--hash-cuts` (`30 20 10`) and
+`--devices` (`4 16 64`) for §5's left-half hash. Fixture: `poc/eigenpair_check_scale`'s Hamming-shell
+subspaces around both Néel states; the left half is a state's first `cut` columns; the hash is a random salt
+per distinct left half, drawn in loop order from one seeded generator, so a run reproduces the tables. Run at
+`49366a5` on an Apple M1, 2026-10-05, with the defaults.
+
+## 8. Plan, with a gate at each step
+
+1. **Rank 1 on virtual CPU devices** (me): a `test/sharded/*.py` case against single-device `"pairs"`, the
+   sharding *spec* asserted, and the collective count from `.lower(...).compile().as_text()`. Correctness
+   only: virtual-device timings are meaningless. Then **multi-GPU** (you): whole `sqd` calls against
+   `"indices"` under the same mesh, and a multi-process run, since virtual devices cannot reach the
+   non-addressable-shard class of errors (`CLAUDE.md`, "Sharding tests"). Gate: ≥ `"indices"`' speed at ≤ its
+   per-device memory. If it passes and one node is the target, stop here.
+2. **Host-only POC** (me, CPU, no library change), from today's `"pairs"` build on XXZ `type1`/`type2` at
+   `n = 60` and molecular-like `n = 14–20`, for `P ∈ {4, 16, 64}`:
+   - rank 2: ELLC's per-bucket padding when every device must hold one shape, under a random whole-key hash
+     against today's lex-ordered row blocks, and rank 3's bytes per slot;
+   - rank 4: per-device entry imbalance, and the per-row width spread (stored entries against plain ELL's
+     `width · N` and against per-device buckets);
+   - rank 10: the same-device fraction under a range split;
+   - rank 6: the search's imbalance, same-device fraction, distinct `Δ`, and receive volume against an
+     all-gather.
+
+   Gates: rank 2 if its padding stays ≤ 1.25×; else rank 4 as plain ELL if its padding is ≤ 1.25× the
+   directed entries, otherwise as directed pairs. Rank 6 only at imbalance ≤ 1.25 and ≥ 2× less receive
+   volume on XXZ.
+3. **The step 2 winner** in the library, behind the same sharded test, then the same multi-GPU gate against
+   rank 1.
+4. **Ranks 6–8** only if a multi-node run shows the all-gather dominating.
+
+## 9. Decisions for you
+
+1. **Is a sharded `"pairs"` worth lifting its single-device restriction**, which `CLAUDE.md` and the docs
+   state? Rank 1 does it with no layout change; ranks 2–7 also change the state order the solver sees.
+2. **Rank 1 first, or straight to step 2's POC?** Rank 1 is the cheapest real measurement; step 2 decides
+   between the layouts without a GPU.
+3. **Molecules.** Ranks 6–7 help local Hamiltonians most; if molecular `J` is the target, rank 3's recomputed
+   factors or rank 9's product layout may matter more than any partition.
