@@ -30,7 +30,7 @@ def fixture(letters, seed):
 
 def stored(operator):
     """Each device's stored ``(i, j, d)``, its padding (zero factor) dropped, in device order."""
-    i, j, d = (np.asarray(a).reshape(np.asarray(a).shape[0], -1) for a in operator[1:])
+    i, j, d = (np.asarray(a).reshape(len(a), -1) for a in operator[1:])
     keep = d != 0
     return [np.concatenate([a[p][keep[p]] for p in range(len(d))]) for a in (i, j, d)]
 
@@ -63,7 +63,6 @@ def case(letters, seed):
             "specs": [str(jax.typeof(a).sharding.spec) for a in operator],
             "product_spec": str(jax.typeof(product).sharding.spec),
             "product_diff": float(np.max(np.abs(np.asarray(product) - reference))),
-            "shards": len(operator[3].addressable_shards),
             "entries_per_device": [
                 int(np.count_nonzero(np.asarray(s.data))) for s in operator[3].addressable_shards
             ],

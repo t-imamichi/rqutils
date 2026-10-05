@@ -325,29 +325,17 @@ class TestShardedPairs:
         for label, case in _pairs_mesh().items():
             for devices, cell in case["devices"].items():
                 where = f"{label}/{devices}"
-                assert cell["specs"] == ["P('x',)", *["P('x', None, None)"] * 3], (
-                    where,
-                    cell["specs"],
-                )
-                assert cell["product_spec"] == "P(None, 'x')", (where, cell["product_spec"])
-                assert cell["shards"] == int(devices), where
+                assert cell["specs"] == ["P('x',)", *["P('x', None, None)"] * 3], where
+                assert cell["product_spec"] == "P(None, 'x')", where
                 counts = cell["entries_per_device"]
-                assert max(counts) - min(counts) <= 1, (where, counts)
-                assert cell["same_entries"], (
-                    f"{where}: the slices are not the flat operator, in order"
-                )
+                assert len(counts) == int(devices) and max(counts) - min(counts) <= 1, counts
+                assert cell["same_entries"], where
 
     def test_one_all_gather_and_one_reduce_scatter_per_batched_matvec(self):
-        expected = {
-            "all-gather": 1,
-            "reduce-scatter": 1,
-            "all-reduce": 0,
-            "all-to-all": 0,
-            "collective-permute": 0,
-        }
-        for label, case in _pairs_mesh().items():
-            for devices, cell in case["devices"].items():
-                assert cell["collectives"] == expected, (f"{label}/{devices}", cell["collectives"])
+        for case in _pairs_mesh().values():
+            for cell in case["devices"].values():
+                got = cell["collectives"]
+                assert got == dict.fromkeys(got, 0) | {"all-gather": 1, "reduce-scatter": 1}, got
 
 
 @functools.cache

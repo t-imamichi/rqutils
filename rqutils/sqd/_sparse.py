@@ -238,9 +238,7 @@ def _drop_zeros(
 
     XX+YY hops cancel on aligned spins: 86% of spinchain's ``type1`` pairs, 32% of ``type2``'s
     (``poc/sparse/prune.md``). The check reads the unfiltered ``pairs``, so it vouches for this filter.
-    ``devices`` splits the entries into that many contiguous, equally padded ``(devices, chunks, chunk)``
-    slices, balanced to one entry where whole X groups measured 1.41-14.26x on ``type1``
-    (``markdown/pairs-mesh-proposal.md`` §4.1).
+    ``devices`` splits them into that many equal contiguous slices (``markdown/pairs-mesh-proposal.md`` §4.1).
     """
     count = int(jnp.count_nonzero(d))
     per = count if devices is None else -(-count // devices)
@@ -263,7 +261,7 @@ def _compact(
     devices: int | None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """:func:`_drop_zeros`' filter as one program: 3.4-3.8x its eager first call on CPU (``poc/sparse/drop-jit.md``)."""
-    rows = 1 if devices is None else devices
+    rows = devices or 1
     (idx,) = jnp.nonzero((d != 0).ravel(), size=rows * length, fill_value=0)
     src = jnp.arange(rows)[:, None] * per + jnp.arange(length)  # slot -> stored entry
     live = (jnp.arange(length) < per) & (src < count)
