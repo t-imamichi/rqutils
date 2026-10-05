@@ -130,11 +130,12 @@ single-device for now, and ``poc/sparse/pairs.md`` has the measurements.
 
 **The source-index setup dominates the solve, so this is not a symmetric memory-for-speed dial:**
 ``Matvec.ONTHEFLY`` pays the :math:`J`-fold :func:`get_xsource` search once per matvec rather than
-once per solve. On CPU, prefer ``Matvec.INDICES`` or ``Matvec.TABLES`` unless the memory genuinely
-will not fit (``NOTES.md``, "``sqd``: ``get_xsource`` setup dominates a solve";
-``markdown/scaling-pocs.md``).
+once per solve, so prefer a stored kernel unless the memory genuinely will not fit (``NOTES.md``,
+"``sqd``: ``get_xsource`` setup dominates a solve"). On one device, CPU or GPU, that is ``Matvec.PAIRS``:
+3.1--4.0x ``Matvec.TABLES`` on one CPU at ``Matvec.INDICES``' memory (``poc/sparse/gpu.md``, section 9).
+Under a mesh it is ``Matvec.INDICES``, inferred from one device; a CPU mesh may favour ``Matvec.TABLES``.
 
-**On a GPU the ranking differs** (``poc/sparse/gpu.md``, section 9): ``Matvec.PAIRS`` is the fastest
+**On a GPU** (``poc/sparse/gpu.md``, section 9) ``Matvec.PAIRS`` is again the fastest
 single-device kernel, 1.1--1.8x ``Matvec.INDICES`` end to end at about 0.6x its memory, while
 ``Matvec.INDICES`` matches ``Matvec.TABLES`` at under half its memory -- so under a mesh, where the
 sparse kernels are unavailable, it is the one to use.
@@ -142,8 +143,9 @@ sparse kernels are unavailable, it is the one to use.
 **:math:`J` is set by the Hamiltonian, and decides which kernels fit.** A spin chain has one X group per
 bond or field, :math:`J = O(n)` (62--120 for an XXZ chain at :math:`n = 60`); Jordan--Wigner fermions have
 one per set of flipped orbitals, :math:`J = O(n^4)` (3768 at :math:`n = 20`, random integrals). At large
-:math:`J` the :math:`4 J N` index table outgrows memory and the per-matvec search slows, leaving
-``Matvec.PAIRS``, which stores only in-subspace transitions; no molecular solve is measured yet.
+:math:`J` the :math:`4 J N` index table outgrows one device and the per-matvec search slows. On one
+device that leaves ``Matvec.PAIRS``, which stores only in-subspace transitions; under a mesh, where it is
+unavailable, ``Matvec.INDICES``, its table split across devices. No molecular solve is measured yet.
 
 Distributed arrays and scaling limits
 =====================================
