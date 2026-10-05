@@ -1,7 +1,8 @@
 # Proposal: `"pairs"` under a mesh
 
-Status: **for review**, 2026-10-05; revised the same day after an independent review (§10). Nothing here is
-built. Figures marked *measured* come from the cited write-ups or from `poc/split_layouts.py` (§7);
+Status: **for review**, 2026-10-05; revised the same day after an independent review (§10). **Rank 1 is
+built** on this branch (2026-10-06, `b1bf0b3`), correctness on virtual CPU devices only (§4.1, §8 step 1);
+nothing else here is. Figures marked *measured* come from the cited write-ups or from `poc/split_layouts.py` (§7);
 everything marked *estimated* is arithmetic on those, not a run. **Post-drop** means after `_drop_zeros`
 (`6d13bfb`) and its padding fix (`d0a9997`); several single-device comparisons predate them and are marked
 *stale*.
@@ -105,9 +106,12 @@ the sharded operator either way.
 Split the Hamiltonian's entries, not the rows: `H = d0 + Σ_p H_p`, device `p` owning a share of the stored
 transitions.
 
-- **Build.** Today's `_sparse_operator`, once, then one contiguous slice of its `i`-sorted stored entries per
-  device, each padded to one size class (`_size_class`) so the shapes agree. Any split is exact, since each
-  device sums into a full-length accumulator; contiguous slices balance to one entry. **Whole X groups,
+- **Build.** `_sparse_operator(..., mesh)`: today's build, once, then `_compact` gives each device one
+  contiguous slice of the `i`-sorted stored entries, the first `count % P` devices one more, each padded to
+  one size class (`_size_class`) so the shapes agree. Any split is exact, since each device sums into a
+  full-length accumulator; contiguous slices balance to one entry. (The first slice form gave each device
+  `ceil(count / P)`, leaving the last short by up to `P − 1`, 2, 2, 2, 0 for 6 entries on 4: found by code
+  review, fixed, and pinned by a test sweeping every remainder at 2–4 devices.) **Whole X groups,
   the first form built, did not balance** (*measured*, `poc/sparse/mesh_balance.py`, n = 60, `2^17`, largest
   device over the mean):
 
@@ -120,7 +124,8 @@ transitions.
   Packing balanced the *searched* counts, but `_drop_zeros` keeps 33,722 of `type1`'s 249,104 pairs, unevenly
   by group, and one group's 22.3% caps any whole-group packing at `0.223·P` the mean. The slices pay 5–12% of
   padding slots. A random split balances too, but loses the slices' contiguous `out[i]` rows.
-- **Matvec.** All-gather `vec` (as `"indices"`); each device runs today's `_apply_pairs` on its entries into
+- **Matvec.** `_apply_pairs_mesh`, chosen by `_run_sparse` under a mesh: all-gather `vec` (as `"indices"`);
+  each device runs today's `_apply_pairs` scan on its entries into
   a full-length local accumulator, both scatter directions, device sort and zero-drop unchanged; one
   `psum_scatter` sums the accumulators and leaves each device its `P('x')` row block; `d0 * vec` is
   elementwise and shards for free.
@@ -133,6 +138,11 @@ transitions.
   (`poc/sparse/gpu.md` §9, pre-drop), not the 1.82×.
 - **Where it loses.** Many nodes, where both collectives grow with `N` and two full vectors per device cap
   memory (ranks 2–3).
+- **Single-device `"pairs"` is unchanged** (*measured* against `dev`, M1, n = 60, `type1`/`type2`): the operator
+  is bit-identical and the matvec's traced graph and lowered HLO identical at `2^17`; whole `sqd` calls
+  interleaved against a `dev` worktree (4 alternations × 5 warm rounds, `2^14` and `2^17`) are 0.996–1.016×,
+  paired wins split, eigenvalues bit-identical. That A/B ran before the remainder fix, which leaves the
+  single-device operator and HLO unchanged; no committed script reproduces it.
 - **Not a degenerate rank 3.** Its symmetric storage needs both `v_i` and `v_j` and writes both rows, which no
   proper 2-D block allows; it is a separate term axis, as in 2.5-D and 3-D layouts. Moving from rank 1 to rank
   2 or 3 changes the storage and the build, not just the mesh shape.
@@ -443,8 +453,12 @@ re-ran it and both tables reproduced exactly.
 1. **Rank 1 on virtual CPU devices** (me) — **done 2026-10-06**: `_sparse_operator(..., mesh)` and
    `_apply_pairs_mesh` (`rqutils/sqd/_sparse.py`), `test/sharded/pairs_mesh.py` (`TestShardedPairs`) and `"pairs"` in
    `sqd_grid.py`. Eigenvalues within 1e-12 of single-device, the batched product within 1.8e-15, entries
-   `P('x', None, None)`, exactly one all-gather and one reduce-scatter. Not done: the iteration count, which
-   `sqd` does not return. Each process still builds the whole host operator. Then
+   `P('x', None, None)`, exactly one all-gather and one reduce-scatter, per-device entries within one at every
+   remainder. Mutants killed: no reduce-scatter (the residual check raises), replicated entries, duplicated
+   slices, every entry on one device, the `ceil` split. Reviewed by `/simplify`, a complexity pass and two
+   `/code-review` runs (one finding, the remainder, fixed; the second clean, also on a `(2, 2)` mesh and a
+   Hamiltonian with no off-diagonal pairs). Not done: the iteration count, which `sqd` does not return. Each
+   process still builds the whole host operator. Then
    **multi-GPU** (you): whole `sqd` calls against `"indices"` under the same mesh, and a multi-process run,
    since virtual devices cannot reach the non-addressable-shard class of errors (`CLAUDE.md`, "Sharding
    tests"). Gate: ≥ `"indices"`' speed at ≤ its per-device memory. If it passes and one node is the target,
@@ -470,9 +484,10 @@ re-ran it and both tables reproduced exactly.
 
 ## 9. Decisions for you
 
-1. **Is a sharded `"pairs"` worth lifting its single-device restriction**, which `CLAUDE.md` and the docs
-   state? Rank 1 does it with no layout change; ranks 2, 3, 9 and 10 also change the state order the solver
-   sees (rank 6 keeps lex order unless it takes rank 2's hash).
+1. **Merge rank 1 to `dev`?** This branch lifts `"pairs"`' single-device restriction, with `CLAUDE.md` and the
+   docs updated, at no single-device cost (§4.1); it is untimed on real devices and unrun multi-process. Ranks
+   2, 3, 9 and 10 would also change the state order the solver sees (rank 6 keeps lex order unless it takes
+   rank 2's hash).
 2. **Rank 1 first, or straight to step 2's measurements?** Rank 1 is the cheapest real measurement; step 2
    decides between the layouts without a GPU, and re-grounds the ELL evidence.
 3. **Molecules.** Rank 3 needs no locality and does not grow with the degree, so it is the molecular layout;
@@ -494,3 +509,8 @@ the initial vector in lex order, `mix64`, the shared count allgather, tail-bucke
 link times, `4·J`, the 2-D collective pattern and its need for directed storage, the GF(2) owner shift, the
 perfect matching, rank 1's reduce-scatter, rank 4 needing only owned rows of `states`, and every other
 measured figure.
+
+**Rank 1's build, 2026-10-06.** `/simplify`'s four passes moved the device split into `_compact`, so the mesh
+path shares the zero-drop's padding and count, made `_apply_pairs_mesh` its own function rather than a rank
+check inside `_apply_pairs`, and ran the sharded child once instead of three times. A complexity pass cut 17
+lines. The first `/code-review` found the `ceil` split's short last device (§4.1); the second found nothing.
