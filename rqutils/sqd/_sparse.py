@@ -238,14 +238,14 @@ def _drop_zeros(
 
     XX+YY hops cancel on aligned spins: 86% of spinchain's ``type1`` pairs, 32% of ``type2``'s
     (``poc/sparse/prune.md``). The check reads the unfiltered ``pairs``, so it vouches for this filter.
-    ``devices`` splits them into that many equal contiguous slices (``markdown/pairs-mesh-proposal.md`` §4.1).
+    ``devices`` splits them into that many contiguous slices, sizes within one (``markdown/pairs-mesh-proposal.md`` §4.1).
     """
     count = int(jnp.count_nonzero(d))
     per = count if devices is None else -(-count // devices)
     if devices is not None:
         chunk = min(chunk, _size_class(per))
     length = _size_class(-(-per // chunk)) * chunk
-    return _compact(t, s, d, count, per, length, chunk, size, devices)
+    return _compact(t, s, d, count, length, chunk, size, devices)
 
 
 @functools.partial(jax.jit, static_argnames=["length", "chunk", "size", "devices"])
@@ -254,7 +254,6 @@ def _compact(
     s: jax.Array,
     d: jax.Array,
     count: int,
-    per: int,
     length: int,
     chunk: int,
     size: int,
@@ -263,8 +262,10 @@ def _compact(
     """:func:`_drop_zeros`' filter as one program: 3.4-3.8x its eager first call on CPU (``poc/sparse/drop-jit.md``)."""
     rows = devices or 1
     (idx,) = jnp.nonzero((d != 0).ravel(), size=rows * length, fill_value=0)
-    src = jnp.arange(rows)[:, None] * per + jnp.arange(length)  # slot -> stored entry
-    live = (jnp.arange(length) < per) & (src < count)
+    # Device p holds entries [start, start + held): the first count % rows devices one more.
+    p, q, r = jnp.arange(rows)[:, None], count // rows, count % rows
+    src = p * q + jnp.minimum(p, r) + jnp.arange(length)  # slot -> stored entry
+    live = jnp.arange(length) < q + (p < r)
     src = idx[jnp.where(live, src, 0)]
     # Padding on distinct rows: one shared row serialized a GPU's atomic adds (poc/sparse/prune.md §6).
     pad = jnp.arange(rows * length, dtype=t.dtype).reshape(rows, length) % size

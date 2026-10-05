@@ -13,6 +13,7 @@ import pytest
 from conftest import MATVECS, run_sharded_child
 
 from rqutils.sqd._solve import _host_scalar
+from rqutils.sqd._sparse import _drop_zeros
 
 
 class TestShardedSqd:
@@ -330,6 +331,21 @@ class TestShardedPairs:
                 counts = cell["entries_per_device"]
                 assert len(counts) == int(devices) and max(counts) - min(counts) <= 1, counts
                 assert cell["same_entries"], where
+
+    @pytest.mark.parametrize("devices", [2, 3, 4])
+    def test_the_split_balances_to_one_entry_at_every_remainder(self, devices):
+        """``ceil(count / devices)`` per device left the last one short by up to ``devices - 1``: 2,2,2,0
+        for 6 entries on 4 devices, which the solve fixtures happened to avoid."""
+        rng = np.random.default_rng(0)
+        for count in range(3 * devices + 2):
+            d = np.zeros(40)
+            d[np.sort(rng.choice(40, count, replace=False))] = rng.normal(size=count)
+            t, s = np.arange(40, dtype=np.int32), np.arange(40, dtype=np.int32)[::-1].copy()
+            *_, got = _drop_zeros(t[None], s[None], d[None], 8, 40, devices)
+            held = [int(np.count_nonzero(row)) for row in np.asarray(got).reshape(devices, -1)]
+            assert max(held) - min(held) <= 1, (count, held)
+            stored = np.asarray(got).reshape(devices, -1)
+            assert np.array_equal(np.concatenate([r[r != 0] for r in stored]), d[d != 0]), count
 
     def test_one_all_gather_and_one_reduce_scatter_per_batched_matvec(self):
         for case in _pairs_mesh().values():
