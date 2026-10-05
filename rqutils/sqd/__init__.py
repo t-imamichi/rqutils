@@ -139,6 +139,12 @@ single-device kernel, 1.1--1.8x ``Matvec.INDICES`` end to end at about 0.6x its 
 ``Matvec.INDICES`` matches ``Matvec.TABLES`` at under half its memory -- so under a mesh, where the
 sparse kernels are unavailable, it is the one to use.
 
+**:math:`J` is set by the Hamiltonian, and decides which kernels fit.** A spin chain has one X group per
+bond or field, :math:`J = O(n)` (62--120 for an XXZ chain at :math:`n = 60`); Jordan--Wigner fermions have
+one per set of flipped orbitals, :math:`J = O(n^4)` (3768 at :math:`n = 20`, random integrals). At large
+:math:`J` the :math:`4 J N` index table outgrows memory and the per-matvec search slows, leaving
+``Matvec.PAIRS``, which stores only in-subspace transitions; no molecular solve is measured yet.
+
 Distributed arrays and scaling limits
 =====================================
 
