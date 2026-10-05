@@ -1,6 +1,6 @@
 # `_drop_zeros` as one jitted program
 
-`poc/sparse/drop_jit.py` (§5) at `ab4a2a3` plus the change, one Apple M1 (8 cores, 16 GiB), 2026-10-05;
+`poc/sparse/drop_jit.py` (§6) at `ab4a2a3` plus the change, one Apple M1 (8 cores, 16 GiB), 2026-10-05;
 the NVIDIA GH200 120GB in §3, at `3b50443`.
 Fixture as `poc/sparse/prune.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` and `type2`,
 Hamming-shell subspaces around both Néel states. In the library since, as `_compact`.
@@ -41,15 +41,32 @@ The first call is 4.0–4.4× faster, 0.79–0.82 s saved, halving a first build
 ~7 ms warm whatever the entry count, so its cost there is per-op dispatch, not work; jitted it is
 3.8–14×.
 
-## 4. What it means, and open
+## 4. A persistent compile cache
+
+`--cache-min-secs S` (at `c3ba388`, M1, `--log2-sizes 14 17`): each child runs twice on a fresh cache
+with that minimum compile time, and the second run is reported.
+
+| pattern, N | `S = 0`: eager first / jit first | first build eager / jit | `S = 1.0`: eager first / jit first |
+| --- | --- | --- | --- |
+| type1 2^14 | 46 / 21 ms | 0.09 / 0.07 s | 328 / 94 ms |
+| type1 2^17 | 64 / 24 ms | 0.11 / 0.07 s | 486 / 125 ms |
+| type2 2^14 | 47 / 21 ms | 0.09 / 0.07 s | 364 / 96 ms |
+| type2 2^17 | 76 / 32 ms | 0.13 / 0.09 s | 481 / 140 ms |
+
+At JAX's default `S = 1.0` the cache stores nothing here: every compile in the build is under a second,
+so both arms match §2. At `S = 0` it hides most of the cost, the whole build's compiles included, and the
+jitted filter is still 2.2–2.7× faster on its first call. So the cache did not already hide the eager cost
+for a caller using the defaults.
+
+## 5. What it means, and open
 
 The first call is 3.4–3.8× faster, 0.23–0.36 s saved per new size class, which is 39–45% of a first build;
 warm it is 1.8–3.3×, but at 0.4–11 ms that hardly matters against a solve. Same output, so nothing to
-trade. On a GH200 the gain is larger (§3). **Open**: whether the persistent
-compile cache already hid the eager cost across processes, which this script does not enable.
+trade. On a GH200 the gain is larger (§3). A persistent cache at its default threshold hides none of it
+(§4). **Open**: §4 on the GH200.
 
-## 5. The script
+## 6. The script
 
 `poc/sparse/drop_jit.py`, against its argparse: `--num-qubits` (60), `--delta` (0.5), `--patterns`
-(`type1 type2`), `--log2-sizes` (`17 19`; the table used `14 17`), `--rounds` (5). Each cell runs two child
+(`type1 type2`), `--log2-sizes` (`17 19`; the table used `14 17`), `--rounds` (5), `--cache-min-secs` (off; §4 used `0` and `1.0`). Each cell runs two child
 processes (`--child`, internal). The eager arm is a copy of the pre-change `_drop_zeros`.
