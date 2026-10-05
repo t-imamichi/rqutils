@@ -1,6 +1,6 @@
 """Two layouts that split each state at a qubit cut: how they fit spinchain's subspaces. Host-only.
 
-For ``markdown/pairs-mesh-proposal.md`` §11. Fixture: ``poc/eigenpair_check_scale``'s Hamming-shell
+For ``markdown/pairs-mesh-proposal.md`` §4.8 (product) and §5 (left-half hash). Fixture: ``poc/eigenpair_check_scale``'s Hamming-shell
 subspaces around both Néel states at ``--num-qubits``; the left half is the state's first ``cut`` columns.
 
 - ``product``: the full product ``S_L × S_R`` a matrix-shaped vector would need, as a multiple of ``N``.
