@@ -114,7 +114,8 @@ contention's noise; on CPU it is 1.00–1.01× (§4).
    only over a solve or two at the larger sizes, more if one operator serves several. **Closed
    (2026-10-05)**: declined, with the sort-free variant in `markdown/parity-codes-proposal.md`, to keep the
    solver generic; codes pay only with few distinct factors and small `kmax`, as in spinchain's XXZ.
-2. **The first-build compile**: a jitted `_drop_zeros` keyed on the size class would compile once per class.
+2. **The first-build compile: done.** The filter is one jitted program, `_compact`, 3.4–3.8× its eager
+   first call on CPU, 0.23–0.36 s off a first build (`poc/sparse/drop-jit.md`).
 
 ## 8. The script
 

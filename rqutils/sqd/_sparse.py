@@ -238,10 +238,16 @@ def _drop_zeros(
     XX+YY hops cancel on aligned spins: 86% of spinchain's ``type1`` pairs, 32% of ``type2``'s
     (``poc/sparse/prune.md``). The check reads the unfiltered ``pairs``, so it vouches for this filter.
     """
-    keep = (d != 0).ravel()
-    count = int(keep.sum())
-    length = _size_class(-(-count // chunk)) * chunk
-    (idx,) = jnp.nonzero(keep, size=length, fill_value=0)
+    count = int(jnp.count_nonzero(d))
+    return _compact(t, s, d, count, _size_class(-(-count // chunk)) * chunk, chunk, size)
+
+
+@functools.partial(jax.jit, static_argnames=["length", "chunk", "size"])
+def _compact(
+    t: jax.Array, s: jax.Array, d: jax.Array, count: int, length: int, chunk: int, size: int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """:func:`_drop_zeros`' filter as one program: 3.4-3.8x its eager first call on CPU (``poc/sparse/drop-jit.md``)."""
+    (idx,) = jnp.nonzero((d != 0).ravel(), size=length, fill_value=0)
     live = jnp.arange(length) < count
     # Padding on distinct rows: one shared row serialized a GPU's atomic adds (poc/sparse/prune.md §6).
     pad = jnp.arange(length, dtype=t.dtype) % size
