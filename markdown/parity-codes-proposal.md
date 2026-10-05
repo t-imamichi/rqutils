@@ -1,6 +1,7 @@
 # Proposal: sort-free "parity codes" for `"pairs"`
 
-Status: **for review**, 2026-10-03. Nothing here is built. Every figure marked *measured* comes from
+Status: **declined**, 2026-10-05, to keep the solver generic (`poc/sparse/prune.md` §7). Drafted
+2026-10-03; nothing here is built. Every figure marked *measured* comes from
 `poc/sparse/prune.md` or `poc/sparse/gpu.md`; every figure marked *estimated* is derived from those
 measurements by the arithmetic in §4, not run.
 

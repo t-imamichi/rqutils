@@ -97,10 +97,9 @@ Two things differ from the CPU:
 1. **Sizes `2^17`–`2^19`.** The defaults were cut to `2^14` for wall time. Only the one `2^17` `type1`
    barrier figure in §2 exists past that, and the ratios may move with `N`.
 2. **The GPU: measured (§5).** `fold` is 1.13–1.18×, and `"indices"` now beats `"tables"` there.
-3. **`codes`' cost.** On CPU it is the `(2, N)` matvec (§3); on the GH200 it is presumably the encode
-   (§5). Time the encode alone, then try a cheaper one than a sort, since a group has ≤ 11 values. If
-   `codes` then wins on a GPU, it is half of `"tables"`' memory for free, though §5 makes `"indices"`
-   the better baseline.
+3. **`codes`' cost: moot.** Coded `"tables"` was dropped (2026-10-03): `"tables"` is behind `"pairs"` on
+   one CPU and one GPU, and behind `"indices"` on a GPU mesh (`poc/sparse/gpu.md` §9), so no measured
+   setting picks it. The GH200 encode cost (§5) stays untimed.
 4. **`fold` in the library: done.** `from_paulisum` moves each group's Z-free term first and flags it
    in the static `PauliSumXZ.zfree_first`; `_bucket_args` folds it into a per-group `const`. Re-run
    after the change, the script's reference (now the library) matches the `fold` arm bit for bit at

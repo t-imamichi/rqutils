@@ -111,7 +111,9 @@ contention's noise; on CPU it is 1.00–1.01× (§4).
 1. **Factor codes in the library** (§4, §6): 1.03–1.09× and up to −56% of the operator on a GH200,
    bit-identical on CPU. The build's `jnp.unique` sort costs 5–89 ms more than `nonzero`'s (0.024 → 0.029 s
    at `type1` `2^20`, 0.090 → 0.179 s at `type2` `2^22`), against 2–83 ms saved per solve, so it pays
-   only over a solve or two at the larger sizes, more if one operator serves several. POC-only so far.
+   only over a solve or two at the larger sizes, more if one operator serves several. **Closed
+   (2026-10-05)**: declined, with the sort-free variant in `markdown/parity-codes-proposal.md`, to keep the
+   solver generic; codes pay only with few distinct factors and small `kmax`, as in spinchain's XXZ.
 2. **The first-build compile**: a jitted `_drop_zeros` keyed on the size class would compile once per class.
 
 ## 8. The script

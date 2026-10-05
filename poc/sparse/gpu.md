@@ -296,8 +296,8 @@ the default by setting is a separate decision.
    `CUDA_ERROR_NO_DEVICE` — undiagnosed; the likeliest cause is `--device` overriding a scheduler's
    `CUDA_VISIBLE_DEVICES`.
 8. **The sparse kernels' host build** (§8), 42% of a `"pairs"` call at `type2` `2^22`, half of it the
-   sort. A stable sort on the device is 1.12–1.50× per `"pairs"` call (`poc/sparse/pairs-sort.md`),
-   unshipped; dropping the sort loses. For `"ell"`, batch its factor calls.
+   sort. The sort now runs on the device, 1.12–1.50× per `"pairs"` call (shipped,
+   `_pairs_sorted_on_device`; `poc/sparse/pairs-sort.md`); dropping it loses. The search half remains.
 9. **`"ell"`'s compile cost** (§7's first calls), and whether the persistent compile cache recovers it.
 10. **`"indices"` on a multi-GPU mesh**, the setting §9 recommends it for.
 
