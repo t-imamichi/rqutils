@@ -21,6 +21,7 @@ CPU, 1.1–1.8× on one GPU, `poc/sparse/gpu.md` §9) but raises under a mesh, s
 should carry over. §6 is the only design that removes the `N`-length gathered vector *and* the all-gather;
 it works best on local Hamiltonians and degrades to §3's cost on molecular ones.
 §9 predicts the winner: per-device bucketed ELL (§3.1) on one node, §6 across nodes.
+§10 makes that ELL shardable and lean: a random hash of the state key, optionally with recomputed factors.
 
 ## 2. Today's sharded `"indices"`, the baseline
 
@@ -153,6 +154,9 @@ inexactness (`CLAUDE.md`, "Reusing `Ax` to cut `body()`'s 3 matvecs to 2").
    For §3.1, the same build also reports the per-row width spread: stored entries against plain ELL's
    `width · N`, and against per-device buckets. Build §3 as plain ELL if its padding is ≤ 1.25× the
    directed entries, otherwise as directed pairs.
+
+   For §10, it also reports ELLC's per-bucket padding when every device must hold one shape, under a
+   random whole-key hash against today's lex-ordered row blocks, and §10.2's bytes per slot.
 2. **§3, or §6 if step 1 passes**, in the library behind a `test/sharded/*.py` case on virtual CPU devices:
    values against single-device `"pairs"`, the sharding *spec* asserted, and the collective count from
    `.lower(...).compile().as_text()`. Correctness only: virtual-device timings are meaningless.
@@ -210,3 +214,65 @@ takes over for local Hamiltonians.**
 - **XLA's lowering of the width reduction on a GPU** may not fuse as well as the scatter path; the
   single-device `"ell"`'s 4.8 s build hints at compile cost.
 - **§6's balance on physical subspaces** decides whether the multi-node case ever leaves the all-gather.
+
+## 10. Fast, simple ELL and CSR variants, with a randomized layout
+
+What single-device measurement already settled (`poc/sparse/pairs.md` §4, §7 item 6, §10, *measured*): row
+degrees are heavy-tailed (mean 3.7–11.6 entries against a maximum of 60–117), so **HYB loses** (42–78% of
+entries spill into its CSR overflow) and a windowed `segment_sum` is 1.7–1.9× slower than C2R. **ELLC**,
+rows bucketed by degree on a ×1.25 grid, 14–19 buckets at 2–7.7% padding, is 1.5–2.3× C2R per matvec on CPU.
+The variants below keep ELLC's speed across devices; simplest first.
+
+### 10.1 Hashed ELLC
+
+- **The constraint.** An SPMD program has one shape on every device, so each degree bucket must be
+  padded to the largest device's count. Today's lex-ordered row blocks have correlated degree histograms
+  (inner-shell states, nearly full, sit apart from outer-shell ones), so padding each bucket to the worst
+  device could cost a lot.
+- **The randomized fix.** Assign each state to a device by a random hash of its whole key, the hashing
+  `poc/partition-states.md` §3 measured at 1.03–1.11× balance on XXZ. Each device's histogram then
+  concentrates on the global one, and padding a bucket to the largest device costs ~`√count` rows
+  (*estimated*, balls in bins).
+- **Matvec.** One all-gather of `vec`, as `"indices"`, then per bucket a gather, a multiply and a reduction
+  along the width, written by `.at[rows].set(..., unique_indices=True)`: each row is in exactly one bucket,
+  so there are no atomics and no scatter-add.
+- **Cost.** States are laid out in hash order, so `sqd` un-permutes `eigvec` and the basis on return, as in
+  §6. Locality is lost, which the all-gather never used.
+
+### 10.2 Hashed ELLC with recomputed factors
+
+Store `(j, group)` per entry (5–6 B) rather than `(j, d)` (20 B), and compute `d` from the local
+`states[i]`'s Z parities by popcount (§4.1 in ELL form). Past the cache the matvec is bandwidth-bound, so
+trading bytes for ALU work should pay on a GPU; XXZ has at most 2 Z terms per group. *Estimated* from the
+measured mean degrees: ~22–70 B/slot, against `"indices"`' `4·J` = 248–480 B/slot, 4–10× less than the
+format a mesh uses today. It is `"indices"` with the misses removed: `"indices"` stores a `-1` and computes a
+diagonal for every `(group, state)` slot, hit or not.
+
+### 10.3 Group-major directed lists, the simplest CSR-like form
+
+One X group is a perfect matching (a state occurs in at most one pair per group, `poc/sparse/pairs.md`
+§7 item 6), so store each group's directed entries per device and let each group's scatter declare
+`unique_indices=True`: no atomics. Under §10.1's hash each group's per-device count is balls in bins, so
+padding is small. The cost is `J` scans per matvec, and single-device the atomic-free scatter was mixed
+(2.26× at `2^22`, 0.67× at `2^20`, *measured*, `poc/sparse/tune.md` §3). The fallback if ELLC's bucket
+compile cost hurts: single-device its 19 scans cost ~+209 MiB of compile memory.
+
+### 10.4 Combined with §6 across nodes
+
+§10.1's random hash balances and §6's linear hash keeps locality; they conflict. Layer them: §6's `A·s`
+picks the node and a random hash the device within it, so inter-node traffic follows the `ppermute`
+pattern while each node runs the fast all-gather plus hashed ELLC.
+
+### 10.5 Not worth it
+
+- **HYB and a windowed `segment_sum`**: lost single-device (above).
+- **`float64` factors for real groups**: −25–30% operator for 0.37–0.94× speed (`poc/sparse/tune.md` §3);
+  §10.2 saves more.
+- **Delta-encoded `j − i`**: a high-bit flip moves an index by up to half of `N`
+  (`markdown/spinchain/rqutils-multiobs-response.md` §2), so deltas do not fit a narrow type.
+- **A sampled degree histogram for the bucket grid**: speeds only the build, and ELLC's fixed ×1.25 grid
+  needs none.
+
+**Pick**: §10.1 as the first mesh kernel, §10.2 as its memory dial. It reuses a measured fastest format
+and a measured balanced hash, and needs no scatter. **What could kill it**: per-bucket padding under one
+shared shape, the §7 step 1 measurement above.
