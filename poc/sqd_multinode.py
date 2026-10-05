@@ -224,7 +224,7 @@ def per_device_bytes() -> dict:
     for dev in jax.local_devices():
         try:
             stats = dev.memory_stats()
-        except AttributeError, RuntimeError:
+        except (AttributeError, RuntimeError):
             continue
         if stats and "bytes_in_use" in stats:
             out[str(dev)] = stats["bytes_in_use"]
@@ -264,7 +264,7 @@ def peak_temp_bytes(hamiltonian, states, mesh=None) -> int | None:
             return int(
                 fn.lower(hamiltonian, states_p).compile().memory_analysis().temp_size_in_bytes
             )
-    except AttributeError, RuntimeError, NotImplementedError:
+    except (AttributeError, RuntimeError, NotImplementedError):
         # Some backends expose no memory_analysis; absent is not zero, so say so with None.
         return None
 

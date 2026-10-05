@@ -147,7 +147,7 @@ One matvec per solve. Measured at `J=120` X groups, `N=30k` states, warm, 9 inte
 
 The sparse kernels are not in this table, and their check pays the fresh search. At n=60, `2^17` states,
 the check is about 0.15 s of a 1.26 s `PAIRS` call. That is the gap left after the 0.17 s construction
-and the 0.93 s solve (`poc/sparse-pairs.md` §9).
+and the 0.93 s solve (`poc/sparse/pairs.md` §9).
 
 **Net for spinchain**: your guard costs about 6% of a warm solve (its own repack, re-uniquify lexsort,
 operator rebuild and a `(0, 0)` matvec), all of which goes away, so every level now comes out ahead,

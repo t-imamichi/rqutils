@@ -122,12 +122,22 @@ class PauliSumXZ:
         num_real_groups: How many leading X groups have real coefficients, static under JAX
             transforms. :meth:`from_paulisum` orders those groups first, so a complex ``c`` can
             still be read as float64 over ``c[:num_real_groups]``. ``0`` promises nothing.
+        term_counts: Each X group's number of Z terms, static under JAX transforms; its row of ``c``
+            is nonzero exactly there. Lets a kernel sum a group's diagonal over a fixed trip count.
+        identity_first: Whether group 0 is the identity X signature, static under JAX transforms.
+            :meth:`from_paulisum` puts it there whenever one exists.
+        zfree_first: Per X group, whether its first term has no Z part, static under JAX transforms.
+            Such a term's diagonal is the constant ``c[g, 0]``, so a kernel need not compute its
+            parity. :meth:`from_paulisum` moves a group's Z-free term first.
     """
 
     x: np.ndarray[tuple[int, int], np.dtype[np.uint8]]
     z: np.ndarray[tuple[int, int, int], np.dtype[np.uint8]]
     c: np.ndarray[tuple[int, int], np.dtype[np.inexact]]
     num_qubits: int = field(metadata={"static": True})
+    term_counts: tuple[int, ...] = field(metadata={"static": True})
+    identity_first: bool = field(metadata={"static": True})
+    zfree_first: tuple[bool, ...] = field(metadata={"static": True})
     num_real_groups: int = field(default=0, metadata={"static": True})
 
     @staticmethod
@@ -212,7 +222,7 @@ class PauliSumXZ:
         return np.unpackbits(states_p, axis=-1)[:, 1 : 1 + num_qubits]
 
     @classmethod
-    def from_paulisum(cls, paulisum: Any, *, atol: float = 1e-12) -> PauliSumXZ:
+    def from_paulisum(cls, paulisum: Any, *, atol: float = 1e-12) -> "PauliSumXZ":
         """Build the packed representation from a Pauli sum.
 
         The only constructor, and the signature half of the bit-alignment contract: it inserts the
@@ -306,6 +316,8 @@ class PauliSumXZ:
         phase_table = np.array([1.0, -1.0j, -1.0, 1.0j])
         for isig, xsig in enumerate(xsignatures):
             ipaulis = order[bounds[isig] : bounds[isig + 1]]
+            # The Z-free term, at most one per group as duplicates are summed, first (`zfree_first`).
+            ipaulis = ipaulis[np.argsort(zbits[ipaulis].any(axis=1), kind="stable")]
             zsigs = zbits_u8[ipaulis]
             zsignatures[isig, : counts[isig]] = zsigs
             # Multiply the coeffs by (-i)^{n_zx}
@@ -322,14 +334,26 @@ class PauliSumXZ:
         if np.all(real):
             phcoeffs = phcoeffs.real
 
+        identity = not np.any(xsignatures[0])
+        counts = tuple(int(k) for k in np.count_nonzero(phcoeffs, axis=1))
+        zfree = tuple(bool(k) and not zsignatures[g, 0].any() for g, k in enumerate(counts))
         # The pad bit is unconditional and the X side reuses pack_states: one alignment code path
         # (NOTES.md, "paulis.symplectic: the pad bit is unconditional").
         xsignatures = cls.pack_states(xsignatures)
         zsignatures = np.packbits(np.pad(zsignatures, {2: (1, 0)}), axis=-1)
-        return cls(xsignatures, zsignatures, phcoeffs, num_qubits, int(np.count_nonzero(real)))
+        return cls(
+            xsignatures,
+            zsignatures,
+            phcoeffs,
+            num_qubits,
+            term_counts=counts,
+            identity_first=identity,
+            num_real_groups=int(np.count_nonzero(real)),
+            zfree_first=zfree,
+        )
 
     @property
-    def arrays(self) -> PackedArrays:
+    def arrays(self) -> "PackedArrays":
         """The packed ``(x, z, c)`` arrays, for splatting into a traced function.
 
         A :class:`PackedArrays` rather than a bare tuple: ``x`` and ``z`` are same-dtype integer

@@ -313,7 +313,7 @@ class TestShardedSparseRejects:
     """The sparse kernels are single-device for now, so a live mesh must raise, not half-work.
 
     A pair's endpoints can sit on different devices and CSR needs its sources gathered
-    (``poc/sparse-pairs.md``, section 7); until that is built the dense kernels are the sharded path.
+    (``poc/sparse/pairs.md``, section 7); until that is built the dense kernels are the sharded path.
     """
 
     def test_a_scoped_mesh_raises_and_leaving_it_works(self):

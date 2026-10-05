@@ -15,7 +15,7 @@ from numpy.typing import DTypeLike
 
 from rqutils.ground_locg import _check_prefilter, ground_locg, residual_floor
 from rqutils.paulis.symplectic import PauliSumXZ
-from rqutils.sqd._dense import _apply_h_kernel, _pack_scanned
+from rqutils.sqd._dense import _apply_buckets, _apply_h_kernel, _bucket_args, _pack_scanned
 from rqutils.sqd._diagonal import get_diagonal
 from rqutils.sqd._states import StateList, _is_filler, get_xsource, uniquify_states
 
@@ -23,7 +23,7 @@ from rqutils.sqd._states import StateList, _is_filler, get_xsource, uniquify_sta
 class Matvec(StrEnum):
     """A :func:`~rqutils.sqd.sqd` matvec kernel, named by what it stores (module documentation).
 
-    Pass a member (``Matvec.ELL``); a plain string is rejected. Members are ``str`` subclasses only so
+    Pass a member (``Matvec.PAIRS``); a plain string is rejected. Members are ``str`` subclasses only so
     that the kernels' internal equality tests stay plain.
     """
 
@@ -31,12 +31,6 @@ class Matvec(StrEnum):
     INDICES = "indices"
     TABLES = "tables"
     PAIRS = "pairs"
-    CSR = "csr"
-    ELL = "ell"
-
-
-#: The kernels whose operator arrays :func:`sqd` builds host-side; single-device for now.
-_SPARSE_MATVECS = (Matvec.PAIRS, Matvec.CSR, Matvec.ELL)
 
 
 def _check_matvec(matvec: Any) -> None:
@@ -223,7 +217,7 @@ def run_sqd(
     """
     # Static, so this runs once per trace; sqd validates too, and this covers direct poc/ callers.
     _check_matvec(matvec)
-    if matvec in _SPARSE_MATVECS:
+    if matvec is Matvec.PAIRS:
         raise ValueError(
             f"run_sqd cannot build matvec=Matvec.{matvec.name}: its entry counts are data-dependent, "
             "so the operator is built host-side before the solve. Call sqd(..., matvec=...) "
@@ -272,17 +266,22 @@ def run_sqd(
         scanned = tuple(
             _pack_scanned(matvec, g[0], d, None) for g, d in zip(groups, diagonals, strict=True)
         )
+        # Bind matvec via partial, not static_argnames: ground_locg splats args positionally, so it
+        # would be traced and retrace the kernel every matvec. "tables" reads no states.
+        apply = functools.partial(_apply_parts, matvec=matvec)
+        args = (scanned, None)
+        d0 = diagonals[0][0]
     else:
-        scanned = (_pack_scanned(matvec, *(hamiltonian.arrays if groups is None else groups[0])),)
-    # Bind matvec via partial, not static_argnames: ground_locg splats args positionally, so it
-    # would be traced and retrace the kernel every matvec. "tables" reads no states.
-    apply = functools.partial(_apply_parts, matvec=matvec)
-    args = (scanned, None if matvec == "tables" else states_u)
+        # Fixed-trip diagonals bucketed by term count, the identity's cached: 3.2-4.5x on a GPU,
+        # 1.8-1.9x on CPU (poc/dense-tune.md). The residual check keeps _apply_parts.
+        apply = functools.partial(_apply_buckets, matvec=matvec)
+        args = _bucket_args(
+            hamiltonian, hamiltonian.x if groups is None else groups[0][0], states_u
+        )
+        d0 = args[3]
 
     def diag0():
-        if matvec == "tables":
-            return diagonals[0][0]
-        return get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u)
+        return d0 if d0 is not None else get_diagonal(hamiltonian.z[0], hamiltonian.c[0], states_u)
 
     return _solve(
         hamiltonian,

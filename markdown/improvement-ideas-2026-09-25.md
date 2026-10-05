@@ -84,7 +84,7 @@ The source cache stores one `int32` per `(X group, state)`, `-1` for an absent t
 open-XXZ Hamiltonians only 8--25% are real; storing each pair once, with the diagonal computed once per
 pair, measured **4.4× faster than `(1, 0)` at 63% less whole-solve memory** (n=60 `type2`) and **5.3× at
 −52%** on the shipped `type1` pattern; setup-inclusive peak −43% at `2^21` (`NOTES.md`, "Sparse transition
-pairs beat every cache level"; `poc/sparse-pairs.md`, branch `sparse-pairs`). Open before an API: GPU
+pairs beat every cache level"; `poc/sparse/pairs.md`, branch `sparse-pairs`). Open before an API: GPU
 timing, sharding.
 
 ### 9. Distributed `states` -- **built, blocked on hardware**

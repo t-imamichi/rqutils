@@ -1,8 +1,8 @@
 # Response: the sparse check no longer repeats the search; `ELL`'s retrace stays, with a figure
 
 Reply to spinchain's `rqutils-sparse-build-request.md`, from the `rqutils` side. Everything below is on
-`dev` at `8d27837`: the check and the timer through `b5cb5da`, and the later changes in §7. **`dev` now
-requires Python 3.14** (§7.3). Measured on one laptop CPU (10 cores, 64 GiB), without the persistent
+`dev` at `605ad4a`: the check and the timer through `b5cb5da`, and the later changes in §7. **`dev` now
+requires Python 3.13** (§7.3). Measured on one laptop CPU (10 cores, 64 GiB), without the persistent
 compile cache.
 
 > **Status: asks 1, 3 and 4 done; ask 5 answered with a figure; ask 2 not taken up.**
@@ -136,8 +136,10 @@ energy across this revision will fail once.**
   past 63 qubits, where a state spans two 64-bit words. The n=100 `PAIRS` build went 3.25 → 2.07 s. Your
   n=30 and n=60 builds are unaffected.
 
-### 7.3 Python 3.14 is now the floor (`8d27837`)
+### 7.3 Python 3.13 is now the floor (`605ad4a`)
 
-`requires-python` is `>=3.14`. The sliding window is now `Executor.map(buffersize=)`, which is new in
-3.14. **An environment on 3.12 or 3.13 will not install this revision.** `b5cb5da`, which is on
+`requires-python` is `>=3.13`. `8d27837` raised it to 3.14 for `Executor.map(buffersize=)`, but
+`qiskit-aer` has no 3.14 wheel for Linux aarch64, so your `runtime.py` could not install next to it on
+the GH200. `605ad4a` reverts that change and brings back the hand-written sliding window,
+which has the same bound on groups in flight. **An environment on 3.12 will not install this revision.** `b5cb5da`, which is on
 `origin/dev`, is the last revision on 3.12.

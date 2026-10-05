@@ -5,15 +5,16 @@ and the matvec kernels. Organized by defect, like ``test_sqd.py``.
 import dataclasses
 import warnings
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from conftest import (
     DENSE_MATVECS,
-    SPARSE_MATVECS,
     apply_h_inputs,
     apply_h_kwargs,
     eigval_of,
+    lowest_projected,
     mixed_real_complex,
     pack_padded,
     real_pauli_strings,
@@ -22,13 +23,17 @@ from conftest import (
 
 from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd import Matvec, apply_h, get_xsource, hproj, run_sqd, sqd, uniquify_states
-from rqutils.sqd._dense import _pack_scanned
+from rqutils.sqd._dense import _bucket_args, _pack_scanned
 from rqutils.sqd._solve import _group_parts
 from rqutils.sqd._sparse import (
     _CHUNK,
-    _ELL_WIDTHS,
-    _SPARSE_APPLY,
+    _GPU_PAIRS_CHUNK,
+    _apply_pairs,
+    _chunk,
+    _group_pairs,
+    _host_sources,
     _padded,
+    _pair_xsources,
     _search_pairs,
     _size_class,
     _sparse_operator,
@@ -796,10 +801,10 @@ def sparse_fixture(kind, rng):
     return strings, rng.normal(size=len(strings)), states[:20]
 
 
-def sparse_operator_of(h, states, states_size, matvec):
+def sparse_operator_of(h, states, states_size):
     """``(states_u, operator)`` for unpacked ``states``, through :func:`sqd`'s own pipeline."""
     states_u = uniquify_states(_pad_states(pack_padded(states), states_size), states_size)
-    return states_u, _sparse_operator(h, states_u, matvec)
+    return states_u, _sparse_operator(h, states_u)
 
 
 def assert_matches_indices(apply, operator, h, states_u, num_states, rng):
@@ -818,28 +823,24 @@ def assert_matches_indices(apply, operator, h, states_u, num_states, rng):
 
 
 class TestSparseKernels:
-    """The sparse kernels against ``"indices"``'s product, per coefficient layout.
+    """``"pairs"`` against ``"indices"``'s product, per coefficient layout.
 
-    ``"pairs"`` applies ``conj(d)`` for the reverse direction, and ``"csr"``/``"ell"`` split their
-    entries into a ``float64`` real-group set and a ``complex128`` rest, so each layout reaches a
-    different half:
-    all real (the complex set is padding), mixed, none real (the real set is padding), and only the
-    identity group (zero entries, one padding chunk).
+    ``"pairs"`` applies ``conj(d)`` for the reverse direction; the layouts are all real, mixed, none real,
+    and only the identity group (zero entries, one padding chunk).
     """
 
     KINDS = ("real", "mixed", "none_real", "identity_only")
 
-    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
     @pytest.mark.parametrize("kind", KINDS)
     @pytest.mark.parametrize("states_size", [20, 32])
-    def test_product_matches_indices(self, kind, matvec, states_size):
+    def test_product_matches_indices(self, kind, states_size):
         rng = np.random.default_rng(20260926)
         strings, coeffs, states = sparse_fixture(kind, rng)
         assert len(states) == 20, (
             "fixture must be exactly states_size=20 so that arm is filler-free"
         )
         h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        states_u, operator = sparse_operator_of(h, states, states_size, matvec)
+        states_u, operator = sparse_operator_of(h, states, states_size)
 
         real = ~np.any(np.asarray(h.c).imag != 0, axis=1)[1:]
         expect = {
@@ -848,29 +849,18 @@ class TestSparseKernels:
             "mixed": 0 < real.sum() < len(real),
         }
         assert expect.get(kind, h.x.shape[0] == 1), f"{kind} fixture lost its layout: {real}"
-        if matvec == "csr":
-            # np.asarray first: jnp.any reads a purely imaginary complex array as all-False.
-            rd, qd = np.asarray(operator[3]), np.asarray(operator[6])
-            assert rd.dtype == np.float64, rd.dtype
-            assert np.any(rd) == (kind in ("real", "mixed")), "real set populated wrongly"
-            assert np.any(qd) == (kind in ("mixed", "none_real")), "complex set populated wrongly"
-        if matvec == "ell":
-            kinds = {np.asarray(fac).dtype.kind for fac in operator[3::3]}
-            assert ("f" in kinds) == (kind in ("real", "mixed")), f"real set wrong: {kinds}"
-            assert ("c" in kinds) == (kind in ("mixed", "none_real")), f"complex set wrong: {kinds}"
         if kind == "identity_only":
-            if matvec == "ell":
-                assert len(operator) == 1, "zero entries is no bucket"
             assert all(a.shape == (1, _CHUNK) for a in operator[1:]), "zero entries is one chunk"
-        assert_matches_indices(_SPARSE_APPLY[matvec], operator, h, states_u, len(states), rng)
+        assert_matches_indices(_apply_pairs, operator, h, states_u, len(states), rng)
 
-    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
     @pytest.mark.parametrize("kind", KINDS)
-    def test_sqd_energy_matches_indices(self, kind, matvec):
+    def test_sqd_energy_matches_indices(self, kind):
         """Energies only: another summation order shifts the trajectory, so iteration counts differ."""
         strings, coeffs, states = sparse_fixture(kind, np.random.default_rng(20260926))
         want = eigval_of(strings, coeffs, states, matvec=Matvec.INDICES)
-        assert eigval_of(strings, coeffs, states, matvec=matvec) == pytest.approx(want, abs=1e-10)
+        assert eigval_of(strings, coeffs, states, matvec=Matvec.PAIRS) == pytest.approx(
+            want, abs=1e-10
+        )
 
     def test_size_class_rounding(self):
         """Exact below 16, then ``m * 2**k`` with ``8 <= m < 16``: waste under 12.5%, at least 1."""
@@ -882,19 +872,18 @@ class TestSparseKernels:
             assert chunks <= size < chunks * 1.125 + 1
             assert size < 16 or 8 <= size >> shift < 16
 
-    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
-    def test_one_shape_class_compiles_once(self, matvec, monkeypatch):
+    def test_one_shape_class_compiles_once(self, monkeypatch):
         """Two subspaces with different entry counts but equal operator shapes share the solve."""
         import rqutils.sqd._sparse as sparse_module
 
-        monkeypatch.setattr(sparse_module, "_CHUNK", 16)  # so "pairs"/"csr" span several chunks too
-        strings, coeffs, states = ell_fixture(np.random.default_rng(20260927))
+        monkeypatch.setattr(sparse_module, "_CHUNK", 16)  # so "pairs" spans several chunks too
+        strings, coeffs, states = skewed_degree_fixture(np.random.default_rng(20260927))
         h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        states_size = 64  # ell_fixture has 43 states
+        states_size = 64  # skewed_degree_fixture has 43 states
         by_shapes = {}
         for keep in range(20, len(states) + 1):
-            _, operator = sparse_operator_of(h, states[:keep], states_size, matvec)
-            entries = sum(int(np.count_nonzero(np.asarray(f))) for f in operator[3::3])
+            _, operator = sparse_operator_of(h, states[:keep], states_size)
+            entries = sum(int(np.count_nonzero(np.asarray(f))) for f in operator[3])
             shapes = tuple(a.shape for a in operator)
             by_shapes.setdefault(shapes, {}).setdefault(entries, states[:keep])
         shared = next(shapes for shapes, rows in by_shapes.items() if len(rows) >= 2)
@@ -904,25 +893,210 @@ class TestSparseKernels:
 
         def compiles(rows):
             before = sparse_module._run_sparse._cache_size()
-            sqd(h, rows, states_size=states_size, return_eigvec=False, matvec=matvec)
+            sqd(h, rows, states_size=states_size, return_eigvec=False, matvec=Matvec.PAIRS)
             return sparse_module._run_sparse._cache_size() - before
 
         compiles(first)
         assert compiles(second) == 0, "a second subspace with the same operator shapes recompiled"
         assert compiles(other) == 1, "control: different operator shapes must compile afresh"
 
+    def test_gpu_pairs_chunk(self, monkeypatch):
+        """``"pairs"`` steps ``_GPU_PAIRS_CHUNK`` entries on a GPU, ``_CHUNK`` on a CPU: ``_CHUNK`` under-filled
+        a GH200 (2.71x/1.37x per iteration at ``2^20``/``2^22``) and is a CPU's optimum (``poc/sparse/tune.md``).
+        """
+        import rqutils.sqd._sparse as sparse_module
+
+        assert _GPU_PAIRS_CHUNK > _CHUNK
+        assert _chunk() == _CHUNK, "the CPU keeps _CHUNK"
+        monkeypatch.setattr(sparse_module.jax, "default_backend", lambda: "gpu")
+        assert _chunk() == _GPU_PAIRS_CHUNK
+
+    def test_zero_factor_pairs_are_not_stored(self):
+        """XX+YY cancels on aligned spins; storing those zeros cost 1.18-1.59x per solve on CPU.
+
+        Without :func:`_drop_zeros` this fixture stores 24 entries for ``hproj``'s 12 nonzero ones.
+        """
+        strings = ["ZZII", "IZZI", "XXII", "YYII", "IXXI", "IYYI", "IIXX", "IIYY"]
+        coeffs = [0.5, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        states = np.array([[(k >> q) & 1 for q in range(4)] for k in range(16)], np.uint8)
+        h = PauliSumXZ.from_paulisum((strings, coeffs))
+        states_u, operator = sparse_operator_of(h, states, 16)
+        stored = int(np.count_nonzero(np.asarray(operator[1]) != np.asarray(operator[2])))
+        dense = hproj(h, states).toarray()
+        assert stored == np.count_nonzero(np.triu(dense, 1)) == 12, stored
+        assert np.all(np.asarray(operator[3])[np.asarray(operator[1]) != np.asarray(operator[2])])
+        assert_matches_indices(
+            _apply_pairs, operator, h, states_u, len(states), np.random.default_rng(1)
+        )
+
+    def test_operator_follows_chunk(self, monkeypatch):
+        """The build lays entries out in ``_chunk()``-wide rows, and the product does not move."""
+        import rqutils.sqd._sparse as sparse_module
+
+        monkeypatch.setattr(sparse_module, "_chunk", lambda: 64)
+        rng = np.random.default_rng(20261002)
+        strings, coeffs, states = sparse_fixture("mixed", rng)
+        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_u, operator = sparse_operator_of(h, states, 32)
+        assert all(a.shape[-1] == 64 for a in operator[1:]), [a.shape for a in operator[1:]]
+        assert_matches_indices(_apply_pairs, operator, h, states_u, len(states), rng)
+
     def test_entry_count_guard(self):
         """Raises before allocating: the passing side is every sparse solve in this file."""
         with pytest.raises(ValueError, match="2147483648 entries"):
-            _padded(2**31, 0)
+            _padded(2**31, 0, _CHUNK)
 
 
-def ell_fixture(rng):
-    """``(strings, coeffs, states)`` whose row degrees span several of ``"ell"``'s width classes.
+class TestBucketedDiagonals:
+    """``"indices"``/``"onthefly"`` sum each group's diagonal over its own term count, the identity's cached.
+
+    ``get_diagonal``'s ``while_loop`` synced with the host per term on a GPU: the fixed-trip form is
+    3.2-4.5x per iteration on a GH200 and 1.8-1.9x on CPU (``poc/dense-tune.md``). The fixture mixes
+    one- and two-term groups (a uniform X field), as ``type2``/``type3`` do, against a dense oracle.
+    """
+
+    STRINGS = (
+        *("I" * k + p + "I" * (4 - k) for k in range(5) for p in ("XX", "YY", "ZZ")),
+        *("I" * k + "X" + "I" * (5 - k) for k in range(6)),
+        "YIIIII",
+        "IIIIIY",
+    )
+
+    @pytest.mark.parametrize("matvec", [Matvec.INDICES, Matvec.ONTHEFLY])
+    @pytest.mark.parametrize("with_identity", [True, False])
+    def test_energy_matches_dense(self, matvec, with_identity):
+        strings = [s for s in self.STRINGS if with_identity or "Z" not in s]
+        coeffs = np.random.default_rng(20261002).normal(size=len(strings))
+        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        assert h.identity_first == with_identity
+        assert h.term_counts is not None
+        assert len(set(h.term_counts[int(with_identity) :])) > 1, "groups must differ in term count"
+        states = unique_states(40, 6, np.random.default_rng(3))
+        want = lowest_projected(strings, coeffs, states)
+        assert eigval_of(strings, coeffs, states, matvec=matvec) == pytest.approx(want, abs=1e-10)
+
+    @pytest.mark.parametrize("matvec", [Matvec.INDICES, Matvec.ONTHEFLY])
+    def test_zfree_terms_fold_into_a_constant(self, matvec):
+        """Each hop's ``XX`` leaves the parity loop for a constant, even listed after its ``YY``.
+
+        1.28-1.50x per iteration on CPU (``poc/dense-codes.md``); without the fold every term stays.
+        """
+        from qiskit.quantum_info import SparsePauliOp
+
+        # Each YY before its XX; YIYIII is a group with no Z-free term to fold.
+        strings = sorted([*self.STRINGS, "YIYIII"], key=lambda s: "Y" not in s)
+        coeffs = np.random.default_rng(20261003).normal(size=len(strings))
+        h = PauliSumXZ.from_paulisum(SparsePauliOp(strings, coeffs))
+        states = unique_states(40, 6, np.random.default_rng(3))
+        buckets = _bucket_args(h, h.x, uniquify_states(pack_padded(states), 64))[0]
+        kept = sum(len(b[0]) * b[2].shape[1] for b in buckets)
+        assert kept == sum(h.term_counts[1:]) - 11, "5 XX hops and 6 X fields fold"
+        got = float(sqd(h, states, return_eigvec=False, matvec=matvec))
+        assert got == pytest.approx(lowest_projected(strings, coeffs, states), abs=1e-10)
+
+    @pytest.mark.parametrize("matvec", [Matvec.INDICES, Matvec.ONTHEFLY])
+    def test_solve_traces_no_diagonal_while_loop(self, matvec):
+        """The matvec holds no ``while``: the solve's two are ``ground_locg``'s and the identity's diagonal.
+
+        The ``while_loop`` kernel this replaced traced 10 here.
+        """
+        coeffs = np.random.default_rng(1).normal(size=len(self.STRINGS))
+        h = PauliSumXZ.from_paulisum((self.STRINGS, coeffs.tolist()))
+        states_p = pack_padded(unique_states(40, 6, np.random.default_rng(3)))
+
+        def whiles(ham):  # every traced while, nested jaxprs walked rather than printed once
+            return count_primitive(
+                run_sqd.trace(ham, states_p, 64, False, matvec).jaxpr.jaxpr, "while"
+            )
+
+        assert h.identity_first
+        assert whiles(h) == 2, whiles(h)
+
+
+class TestComplexScanCarry:
+    """On CUDA no sparse kernel scans over a ``complex128`` carry; elsewhere every one does.
+
+    XLA's GPU scatter splits a complex carry into real and imaginary parts and rejoins it at every scan
+    step, a full pass over ``out`` each: 75-88% of a GH200 ``"pairs"`` matvec from ``2^20``, the cliff
+    ``poc/sparse/gpu.md`` section 3 read as L2. On CPU the split is the slower one (0.68-0.90x per
+    iteration), so ``jax.lax.platform_dependent`` picks; this checks both branches as traced.
+    """
+
+    @pytest.mark.parametrize("batch", [(), (2,)])
+    def test_carry_per_platform(self, batch):
+        strings, coeffs, states = sparse_fixture("mixed", np.random.default_rng(20261001))
+        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_u, operator = sparse_operator_of(h, states, 32)
+        vec = jnp.ones((*batch, states_u.shape[0]), jnp.complex128)
+        jaxpr = jax.make_jaxpr(_apply_pairs)(vec, *operator)
+        switches = [e for e in jaxpr.eqns if "branches_platforms" in e.params]
+        assert switches, "the kernel must choose its carry per platform"
+        assert not [e for e in jaxpr.eqns if e.primitive.name == "scan"], (
+            "a scan outside the switch"
+        )
+        want = {("cuda",): [np.float64, np.float64], None: [np.complex128]}
+        for eqn in switches:
+            platforms = eqn.params["branches_platforms"]
+            assert set(platforms) == set(want), platforms
+            for branch, key in zip(eqn.params["branches"], platforms, strict=True):
+                scans = [e for e in branch.jaxpr.eqns if e.primitive.name == "scan"]
+                assert len(scans) == 1, f"{key}: {len(scans)} scans"
+                # The body emits no ys, so a scan's outputs are its carry.
+                assert [v.aval.dtype for v in scans[0].outvars] == want[key], key
+
+
+def count_primitive(jaxpr, name):
+    """How many ``name`` equations ``jaxpr`` holds, every nested jaxpr walked at each of its uses."""
+    total = 0
+    for eqn in jaxpr.eqns:
+        total += eqn.primitive.name == name
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, tuple) else (param,):
+                inner = getattr(sub, "jaxpr", sub)
+                if hasattr(inner, "eqns"):
+                    total += count_primitive(inner, name)
+    return total
+
+
+def scatter_hints(jaxpr):
+    """``indices_are_sorted`` of every ``scatter-add`` in ``jaxpr``, nested jaxprs included."""
+    hints = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "scatter-add":
+            hints.append(eqn.params["indices_are_sorted"])
+        for param in eqn.params.values():
+            for sub in param if isinstance(param, tuple) else (param,):
+                inner = getattr(sub, "jaxpr", sub)
+                if hasattr(inner, "eqns"):
+                    hints += scatter_hints(inner)
+    return hints
+
+
+class TestNoSortedHint:
+    """No sparse scatter carries ``indices_are_sorted``, on any platform.
+
+    The hint slowed XLA's GPU scatter (``"csr"`` 2.12-3.24x per iteration on a GH200 without it,
+    ``"pairs"`` 0.37-0.64x with it on ``out[i]``) and bought a CPU nothing, 1.00x on an M1
+    (``poc/sparse/tune.md``); a real and a complex carry both checked, every platform branch walked.
+    """
+
+    @pytest.mark.parametrize("kind", ["mixed", "real"])
+    def test_no_scatter_is_marked_sorted(self, kind):
+        strings, coeffs, states = sparse_fixture(kind, np.random.default_rng(20261002))
+        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
+        states_u, operator = sparse_operator_of(h, states, 32)
+        dtype = jnp.complex128 if np.iscomplexobj(np.asarray(h.c)) else jnp.float64
+        jaxpr = jax.make_jaxpr(_apply_pairs)(jnp.ones(states_u.shape[0], dtype), *operator)
+        hints = scatter_hints(jaxpr.jaxpr)
+        assert hints and not any(hints), hints
+
+
+def skewed_degree_fixture(rng):
+    """``(strings, coeffs, states)`` whose row degrees vary widely, so operator shapes vary with the subspace.
 
     Every single flip and nearest-neighbour double flip on 8 qubits, odd sites as ``Y`` (complex
     groups), over the Hamming ball of radius 2 plus a few weight-3 states: inner states keep nearly
-    every neighbour and outer ones few, the heavy tail ``"ell"`` buckets.
+    every neighbour and outer ones few.
     """
     n = 8
     strings = ["Z" * n]
@@ -968,6 +1142,30 @@ class TestSearchPairs:
             found += len(i)
         assert found > 0, "the fixture must exercise a match"
 
+    @pytest.mark.parametrize("num_qubits", [40, 100, 140])
+    def test_pairs_rebuild_the_searched_sources(self, num_qubits):
+        """The check rebuilds each group's sources from the build's pairs instead of searching again.
+
+        Both directions come from one pair, and an identity group maps a real row to itself and a
+        filler to -1; dropping either leaves a source array the search would not have returned.
+        """
+        rng = np.random.default_rng(num_qubits + 1)
+        hops = ["I" * k + "XX" + "I" * (num_qubits - k - 2) for k in (0, num_qubits // 2)]
+        strings = ["Z" + "I" * (num_qubits - 1), *real_pauli_strings(num_qubits, 6, rng), *hops]
+        h = PauliSumXZ.from_paulisum((strings, rng.normal(size=len(strings))))
+        assert not np.asarray(h.x[0]).any(), "the fixture needs a leading identity group"
+        base = h.pack_states(rng.integers(0, 2, (40, num_qubits), dtype=np.uint8))
+        packed = np.unique(np.concatenate([base, *(base ^ x for x in h.x[1:4])]), axis=0)
+        size = len(packed) + 7  # fillers too
+        states_u = uniquify_states(_pad_states(packed, size), size)
+        pairs = _group_pairs(h, states_u)
+        assert sum(len(i) for i, _ in pairs.values()) > 0, "the fixture must exercise a pair"
+        rebuilt = list(_pair_xsources(h.x, states_u, pairs))
+        searched = list(_host_sources(h.x, states_u, lambda j: j))
+        assert len(rebuilt) == len(searched) == h.x.shape[0]
+        for g, (a, b) in enumerate(zip(rebuilt, searched, strict=True)):
+            assert a.dtype == b.dtype and np.array_equal(a, b), f"group {g}"
+
 
 class TestPairsOrder:
     """``"pairs"`` stores its pairs sorted by ``i`` across groups, not group by group (``NOTES.md``,
@@ -978,58 +1176,13 @@ class TestPairsOrder:
         rng = np.random.default_rng(5)
         strings, coeffs, states = sparse_fixture("real", rng)
         h = PauliSumXZ.from_paulisum((strings, coeffs))
-        states_u, (_, pi, pj, _) = sparse_operator_of(h, states, 32, Matvec.PAIRS)
+        states_u, (_, pi, pj, _) = sparse_operator_of(h, states, 32)
         i, j = (np.asarray(a).ravel() for a in (pi, pj))
         real = i < j  # padding entries have i == j
-        offdiag = int(not np.asarray(h.x[0]).any())  # as the build: skip an identity group
+        offdiag = int(h.identity_first)  # as the build: skip an identity group
         gi, gj = (np.concatenate(a) for a in zip(*_search_pairs(h.x[offdiag:], states_u)))
         assert np.any(np.diff(gi) < 0), "the group-by-group order must not already be sorted"
         assert np.all(np.diff(i[real]) >= 0), "pairs must be sorted by i"
         assert sorted(zip(i[real].tolist(), j[real].tolist())) == sorted(
             zip(gi.tolist(), gj.tolist())
-        )
-
-
-class TestEllKernel:
-    """What is specific to ``"ell"``: degree classes, padded slots and padding rows.
-
-    A degree rounded *down* drops a row's last entries, and a padding row given its real row's
-    factors adds that row again; both keep every internal path self-consistent, so the product is
-    checked against ``"indices"``.
-    """
-
-    STATES_SIZE = 64  # the fixture has 43 states, so 21 filler rows
-
-    @pytest.mark.parametrize("chunk", [None, 8])
-    def test_product_matches_indices(self, chunk, monkeypatch):
-        """Also at ``_CHUNK = 8``, where a bucket spans several pieces and so a scan of more than one."""
-        import rqutils.sqd._sparse as sparse_module
-
-        if chunk is not None:
-            monkeypatch.setattr(sparse_module, "_CHUNK", chunk)
-        rng = np.random.default_rng(20260927)
-        strings, coeffs, states = ell_fixture(rng)
-        h = PauliSumXZ.from_paulisum((strings, coeffs.tolist()))
-        states_u, operator = sparse_operator_of(h, states, self.STATES_SIZE, "ell")
-        xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in h.x])
-
-        # Degrees from the search alone, per coefficient set, to show the fixture reaches each case.
-        real = ~np.any(np.asarray(h.c).imag != 0, axis=1)
-        buckets = [operator[k : k + 3] for k in range(1, len(operator), 3)]
-        for is_real in (True, False):
-            deg = (xsources[1:][real[1:] == is_real] >= 0).sum(axis=0)[: len(states)]
-            mine = [b for b in buckets if (np.asarray(b[2]).dtype == np.float64) == is_real]
-            assert len(mine) >= 3, f"real={is_real}: {len(mine)} buckets"
-            assert sorted({b[1].shape[-1] for b in mine}) == [b[1].shape[-1] for b in mine]
-            assert not np.isin(deg, _ELL_WIDTHS).all(), f"real={is_real}: no degree is rounded"
-        assert any(b[0].size > np.unique(np.asarray(b[0])).size for b in buckets), "no padding row"
-        if chunk is not None:
-            assert any(b[0].shape[0] > 1 for b in buckets), "no bucket spans several pieces"
-        assert_matches_indices(_SPARSE_APPLY["ell"], operator, h, states_u, len(states), rng)
-
-    def test_sqd_energy_matches_indices(self):
-        strings, coeffs, states = ell_fixture(np.random.default_rng(20260927))
-        want = eigval_of(strings, coeffs, states, matvec=Matvec.INDICES)
-        assert eigval_of(strings, coeffs, states, matvec=Matvec.ELL) == pytest.approx(
-            want, abs=1e-10
         )

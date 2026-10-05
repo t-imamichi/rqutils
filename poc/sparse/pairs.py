@@ -1,7 +1,7 @@
 """Sparse transition pairs instead of dense source indices -- every prototype and measurement in one script.
 
 Item 8 of ``markdown/improvement-ideas-2026-09-25.md``; the write-up with every result is
-``poc/sparse-pairs.md``. At ``matvec="indices"``/``"tables"`` ``sqd`` stores one ``int32`` source per
+``poc/sparse/pairs.md``. At ``matvec="indices"``/``"tables"`` ``sqd`` stores one ``int32`` source per
 ``(X group, state)`` (``4*J`` B/slot) though on sampled subspaces most are ``-1``. XOR is an involution, so
 each real transition of a group ``g != 0`` is a pair; storing it once, and computing its diagonal once since
 ``H_ji = conj(H_ij)`` exactly for one X signature, removes the placeholders and half the diagonal work.
@@ -33,10 +33,10 @@ Hamming shells or ``recovery``, grown by spinchain-style ranked H-expansion from
 * ``batch``   -- one ``(2, N)`` application against two ``(N,)`` and an ``(N, 2)`` layout, then whole
   solves with ``ground_locg``'s ``batch_matvec`` on and off.
 
-Run: uv run python poc/sparse_pairs.py matvec [--log2-sizes 15 17 19 21] [--arms ...]
-     uv run python poc/sparse_pairs.py solve [--log2-size 17]
-     uv run python poc/sparse_pairs.py peak [--log2-sizes 17 19 21]
-     uv run python poc/sparse_pairs.py general
+Run: uv run python poc/sparse/pairs.py matvec [--log2-sizes 15 17 19 21] [--arms ...]
+     uv run python poc/sparse/pairs.py solve [--log2-size 17]
+     uv run python poc/sparse/pairs.py peak [--log2-sizes 17 19 21]
+     uv run python poc/sparse/pairs.py general
 Set XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1" for one thread.
 """
 
@@ -56,6 +56,10 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sp
+
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)  # poc/, for its fixtures
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 from scipy.sparse.csgraph import reverse_cuthill_mckee
 

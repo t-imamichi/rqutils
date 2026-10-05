@@ -48,7 +48,7 @@ from rqutils.sqd import (
     uniquify_states,
 )
 from rqutils.sqd._solve import _spread_seed
-from rqutils.sqd._sparse import _run_sparse, _sparse_operator, _sparse_residual
+from rqutils.sqd._sparse import _group_pairs, _run_sparse, _sparse_operator, _sparse_residual
 from rqutils.sqd._states import _MAX_STATES, _pad_states
 
 
@@ -1015,16 +1015,16 @@ class TestSparseEigenpairCheck:
     It must still compute the true ``Hv``; that it catches a wrong pair is in :class:`TestEigenpairCheck`.
     """
 
-    @pytest.mark.parametrize("matvec", SPARSE_MATVECS)
-    def test_a_genuine_pair_passes_with_the_true_hv(self, matvec):
+    def test_a_genuine_pair_passes_with_the_true_hv(self):
         from rqutils.paulis.symplectic import PauliSumXZ
 
         rng = np.random.default_rng(3)
         h = PauliSumXZ.from_paulisum((["YZII", "XXII", "IZZI", "IIYY"], [0.5, -0.3, 0.7, 0.2]))
         states_u = uniquify_states(_pad_states(pack_padded(unique_states(12, 4, rng)), 16), 16)
-        operator = _sparse_operator(h, states_u, matvec)
-        result = _run_sparse(h, states_u, operator, 16, True, matvec)
-        residual, ax_norm = _sparse_residual(h, states_u, result.eigval, result.eigvec)
+        pairs = _group_pairs(h, states_u)
+        operator = _sparse_operator(h, states_u, pairs)
+        result = _run_sparse(h, states_u, operator, 16, True)
+        residual, ax_norm = _sparse_residual(h, states_u, result.eigval, result.eigvec, pairs)
         xsources = np.stack([np.asarray(get_xsource(x, states_u)) for x in h.x])
         hv = apply_h(result.eigvec, states=states_u, xsources=xsources, zsignatures=h.z, coeffs=h.c)
         assert float(ax_norm) == pytest.approx(float(np.linalg.norm(hv)), rel=1e-12)

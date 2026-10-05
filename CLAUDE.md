@@ -64,7 +64,7 @@ When a rule needs evidence, it points there rather than restating it.
 `markdown/`, and proof-of-concept scripts in `poc/`.
 
 **A POC's results go in a `poc/<name>.md` write-up beside its script, not in `NOTES.md`.** Follow
-`poc/sparse-pairs.md`: a provenance line (script, hardware, date), numbered sections by topic rather
+`poc/sparse/pairs.md`: a provenance line (script, hardware, date), numbered sections by topic rather
 than by date, a "What it means" and an "Open" section, and a closing section on the script checked
 against its argparse. A superseded claim is stated once, in its final form, with what was retracted.
 Say so when no committed script reproduces a number. `NOTES.md` keeps the entry's `###` heading
@@ -229,6 +229,10 @@ Five reasons a mutant survives that are *not* missing coverage:
 - **Use `eigvalsh` or sparse `eigsh(k=1)`, never `eigh`** — 77 s vs 0.02 s at the sizes here.
 - **A/B whole calls against a worktree of the pre-change revision**, not a predicate in isolation. A
   predicate microbenchmark has twice reported a regression that whole-call timing showed to be zero.
+- **An in-process A/B of a patched kernel needs a function of its own per arm, and a check that it took.**
+  A second `jax.jit` of the same function reuses the first's trace, so a table read at trace time is
+  patched for neither: both arms ran the shipped kernel. Assert the arms' `.lower(...).as_text()` differ.
+  `poc/sparse/layout.md` §4.
 - **A/B both arms warm.** Changing a traced expression invalidates the compilation cache; one cold run
   measured 125 s against a warm 20 s, which reads as catastrophic and is not.
 - **Pass arrays as arguments to a `jit`ted benchmark, never close over them.** XLA constant-folds a
@@ -292,6 +296,14 @@ ingest). Terms are grouped by unique X signature, Z groups zero-padded to a rect
   `TABLES` splits: `INDICES` measured 0.92× on one Hamiltonian (`poc/real-groups.md` §6). Never reorder
   groups after construction: a complex group inside that prefix loses its imaginary part silently. `0`,
   the default, promises nothing.
+- **`term_counts` and `identity_first` are static too**, filled by `from_paulisum`: each group's Z-term
+  count and whether group 0 is the identity. `run_sqd`'s `"indices"`/`"onthefly"` trust them to sum
+  each diagonal over a fixed trip count, bucketed by count, the identity's cached once per solve —
+  `get_diagonal`'s `while_loop` synced with the host per term on a GPU (`poc/dense-tune.md`). Reordering
+  groups breaks these as well. Both are required: there is no `while_loop` fallback.
+- **`zfree_first`** (static, required) flags groups whose term 0 has no Z part;
+  `from_paulisum` moves that term first. Those kernels fold it into a constant (1.28–1.50× CPU,
+  1.13–1.18× GH200, `poc/dense-codes.md`). A flag on a term with a Z part is a wrong diagonal, not a slowdown.
 
 ### `sqd/` — sample-based quantum diagonalization
 
@@ -322,16 +334,20 @@ and fills `residual`/`ax_norm` only under `check_residual=True`; pad its input w
 **`matvec=` takes a `Matvec` member** (a `StrEnum`; plain strings raise `TypeError`, since the string form was
 never released) **naming the kernel by what it stores**: `"onthefly"` (nothing; sources searched and factors
 computed every matvec — the memory floor), `"indices"` (per-group source-index tables; the default) and
-`"tables"` (indices *and* factors), plus three sparse kernels: `"pairs"` (each transition once, with its
-factor), `"csr"` (both directions by target row, `float64` factors where a group is real) and `"ell"`
-(rows bucketed by degree rounded up to a ×1.25 grid: a gather-reduce per row, one write per row — the
-fastest, ~2× `"csr"` per solve). Their entry counts depend on the data, so `sqd()` builds them
-**host-side before the jitted solve**, rounding chunk and piece counts to `m·2^k` (8 ≤ m < 16) so the solve
-recompiles per size class — `"ell"` keys on every (width, piece class) pair, so it recompiles more often
-than `"csr"`, and each of its bucket scans adds compile memory (fixed in N). They are `sqd`-only (`run_sqd`
-and `apply_h` reject them), **single-device** (they raise under a mesh), and their residual check runs
-on the host after the solve, from host-searched sources and recomputed diagonals (`_sparse_residual`),
-so it reads none of their cached data. Measurements: `poc/sparse-pairs.md` §9–§10. Before
+`"tables"` (indices *and* factors), plus one sparse kernel, `"pairs"` (each transition once, with its
+factor). `"csr"` and `"ell"` were removed for it, dominated or mixed on both backends
+(`poc/sparse/tune.md` §3); `poc/sparse/legacy.py` keeps them for the POCs, keyed by string name.
+**On CUDA `_scan_add` carries a complex `out` as real and imaginary parts; don't merge them** — XLA's GPU
+scatter would split the whole carry every scan step, 2.5–17.9× per iteration. The split loses on CPU, so
+`platform_dependent` keeps it CUDA-only (`poc/sparse/split.md`). No scatter is marked
+`indices_are_sorted`: it slows a GPU scatter 2–3× and buys a CPU nothing (`poc/sparse/tune.md`).
+`"pairs"`' entry count depends on the data, so `sqd()` builds it **host-side before the jitted solve**
+(in `2^19`-entry chunks on a GPU, `_GPU_PAIRS_CHUNK`, else `2^15`, its sort by `i` done on the device),
+rounding the chunk count to `m·2^k` (8 ≤ m < 16) so the solve recompiles per size class. Entries with an exactly-zero factor are dropped (`_drop_zeros`; XX+YY hops cancel on aligned
+spins, 86% of `type1`'s pairs), so the check must keep reading the unfiltered `pairs`. It is
+`sqd`-only (`run_sqd` and `apply_h` reject it), **single-device** (it raises under a mesh), and its
+residual check runs on the host after the solve, from the build's searched pairs and recomputed
+diagonals (`_sparse_residual`), so it reads none of its cached data. Measurements: `poc/sparse/pairs.md` §9–§10. Before
 2026-09-26 this was `cache_level=(source_indices, diagonals)`, the three being `(0, 0)`, `(1, 0)` and
 `(1, 2)`; `NOTES.md` and older docs still use the tuples. The other three tuples were dominated on memory
 *and* time (`NOTES.md`'s n=100 memory and n=22 six-level timing tables), which is why no name exists for them.

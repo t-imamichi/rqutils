@@ -76,7 +76,7 @@ does not by itself justify reopening the declined start-vector API.
 
 ## 4. The script
 
-`poc/warmstart_rounds.py` grows the subspace with `sparse_pairs.recovery_scores` (`signed=True` for the
+`poc/warmstart_rounds.py` grows the subspace with `sparse.pairs.recovery_scores` (`signed=True` for the
 first-order arm) and drives `ground_locg` as `run_sqd` does (batched, `Σ|c|` bound, `(1, 0)` operator via
 `apply_h`). Arguments: `--num-qubits` (60), `--pattern` (`type1`), `--delta` (0.5), `--seed-log2` (12, the
 Hamming-shell core), `--top` (17, the last round's log2 size).

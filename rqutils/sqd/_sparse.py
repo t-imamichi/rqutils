@@ -1,8 +1,9 @@
-"""The sparse kernels, ``"pairs"``, ``"csr"`` and ``"ell"``: host-side construction and the solve."""
+"""The sparse kernel, ``"pairs"``: host-side construction and the solve."""
 
 import functools
 import logging
 import os
+from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
@@ -16,8 +17,35 @@ from rqutils.sqd._diagonal import _z_parity, get_diagonal
 from rqutils.sqd._solve import _SOLVE_STATIC, Matvec, SqdResult, _solve
 from rqutils.sqd._states import _MAX_STATES, StateList, _is_filler
 
-#: Entries per scanned chunk, so the sparse kernels' temporaries are ``O(chunk)`` (``poc/sparse-pairs.md``).
+#: Entries per scanned chunk, so the sparse kernels' temporaries are ``O(chunk)`` (``poc/sparse/pairs.md``).
 _CHUNK = 1 << 15
+#: ``"pairs"``' chunk on a GPU, which ``_CHUNK`` under-fills: 2.71x/1.37x per iteration on a GH200 at
+#: ``2^20``/``2^22``, the smallest size on the plateau, +8 MiB temp (``poc/sparse/tune.md``).
+_GPU_PAIRS_CHUNK = 1 << 19
+
+
+def _chunk() -> int:
+    """Entries per scanned chunk on the default backend."""
+    return _GPU_PAIRS_CHUNK if jax.default_backend() == "gpu" else _CHUNK
+
+
+def _pairs_sorted_on_device(
+    pairs: dict[int, tuple[np.ndarray, np.ndarray]], groups: range, alloc: Callable
+) -> list[jax.Array]:
+    """``"pairs"``' ``(i, j, group)``, each pair once, stably sorted by ``i`` on the device.
+
+    Stable, so a row's pairs keep group order. 1.12-1.50x per build-plus-solve over a host counting sort
+    on a GH200, 0.98-0.99x on an M1 (``poc/sparse/pairs-sort.md``).
+    """
+    sizes = [len(pairs[g][0]) for g in groups]
+    i, j, grp = alloc(count := sum(sizes))
+    for k, out in enumerate((i, j)):  # the empty array: no group but the identity
+        np.concatenate([np.empty(0, np.int32), *(pairs[g][k] for g in groups)], out=out[:count])
+    grp[:count] = np.repeat(np.asarray(groups, np.int32), sizes)
+    # Padding's i is size - 1, above every pair's i < j, so it sorts last.
+    i, j, grp = map(jnp.asarray, (i, j, grp))
+    order = jnp.argsort(i, stable=True)
+    return [i[order], j[order], grp[order]]
 
 
 def _size_class(chunks: int) -> int:
@@ -97,10 +125,17 @@ def _host_sources[T](
         return reduce(xsource)
 
     # np.searchsorted releases the GIL, so threads scale where the jitted search runs on one core.
-    # buffersize bounds the groups in flight or unread, with no barrier waiting on the slowest.
+    # A sliding window, not batches: at most `workers` groups in flight, none waiting on the slowest.
+    # ponytail: Executor.map(buffersize=workers) replaces this once the floor is Python 3.14.
     workers = os.cpu_count() or 1
     with ThreadPoolExecutor(workers) as pool:
-        yield from pool.map(one, _words(np.asarray(x)), buffersize=workers)
+        pending = deque()
+        for xw in _words(np.asarray(x)):
+            pending.append(pool.submit(one, xw))
+            if len(pending) >= workers:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
 
 
 def _search_pairs(x: np.ndarray, states_u: StateList) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -114,30 +149,64 @@ def _search_pairs(x: np.ndarray, states_u: StateList) -> list[tuple[np.ndarray, 
     return list(_host_sources(x, states_u, pairs))
 
 
-def _sparse_residual(
-    hamiltonian: PauliSumXZ, states_u: StateList, eigval: jax.Array, eigvec: jax.Array
-) -> tuple[jax.Array, jax.Array]:
-    """``(||Hv - Ev||, ||Hv||)`` by the ``"indices"`` kernel one group at a time, from host-searched sources.
+def _group_pairs(
+    hamiltonian: PauliSumXZ, states_u: StateList
+) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    """:func:`_search_pairs` keyed by group, for every group but a leading identity."""
+    groups = range(int(hamiltonian.identity_first), hamiltonian.x.shape[0])
+    return dict(
+        zip(groups, _search_pairs(np.asarray(hamiltonian.x)[groups], states_u), strict=True)
+    )
 
-    Reads none of the sparse operator, and reuses the search as the dense kernels reuse cached xsources
-    (``NOTES.md``, "sqd sparse kernels: the residual check runs on the host").
+
+def _pair_xsources(
+    x: np.ndarray, states_u: StateList, pairs: dict[int, tuple[np.ndarray, np.ndarray]]
+) -> Iterator[np.ndarray]:
+    """:func:`_host_sources`' sources per X signature, rebuilt from ``pairs`` rather than searched.
+
+    XOR is an involution, so ``(i, j)`` gives both ``xsource[i] = j`` and ``xsource[j] = i``; the
+    identity group, the one :func:`_group_pairs` skips, maps each real row to itself.
+    """
+    size = states_u.shape[0]
+    real = size - int(np.count_nonzero(_is_filler(np.asarray(states_u))))
+    for g in range(len(x)):
+        xsource = np.full(size, -1, np.int32)
+        if g not in pairs:
+            xsource[:real] = np.arange(real, dtype=np.int32)
+        else:
+            i, j = pairs[g]
+            xsource[i], xsource[j] = j, i
+        yield xsource
+
+
+def _sparse_residual(
+    hamiltonian: PauliSumXZ,
+    states_u: StateList,
+    eigval: jax.Array,
+    eigvec: jax.Array,
+    pairs: dict[int, tuple[np.ndarray, np.ndarray]],
+) -> tuple[jax.Array, jax.Array]:
+    """``(||Hv - Ev||, ||Hv||)`` by the ``"indices"`` kernel one group at a time, from the build's ``pairs``.
+
+    Reads none of the sparse operator, and reuses the search (:func:`_group_pairs`) as the dense kernels
+    reuse cached xsources (``NOTES.md``, "sqd sparse kernels: the residual check runs on the host").
     """
     x, z, c = hamiltonian.arrays
     ax = jnp.zeros_like(eigvec)
-    for g, xsource in enumerate(_host_sources(x, states_u, lambda j: j)):
+    for g, xsource in enumerate(_pair_xsources(x, states_u, pairs)):
         scanned = _pack_scanned(Matvec.INDICES, xsource[None], z[g : g + 1], c[g : g + 1])
         ax = _apply_h_kernel(eigvec, scanned, states_u, matvec=Matvec.INDICES, init=ax)
     return jnp.linalg.norm(ax - eigval * eigvec), jnp.linalg.norm(ax)
 
 
-def _padded(count: int, fill: int) -> np.ndarray:
-    """A flat int32 array of ``count`` entries rounded up to whole chunks of a size class, all ``fill``.
+def _padded(count: int, fill: int, chunk: int) -> np.ndarray:
+    """A flat int32 array of ``count`` entries rounded up to whole ``chunk``s of a size class, all ``fill``.
 
     Raises:
         ValueError: See :func:`_check_entries`.
     """
     _check_entries(count)
-    return np.full(_size_class(-(-count // _CHUNK)) * _CHUNK, fill, dtype=np.int32)
+    return np.full(_size_class(-(-count // chunk)) * chunk, fill, dtype=np.int32)
 
 
 @functools.partial(jax.jit, static_argnames="kmax")
@@ -161,169 +230,95 @@ def _entry_factors(
     return jax.lax.map(one, (target, source, group))
 
 
-#: ``"ell"``'s row widths, a x1.25 geometric grid: few buckets (each its own compiled scan) at a few
-#: percent padding (``poc/sparse-pairs.md``, section 10).
-_ELL_WIDTHS = np.unique(np.ceil(1.25 ** np.arange(100)).astype(np.int64))
+def _drop_zeros(
+    t: jax.Array, s: jax.Array, d: jax.Array, chunk: int, size: int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``(t, s, d)`` without the entries whose factor is exactly zero, order kept, re-padded to a size class.
 
-
-def _flat_factors(
-    t: np.ndarray,
-    s: np.ndarray,
-    g: np.ndarray,
-    z: jax.Array,
-    c: jax.Array,
-    states: StateList,
-    kmax: int,
-) -> jax.Array:
-    """:func:`_entry_factors` over flat host entries, one ``(1, _CHUNK)`` chunk per call.
-
-    A fixed chunk shape, so it compiles once per coefficient dtype rather than per bucket shape.
+    XX+YY hops cancel on aligned spins: 86% of spinchain's ``type1`` pairs, 32% of ``type2``'s
+    (``poc/sparse/prune.md``). The check reads the unfiltered ``pairs``, so it vouches for this filter.
     """
-    out = []
-    for k in range(0, len(t), _CHUNK):
-        chunk = [a[k : k + _CHUNK] for a in (t, s, g)]
-        n = len(chunk[0])
-        if n < _CHUNK:
-            chunk = [np.pad(a, (0, _CHUNK - n)) for a in chunk]
-        f = _entry_factors(*(jnp.asarray(a[None]) for a in chunk), z, c, states, kmax)
-        out.append(f[0, :n])
-    return jnp.concatenate(out)
+    count = int(jnp.count_nonzero(d))
+    return _compact(t, s, d, count, _size_class(-(-count // chunk)) * chunk, chunk, size)
 
 
-def _sort_by_target(
-    pairs: dict[int, tuple[np.ndarray, np.ndarray]],
-    subset: list[int],
-    size: int,
-    alloc: Callable[[int], list[np.ndarray]],
-    both: bool = True,
-) -> tuple[list[np.ndarray], np.ndarray]:
-    """Counting-sort ``subset``'s transitions by target into ``alloc(count)``, both directions by default.
-
-    With ``both=False``, each pair once as ``(i, j)``, sorted by ``i``: ``"pairs"``' layout.
-
-    ``alloc`` returns arrays for ``(target, source, group)`` or ``(source, group)``. A row occurs at
-    most once per group, so each group's fill is conflict-free (``poc/sparse-pairs.md``, section 2);
-    each group is popped from ``pairs`` once written. Returns the arrays and each row's end offset.
-    """
-    directions = 2 if both else 1
-    end = np.zeros(size + 1, np.int64)
-    for g in subset:
-        for rows in pairs[g][:directions]:
-            end[rows + 1] += 1
-    np.cumsum(end, out=end)
-    out = alloc(int(end[-1]))
-    for g in subset:
-        i, j = pairs.pop(g)
-        for target, source in ((i, j), (j, i))[:directions]:
-            pos = end[target]
-            for array, value in zip(out, (target, source, g)[-len(out) :]):
-                array[pos] = value
-            end[target] += 1
-    return out, end[:-1]
-
-
-def _ell_buckets(
-    pairs: dict[int, tuple[np.ndarray, np.ndarray]],
-    subset: list[int],
-    size: int,
-    z: jax.Array,
-    c_set: jax.Array,
-    states_u: StateList,
-    kmax: int,
-) -> list[jax.Array]:
-    """``"ell"``'s ``(rows, src, fac)`` per width for one coefficient set; see :func:`_sparse_operator`.
-
-    Raises:
-        ValueError: If the padded slot count reaches :math:`2^{31}` -- see :func:`_check_entries`.
-    """
-    (src, grp), end = _sort_by_target(
-        pairs, subset, size, lambda count: [np.empty(count, np.int32) for _ in range(2)]
-    )
-    deg = np.diff(end, prepend=0)
-    width = np.where(deg > 0, _ELL_WIDTHS[np.searchsorted(_ELL_WIDTHS, deg)], 0)
-    # Rows per piece fixed per width and pieces size-classed, so shapes come from a bounded set.
-    plan = []
-    for w in np.unique(width[width > 0]).tolist():
-        per = max(1, _CHUNK // w)
-        rows = np.flatnonzero(width == w).astype(np.int32)
-        plan.append((w, per, _size_class(-(-len(rows) // per)), rows))
-    del width
-    _check_entries(sum(w * per * pieces for w, per, pieces, _ in plan))
-    pos = (end - deg).astype(np.int32)  # row starts
-    del end
-    buckets = []
-    for w, per, pieces, rows in plan:
-        pad = (0, pieces * per - len(rows))
-        # Padding rows repeat a real row with no entries: a dummy output slot costs two (2, N) copies.
-        r = np.pad(rows, pad, constant_values=rows[0]).reshape(pieces, per)
-        lane = np.arange(w, dtype=np.int32)
-        valid = lane < np.pad(deg[rows], pad).reshape(pieces, per, 1)
-        slot = np.where(valid, pos[r][..., None] + lane, 0)
-        # An empty slot gets source = target, which _entry_factors' t == s rule zeroes.
-        s, g = np.where(valid, src[slot], r[..., None]), grp[slot]
-        del slot
-        fac = _flat_factors(np.repeat(r, w), s.ravel(), g.ravel(), z, c_set, states_u, kmax)
-        del g
-        fac.block_until_ready()  # the host-to-device copies of s are asynchronous
-        s[~valid] = 0
-        del valid
-        buckets += [jnp.asarray(r), jnp.asarray(s), fac.reshape(s.shape)]
-    return buckets
+@functools.partial(jax.jit, static_argnames=["length", "chunk", "size"])
+def _compact(
+    t: jax.Array, s: jax.Array, d: jax.Array, count: int, length: int, chunk: int, size: int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """:func:`_drop_zeros`' filter as one program: 3.4-3.8x its eager first call on CPU (``poc/sparse/drop-jit.md``)."""
+    (idx,) = jnp.nonzero((d != 0).ravel(), size=length, fill_value=0)
+    live = jnp.arange(length) < count
+    # Padding on distinct rows: one shared row serialized a GPU's atomic adds (poc/sparse/prune.md §6).
+    pad = jnp.arange(length, dtype=t.dtype) % size
+    t, s = (jnp.where(live, a.ravel()[idx], pad).reshape(-1, chunk) for a in (t, s))
+    return t, s, jnp.where(live, d.ravel()[idx], 0).reshape(-1, chunk)
 
 
 def _sparse_operator(
-    hamiltonian: PauliSumXZ, states_u: StateList, matvec: Matvec
+    hamiltonian: PauliSumXZ,
+    states_u: StateList,
+    pairs: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> tuple[jax.Array, ...]:
-    """Build a sparse ``matvec``'s operator arrays on the host, one X group's search at a time.
+    """Build ``"pairs"``' ``(d0, i, j, d)`` on the host, each entry array ``(chunks, _chunk())``.
 
-    Returns ``(d0, i, j, d)`` for ``"pairs"`` and ``(d0, rt, rs, rd, qt, qs, qd)`` for ``"csr"``, each
-    entry array ``(chunks, _CHUNK)``; ``r``/``q`` are the real-coefficient groups (float64 factors)
-    and the rest. Padding entries have equal endpoints and a zero factor.
-
-    ``"ell"`` returns ``d0`` then, per set (real first) and ascending row width ``w``, ``rows``
-    ``(pieces, R)``, ``src`` and ``fac`` ``(pieces, R, w)``, ``R = max(1, _CHUNK // w)``; slots past a
-    row's degree, and padding rows, have source 0 and factor 0.
+    Each transition once, sorted by ``i`` across groups so ``out[i]`` and ``vec[i]`` are local
+    (``NOTES.md``, "sqd sparse kernels: pairs sorted by i"); padding entries have equal endpoints and a
+    zero factor, and so does no stored pair (:func:`_drop_zeros`). ``pairs`` is :func:`_group_pairs`'
+    output, searched here when not given.
 
     Raises:
         ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_check_entries`.
     """
-    size = states_u.shape[0]
+    size, chunk = states_u.shape[0], _chunk()
     z, c = jnp.asarray(hamiltonian.z), jnp.asarray(hamiltonian.c)
-    first = int(np.all(np.asarray(hamiltonian.x[0]) == 0))
+    pairs = _group_pairs(hamiltonian, states_u) if pairs is None else pairs
+    first = int(hamiltonian.identity_first)
     d0 = get_diagonal(z[0], c[0], states_u) if first else jnp.zeros(size, c.dtype)
     groups = range(first, hamiltonian.x.shape[0])
     coeffs = np.asarray(hamiltonian.c)
     kmax = max((int(np.count_nonzero(coeffs[g])) for g in groups), default=1)
-    pairs = dict(
-        zip(groups, _search_pairs(np.asarray(hamiltonian.x)[groups], states_u), strict=True)
-    )
-
-    def on_device(host, c_set):
-        # Pops each host array as it is copied, so no host entry array outlives its device copy.
-        t, s, g = (jnp.asarray(host.pop(0).reshape(-1, _CHUNK)) for _ in range(3))
-        return t, s, _entry_factors(t, s, g, z, c_set, states_u, kmax)
 
     def alloc(count):  # i, j, group
-        return [_padded(count, f) for f in (size - 1, size - 1, 0)]
+        return [_padded(count, f, chunk) for f in (size - 1, size - 1, 0)]
 
-    if matvec == "pairs":
-        # Sorted by i across groups, so out[i] and vec[i] are local (NOTES.md, "sqd sparse kernels:
-        # pairs sorted by i").
-        host = _sort_by_target(pairs, list(groups), size, alloc, both=False)[0]
-        return (d0, *on_device(host, c))
+    t, s, g = (a.reshape(-1, chunk) for a in _pairs_sorted_on_device(pairs, groups, alloc))
+    return d0, *_drop_zeros(t, s, _entry_factors(t, s, g, z, c, states_u, kmax), chunk, size)
 
-    real = np.isreal(coeffs).all(axis=1)
-    arrays = [d0]
-    for subset, c_set in (
-        ([g for g in groups if real[g]], c.real),
-        ([g for g in groups if not real[g]], c),
-    ):
-        if matvec == "ell":
-            arrays += _ell_buckets(pairs, subset, size, z, c_set, states_u, kmax)
-            continue
-        host = _sort_by_target(pairs, subset, size, alloc)[0]
-        arrays += on_device(host, c_set)
-    return tuple(arrays)
+
+def _scan_add(
+    updates: Callable[[tuple[jax.Array, ...]], list[tuple[jax.Array, jax.Array]]],
+    out: jax.Array,
+    xs: tuple[jax.Array, ...],
+) -> jax.Array:
+    """``out`` after a scan adding each chunk's ``updates`` -- ``(index, value)`` -- into it.
+
+    On CUDA a complex ``out`` is carried as its real and imaginary parts: XLA's GPU scatter otherwise
+    splits the carry itself, a full pass over ``out`` per scan step. Elsewhere that costs 0.68-0.90x
+    and an extra ``out`` of temp, so the carry stays complex (``poc/sparse/split.md``). No scatter is
+    marked sorted: that slows a GPU scatter 2.1-3.2x and buys a CPU nothing (``poc/sparse/tune.md``).
+    """
+
+    def scan(*parts):
+        def body(parts, chunk):
+            for index, value in updates(chunk):
+                values = (value.real, value.imag) if len(parts) == 2 else (value,)
+                parts = tuple(p.at[..., index].add(v) for p, v in zip(parts, values, strict=True))
+            return parts, None
+
+        return jax.lax.scan(body, parts, xs)[0]
+
+    def fused(out):
+        return scan(out)[0]
+
+    if not jnp.iscomplexobj(out):
+        return fused(out)
+
+    def split(out):
+        re, im = scan(out.real, out.imag)
+        return jax.lax.complex(re, im)
+
+    return jax.lax.platform_dependent(out, default=fused, cuda=split)
 
 
 def _apply_pairs(
@@ -332,69 +327,37 @@ def _apply_pairs(
     """``"pairs"``: ``d0 * vec``, then per pair ``out[i] += d * vec[j]`` and ``out[j] += conj(d) * vec[i]``."""
     sharding = jax.typeof(vec).sharding
 
-    def body(out, chunk):
+    def updates(chunk):
         i, j, di = chunk
-        out = out.at[..., i].add(di * vec.at[..., j].get(out_sharding=sharding))
-        return out.at[..., j].add(jnp.conj(di) * vec.at[..., i].get(out_sharding=sharding)), None
+        return [
+            (i, di * vec.at[..., j].get(out_sharding=sharding)),
+            (j, jnp.conj(di) * vec.at[..., i].get(out_sharding=sharding)),
+        ]
 
-    return jax.lax.scan(body, d0 * vec, (pi, pj, d))[0]
-
-
-def _apply_csr(vec: jax.Array, d0: jax.Array, *entries: jax.Array) -> jax.Array:
-    """``"csr"``: ``d0 * vec``, then ``out[t] += d * vec[s]`` over each target-sorted ``(t, s, d)`` set."""
-    sharding = jax.typeof(vec).sharding
-
-    def body(acc, chunk):
-        ti, si, di = chunk
-        gathered = vec.at[..., si].get(out_sharding=sharding)
-        return acc.at[..., ti].add(di * gathered, indices_are_sorted=True), None
-
-    out = d0 * vec
-    for k in range(0, len(entries), 3):
-        out = jax.lax.scan(body, out, entries[k : k + 3])[0]
-    return out
+    return _scan_add(updates, d0 * vec, (pi, pj, d))
 
 
-def _apply_ell(vec: jax.Array, d0: jax.Array, *buckets: jax.Array) -> jax.Array:
-    """``"ell"``: ``d0 * vec``, then per ``(rows, src, fac)`` piece ``out[rows] += sum(fac * vec[src])``."""
-    sharding = jax.typeof(vec).sharding
-
-    def body(acc, piece):
-        rows, src, fac = piece
-        val = jnp.sum(fac * vec.at[..., src].get(out_sharding=sharding), axis=-1)
-        return acc.at[..., rows].add(val), None
-
-    out = d0 * vec
-    for k in range(0, len(buckets), 3):
-        out = jax.lax.scan(body, out, buckets[k : k + 3])[0]
-    return out
-
-
-_SPARSE_APPLY = {Matvec.PAIRS: _apply_pairs, Matvec.CSR: _apply_csr, Matvec.ELL: _apply_ell}
-
-
-@jax.jit(static_argnames=_SOLVE_STATIC)
+@jax.jit(static_argnames=[s for s in _SOLVE_STATIC if s != "matvec"])
 def _run_sparse(
     hamiltonian: PauliSumXZ,
     states_u: StateList,
     operator: tuple[jax.Array, ...],
     states_size: int,
     return_eigvec: bool,
-    matvec: Matvec,
     maxiter: int = 1000,
     atol: float = 0.0,
     rtol: float | None = None,
     prefilter: tuple[int, int] | None = (32, 2),
     log_level: int = logging.INFO,
 ) -> SqdResult:
-    """:func:`run_sqd` for the sparse kernels, given :func:`_sparse_operator`'s arrays.
+    """:func:`run_sqd` for ``"pairs"``, given :func:`_sparse_operator`'s arrays.
 
     It runs no residual check: :func:`sqd` checks with :func:`_sparse_residual` after it returns.
     """
     return _solve(
         hamiltonian,
         states_u,
-        _SPARSE_APPLY[matvec],
+        _apply_pairs,
         operator,
         lambda: operator[0],
         None,

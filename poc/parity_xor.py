@@ -4,7 +4,7 @@
 ``B`` packed bytes. Parity is linear over XOR, so ``bitwise_count(xor_reduce(s & z)) & 1`` gives the same
 bit with one popcount per state; with ``B % 8 == 0`` the bytes can be bitcast to ``uint64`` words first.
 ``matvec=Matvec.INDICES`` rebuilds every diagonal per matvec, ~64% of its solve against ``TABLES``
-(``poc/sparse-pairs.md`` §9), so that is where a faster parity would show.
+(``poc/sparse/pairs.md`` §9), so that is where a faster parity would show.
 
 Arms swap ``rqutils.sqd._diagonal._z_parity`` (looked up at trace time) and clear jax's caches, so each
 retraces; rounds alternate the arms and report min/median plus a paired win count.
@@ -27,7 +27,7 @@ jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 import numpy as np
-from sparse_pairs import spinchain_problem
+from sparse.pairs import spinchain_problem
 
 import rqutils.sqd._diagonal as diagonal_mod
 from rqutils.sqd import Matvec, get_diagonal, sqd, uniquify_states

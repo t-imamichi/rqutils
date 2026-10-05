@@ -16,7 +16,6 @@ from rqutils.paulis.symplectic import PauliSumXZ
 from rqutils.sqd._diagonal import get_diagonal
 from rqutils.sqd._solve import (
     _RESIDUAL_SLACK,
-    _SPARSE_MATVECS,
     Matvec,
     SqdResult,
     _check_matvec,
@@ -24,7 +23,7 @@ from rqutils.sqd._solve import (
     _residual_floor_of,
     run_sqd,
 )
-from rqutils.sqd._sparse import _run_sparse, _sparse_operator, _sparse_residual
+from rqutils.sqd._sparse import _group_pairs, _run_sparse, _sparse_operator, _sparse_residual
 from rqutils.sqd._states import (
     _MAX_STATES,
     StateList,
@@ -269,7 +268,7 @@ def _sqd_inputs(
 ) -> tuple[PauliSumXZ, StateList, int]:
     """Validate :func:`sqd`'s arguments; return the Hamiltonian, padded packed states, ``states_size``."""
     _check_matvec(matvec)
-    if matvec in _SPARSE_MATVECS and not get_abstract_mesh().empty:
+    if matvec is Matvec.PAIRS and not get_abstract_mesh().empty:
         raise ValueError(
             f"matvec=Matvec.{matvec.name} is single-device for now; call sqd outside the mesh "
             "context, or use Matvec.ONTHEFLY, INDICES or TABLES for a sharded solve"
@@ -323,14 +322,17 @@ def _solve_sqd(
     LOG.debug("Starting SQD with array size %s", states_size)
     start = time.time()
     tols = {"maxiter": maxiter, "atol": atol, "rtol": rtol, "prefilter": prefilter}
-    if matvec in _SPARSE_MATVECS:
+    if matvec is Matvec.PAIRS:
         # run_sqd is jitted and the entry counts are data-dependent, so the operator is built here.
         states_u = uniquify_states(states_p, states_size)
-        operator = _sparse_operator(hamiltonian, states_u, matvec)
+        pairs = _group_pairs(hamiltonian, states_u)  # one search, for the build and the check
+        operator = _sparse_operator(hamiltonian, states_u, pairs)
         LOG.info("Built the %s operator in %f seconds.", matvec, time.time() - start)
-        result = _run_sparse(hamiltonian, states_u, operator, states_size, True, matvec, **tols)
+        result = _run_sparse(hamiltonian, states_u, operator, states_size, True, **tols)
         del operator  # the check reads none of it
-        residual, ax_norm = _sparse_residual(hamiltonian, states_u, result.eigval, result.eigvec)
+        residual, ax_norm = _sparse_residual(
+            hamiltonian, states_u, result.eigval, result.eigvec, pairs
+        )
         result = result._replace(residual=residual, ax_norm=ax_norm)
     else:
         result = run_sqd(

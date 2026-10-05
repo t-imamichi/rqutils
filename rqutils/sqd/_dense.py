@@ -9,7 +9,7 @@ import numpy as np
 from jax.sharding import PartitionSpec, get_abstract_mesh
 from numpy.typing import NDArray
 
-from rqutils.sqd._diagonal import get_diagonal
+from rqutils.sqd._diagonal import _z_parity, get_diagonal
 from rqutils.sqd._states import StateList, get_xsource
 
 # Dtype kind per `apply_h` keyword: `u` packed bytes, `i` positions (-1 = absent), `fc` float or
@@ -281,3 +281,58 @@ def _apply_h_kernel(
         return out + apply_xgrp(xsource, diagonal, vec), None
 
     return jax.lax.scan(fn, jnp.zeros_like(vec) if init is None else init, scanned)[0]
+
+
+def _apply_buckets(
+    vec: jax.Array,
+    buckets: tuple[tuple[jax.Array, jax.Array, jax.Array, jax.Array], ...],
+    sources: jax.Array,
+    states: StateList,
+    d0: jax.Array | None,
+    *,
+    matvec: str,
+) -> jax.Array:
+    """:math:`Hv` with each X group's diagonal summed over a fixed trip count, its group's term count.
+
+    ``d0`` is the identity group's diagonal, computed once per solve; ``buckets`` are ``(group, const,
+    z, c)`` per distinct count of terms with a Z part, ``const`` the Z-free term's coefficient (or 0),
+    ``z`` and ``c`` cut to the rest, and ``sources`` the ``(J, N)`` source table
+    (``"indices"``) or the X signatures (``"onthefly"``), read by group. ``get_diagonal``'s
+    ``while_loop`` syncs with the host per term on a GPU (``poc/dense-tune.md``).
+    """
+    out = jnp.zeros_like(vec) if d0 is None else d0 * vec
+
+    def fn(out, val):
+        group, const, z, c = val  # z is (terms, B) per step: a static trip count
+        xsource = sources[group] if matvec == "indices" else get_xsource(sources[group], states)
+        diagonal = const + sum(
+            c[t] * (1.0 - 2.0 * _z_parity(states, z[t])) for t in range(z.shape[0])
+        )
+        return out + apply_xgrp(xsource, diagonal, vec), None
+
+    for bucket in buckets:
+        out = jax.lax.scan(fn, out, bucket)[0]
+    return out
+
+
+def _bucket_args(hamiltonian: Any, sources: jax.Array, states: StateList) -> tuple:
+    """:func:`_apply_buckets`' ``(buckets, sources, states, d0)``.
+
+    ``hamiltonian`` is a :class:`~rqutils.paulis.symplectic.PauliSumXZ`; one bucket per distinct count
+    of terms with a Z part, over the groups after a leading identity, whose diagonal is ``d0``. A
+    ``zfree_first`` group's first term folds into ``const``: 1.28-1.50x on CPU (``poc/dense-codes.md``).
+    """
+    counts = hamiltonian.term_counts
+    zfree = hamiltonian.zfree_first
+    _, z, c = hamiltonian.arrays
+    first = int(hamiltonian.identity_first)
+    d0 = get_diagonal(z[0], c[0], states) if first else None
+    groups = range(first, len(counts))
+    buckets = []
+    for k in sorted({counts[g] - zfree[g] for g in groups}):
+        idx = np.array([g for g in groups if counts[g] - zfree[g] == k], np.int32)
+        skip = np.asarray(zfree, np.int32)[idx]
+        terms = skip[:, None] + np.arange(k, dtype=np.int32)
+        const = skip * c[idx, 0]
+        buckets.append((idx, const, z[idx[:, None], terms], c[idx[:, None], terms]))
+    return tuple(buckets), sources, states, d0

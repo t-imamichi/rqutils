@@ -22,7 +22,7 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 
-from sparse_pairs import spinchain_problem
+from sparse.pairs import spinchain_problem
 
 import rqutils
 import rqutils.sqd._solve as solve_mod

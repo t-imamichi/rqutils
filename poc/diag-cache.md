@@ -210,7 +210,7 @@ builders are in `poc/sqd_multinode.py`, and the two-kernel form is `poc/diag_cac
   the two and cannot go below `(1, 0)`: every cached group adds 8 B/slot, plus the 16 B/slot two-kernel
   temp, on top of `(1, 0)`'s footprint.
 - **So it cannot help a memory-bound `(1, 0)` run** (spinchain at n ≥ 30, where `(1, 0)` already fills
-  memory): there is no memory left to spend on it. Sparse transition pairs (`poc/sparse-pairs.md` §6) are
+  memory): there is no memory left to spend on it. Sparse transition pairs (`poc/sparse/pairs.md` §6) are
   the lever for that regime, since they shrink `(1, 0)`'s own source cache.
 - **Cheap only at large `J`** (overhead `4/J` of the saving) and net-negative below about `J = 7`, where a
   dial should refuse rather than silently cost memory.

@@ -54,7 +54,7 @@ The first three are **dense**: they accept a mesh and are the only ones `run_sqd
 contains a small fraction of each group's targets (hit rate 8–12% on the fixtures below), so the dense
 kernels spend most of their source-index table on the `-1` "absent" marker.
 
-Warm `sqd` at n=60, `2^17` states, packed input (`poc/sparse-pairs.md` §9):
+Warm `sqd` at n=60, `2^17` states, packed input (`poc/sparse/pairs.md` §9):
 
 | fixture | `INDICES` | `PAIRS` | `CSR` | `ELL` |
 | --- | --- | --- | --- | --- |

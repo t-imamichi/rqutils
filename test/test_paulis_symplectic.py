@@ -599,6 +599,39 @@ class TestRealGroupsFirst:
         assert hamiltonian.num_real_groups == hamiltonian.c.shape[0]
 
 
+class TestTermCounts:
+    """``term_counts`` and ``identity_first`` are what the fixed-trip diagonal kernel trusts.
+
+    A count one short drops a group's last Z term from every matvec, and a false ``identity_first``
+    applies group 0's diagonal to ``vec`` itself; both are checked against the arrays they summarize.
+    """
+
+    @pytest.mark.parametrize("with_identity", [True, False])
+    def test_from_paulisum_fills_both(self, with_identity):
+        strings = ["XXIII", "YYIII", "IXIII", "IYIII", "IIXZI", "IIYZI", "IIZYI"]
+        if with_identity:
+            strings += ["ZZIII", "IIIZZ", "ZIIII"]
+        h = PauliSumXZ.from_paulisum((strings, np.linspace(0.3, 1.1, len(strings))))
+        assert h.term_counts == tuple(int(k) for k in np.count_nonzero(np.asarray(h.c), axis=1))
+        assert h.identity_first == (not np.asarray(h.x[0]).any()) == with_identity
+        assert sorted(set(h.term_counts)) != [h.term_counts[0]], "the fixture must mix term counts"
+
+    def test_zfree_first_names_exactly_the_leading_z_free_terms(self):
+        """A flag on a term with a Z part would fold its coefficient in as a constant, a wrong diagonal.
+
+        Qiskit input keeps the caller's order, so ``YY`` listed before ``XX`` exercises the reorder.
+        """
+        from qiskit.quantum_info import SparsePauliOp
+
+        strings = ["YYIII", "XXIII", "IZIII", "IIYZI", "IIXII", "IIIZZ", "IIIII", "YIYII"]
+        h = PauliSumXZ.from_paulisum(SparsePauliOp(strings, np.linspace(0.3, 1.1, len(strings))))
+        z = np.asarray(h.z)
+        zfree = [[not z[g, t].any() for t in range(k)] for g, k in enumerate(h.term_counts)]
+        assert h.zfree_first == tuple(bool(row) and row[0] for row in zfree)
+        assert not any(any(row[1:]) for row in zfree), "a Z-free term was left behind position 0"
+        assert sum(h.zfree_first) == 3, "the identity, XX and IIXII groups, not YIYII's"
+
+
 class TestBinaryStateValidation:
     """``pack_states`` must reject non-binary input rather than silently collapsing it.
 
