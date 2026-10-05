@@ -306,10 +306,10 @@ class TestShardedDiagonals:
 
 
 class TestShardedPairs:
-    """Term-parallel ``"pairs"``: whole X groups packed onto devices, all-gather in, reduce-scatter out.
+    """Term-parallel ``"pairs"``: a contiguous slice of the entries per device, all-gather in, reduce-scatter out.
 
-    ``markdown/pairs-mesh-proposal.md`` section 4.1. Real and complex fixtures with 40 terms, so every
-    device owns groups at 2 and 4 devices; ``sqd``'s residual check runs on each sharded solve.
+    ``markdown/pairs-mesh-proposal.md`` section 4.1. Real and complex fixtures with 40 terms at 2 and 4
+    devices; ``sqd``'s residual check runs on each sharded solve.
     """
 
     def test_sharded_pairs_matches_single_device_and_dense(self):
@@ -334,7 +334,9 @@ class TestShardedPairs:
                 )
                 assert cell["product_spec"] == "P(None, 'x')", (where, cell["product_spec"])
                 assert cell["shards"] == int(devices), where
-                assert min(cell["entries_per_device"]) > 0, (where, cell["entries_per_device"])
+                counts = cell["entries_per_device"]
+                # Contiguous slices balance to one entry; whole X groups measured 1.41-14.26x on type1.
+                assert max(counts) - min(counts) <= 1, (where, counts)
                 assert cell["same_entries"], (
                     f"{where}: the devices' entries are not the flat operator's"
                 )

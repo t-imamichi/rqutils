@@ -198,7 +198,7 @@ def sqd(
             A sparse ``matvec`` is built on the host before the solve (logged as its own phase),
             its array shapes rounded up to size classes so the solve recompiles per class rather
             than per subspace. Under a mesh ``Matvec.PAIRS`` runs term-parallel: each device applies a
-            share of the X groups to the all-gathered vector, and one reduce-scatter sums them.
+            contiguous slice of the entries to the all-gathered vector, and one reduce-scatter sums them.
             Every process builds the whole operator on the host.
         prefilter: ``(degree, cycles)`` Chebyshev prefilter, forwarded verbatim to
             :func:`rqutils.ground_locg.ground_locg` (see there) and validated by

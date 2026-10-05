@@ -126,8 +126,8 @@ The other dense storage combinations are dominated on both memory and time (``NO
 two other sparse layouts, ``"csr"`` and ``"ell"``, removed for ``Matvec.PAIRS`` (``poc/sparse/tune.md``,
 section 3). ``Matvec.PAIRS`` stores only the transitions that land inside the subspace, where the source
 indices mostly hold the ``-1`` absent marker; :func:`sqd` builds it host-side before the solve, and
-``poc/sparse/pairs.md`` has the measurements. Under a mesh it runs term-parallel, each device a share of
-the X groups, with one all-gather and one reduce-scatter per matvec (``markdown/pairs-mesh-proposal.md``,
+``poc/sparse/pairs.md`` has the measurements. Under a mesh it runs term-parallel, each device a contiguous
+slice of the entries, with one all-gather and one reduce-scatter per matvec (``markdown/pairs-mesh-proposal.md``,
 section 4.1).
 
 **The source-index setup dominates the solve, so this is not a symmetric memory-for-speed dial:**
@@ -148,7 +148,7 @@ bond or field, :math:`J = O(n)` (62--120 for an XXZ chain at :math:`n = 60`); Jo
 one per set of flipped orbitals, :math:`J = O(n^4)` (3768 at :math:`n = 20`, random integrals). At large
 :math:`J` the :math:`4 J N` index table outgrows one device and the per-matvec search slows. On one
 device that leaves ``Matvec.PAIRS``, which stores only in-subspace transitions; under a mesh, the same
-split by X group, or ``Matvec.INDICES``' table split across devices. No molecular solve is measured yet.
+split across devices, or ``Matvec.INDICES``' table split across devices. No molecular solve is measured yet.
 
 Distributed arrays and scaling limits
 =====================================

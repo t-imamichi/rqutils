@@ -4,7 +4,7 @@ import functools
 import logging
 import os
 from collections import deque
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import jax
@@ -31,7 +31,7 @@ def _chunk() -> int:
 
 
 def _pairs_sorted_on_device(
-    pairs: dict[int, tuple[np.ndarray, np.ndarray]], groups: Sequence[int], alloc: Callable
+    pairs: dict[int, tuple[np.ndarray, np.ndarray]], groups: range, alloc: Callable
 ) -> list[jax.Array]:
     """``"pairs"``' ``(i, j, group)``, each pair once, stably sorted by ``i`` on the device.
 
@@ -260,15 +260,13 @@ def _sparse_operator(
     hamiltonian: PauliSumXZ,
     states_u: StateList,
     pairs: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
-    groups: Sequence[int] | None = None,
 ) -> tuple[jax.Array, ...]:
     """Build ``"pairs"``' ``(d0, i, j, d)`` on the host, each entry array ``(chunks, _chunk())``.
 
     Each transition once, sorted by ``i`` across groups so ``out[i]`` and ``vec[i]`` are local
     (``NOTES.md``, "sqd sparse kernels: pairs sorted by i"); padding entries have equal endpoints and a
     zero factor, and so does no stored pair (:func:`_drop_zeros`). ``pairs`` is :func:`_group_pairs`'
-    output, searched here when not given; ``groups`` restricts the entries to those X groups (all but a
-    leading identity by default).
+    output, searched here when not given.
 
     Raises:
         ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_check_entries`.
@@ -278,7 +276,7 @@ def _sparse_operator(
     pairs = _group_pairs(hamiltonian, states_u) if pairs is None else pairs
     first = int(hamiltonian.identity_first)
     d0 = get_diagonal(z[0], c[0], states_u) if first else jnp.zeros(size, c.dtype)
-    groups = range(first, hamiltonian.x.shape[0]) if groups is None else groups
+    groups = range(first, hamiltonian.x.shape[0])
     coeffs = np.asarray(hamiltonian.c)
     kmax = max((int(np.count_nonzero(coeffs[g])) for g in groups), default=1)
 
@@ -295,30 +293,27 @@ def _mesh_operator(
     pairs: dict[int, tuple[np.ndarray, np.ndarray]],
     mesh: jax.sharding.Mesh,
 ) -> tuple[jax.Array, ...]:
-    """Term-parallel ``"pairs"``: whole X groups packed onto the devices by entry count.
+    """Term-parallel ``"pairs"``: the flat operator's entries in one contiguous slice per device.
 
-    Each device's entries are :func:`_sparse_operator` on its groups, padded to the longest device's chunk
-    count, stacked ``(devices, chunks, chunk)`` and partitioned on the device axis; ``d0`` is partitioned
-    as ``vec`` is (``markdown/pairs-mesh-proposal.md`` §4.1).
+    Any split is exact, each device summing into a full-length accumulator; contiguous slices of the
+    ``i``-sorted entries balance to one entry, where whole X groups measured 1.41-14.26x on ``type1``
+    (``markdown/pairs-mesh-proposal.md`` §4.1). Entries are ``(devices, chunks, chunk)``, ``d0`` as ``vec``.
     """
-    size, chunk = states_u.shape[0], _chunk()
-    owned: list[list[int]] = [[] for _ in range(mesh.size)]
-    loads = [0] * mesh.size
-    for g in sorted(pairs, key=lambda g: -len(pairs[g][0])):  # greedy: largest group first
-        p = loads.index(min(loads))
-        owned[p].append(g)
-        loads[p] += len(pairs[g][0])
-    parts = [_sparse_operator(hamiltonian, states_u, pairs, sorted(g)) for g in owned]
-    length = max(p[1].shape[0] for p in parts)
-    pad = np.arange(length * chunk, dtype=np.int32).reshape(length, chunk) % size
-
-    def padded(a, fill):  # equal endpoints on distinct rows and a zero factor, as _drop_zeros pads
-        a = np.asarray(a)
-        return np.concatenate([a, fill[: length - a.shape[0]].astype(a.dtype)])
-
-    stacked = [
-        np.stack([padded(p[k], pad if k < 3 else 0 * pad) for p in parts]) for k in (1, 2, 3)
-    ]
+    size, devices = states_u.shape[0], mesh.size
+    d0, *entries = (np.asarray(a).ravel() for a in _sparse_operator(hamiltonian, states_u, pairs))
+    live = int(np.count_nonzero(entries[2]))  # _drop_zeros puts the stored entries first
+    per = -(-live // devices)
+    chunk = min(_chunk(), _size_class(per))
+    length = _size_class(-(-per // chunk)) * chunk
+    # Padding as _drop_zeros pads: equal endpoints on distinct rows and a zero factor.
+    pad = np.arange(devices * length, dtype=np.int32).reshape(devices, length) % size
+    stacked = []
+    for k, a in enumerate(entries):
+        out = (pad if k < 2 else np.zeros_like(pad)).astype(a.dtype)
+        for p in range(devices):
+            piece = a[p * per : min((p + 1) * per, live)]
+            out[p, : len(piece)] = piece
+        stacked.append(out.reshape(devices, -1, chunk))
 
     # From host arrays every process holds, so each process places only its own shards.
     def place(a, *spec):
@@ -328,7 +323,7 @@ def _mesh_operator(
             lambda index: a[index],
         )
 
-    return place(np.asarray(parts[0][0])), *(place(a, None, None) for a in stacked)
+    return place(d0), *(place(a, None, None) for a in stacked)
 
 
 def _scan_add(

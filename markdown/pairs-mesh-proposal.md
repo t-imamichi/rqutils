@@ -16,7 +16,7 @@ recommendation (simplicity first, then predicted speed and memory):
 
 | rank | algorithm | §   | communication per matvec | operator per device | new code | for |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | term-parallel `"pairs"` | 4.1 | all-gather + reduce-scatter (~2×) | symmetric pairs / `P` | `shard_map` wrapper, group packing | first step, one node |
+| 1 | term-parallel `"pairs"` | 4.1 | all-gather + reduce-scatter (~2×) | symmetric pairs / `P` | `shard_map` wrapper, contiguous entry split | first step, one node |
 | 2 | 1-D hashed rows, ELLC, all-gather then halo | 4.2 | one all-gather, then one padded `all_to_all` of the sources read | ELLC / `P` | row hash, buckets, then send lists | spin chains, one node and many |
 | 3 | 2-D hashed, ELLC within each block | 4.3 | all-gather along `'r'` + reduce-scatter along `'c'`, `N/√P` each | directed entries / `P` | owner-pair bucketing | molecules; spin chains at small `P` |
 | 4 | recomputed factors | 4.4 | as the kernel it dials | ~3–43 B/slot (*estimated*) | popcount factors | memory dial for 2, 3, 6 |
@@ -102,12 +102,24 @@ the sharded operator either way.
 
 ### 4.1 Term-parallel `"pairs"` (rank 1)
 
-Split the Hamiltonian, not the rows: `H = d0 + Σ_p H_p`, device `p` owning a subset of whole X groups.
+Split the Hamiltonian's entries, not the rows: `H = d0 + Σ_p H_p`, device `p` owning a share of the stored
+transitions.
 
-- **Build.** Assign groups to devices by greedy bin packing on their entry counts, which needs every group's
-  count: from the full host search, or, multi-process, from the shared count allgather (§4 preamble). Each
-  device runs today's `_sparse_operator`, unchanged, on its sub-Hamiltonian, its chunk count padded to the
-  largest device's size class (`_size_class`) so the shapes agree.
+- **Build.** Today's `_sparse_operator`, once, then one contiguous slice of its `i`-sorted stored entries per
+  device, each padded to one size class (`_size_class`) so the shapes agree. Any split is exact, since each
+  device sums into a full-length accumulator; contiguous slices balance to one entry. **Whole X groups,
+  the first form built, did not balance** (*measured*, `poc/sparse/mesh_balance.py`, n = 60, `2^17`, largest
+  device over the mean):
+
+  | pattern | `J` | largest group's share of the kept entries | `P = 4` | `P = 16` | `P = 64` |
+  | --- | --- | --- | --- | --- | --- |
+  | `type1`, `type4`, whole groups | 61 | 22.3% | 1.41× | 3.86× | 14.26×, 3 devices idle |
+  | `type2`, `type3`, whole groups | 119 | 1.6% | 1.00× | 1.07× | 1.07× |
+  | all four, contiguous slices | | | 1.000× | 1.000× | 1.000× |
+
+  Packing balanced the *searched* counts, but `_drop_zeros` keeps 33,722 of `type1`'s 249,104 pairs, unevenly
+  by group, and one group's 22.3% caps any whole-group packing at `0.223·P` the mean. The slices pay 5–12% of
+  padding slots. A random split balances too, but loses the slices' contiguous `out[i]` rows.
 - **Matvec.** All-gather `vec` (as `"indices"`); each device runs today's `_apply_pairs` on its entries into
   a full-length local accumulator, both scatter directions, device sort and zero-drop unchanged; one
   `psum_scatter` sums the accumulators and leaves each device its `P('x')` row block; `d0 * vec` is
@@ -120,8 +132,7 @@ Split the Hamiltonian, not the rows: `H = d0 + Σ_p H_p`, device `p` owning a su
   is `N`, not `N/P`: expect the large-`N` end of single-device `"pairs"`' edge, 1.08× at `type1` `2^22`
   (`poc/sparse/gpu.md` §9, pre-drop), not the 1.82×.
 - **Where it loses.** Many nodes, where both collectives grow with `N` and two full vectors per device cap
-  memory (ranks 2–3). And `P` approaching `J`, where a few groups dominate the entry count; splitting a large
-  group's chunks across devices fixes that, since chunks are independent.
+  memory (ranks 2–3).
 - **Not a degenerate rank 3.** Its symmetric storage needs both `v_i` and `v_j` and writes both rows, which no
   proper 2-D block allows; it is a separate term axis, as in 2.5-D and 3-D layouts. Moving from rank 1 to rank
   2 or 3 changes the storage and the build, not just the mesh shape.

@@ -2385,9 +2385,11 @@ putting `"indices"` ahead of `"tables"`; codes 0.88–0.97×. The fold shipped (
 
 ### sqd `"pairs"` under a mesh: term-parallel, one all-gather and one reduce-scatter (2026-10-06)
 
-Built, correctness only (4 virtual CPU devices): whole X groups packed per device, eigenvalues within 1e-12 of
-single-device, the batched product within 1.8e-15, entries `P('x', None, None)`; every process builds the whole
-host operator, so multi-process and real-device timing are unrun. `markdown/pairs-mesh-proposal.md` §4.1, §8
+Built, correctness only (4 virtual CPU devices): one contiguous slice of the flat entries per device, eigenvalues
+within 1e-12 of single-device, the batched product within 1.8e-15, entries `P('x', None, None)`; every process builds the whole
+host operator, so multi-process and real-device timing are unrun. Whole X groups, the first form, measured
+1.41–14.26× device imbalance on `type1`/`type4` (one group 22.3% of the kept entries); the slice is 1.000× on all four
+patterns at 5–12% padding. `markdown/pairs-mesh-proposal.md` §4.1, §8
 
 ### sqd `"pairs"`: `_drop_zeros` jitted, 3.4–3.8× its first call on CPU (2026-10-05)
 
