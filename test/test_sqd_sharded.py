@@ -3,6 +3,7 @@
 """
 
 import ast
+import functools
 import inspect
 import textwrap
 
@@ -308,14 +309,11 @@ class TestShardedDiagonals:
 class TestShardedPairs:
     """Term-parallel ``"pairs"``: a contiguous slice of the entries per device, all-gather in, reduce-scatter out.
 
-    ``markdown/pairs-mesh-proposal.md`` section 4.1. Real and complex fixtures with 40 terms at 2 and 4
-    devices; ``sqd``'s residual check runs on each sharded solve.
+    ``markdown/pairs-mesh-proposal.md`` section 4.1; ``sqd``'s residual check runs on each sharded solve.
     """
 
     def test_sharded_pairs_matches_single_device_and_dense(self):
-        got = run_sharded_child("pairs_mesh")
-        for label, case in got.items():
-            assert case["groups"] > 4, f"{label}: {case['groups']} X groups cannot fill 4 devices"
+        for label, case in _pairs_mesh().items():
             assert case["single"] == pytest.approx(case["dense"], abs=1e-10), label
             for devices, cell in case["devices"].items():
                 where = f"{label}/{devices}"
@@ -324,8 +322,7 @@ class TestShardedPairs:
 
     def test_entries_are_partitioned_not_replicated(self):
         """A replicated operator agrees in value, so the spec and per-device contents are asserted."""
-        got = run_sharded_child("pairs_mesh")
-        for label, case in got.items():
+        for label, case in _pairs_mesh().items():
             for devices, cell in case["devices"].items():
                 where = f"{label}/{devices}"
                 assert cell["specs"] == ["P('x',)", *["P('x', None, None)"] * 3], (
@@ -335,16 +332,25 @@ class TestShardedPairs:
                 assert cell["product_spec"] == "P(None, 'x')", (where, cell["product_spec"])
                 assert cell["shards"] == int(devices), where
                 counts = cell["entries_per_device"]
-                # Contiguous slices balance to one entry; whole X groups measured 1.41-14.26x on type1.
                 assert max(counts) - min(counts) <= 1, (where, counts)
                 assert cell["same_entries"], (
-                    f"{where}: the devices' entries are not the flat operator's"
+                    f"{where}: the slices are not the flat operator, in order"
                 )
 
     def test_one_all_gather_and_one_reduce_scatter_per_batched_matvec(self):
-        got = run_sharded_child("pairs_mesh")
-        expected = {"all-gather": 1, "reduce-scatter": 1, "all-reduce": 0, "all-to-all": 0}
-        for label, case in got.items():
+        expected = {
+            "all-gather": 1,
+            "reduce-scatter": 1,
+            "all-reduce": 0,
+            "all-to-all": 0,
+            "collective-permute": 0,
+        }
+        for label, case in _pairs_mesh().items():
             for devices, cell in case["devices"].items():
-                counts = {k: cell["collectives"][k] for k in expected}
-                assert counts == expected, (f"{label}/{devices}", cell["collectives"])
+                assert cell["collectives"] == expected, (f"{label}/{devices}", cell["collectives"])
+
+
+@functools.cache
+def _pairs_mesh():
+    """``pairs_mesh``'s result, run once for the three tests above: it is deterministic, ~8 s a run."""
+    return run_sharded_child("pairs_mesh")

@@ -232,41 +232,63 @@ def _entry_factors(
 
 
 def _drop_zeros(
-    t: jax.Array, s: jax.Array, d: jax.Array, chunk: int, size: int
+    t: jax.Array, s: jax.Array, d: jax.Array, chunk: int, size: int, devices: int | None = None
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``(t, s, d)`` without the entries whose factor is exactly zero, order kept, re-padded to a size class.
 
     XX+YY hops cancel on aligned spins: 86% of spinchain's ``type1`` pairs, 32% of ``type2``'s
     (``poc/sparse/prune.md``). The check reads the unfiltered ``pairs``, so it vouches for this filter.
+    ``devices`` splits the entries into that many contiguous, equally padded ``(devices, chunks, chunk)``
+    slices, balanced to one entry where whole X groups measured 1.41-14.26x on ``type1``
+    (``markdown/pairs-mesh-proposal.md`` §4.1).
     """
     count = int(jnp.count_nonzero(d))
-    return _compact(t, s, d, count, _size_class(-(-count // chunk)) * chunk, chunk, size)
+    per = count if devices is None else -(-count // devices)
+    if devices is not None:
+        chunk = min(chunk, _size_class(per))
+    length = _size_class(-(-per // chunk)) * chunk
+    return _compact(t, s, d, count, per, length, chunk, size, devices)
 
 
-@functools.partial(jax.jit, static_argnames=["length", "chunk", "size"])
+@functools.partial(jax.jit, static_argnames=["length", "chunk", "size", "devices"])
 def _compact(
-    t: jax.Array, s: jax.Array, d: jax.Array, count: int, length: int, chunk: int, size: int
+    t: jax.Array,
+    s: jax.Array,
+    d: jax.Array,
+    count: int,
+    per: int,
+    length: int,
+    chunk: int,
+    size: int,
+    devices: int | None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """:func:`_drop_zeros`' filter as one program: 3.4-3.8x its eager first call on CPU (``poc/sparse/drop-jit.md``)."""
-    (idx,) = jnp.nonzero((d != 0).ravel(), size=length, fill_value=0)
-    live = jnp.arange(length) < count
+    rows = 1 if devices is None else devices
+    (idx,) = jnp.nonzero((d != 0).ravel(), size=rows * length, fill_value=0)
+    src = jnp.arange(rows)[:, None] * per + jnp.arange(length)  # slot -> stored entry
+    live = (jnp.arange(length) < per) & (src < count)
+    src = idx[jnp.where(live, src, 0)]
     # Padding on distinct rows: one shared row serialized a GPU's atomic adds (poc/sparse/prune.md §6).
-    pad = jnp.arange(length, dtype=t.dtype) % size
-    t, s = (jnp.where(live, a.ravel()[idx], pad).reshape(-1, chunk) for a in (t, s))
-    return t, s, jnp.where(live, d.ravel()[idx], 0).reshape(-1, chunk)
+    pad = jnp.arange(rows * length, dtype=t.dtype).reshape(rows, length) % size
+    shape = (-1, chunk) if devices is None else (devices, -1, chunk)
+    t, s = (jnp.where(live, a.ravel()[src], pad).reshape(shape) for a in (t, s))
+    return t, s, jnp.where(live, d.ravel()[src], 0).reshape(shape)
 
 
 def _sparse_operator(
     hamiltonian: PauliSumXZ,
     states_u: StateList,
     pairs: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
+    mesh: jax.sharding.Mesh | None = None,
 ) -> tuple[jax.Array, ...]:
     """Build ``"pairs"``' ``(d0, i, j, d)`` on the host, each entry array ``(chunks, _chunk())``.
 
     Each transition once, sorted by ``i`` across groups so ``out[i]`` and ``vec[i]`` are local
     (``NOTES.md``, "sqd sparse kernels: pairs sorted by i"); padding entries have equal endpoints and a
     zero factor, and so does no stored pair (:func:`_drop_zeros`). ``pairs`` is :func:`_group_pairs`'
-    output, searched here when not given.
+    output, searched here when not given. Under a non-empty ``mesh`` the entries are one contiguous slice
+    per device, ``(devices, chunks, chunk)`` partitioned on the device axis, and ``d0`` is partitioned as
+    ``vec`` is: term-parallel, for :func:`_apply_pairs_mesh`.
 
     Raises:
         ValueError: If the entry count reaches :math:`2^{31}` -- see :func:`_check_entries`.
@@ -284,46 +306,21 @@ def _sparse_operator(
         return [_padded(count, f, chunk) for f in (size - 1, size - 1, 0)]
 
     t, s, g = (a.reshape(-1, chunk) for a in _pairs_sorted_on_device(pairs, groups, alloc))
-    return d0, *_drop_zeros(t, s, _entry_factors(t, s, g, z, c, states_u, kmax), chunk, size)
-
-
-def _mesh_operator(
-    hamiltonian: PauliSumXZ,
-    states_u: StateList,
-    pairs: dict[int, tuple[np.ndarray, np.ndarray]],
-    mesh: jax.sharding.Mesh,
-) -> tuple[jax.Array, ...]:
-    """Term-parallel ``"pairs"``: the flat operator's entries in one contiguous slice per device.
-
-    Any split is exact, each device summing into a full-length accumulator; contiguous slices of the
-    ``i``-sorted entries balance to one entry, where whole X groups measured 1.41-14.26x on ``type1``
-    (``markdown/pairs-mesh-proposal.md`` §4.1). Entries are ``(devices, chunks, chunk)``, ``d0`` as ``vec``.
-    """
-    size, devices = states_u.shape[0], mesh.size
-    d0, *entries = (np.asarray(a).ravel() for a in _sparse_operator(hamiltonian, states_u, pairs))
-    live = int(np.count_nonzero(entries[2]))  # _drop_zeros puts the stored entries first
-    per = -(-live // devices)
-    chunk = min(_chunk(), _size_class(per))
-    length = _size_class(-(-per // chunk)) * chunk
-    # Padding as _drop_zeros pads: equal endpoints on distinct rows and a zero factor.
-    pad = np.arange(devices * length, dtype=np.int32).reshape(devices, length) % size
-    stacked = []
-    for k, a in enumerate(entries):
-        out = (pad if k < 2 else np.zeros_like(pad)).astype(a.dtype)
-        for p in range(devices):
-            piece = a[p * per : min((p + 1) * per, live)]
-            out[p, : len(piece)] = piece
-        stacked.append(out.reshape(devices, -1, chunk))
+    factors = _entry_factors(t, s, g, z, c, states_u, kmax)
+    if mesh is None or mesh.empty:
+        return d0, *_drop_zeros(t, s, factors, chunk, size)
 
     # From host arrays every process holds, so each process places only its own shards.
     def place(a, *spec):
+        a = np.asarray(a)
         return jax.make_array_from_callback(
             a.shape,
             NamedSharding(mesh, PartitionSpec(mesh.axis_names, *spec)),
             lambda index: a[index],
         )
 
-    return place(d0), *(place(a, None, None) for a in stacked)
+    entries = _drop_zeros(t, s, factors, chunk, size, mesh.size)
+    return place(d0), *(place(a, None, None) for a in entries)
 
 
 def _scan_add(
@@ -364,14 +361,16 @@ def _scan_add(
 def _apply_pairs(
     vec: jax.Array, d0: jax.Array, pi: jax.Array, pj: jax.Array, d: jax.Array
 ) -> jax.Array:
-    """``"pairs"``: ``d0 * vec``, then per pair ``out[i] += d * vec[j]`` and ``out[j] += conj(d) * vec[i]``.
+    """``"pairs"``: ``d0 * vec``, then per pair ``out[i] += d * vec[j]`` and ``out[j] += conj(d) * vec[i]``."""
+    return _pairs_scan(vec, d0 * vec, pi, pj, d)
 
-    Given :func:`_mesh_operator`'s ``(devices, chunks, chunk)`` entries, each device applies its own X
-    groups to the all-gathered ``vec`` and one reduce-scatter sums the devices' full-length results.
-    """
-    if pi.ndim == 2:
-        return _pairs_scan(vec, d0 * vec, pi, pj, d)
-    axis = get_abstract_mesh().axis_names
+
+def _apply_pairs_mesh(
+    vec: jax.Array, d0: jax.Array, pi: jax.Array, pj: jax.Array, d: jax.Array
+) -> jax.Array:
+    """:func:`_apply_pairs` on a mesh operator: each device's entry slice applied to the all-gathered
+    ``vec``, the devices' full-length results summed by one reduce-scatter."""
+    axis = jax.typeof(pi).sharding.spec[0]
     spec = PartitionSpec(*[None] * (vec.ndim - 1), axis)
 
     def local(vec, d0, pi, pj, d):
@@ -416,7 +415,7 @@ def _run_sparse(
     prefilter: tuple[int, int] | None = (32, 2),
     log_level: int = logging.INFO,
 ) -> SqdResult:
-    """:func:`run_sqd` for ``"pairs"``, given :func:`_sparse_operator`'s or :func:`_mesh_operator`'s arrays.
+    """:func:`run_sqd` for ``"pairs"``, given :func:`_sparse_operator`'s arrays, built under the same mesh.
 
     It runs no residual check: :func:`sqd` checks with :func:`_sparse_residual` after it returns.
     """
@@ -427,7 +426,7 @@ def _run_sparse(
     return _solve(
         hamiltonian,
         states_u,
-        _apply_pairs,
+        _apply_pairs if sharding is None else _apply_pairs_mesh,
         operator,
         lambda: operator[0],
         None,

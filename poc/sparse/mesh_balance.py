@@ -5,7 +5,7 @@ For ``markdown/pairs-mesh-proposal.md`` §4.1. Fixture as ``poc/sparse/prune.py`
 
 - ``groups``: whole X groups packed greedily on their *searched* counts, largest first (the first build),
   loaded with what ``_drop_zeros`` keeps of each group.
-- ``split``: ``_mesh_operator`` itself, its stored entries per device, and its slots over stored entries.
+- ``split``: ``_sparse_operator`` under a mesh, the shipped form, its stored entries per device, and its slots over stored entries.
 
 Each reports the largest device's load over the mean. Host-only arithmetic, except ``split``, which
 places arrays on ``--devices``' largest virtual CPU mesh.
@@ -22,10 +22,11 @@ import jax
 
 jax.config.update("jax_enable_x64", True)
 
+import jax.numpy as jnp
 import numpy as np
-from jax.sharding import AxisType
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # poc/
+from _scaling_common import make_1d_mesh
 from eigenpair_check_scale import hamming_shells, patterns, xxz
 
 import rqutils.sqd._sparse as sm
@@ -48,7 +49,7 @@ for name in ("type1", "type2", "type3", "type4"):
     states_u = uniquify_states(states_p, size)
     pairs = sm._group_pairs(h, states_u)
     # What _drop_zeros keeps of each group: the factors of its searched pairs, nonzero.
-    z, c = jax.numpy.asarray(h.z), jax.numpy.asarray(h.c)
+    z, c = jnp.asarray(h.z), jnp.asarray(h.c)
     kmax = max(int(np.count_nonzero(np.asarray(h.c)[g])) for g in pairs)
     kept = {}
     for g, (i, j) in pairs.items():
@@ -65,10 +66,8 @@ for name in ("type1", "type2", "type3", "type4"):
             loads[k] += len(pairs[g][0])
             post[k] += kept[g]
         groups.append(f"P={p} {max(post) / (total / p):.2f}x, {post.count(0)} idle")
-        mesh = jax.make_mesh(
-            (p,), ("x",), devices=jax.devices()[:p], axis_types=(AxisType.Explicit,)
-        )
-        d = np.asarray(sm._mesh_operator(h, states_u, pairs, mesh)[3]).reshape(p, -1)
+        mesh = make_1d_mesh(devices=jax.devices()[:p])
+        d = np.asarray(sm._sparse_operator(h, states_u, pairs, mesh)[3]).reshape(p, -1)
         live = np.count_nonzero(d, axis=1)
         assert live.sum() == total, (name, p, live.sum(), total)
         split.append(f"P={p} {live.max() / live.mean():.3f}x, slots {d.size / total:.2f}x")

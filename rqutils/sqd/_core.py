@@ -23,13 +23,7 @@ from rqutils.sqd._solve import (
     _residual_floor_of,
     run_sqd,
 )
-from rqutils.sqd._sparse import (
-    _group_pairs,
-    _mesh_operator,
-    _run_sparse,
-    _sparse_operator,
-    _sparse_residual,
-)
+from rqutils.sqd._sparse import _group_pairs, _run_sparse, _sparse_operator, _sparse_residual
 from rqutils.sqd._states import (
     _MAX_STATES,
     StateList,
@@ -328,12 +322,7 @@ def _solve_sqd(
         # run_sqd is jitted and the entry counts are data-dependent, so the operator is built here.
         states_u = uniquify_states(states_p, states_size)
         pairs = _group_pairs(hamiltonian, states_u)  # one search, for the build and the check
-        mesh = jax.sharding.get_mesh()
-        operator = (
-            _sparse_operator(hamiltonian, states_u, pairs)
-            if mesh.empty
-            else _mesh_operator(hamiltonian, states_u, pairs, mesh)
-        )
+        operator = _sparse_operator(hamiltonian, states_u, pairs, jax.sharding.get_mesh())
         LOG.info("Built the %s operator in %f seconds.", matvec, time.time() - start)
         result = _run_sparse(hamiltonian, states_u, operator, states_size, True, **tols)
         del operator  # the check reads none of it

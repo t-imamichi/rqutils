@@ -440,8 +440,8 @@ re-ran it and both tables reproduced exactly.
 
 ## 8. Plan, with a gate at each step
 
-1. **Rank 1 on virtual CPU devices** (me) — **done 2026-10-06**: `_mesh_operator` and the `shard_map` branch of
-   `_apply_pairs` (`rqutils/sqd/_sparse.py`), `test/sharded/pairs_mesh.py` (`TestShardedPairs`) and `"pairs"` in
+1. **Rank 1 on virtual CPU devices** (me) — **done 2026-10-06**: `_sparse_operator(..., mesh)` and
+   `_apply_pairs_mesh` (`rqutils/sqd/_sparse.py`), `test/sharded/pairs_mesh.py` (`TestShardedPairs`) and `"pairs"` in
    `sqd_grid.py`. Eigenvalues within 1e-12 of single-device, the batched product within 1.8e-15, entries
    `P('x', None, None)`, exactly one all-gather and one reduce-scatter. Not done: the iteration count, which
    `sqd` does not return. Each process still builds the whole host operator. Then
