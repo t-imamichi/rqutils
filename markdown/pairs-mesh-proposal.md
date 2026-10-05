@@ -1,8 +1,8 @@
 # Proposal: `"pairs"` under a mesh
 
 Status: **for review**, 2026-10-05; revised the same day after an independent review (§10). **Rank 1 is
-built** on this branch (2026-10-06, `b1bf0b3`), correctness on virtual CPU devices only (§4.1, §8 step 1);
-nothing else here is. Figures marked *measured* come from the cited write-ups or from `poc/split_layouts.py` (§7);
+merged** to `dev` (2026-10-06, `f5a981a`), correctness on virtual CPU devices only (§4.1, §8 step 1);
+nothing else here is built. Figures marked *measured* come from the cited write-ups or from `poc/split_layouts.py` (§7);
 everything marked *estimated* is arithmetic on those, not a run. **Post-drop** means after `_drop_zeros`
 (`6d13bfb`) and its padding fix (`d0a9997`); several single-device comparisons predate them and are marked
 *stale*.
@@ -10,8 +10,8 @@ everything marked *estimated* is arithmetic on those, not a run. **Post-drop** m
 ## 1. Summary, and the algorithms ranked
 
 `Matvec.PAIRS` is the fastest single-device kernel on both backends (*measured*: 3.9–5.6× `"indices"` on one
-CPU, 1.08–1.82× on one GPU, `poc/sparse/gpu.md` §9) but raises under a mesh, so a sharded solve falls back to
-`"indices"`. The GPU figure predates the zero-drop, which made `"pairs"` itself 1.85–5.46× faster per solve
+CPU, 1.08–1.82× on one GPU, `poc/sparse/gpu.md` §9) but raised under a mesh until rank 1, so a sharded solve fell
+back to `"indices"`. The GPU figure predates the zero-drop, which made `"pairs"` itself 1.85–5.46× faster per solve
 on a GH200 (`poc/sparse/prune.md` §6), so today's gap is likely wider; unmeasured. Every candidate, ranked by
 recommendation (simplicity first, then predicted speed and memory):
 
@@ -484,7 +484,7 @@ re-ran it and both tables reproduced exactly.
 
 ## 9. Decisions for you
 
-1. **Merge rank 1 to `dev`?** This branch lifts `"pairs"`' single-device restriction, with `CLAUDE.md` and the
+1. **Merge rank 1 to `dev`?** *Decided: merged, `f5a981a`.* It lifts `"pairs"`' single-device restriction, with `CLAUDE.md` and the
    docs updated, at no single-device cost (§4.1); it is untimed on real devices and unrun multi-process. Ranks
    2, 3, 9 and 10 would also change the state order the solver sees (rank 6 keeps lex order unless it takes
    rank 2's hash).

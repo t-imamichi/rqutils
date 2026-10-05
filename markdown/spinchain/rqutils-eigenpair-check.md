@@ -162,7 +162,7 @@ There is no flag to turn the check off in `sqd()`; the plumbing (`run_sqd(check_
   replicated, so every rank takes the same branch and raises together — no collective sits inside the
   conditional.
 - Verified on 4 virtual CPU devices (`poc/sharding.py`: all six cache levels agreed then, and the three
-  dense kernels agree today; the sparse kernels raise under a mesh). **Not verified on
+  dense kernels agree today; `"pairs"` runs under a mesh since `f5a981a`, `test/sharded/pairs_mesh.py`). **Not verified on
   a real multi-process run** — the `rqutils` sandbox cannot bind a coordinator port. If you run SKQD
   across nodes, an `mpirun` smoke test after upgrading is worth the minute.
 
