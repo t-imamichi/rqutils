@@ -2,9 +2,12 @@
 
 Fixture as ``poc/sparse/prune.py``. Each ``(pattern, size, arm)`` runs in a fresh subprocess, so ``first``
 pays every compile; ``warm`` is the min of ``--rounds`` further calls on the same inputs. Both sync once for
-the count, and the eager arm must return the library's arrays exactly.
+the count, and the eager arm must return the library's arrays exactly. With ``--cache-min-secs`` each
+child runs twice on a fresh persistent compile cache (that minimum compile time), and the
+second run is reported: what a later process pays once the cache is warm.
 
 Run: uv run python poc/sparse/drop_jit.py [--patterns type1 type2] [--log2-sizes 17 19] [--rounds 5]
+     [--cache-min-secs 0]
 """
 
 import argparse
@@ -12,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 import jax
@@ -35,6 +39,8 @@ parser.add_argument("--delta", type=float, default=0.5)
 parser.add_argument("--patterns", nargs="+", default=["type1", "type2"])
 parser.add_argument("--log2-sizes", type=int, nargs="+", default=[17, 19])
 parser.add_argument("--rounds", type=int, default=5)
+parser.add_argument("--cache-min-secs", type=float, help="time a warm persistent compile cache")
+parser.add_argument("--cache-dir", help=argparse.SUPPRESS)
 parser.add_argument("--child", nargs=3, metavar=("PATTERN", "LOG2", "ARM"), help=argparse.SUPPRESS)
 options = parser.parse_args()
 
@@ -52,6 +58,9 @@ def drop_eager(t, s, d, chunk, size):
 
 
 def child(pattern, log2, arm):
+    if options.cache_dir:
+        jax.config.update("jax_compilation_cache_dir", options.cache_dir)
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", options.cache_min_secs)
     n = options.num_qubits
     ham = PauliSumXZ.from_paulisum(xxz(n, options.delta, *patterns(n)[pattern]))
     states = hamming_shells(n, 1 << int(log2), np.random.default_rng(0))
@@ -97,14 +106,14 @@ for pattern in options.patterns:
         for arm in ("eager", "jit"):
             cmd = [sys.executable, __file__, "--rounds", str(options.rounds)]
             cmd += ["--num-qubits", str(options.num_qubits), "--delta", str(options.delta)]
-            out = subprocess.run(
-                [*cmd, "--child", pattern, str(log2), arm],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if out.returncode:
-                sys.exit(out.stderr)
+            cmd += ["--child", pattern, str(log2), arm]
+            with tempfile.TemporaryDirectory() as cache:
+                if options.cache_min_secs is not None:
+                    cmd += ["--cache-dir", cache, "--cache-min-secs", str(options.cache_min_secs)]
+                for _ in range(1 if options.cache_min_secs is None else 2):  # the 1st fills it
+                    out = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                    if out.returncode:
+                        sys.exit(out.stderr)
             r[arm] = json.loads(out.stdout.strip().splitlines()[-1])
         e, j = r["eager"], r["jit"]
         print(
