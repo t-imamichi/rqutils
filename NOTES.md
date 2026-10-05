@@ -2384,7 +2384,7 @@ putting `"indices"` ahead of `"tables"`; codes 0.88–0.97×. The fold shipped (
 
 M1, `type1`/`type2` `2^14`/`2^17`, fresh process per arm: the filter's first call 325–484 → 92–140 ms,
 a first build 0.56–0.78 → 0.34–0.44 s; warm 1.8–3.3×, bit-identical. Shipped as `_compact`, after a host sync for
-the count. GH200 unmeasured. `poc/sparse/drop-jit.md` §2
+the count. GH200 `2^20`/`2^22`: first call 4.0–4.4×, first build halved (−0.8 s). `poc/sparse/drop-jit.md` §2, §3
 
 ### sqd: `get_diagonal`'s `while_loop` stays outside the solve loop, deliberately (2026-10-05)
 

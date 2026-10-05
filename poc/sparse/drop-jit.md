@@ -1,6 +1,7 @@
 # `_drop_zeros` as one jitted program
 
-`poc/sparse/drop_jit.py` (§4) at `ab4a2a3` plus the change, one Apple M1 (8 cores, 16 GiB), 2026-10-05.
+`poc/sparse/drop_jit.py` (§5) at `ab4a2a3` plus the change, one Apple M1 (8 cores, 16 GiB), 2026-10-05;
+the NVIDIA GH200 120GB in §3, at `3b50443`.
 Fixture as `poc/sparse/prune.md`: spinchain's open-XXZ `xxz` at n=60, `δ = 0.5`, `type1` and `type2`,
 Hamming-shell subspaces around both Néel states. In the library since, as `_compact`.
 
@@ -25,14 +26,29 @@ eager arm returns the library's arrays exactly (asserted):
 
 A run before shipping, with the jitted form local to the script, gave the same figures within 10%.
 
-## 3. What it means, and open
+## 3. On the GH200
+
+`--log2-sizes 20 22`, `--patterns type1 type2`, default `--rounds`:
+
+| pattern, N | entries kept | eager first / warm | jit first / warm | first build eager / jit |
+| --- | --- | --- | --- | --- |
+| type1 2^20 | 524288 | 1080 / 7.1 ms | 248 / 0.5 ms | 1.58 / 0.74 s |
+| type1 2^22 | 2097152 | 1067 / 7.2 ms | 254 / 1.1 ms | 1.60 / 0.78 s |
+| type2 2^20 | 4718592 | 1044 / 7.1 ms | 258 / 0.8 ms | 1.55 / 0.76 s |
+| type2 2^22 | 23068672 | 1076 / 7.5 ms | 259 / 2.0 ms | 1.65 / 0.83 s |
+
+The first call is 4.0–4.4× faster, 0.79–0.82 s saved, halving a first build (2.0–2.1×). Eager is flat at
+~7 ms warm whatever the entry count, so its cost there is per-op dispatch, not work; jitted it is
+3.8–14×.
+
+## 4. What it means, and open
 
 The first call is 3.4–3.8× faster, 0.23–0.36 s saved per new size class, which is 39–45% of a first build;
 warm it is 1.8–3.3×, but at 0.4–11 ms that hardly matters against a solve. Same output, so nothing to
-trade. **Open**: the GH200, where `prune.md` §6 measured the warm filter; and whether the persistent
+trade. On a GH200 the gain is larger (§3). **Open**: whether the persistent
 compile cache already hid the eager cost across processes, which this script does not enable.
 
-## 4. The script
+## 5. The script
 
 `poc/sparse/drop_jit.py`, against its argparse: `--num-qubits` (60), `--delta` (0.5), `--patterns`
 (`type1 type2`), `--log2-sizes` (`17 19`; the table used `14 17`), `--rounds` (5). Each cell runs two child
