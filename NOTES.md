@@ -2380,6 +2380,13 @@ iteration at equal memory. `"tables"` diagonals as `uint8` codes cut the operato
 temp ~0.5× for 0.80–0.84× (lost in the `(2, N)` matvec), bit-identical. GH200 `2^20`–`2^22`: fold 1.13–1.18×,
 putting `"indices"` ahead of `"tables"`; codes 0.88–0.97×. The fold shipped (`zfree_first`). `poc/dense-codes.md` §2–§6
 
+### sqd: `get_diagonal`'s `while_loop` stays outside the solve loop, deliberately (2026-10-05)
+
+Closed unbuilt. What still reaches it runs once per solve or call: the residual check (+0.6–0.9% of a CPU
+solve, "`EigenpairCheckError`"; ~1% on a GPU, estimated not measured), `"tables"`' precompute, `"pairs"`' `d0` and check, `hproj`, `apply_h`.
+Bucketing the check would drop its independence from `term_counts`/`zfree_first`; a fixed trip pads to
+the rectangle, the identity's 59 terms at `type1`. Reopen if spinchain measures `apply_h` time on a GPU.
+
 ### sqd sparse kernels: `"csr"` and `"ell"` leave the library, `"pairs"` stays (2026-10-02)
 
 GH200 tuned (`2^17`, ×2 grid), `"ell"` against `"pairs"` per iteration is 0.28×/1.50× (`type1` `2^20`/`2^22`)
