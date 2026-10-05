@@ -58,12 +58,26 @@ so both arms match §2. At `S = 0` it hides most of the cost, the whole build's 
 jitted filter is still 2.2–2.7× faster on its first call. So the cache did not already hide the eager cost
 for a caller using the defaults.
 
+**On the GH200** (`--log2-sizes 20 22`, at `c3ba388`):
+
+| pattern, N | `S = 0`: eager first / jit first | first build eager / jit | `S = 1.0`: eager first / jit first | first build eager / jit |
+| --- | --- | --- | --- | --- |
+| type1 2^20 | 176 / 36 ms | 0.29 / 0.15 s | 997 / 173 ms | 1.49 / 0.67 s |
+| type1 2^22 | 192 / 38 ms | 0.33 / 0.18 s | 1028 / 177 ms | 1.56 / 0.71 s |
+| type2 2^20 | 183 / 37 ms | 0.31 / 0.16 s | 1008 / 188 ms | 1.52 / 0.70 s |
+| type2 2^22 | 179 / 38 ms | 0.37 / 0.23 s | 1029 / 187 ms | 1.61 / 0.77 s |
+
+The same conclusion, more strongly: at `S = 0` the jitted first call is still 4.7–5.1× faster. At
+`S = 1.0` eager is within 5% of §3, but jit's first call is 173–188 ms against §3's 248–259, and the build
+0.67–0.77 s against 0.74–0.83. Unexplained: whether the default cache stored a compile over 1 s, or the
+second process gained from something outside JAX (a CUDA driver cache), this design cannot separate.
+
 ## 5. What it means, and open
 
 The first call is 3.4–3.8× faster, 0.23–0.36 s saved per new size class, which is 39–45% of a first build;
 warm it is 1.8–3.3×, but at 0.4–11 ms that hardly matters against a solve. Same output, so nothing to
 trade. On a GH200 the gain is larger (§3). A persistent cache at its default threshold hides none of it
-(§4). **Open**: §4 on the GH200.
+(§4), on either backend. **Open**: the source of §4's GH200 `S = 1.0` jit gain.
 
 ## 6. The script
 
