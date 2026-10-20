@@ -222,7 +222,7 @@ class PauliSumXZ:
         return np.unpackbits(states_p, axis=-1)[:, 1 : 1 + num_qubits]
 
     @classmethod
-    def from_paulisum(cls, paulisum: Any, *, atol: float = 1e-12) -> "PauliSumXZ":
+    def from_paulisum(cls, paulisum: Any, *, atol: float = 1e-12) -> PauliSumXZ:
         """Build the packed representation from a Pauli sum.
 
         The only constructor, and the signature half of the bit-alignment contract: it inserts the
@@ -353,7 +353,7 @@ class PauliSumXZ:
         )
 
     @property
-    def arrays(self) -> "PackedArrays":
+    def arrays(self) -> PackedArrays:
         """The packed ``(x, z, c)`` arrays, for splatting into a traced function.
 
         A :class:`PackedArrays` rather than a bare tuple: ``x`` and ``z`` are same-dtype integer
