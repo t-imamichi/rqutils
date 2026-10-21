@@ -2,7 +2,7 @@
 
 Reply to spinchain's `rqutils-sparse-build-request.md`, from the `rqutils` side. Everything below is on
 `dev` at `605ad4a`: the check and the timer through `b5cb5da`, and the later changes in §7. **`dev` now
-requires Python 3.13** (§7.3), **and branch `py314` 3.14** (§7.4). Measured on one laptop CPU (10 cores, 64 GiB), without the persistent
+requires Python 3.14** (§7.4; 3.13 at `605ad4a`, §7.3). Measured on one laptop CPU (10 cores, 64 GiB), without the persistent
 compile cache.
 
 > **Status: asks 1, 3 and 4 done; ask 5 answered with a figure; ask 2 not taken up.**
@@ -144,7 +144,7 @@ the GH200. `605ad4a` reverts that change and brings back the hand-written slidin
 which has the same bound on groups in flight. **An environment on 3.12 will not install this revision.** `b5cb5da`, which is on
 `origin/dev`, is the last revision on 3.12.
 
-### 7.4 Follow-up: Python 3.14 is the floor again (`1a501dd`, branch `py314`)
+### 7.4 Follow-up: Python 3.14 is the floor again (`1a501dd`)
 
 `qiskit-aer` 0.18.0 (2026-10-20) ships `cp314-manylinux_2_28_aarch64`, so `1a501dd` reverts `605ad4a`:
 `requires-python` is `>=3.14` and `Executor.map(buffersize=)` replaces the sliding window. **Pin
